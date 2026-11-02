@@ -19,7 +19,8 @@
 //!    work of their own, so the reply and the data stay apart (AAP 0.3.3).
 //!
 //! Every `9500-LOG-ERROR` record is logged as one JSON line with the
-//! `CCPAUERY` fields; `carddemo_runtime::telemetry` formats it. CP00 has no
+//! `CCPAUERY` fields, a card number in its event key masked to the last four
+//! characters; `carddemo_runtime::telemetry` formats it. CP00 has no
 //! error queue: a request without a confirmed reply is logged and rejected
 //! without requeue, which consumes it as the COBOL's no-syncpoint get does
 //! (P-COPAUA0C-002).
@@ -37,12 +38,14 @@
 //!
 //! An input whose COBOL result the audit cannot pin reaches this flow as an
 //! `auth_decision::Unproven` naming its `halt` escalation. A request amount
-//! of that kind gets no reply; a write plan of that kind writes nothing. Both
-//! are logged with the escalation ID (AAP 0.9.6).
+//! of that kind gets no reply, nor does a card the cross-reference lacks,
+//! whose decision on the first message of a task tests a flag no statement
+//! set (E-41); a write plan of that kind writes nothing. Each is logged with
+//! the escalation ID and its request is rejected without requeue (AAP 0.9.6).
 
 use carddemo_domain::clock::{self, AnyClock, Clock};
 use carddemo_domain::numeric::Money;
-use carddemo_domain::ports::{AuthorizationStore, PortError};
+use carddemo_domain::ports::AuthorizationStore;
 use carddemo_domain::rules::auth_decision::{
     self, AuthContext, AuthDecision, AuthRequest, AuthWritePlan, ErrorLevel, ErrorLogEntry,
     SummaryWrite, Unproven, WriteStep,
@@ -50,12 +53,18 @@ use carddemo_domain::rules::auth_decision::{
 use carddemo_persistence::Db;
 
 use crate::consumer::{self, Disposition, FailureAction, Flow, PublishFailure, Reply, Request};
+use crate::db_deadline::{BoundedStore, bounded};
 use crate::ids;
 
 /// COPAUA0C 2100-EXTRACT-REQUEST-MSG — P-COPAUA0C-004: the paragraph a
 /// request with an unproven amount is rejected at, recorded as the message
 /// span's `location`.
 const EXTRACT_PARAGRAPH: &str = "2100-EXTRACT-REQUEST-MSG";
+
+/// COPAUA0C 6000-MAKE-DECISION — P-COPAUA0C-028: the paragraph a request
+/// whose decision the audit cannot pin (E-41) is rejected at, recorded as the
+/// message span's `location`.
+const DECISION_PARAGRAPH: &str = "6000-MAKE-DECISION";
 
 /// COPAUA0C 8000-WRITE-AUTH-TO-DB — P-COPAUA0C-035: the paragraph a write
 /// plan the audit cannot pin is skipped at, recorded in its log event and as
@@ -115,7 +124,9 @@ impl Flow for Cp00Flow {
     /// when its amount is unproven, when a read fails critically (`C001` to
     /// `C003`, `I002`) or when it names no reply queue (`M004`): each of those
     /// ends the COBOL task before or at `7100-SEND-RESPONSE`, after its
-    /// no-syncpoint get has consumed the request.
+    /// no-syncpoint get has consumed the request. A card the cross-reference
+    /// lacks is rejected too, after its `A001` warning, because its decision
+    /// is unproven (E-41): no guessed reply is sent.
     async fn handle(&self, req: &Request) -> Disposition<PendingWrite> {
         let (request, amount) = match self.extract(req) {
             Ok(extracted) => extracted,
@@ -127,7 +138,13 @@ impl Flow for Cp00Flow {
         };
         match respond(req, request, amount, context) {
             Ok((reply, after_ack)) => Disposition::Reply { reply, after_ack },
-            Err(entry) => {
+            Err(NoReply::Unproven(unproven)) => {
+                log_unproven(req, unproven, DECISION_PARAGRAPH);
+                Disposition::Reject {
+                    location: DECISION_PARAGRAPH,
+                }
+            }
+            Err(NoReply::Logged(entry)) => {
                 self.log_entry(&entry);
                 Disposition::Reject {
                     location: entry.location,
@@ -158,10 +175,11 @@ impl Flow for Cp00Flow {
     ///
     /// Plans the writes at the clock's instant and runs them. A card the
     /// cross-reference lacks plans none
-    /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L463-465]; a plan the
-    /// audit cannot pin (a declined found card, E-41) is logged with its
-    /// escalation and writes nothing. The request is already acknowledged, so
-    /// nothing here reaches the broker.
+    /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L463-465], and
+    /// [`Flow::handle`] already rejects such a request before any reply; a
+    /// plan the audit cannot pin (a declined found card, E-41) is logged with
+    /// its escalation and writes nothing. The request is already acknowledged,
+    /// so nothing here reaches the broker.
     ///
     /// Each failure's location is recorded in the message span as soon as it
     /// is logged ([`consumer::record_location`]): the `I003` or `I004` of a
@@ -221,21 +239,26 @@ impl Cp00Flow {
     /// the COBOL task through `9990-END-ROUTINE` before any reply, so its
     /// location is returned and the request is rejected. A unit of work that
     /// cannot be opened stands in for the failed first read: `C001`.
+    ///
+    /// The `BEGIN`, each read and the `ROLLBACK` run under the limits of
+    /// `crate::db_deadline`. A read the server cancels at the statement
+    /// timeout, or that outlives the database deadline, fails like any other
+    /// read failure, so it becomes the `C001`, `C002`, `C003` or
+    /// `I002` record of that read; the database cause of every failed read is
+    /// logged beside the record, which keeps only the legacy codes.
     async fn read(&self, request: &AuthRequest) -> Result<AuthContext, &'static str> {
-        let mut uow = match self.db.begin().await {
+        let mut uow = match bounded("begin", self.db.begin()).await {
             Ok(uow) => uow,
             Err(error) => {
                 tracing::warn!(flow = Self::NAME, error = %error, "read unit of work not opened");
-                let entry = auth_decision::xref_read_failure_entry(
-                    &request.pa_rq_card_num,
-                    &PortError::from(error),
-                );
+                let entry = auth_decision::xref_read_failure_entry(&request.pa_rq_card_num, &error);
                 self.log_entry(&entry);
                 return Err(entry.location);
             }
         };
-        let context = auth_decision::gather(&mut uow.store(), request).await;
-        if let Err(error) = uow.rollback().await {
+        let context =
+            auth_decision::gather(&mut BoundedStore::new(Self::NAME, uow.store()), request).await;
+        if let Err(error) = bounded("rollback", uow.rollback()).await {
             tracing::warn!(flow = Self::NAME, error = %error, "read unit of work not rolled back");
         }
         for entry in &context.log {
@@ -257,34 +280,39 @@ impl Cp00Flow {
     /// under its own savepoint in the store. A unit of work that cannot be
     /// opened or committed loses the summary write, so it is logged as `I003`.
     ///
+    /// The `BEGIN`, each write and the `COMMIT` run under the limits of
+    /// `crate::db_deadline`, so a stalled database cannot hold the consumer
+    /// after the acknowledgement. A write the server cancels at the statement
+    /// timeout, or that outlives the database deadline, fails like any other
+    /// failed write (`I003` or `I004`); its savepoint is rolled back before
+    /// the `COMMIT`, which still keeps the summary written before a failed
+    /// detail. A `BEGIN` or `COMMIT` that fails or outlives the deadline is
+    /// `I003`. The database cause of each failure is logged beside the record,
+    /// and the acknowledged request is never replayed.
+    ///
     /// Each record's location is recorded in the message span as soon as it
     /// is logged ([`consumer::record_location`]). A failed commit's `I003`
     /// replaces an earlier `I004`, because the summary that record left in
     /// place is lost with the commit.
     async fn write(&self, plan: &AuthWritePlan) {
-        let mut uow = match self.db.begin().await {
+        let mut uow = match bounded("begin", self.db.begin()).await {
             Ok(uow) => uow,
             Err(error) => {
-                let entry = auth_decision::write_failure_entry(
-                    WriteStep::Summary,
-                    &PortError::from(error),
-                    plan,
-                );
+                tracing::warn!(flow = Self::NAME, error = %error, "write unit of work not opened");
+                let entry = auth_decision::write_failure_entry(WriteStep::Summary, &error, plan);
                 self.log_entry(&entry);
                 consumer::record_location(entry.location);
                 return;
             }
         };
-        if let Some(entry) = write_segments(&mut uow.store(), plan).await {
+        let written = write_segments(&mut BoundedStore::new(Self::NAME, uow.store()), plan).await;
+        if let Some(entry) = written {
             self.log_entry(&entry);
             consumer::record_location(entry.location);
         }
-        if let Err(error) = uow.commit().await {
-            let entry = auth_decision::write_failure_entry(
-                WriteStep::Summary,
-                &PortError::from(error),
-                plan,
-            );
+        if let Err(error) = bounded("commit", uow.commit()).await {
+            tracing::warn!(flow = Self::NAME, error = %error, "write unit of work not committed");
+            let entry = auth_decision::write_failure_entry(WriteStep::Summary, &error, plan);
             self.log_entry(&entry);
             consumer::record_location(entry.location);
         }
@@ -306,24 +334,33 @@ impl Cp00Flow {
 /// request's `reply_to`, with the request's `correlation_id` (`MQMD-CORRELID`
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L745]) and a new
 /// `message_id` (`MQMI-NONE` [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L746]).
-/// A card the cross-reference lacks is answered too, with the `3100` decline
-/// the domain gives it (the E-41 proposal that section D row P-COPAUA0C-026
-/// records); only its write is skipped.
+///
+/// A card the cross-reference lacks is not answered: its decision tests a
+/// flag no statement set (E-41, halt, P-COPAUA0C-028), so the `3100` decline
+/// the domain gives it, the proposal section D row P-COPAUA0C-026 records, is
+/// not sent. [`auth_decision::decidable`] decides this before the decision
+/// and before the reply queue is looked at, since `6000-MAKE-DECISION` runs
+/// before `7100-SEND-RESPONSE`.
 ///
 /// # Errors
 ///
-/// The `M004` record when the request names no reply queue: the `MQPUT1` to
-/// a blank `MQOD-OBJECTNAME` fails, and its AMQP counterpart is a publish the
-/// broker returns as unroutable, [`PublishFailure::Returned`].
+/// - [`NoReply::Unproven`] (`E-41`) when the cross-reference lacks the card.
+/// - [`NoReply::Logged`] with the `M004` record when the request names no
+///   reply queue: the `MQPUT1` to a blank `MQOD-OBJECTNAME` fails, and its
+///   AMQP counterpart is a publish the broker returns as unroutable,
+///   [`PublishFailure::Returned`].
 fn respond(
     req: &Request,
     request: AuthRequest,
     amount: Money<10>,
     context: AuthContext,
-) -> Result<(Reply, PendingWrite), ErrorLogEntry> {
+) -> Result<(Reply, PendingWrite), NoReply> {
+    auth_decision::decidable(&context).map_err(NoReply::Unproven)?;
     let decision = auth_decision::decide(amount, &context);
     let Some(queue) = reply_queue(req) else {
-        return Err(reply_failure_entry_for(&PublishFailure::Returned));
+        return Err(NoReply::Logged(reply_failure_entry_for(
+            &PublishFailure::Returned,
+        )));
     };
     let reply = Reply {
         queue: queue.to_owned(),
@@ -338,6 +375,17 @@ fn respond(
         context,
     };
     Ok((reply, work))
+}
+
+/// COPAUA0C 6000-MAKE-DECISION / 7100-SEND-RESPONSE — P-COPAUA0C-012,
+/// P-COPAUA0C-028: why [`respond`] gives a request no reply.
+#[derive(Debug, PartialEq, Eq)]
+enum NoReply {
+    /// The decision is one the audit cannot pin: logged with its escalation
+    /// at `6000-MAKE-DECISION`, with no record of its own.
+    Unproven(Unproven),
+    /// The `CCPAUERY` record to log, `M004`.
+    Logged(ErrorLogEntry),
 }
 
 /// COPAUA0C 3100-READ-REQUEST-MQ / 7100-SEND-RESPONSE — P-COPAUA0C-002,
@@ -425,9 +473,10 @@ fn log_unproven(req: &Request, unproven: Unproven, paragraph: &'static str) {
 /// `err_message`, …) rather than bare `level` and `message`, which the JSON
 /// formatter already uses for the event's own level and message.
 ///
-/// The event key is logged as the record carries it, the full card number of
-/// `A001`, `C001` and `I004` included, because the replacement keeps the
-/// `CSSL` record's content; the log stays on the local JSON stdout.
+/// The event key is logged through [`logged_event_key`]: a card number is
+/// masked to its last four characters, so no log line carries a full card
+/// number, while the account and customer keys are logged as they are. The
+/// [`ErrorLogEntry`] itself keeps the key the COBOL moves.
 fn log_record(entry: &ErrorLogEntry, clock: &impl Clock) {
     let now = clock.now();
     let err_date = clock::yymmdd(now);
@@ -436,7 +485,7 @@ fn log_record(entry: &ErrorLogEntry, clock: &impl Clock) {
     let err_subsystem = char::from(entry.source.code());
     let err_code_1 = entry.code_1.trimmed();
     let err_code_2 = entry.code_2.trimmed();
-    let err_event_key = entry.event_key.trimmed();
+    let err_event_key = logged_event_key(entry);
     // One field list for both levels: a tracing callsite fixes its level at
     // compile time, so each level needs its own macro call.
     macro_rules! error_log_record {
@@ -463,13 +512,55 @@ fn log_record(entry: &ErrorLogEntry, clock: &impl Clock) {
     }
 }
 
+/// COPAUA0C 5200-READ-ACCT-RECORD / 5300-READ-CUST-RECORD — P-COPAUA0C-007:
+/// the `ERR-LOCATION`s whose `ERR-EVENT-KEY` is not a card number. `A002` and
+/// `C002` carry the account ID `WS-CARD-RID-ACCT-ID-X`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L546]
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L559]; `A003` and `C003`
+/// the customer ID `WS-CARD-RID-CUST-ID`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L594]
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L607]. Every other
+/// record moves `XREF-CARD-NUM` or `PA-CARD-NUM` into the key
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L499]
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L930].
+const NON_CARD_KEY_LOCATIONS: [&str; 4] = ["A002", "C002", "A003", "C003"];
+
+/// The trailing characters of a card number a log line shows, as the
+/// `Debug` form of `CardNumber` shows them.
+const CARD_KEY_SHOWN: usize = 4;
+
+/// COPAUA0C 9500-LOG-ERROR — P-COPAUA0C-015: `ERR-EVENT-KEY` of `entry` as its
+/// log line carries it, without its right padding.
+///
+/// A card number, the key of every location but those in
+/// [`NON_CARD_KEY_LOCATIONS`], has every character but its last four replaced
+/// by `*`, and every character when it has four or fewer: the log keeps the
+/// `CCPAUERY` field and enough of the card to tell records apart, never the
+/// full number. The account and customer keys are logged as they are.
+fn logged_event_key(entry: &ErrorLogEntry) -> String {
+    let key = entry.event_key.trimmed();
+    if NON_CARD_KEY_LOCATIONS.contains(&entry.location) {
+        return key.into_owned();
+    }
+    let count = key.chars().count();
+    let hidden = if count > CARD_KEY_SHOWN {
+        count - CARD_KEY_SHOWN
+    } else {
+        count
+    };
+    std::iter::repeat_n('*', hidden)
+        .chain(key.chars().skip(hidden))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
+    use std::future::{self, Future};
     use std::io;
     use std::pin::pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
+    use std::time::{Duration, Instant};
 
     use carddemo_domain::clock::{AnyClock, Clock};
     use carddemo_domain::entities::{
@@ -483,14 +574,17 @@ mod tests {
     use carddemo_domain::ports::{AuthorizationStore, Browse, Direction, PortError, PortResult};
     use carddemo_domain::rules::auth_decision::{
         self, AuthContext, AuthWritePlan, ErrorLevel, ErrorLogEntry, ErrorSource, Lookup,
-        SummaryWrite,
+        SummaryWrite, Unproven, WriteStep,
     };
+    use carddemo_persistence::connect_with_statement_timeout;
+    use carddemo_testkit::TestStack;
 
     use super::{
-        Cp00Flow, PendingWrite, log_record, reply_failure_entry_for, reply_queue, respond,
-        write_segments,
+        Cp00Flow, NoReply, PendingWrite, log_record, logged_event_key, reply_failure_entry_for,
+        reply_queue, respond, write_segments,
     };
-    use crate::consumer::{Flow, PublishFailure, Reply, Request};
+    use crate::consumer::{Disposition, Flow, PublishFailure, Reply, Request};
+    use crate::db_deadline::BoundedStore;
 
     /// The section F pin of P-COPAUA0C-030 and P-COPAUA0C-031.
     const PINNED: &str = "2022-07-01T12:00:00Z";
@@ -627,7 +721,7 @@ mod tests {
 
     /// Parses `body` and answers it against `context`, as `handle` does after
     /// the reads.
-    fn answer(req: &Request, context: AuthContext) -> Result<(Reply, PendingWrite), ErrorLogEntry> {
+    fn answer(req: &Request, context: AuthContext) -> Result<(Reply, PendingWrite), NoReply> {
         let request = auth_decision::parse_request(&req.body);
         let amount = auth_decision::parse_amount(&request).expect("a pinned amount");
         respond(req, request, amount, context)
@@ -659,20 +753,33 @@ mod tests {
     struct FakeStore {
         calls: Vec<&'static str>,
         failing: Option<&'static str>,
+        stalling: Option<&'static str>,
     }
 
     impl FakeStore {
         fn failing(call: &'static str) -> Self {
             Self {
-                calls: Vec::new(),
                 failing: Some(call),
+                ..Self::default()
             }
         }
 
-        /// Records `call` and answers it: the injected failure when it is the
-        /// failing call, `value` otherwise.
-        fn answer<T>(&mut self, call: &'static str, value: T) -> PortResult<T> {
+        /// A store whose `call` never answers, as a write blocked by a lock
+        /// another session holds.
+        fn stalling(call: &'static str) -> Self {
+            Self {
+                stalling: Some(call),
+                ..Self::default()
+            }
+        }
+
+        /// Records `call` and answers it: never when it is the stalling call,
+        /// the injected failure when it is the failing call, `value` otherwise.
+        async fn answer<T: Send>(&mut self, call: &'static str, value: T) -> PortResult<T> {
             self.calls.push(call);
+            if self.stalling == Some(call) {
+                future::pending::<()>().await;
+            }
             if self.failing == Some(call) {
                 Err(PortError::Unavailable("injected failure".to_owned()))
             } else {
@@ -700,11 +807,11 @@ mod tests {
         }
 
         async fn insert_summary(&mut self, _summary: PendingAuthSummary) -> PortResult<()> {
-            self.answer("insert_summary", ())
+            self.answer("insert_summary", ()).await
         }
 
         async fn update_summary(&mut self, _summary: PendingAuthSummary) -> PortResult<()> {
-            self.answer("update_summary", ())
+            self.answer("update_summary", ()).await
         }
 
         async fn delete_summary(&mut self, _id: AccountId) -> PortResult<()> {
@@ -720,7 +827,7 @@ mod tests {
         }
 
         async fn insert_detail(&mut self, _detail: NewPendingAuthDetail) -> PortResult<AuthId> {
-            self.answer("insert_detail", AuthId::from(1))
+            self.answer("insert_detail", AuthId::from(1)).await
         }
 
         async fn read_detail(&mut self, _id: AuthId) -> PortResult<PendingAuthDetail> {
@@ -869,19 +976,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_card_is_answered_and_plans_no_write() {
-        // P-COPAUA0C-026 (section D, the E-41 proposal), P-COPAUA0C-035: the
-        // reply is sent and 8000 is not performed.
+    fn an_unknown_card_is_halted_without_a_reply() {
+        // P-COPAUA0C-028 (E-41 halt): the decision of a card the cross-reference
+        // lacks is unproven, so the P-COPAUA0C-026 proposal (05/3100) is not
+        // sent, whether or not a reply queue is named, and no write follows.
         let body = request_text(UNKNOWN_CARD, "100.00", "TXN000000000002");
-        let req = request(&body, Some("CP00.REPLY.QUEUE"));
-        let (reply, work) = answer(&req, unknown_card_context()).expect("a reply");
-        assert_eq!(
-            reply.body,
-            b"9999999999999999,TXN000000000002,120000,05,3100,          0.00, "
-        );
-        assert_eq!(reply.correlation_id, req.correlation_id);
-        assert!(!work.decision.approved);
-        assert!(plan_of(&work).is_none());
+        for reply_to in [Some("CP00.REPLY.QUEUE"), None] {
+            let req = request(&body, reply_to);
+            let outcome = answer(&req, unknown_card_context());
+            assert_eq!(
+                outcome.map(|(reply, _)| reply),
+                Err(NoReply::Unproven(Unproven {
+                    escalation_id: "E-41"
+                })),
+                "{reply_to:?}"
+            );
+        }
     }
 
     #[test]
@@ -892,7 +1002,9 @@ mod tests {
         let (condition_code, reason_code) = PublishFailure::Returned.mq_codes();
         for reply_to in [None, Some(""), Some("   ")] {
             let req = request(&body, reply_to);
-            let entry = answer(&req, fixture_context()).expect_err("no reply queue");
+            let Err(NoReply::Logged(entry)) = answer(&req, fixture_context()) else {
+                panic!("no reply queue is the M004 record: {reply_to:?}");
+            };
             assert_eq!(entry.location, "M004", "{reply_to:?}");
             assert_eq!(entry.level, ErrorLevel::Critical);
             assert_eq!(entry.source, ErrorSource::Mq);
@@ -993,33 +1105,57 @@ mod tests {
     }
 
     #[test]
+    fn a_write_past_the_database_deadline_takes_its_failure_path() {
+        // P-COPAUA0C-013, P-COPAUA0C-014, P-COPAUA0C-035: a summary write that
+        // never completes is I003 and the detail is not attempted; a detail
+        // insert that never completes is I004 after the summary write. Each
+        // carries the IMS status of a store failure (E-44), and neither is
+        // retried.
+        let plan = approved_plan(false);
+        for (stalled, location) in [("insert_summary", "I003"), ("insert_detail", "I004")] {
+            let mut store = BoundedStore::with_deadline(
+                Cp00Flow::NAME,
+                FakeStore::stalling(stalled),
+                Duration::from_millis(20),
+            );
+            let entry = carddemo_testkit::block_on(write_segments(&mut store, &plan))
+                .expect("a stalled write is a failed write");
+            assert_eq!(entry.location, location, "{stalled}");
+            assert_eq!(entry.level, ErrorLevel::Critical, "{stalled}");
+            assert_eq!(entry.code_1.trimmed(), "AO", "{stalled}");
+        }
+    }
+
+    #[test]
     fn an_error_log_record_is_one_json_line_of_ccpauery_fields() {
         // P-COPAUA0C-015, P-COPAUA0C-031: ERR-DATE YYMMDD and ERR-TIME HHMMSS of
         // the pinned instant, application CP00, program COPAUA0C; a critical
-        // record is an ERROR event, a warning a WARN event.
+        // record is an ERROR event, a warning a WARN event. The A001 key, the
+        // card number, is logged masked to its last four characters.
         let critical = reply_failure_entry_for(&PublishFailure::Returned);
         let warning = unknown_card_context().log.remove(0);
+        let message = |text: &str| format!("\"err_message\":\"{text}\"");
         let cases = [
             (
                 &critical,
                 "\"level\":\"ERROR\"",
                 [
-                    "\"err_location\":\"M004\"",
-                    "\"err_level\":\"C\"",
-                    "\"err_subsystem\":\"M\"",
-                    "\"err_message\":\"FAILED TO PUT ON REPLY MQ\"",
-                    "\"err_event_key\":\"\"",
+                    "\"err_location\":\"M004\"".to_owned(),
+                    "\"err_level\":\"C\"".to_owned(),
+                    "\"err_subsystem\":\"M\"".to_owned(),
+                    message(messages::FAILED_TO_PUT_ON_REPLY_MQ),
+                    "\"err_event_key\":\"\"".to_owned(),
                 ],
             ),
             (
                 &warning,
                 "\"level\":\"WARN\"",
                 [
-                    "\"err_location\":\"A001\"",
-                    "\"err_level\":\"W\"",
-                    "\"err_subsystem\":\"A\"",
-                    "\"err_message\":\"CARD NOT FOUND IN XREF\"",
-                    "\"err_event_key\":\"9999999999999999\"",
+                    "\"err_location\":\"A001\"".to_owned(),
+                    "\"err_level\":\"W\"".to_owned(),
+                    "\"err_subsystem\":\"A\"".to_owned(),
+                    message(messages::CARD_NOT_FOUND_IN_XREF),
+                    "\"err_event_key\":\"************9999\"".to_owned(),
                 ],
             ),
         ];
@@ -1033,12 +1169,142 @@ mod tests {
                 "\"err_application\":\"CP00\"",
                 "\"err_program\":\"COPAUA0C\"",
             ];
-            for expected in common.iter().chain(&fields) {
+            for expected in common.into_iter().chain(fields.iter().map(String::as_str)) {
                 assert!(line.contains(expected), "{expected} missing from {line}");
             }
+            assert!(!line.contains(UNKNOWN_CARD), "{line}");
         }
         let codes = logged_line(&critical);
         assert!(codes.contains(&format!("\"err_code_1\":\"{}\"", critical.code_1.trimmed())));
         assert!(codes.contains(&format!("\"err_code_2\":\"{}\"", critical.code_2.trimmed())));
+    }
+
+    /// A record at `location` keyed by `key`. Only the location and the key
+    /// decide how the log shows the key.
+    fn keyed_entry(location: &'static str, key: &str) -> ErrorLogEntry {
+        ErrorLogEntry {
+            location,
+            level: ErrorLevel::Warning,
+            source: ErrorSource::App,
+            code_1: Alnum::spaces(),
+            code_2: Alnum::spaces(),
+            message: messages::ACCT_NOT_FOUND_IN_XREF,
+            event_key: Alnum::move_from(key),
+        }
+    }
+
+    #[test]
+    fn a_card_number_event_key_is_logged_masked_and_other_keys_as_they_are() {
+        // P-COPAUA0C-015: XREF-CARD-NUM (A001, C001) and PA-CARD-NUM (I004)
+        // keep only their last four characters in the log; the account and
+        // customer keys of A002/C002 and A003/C003 stay whole; a key never set
+        // (M004, E-25) stays empty. The records themselves keep the full key.
+        let failure = PortError::Unavailable("injected failure".to_owned());
+        let card = CardNumber::move_from(FIXTURE_CARD);
+        let cases = [
+            (unknown_card_context().log.remove(0), "************9999"),
+            (
+                auth_decision::xref_read_failure_entry(&card, &failure),
+                "************5740",
+            ),
+            (
+                auth_decision::write_failure_entry(
+                    WriteStep::Detail,
+                    &failure,
+                    &approved_plan(false),
+                ),
+                "************5740",
+            ),
+            (reply_failure_entry_for(&PublishFailure::Nacked), ""),
+            (keyed_entry("A002", "00000000050"), "00000000050"),
+            (keyed_entry("C002", "00000000050"), "00000000050"),
+            (keyed_entry("A003", "000000050"), "000000050"),
+            (keyed_entry("C003", "000000050"), "000000050"),
+            (keyed_entry("A001", "1234"), "****"),
+        ];
+        for (entry, logged) in cases {
+            assert_eq!(logged_event_key(&entry), logged, "{}", entry.location);
+            let line = logged_line(&entry);
+            assert!(
+                line.contains(&format!("\"err_event_key\":\"{logged}\"")),
+                "{line}"
+            );
+            assert!(
+                !line.contains(FIXTURE_CARD) && !line.contains(UNKNOWN_CARD),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            auth_decision::xref_read_failure_entry(&card, &failure)
+                .event_key
+                .trimmed(),
+            FIXTURE_CARD
+        );
+    }
+
+    #[test]
+    fn a_detail_insert_the_server_cancels_keeps_the_summary_written_before_it() {
+        // P-COPAUA0C-013, P-COPAUA0C-014, P-COPAUA0C-035: another session holds
+        // the detail table far longer than the statement timeout. The server
+        // cancels the detail insert (I004), the summary written before it is
+        // committed, and the write ends while the lock is still held, so
+        // neither the insert nor the COMMIT waits for the lock.
+        const STATEMENT_TIMEOUT: Duration = Duration::from_millis(500);
+        const LOCK_HELD: Duration = Duration::from_secs(8);
+        let stack = Arc::new(carddemo_testkit::block_on(TestStack::postgres()));
+        carddemo_testkit::block_on(async {
+            stack.seed().await.expect("the fixture state loads");
+            let db = connect_with_statement_timeout(stack.database_url(), STATEMENT_TIMEOUT)
+                .await
+                .expect("the pool opens");
+            let flow = Cp00Flow::new(db, pinned_clock());
+            let body = request_text(FIXTURE_CARD, "10.00", "TXN000000000001");
+            let req = request(&body, Some("CP00.REPLY.QUEUE"));
+            let Disposition::Reply { after_ack, .. } = flow.handle(&req).await else {
+                panic!("a found card within its limit is answered");
+            };
+
+            let locker = Arc::clone(&stack);
+            let lock = tokio::spawn(async move {
+                // The sleep is LOCK_HELD.
+                locker
+                    .exec_sql(
+                        "BEGIN; LOCK TABLE pending_auth_details IN ACCESS EXCLUSIVE MODE; \
+                         SELECT pg_sleep(8); COMMIT",
+                    )
+                    .await;
+            });
+            let granted = "SELECT count(*) FROM pg_locks JOIN pg_class ON pg_class.oid = \
+                           pg_locks.relation WHERE pg_class.relname = 'pending_auth_details' \
+                           AND pg_locks.mode = 'AccessExclusiveLock' AND pg_locks.granted";
+            while stack.fetch_text_rows(granted).await != [[Some("1".to_owned())]] {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            let started = Instant::now();
+            flow.after_ack(&req, after_ack).await;
+            let took = started.elapsed();
+            assert!(
+                took >= STATEMENT_TIMEOUT && took < LOCK_HELD,
+                "the write took {took:?}"
+            );
+            assert!(!lock.is_finished(), "the lock is still held");
+            assert_eq!(
+                stack
+                    .fetch_text_rows(
+                        "SELECT pa_approved_auth_cnt, pa_approved_auth_amt \
+                         FROM pending_auth_summaries WHERE pa_acct_id = 50"
+                    )
+                    .await,
+                [[Some("1".to_owned()), Some("10.00".to_owned())]]
+            );
+            lock.await.expect("the lock session ends");
+            assert_eq!(
+                stack
+                    .fetch_text_rows("SELECT count(*) FROM pending_auth_details")
+                    .await,
+                [[Some("0".to_owned())]]
+            );
+        });
     }
 }

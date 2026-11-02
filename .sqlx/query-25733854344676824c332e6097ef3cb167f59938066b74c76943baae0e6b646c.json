@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(1) AS \"count!\"\n                         FROM transaction_types\n                        WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "25733854344676824c332e6097ef3cb167f59938066b74c76943baae0e6b646c"
+}

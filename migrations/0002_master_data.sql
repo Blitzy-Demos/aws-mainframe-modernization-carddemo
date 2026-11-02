@@ -245,3 +245,12 @@ CREATE TABLE users (
     sec_usr_type  VARCHAR(1)  COLLATE "C" NOT NULL
         CHECK (sec_usr_type = rtrim(sec_usr_type) AND sec_usr_type !~ '[^\x01-\xff]')
 );
+
+-- COUSR00C browses USRSEC in KSDS key order [app/cbl/COUSR00C.cbl:L284-311], which is the
+-- byte order of the 8-byte SEC-USR-ID padded with spaces. browse_users
+-- (crates/persistence/src/repos/users.rs) therefore compares and orders by
+-- rpad(user_id, 8) COLLATE "C": the right-trimmed key alone sorts 'AB' before 'AB'
+-- followed by a byte below the space, where the padded key sorts it after. This
+-- expression index supplies that order and the start-key bound; the primary key still
+-- serves the keyed READs.
+CREATE INDEX users_padded_user_id ON users ((rpad(user_id, 8)) COLLATE "C");

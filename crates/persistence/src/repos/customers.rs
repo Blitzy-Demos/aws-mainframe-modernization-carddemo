@@ -29,10 +29,9 @@
 //! `CUSTDAT` is `RECOVERY(NONE)` [app/csd/CARDDEMO.CSD:L59]. `COACTUPC` rewrites
 //! the account and then the customer, and a failed customer rewrite leaves the
 //! account rewrite in place (P-COACTUPC-014) [app/cbl/COACTUPC.cbl:L4060-4102].
-//! The rewrite and the locking read therefore each run under their own savepoint
-//! through `crate::tx::savepoint` and `crate::tx::settle`: a failure rolls back
-//! that statement alone and leaves the caller's transaction usable. The plain
-//! read runs on the transaction directly.
+//! The rewrite, the locking read and the read each run under their own
+//! savepoint through `crate::tx::savepoint` and `crate::tx::settle`: a failure
+//! rolls back that statement alone and leaves the caller's transaction usable.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,8 +40,8 @@ use carddemo_domain::numeric::CustomerId;
 use carddemo_domain::ports::{CustomerReader, CustomerWriter, PortError, PortResult};
 
 use super::{alnum, cust_ssn, customer_id, expect_affected, fico_score, keyed_records};
+use crate::PersistenceError;
 use crate::tx::{PgStore, savepoint, settle};
-use crate::{PersistenceError, port_error};
 
 /// The table every statement of this module names, and every `Corrupt` error.
 const TABLE: &str = "customers";
@@ -126,8 +125,8 @@ fn integer(value: i64, column: &'static str) -> PortResult<i32> {
 
 impl CustomerReader for PgStore<'_, '_> {
     /// CICS `READ DATASET('CUSTDAT')` by the 9-byte customer key, and the batch
-    /// keyed `READ` of `CUSTFILE`. No lock is taken, and no savepoint is needed:
-    /// the read changes nothing.
+    /// keyed `READ` of `CUSTFILE`. No lock is taken; the read runs under its
+    /// own savepoint, so a failure leaves the caller's transaction usable.
     ///
     /// - `COACTVWC` `9400-GETCUSTDATA-BYCUST` — P-COACTVWC-010
     ///   [app/cbl/COACTVWC.cbl:L825-870]
@@ -145,7 +144,8 @@ impl CustomerReader for PgStore<'_, '_> {
     /// its PIC clause included, is [`PortError::Unavailable`].
     async fn read_customer(&mut self, id: CustomerId) -> PortResult<Customer> {
         let key = integer(id.to_i64(), "customer_id")?;
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             CustomerRow,
             "SELECT customer_id, cust_first_name, cust_middle_name, cust_last_name, \
                     cust_addr_line_1, cust_addr_line_2, cust_addr_line_3, \
@@ -157,9 +157,9 @@ impl CustomerReader for PgStore<'_, '_> {
              WHERE customer_id = $1",
             key,
         )
-        .fetch_one(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_one(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?;
         Customer::try_from(row).map_err(PortError::from)
     }
 
@@ -284,7 +284,8 @@ impl PgStore<'_, '_> {
     /// CBSTM03B 3000-CUSTFILE-PROC — P-CBSTM03B-004 [app/cbl/CBSTM03B.CBL:L181-204]
     /// for CBSTM03A 2000-CUSTFILE-GET — P-CBSTM03A-1258
     /// [app/cbl/CBSTM03A.CBL:L368-390]: the keyed `READ` of `CUSTFILE` for
-    /// each of `ids`, all in one statement. No lock is taken.
+    /// each of `ids`, all in one statement. No lock is taken; the statement
+    /// runs under its own savepoint, as every store statement does.
     ///
     /// Each entry is what [`CustomerReader::read_customer`] returns for its ID:
     /// the record; [`PortError::NotFound`] when no customer has the ID; or
@@ -311,7 +312,8 @@ impl PgStore<'_, '_> {
         let rows = if keys.is_empty() {
             Vec::new()
         } else {
-            sqlx::query_as!(
+            let mut sp = savepoint(self.tx).await?;
+            let result = sqlx::query_as!(
                 CustomerRow,
                 "SELECT customer_id, cust_first_name, cust_middle_name, cust_last_name, \
                         cust_addr_line_1, cust_addr_line_2, cust_addr_line_3, \
@@ -323,9 +325,9 @@ impl PgStore<'_, '_> {
                  WHERE customer_id = ANY($1)",
                 keys.as_slice(),
             )
-            .fetch_all(&mut **self.tx)
-            .await
-            .map_err(|err| port_error(&err))?
+            .fetch_all(&mut *sp)
+            .await;
+            settle(sp, result).await?
         };
         Ok(keyed_records(
             binds,

@@ -6,8 +6,9 @@
 //! The COBTUPDT paragraphs fall through in their source order, and the job keeps it:
 //!
 //! 1. `0001-OPEN-FILES`: [`load_records`] reads the whole input and frames its 53-byte
-//!    records. A file that cannot be read, or whose records do not fit `WS-INPUT-REC`, ends
-//!    the job with exit 16 before any change (P-COBTUPDT-011, E-36).
+//!    records on Tokio's blocking pool, inside the job span. A file that cannot be read, or
+//!    whose records do not fit `WS-INPUT-REC`, ends the job with exit 16 before any change
+//!    (P-COBTUPDT-011, E-36).
 //! 2. `1001-READ-NEXT-RECORDS` and `1002-READ-RECORDS`: every record, in file order, is shown
 //!    with its `PROCESSING` display (P-COBTUPDT-005).
 //! 3. `1003-TREAT-RECORD` and the statement it performs: [`treat_record`] hands the record to
@@ -44,6 +45,7 @@ use tracing::Span;
 use super::{JobContext, setup_failure};
 use crate::cli::Mnttrdb2Args;
 use crate::exit::ExitStatus;
+use crate::generations::blocking;
 
 /// The label an over-long `INPFILE` record is reported under: the program whose 53-byte
 /// `WS-INPUT-REC` it does not fit.
@@ -55,20 +57,24 @@ const INPUT_LAYOUT: &str = "COBTUPDT";
 /// type master in file order inside one unit of work, commits it, and returns
 /// [`ExitStatus::ReturnCode`] with 4 when any record failed, else 0.
 ///
-/// The job reads no setting, clock or generation, so the context is unused.
+/// The job reads no setting, clock or generation, so the context is unused. [`load_records`]
+/// runs on Tokio's blocking pool, inside the job span, before the unit of work begins.
 ///
 /// Each of these ends the job with a setup failure (exit 16):
 ///
-/// - the input cannot be read or framed (P-COBTUPDT-011, E-36), before any change;
+/// - the input cannot be read or framed (P-COBTUPDT-011, E-36), or the runtime shuts down
+///   before it is read, before any change;
 /// - the unit of work cannot begin, before any change;
 /// - the commit at `STOP RUN` fails, which leaves every statement of the run undone. The job
 ///   span keeps the `read` and `rejected` counts recorded before the commit and records
 ///   `written` and `deleted` as 0, and one `warn` event carries the inserts, updates and
 ///   deletes undone.
 pub(super) async fn run(_ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> ExitStatus {
-    let records = match load_records(&args.input) {
-        Ok(records) => records,
-        Err(status) => return status,
+    let input = args.input.clone();
+    let records = match blocking(move || load_records(&input)).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(status)) => return status,
+        Err(cancelled) => return setup_failure("INPFILE read did not complete", cancelled),
     };
     let mut uow = match db.begin().await {
         Ok(uow) => uow,

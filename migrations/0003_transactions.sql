@@ -168,6 +168,13 @@ CREATE UNIQUE INDEX transactions_master_tran_id ON transactions (tran_id) WHERE 
 -- over the live file.
 CREATE INDEX transactions_master_proc_ts ON transactions (tran_proc_ts) WHERE in_master;
 
+-- Serves the COMBTRAN revive lookup (crates/persistence/src/repos/transactions.rs revive) of
+-- the row outside the live master equal in tran_id and content, lowest transaction_id
+-- first, so each loaded record probes only the retained rows of its own TRAN-ID. It is not
+-- unique: a TRAN-ID held by non-live rows may be issued again, and several non-live rows
+-- may share it, so tran_id stays unique among live rows only.
+CREATE INDEX transactions_retained_tran_id ON transactions (tran_id, transaction_id) WHERE NOT in_master;
+
 -- The live TRANSACT file. A simple view over one table, so PostgreSQL makes it
 -- automatically updatable: an INSERT through it takes in_master = TRUE from the column
 -- default, and WITH LOCAL CHECK OPTION rejects any INSERT or UPDATE through it whose row
@@ -208,3 +215,13 @@ CREATE TABLE transaction_category_balances (
         CHECK (tran_cat_bal <> 'NaN'),
     PRIMARY KEY (trancat_acct_id, trancat_type_cd, trancat_cd)
 );
+
+-- The KSDS key order of TCATBALF is the 17 key bytes, the type code compared padded to its
+-- X(02) bytes. The primary key on the right-trimmed column cannot supply it: it puts '1'
+-- before '1' || chr(1), where the padded bytes put the control character, below the space,
+-- first. This index supplies the sequential order of CBACT04C 1000-TCATBALF-GET-NEXT
+-- [app/cbl/CBACT04C.cbl:L325-348] and the keyset bound of tcatbals_after
+-- (crates/persistence/src/repos/tcatbal.rs); the primary key still serves the keyed READ
+-- and REWRITE of CBTRN02C.
+CREATE INDEX transaction_category_balances_padded_key
+    ON transaction_category_balances (trancat_acct_id, (rpad(trancat_type_cd, 2)) COLLATE "C", trancat_cd);

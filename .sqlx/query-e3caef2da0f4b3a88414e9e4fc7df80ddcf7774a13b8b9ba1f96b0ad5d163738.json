@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT transaction_id AS \"transaction_id!\", tran_id AS \"tran_id!\",\n       tran_type_cd AS \"tran_type_cd!\", tran_cat_cd AS \"tran_cat_cd!\",\n       tran_source AS \"tran_source!\", tran_desc AS \"tran_desc!\", tran_amt AS \"tran_amt!\",\n       tran_merchant_id AS \"tran_merchant_id!\", tran_merchant_name AS \"tran_merchant_name!\",\n       tran_merchant_city AS \"tran_merchant_city!\", tran_merchant_zip AS \"tran_merchant_zip!\",\n       tran_card_num AS \"tran_card_num!\", tran_orig_ts AS \"tran_orig_ts!\",\n       tran_proc_ts AS \"tran_proc_ts!\"\nFROM transaction_master\nWHERE substr(tran_proc_ts, 1, 10) >= $1\n  AND substr(tran_proc_ts, 1, 10) <= $2\nORDER BY tran_id",
+  "query": "SELECT transaction_id AS \"transaction_id!\", tran_id AS \"tran_id!\",\n       tran_type_cd AS \"tran_type_cd!\", tran_cat_cd AS \"tran_cat_cd!\",\n       tran_source AS \"tran_source!\", tran_desc AS \"tran_desc!\", tran_amt AS \"tran_amt!\",\n       tran_merchant_id AS \"tran_merchant_id!\", tran_merchant_name AS \"tran_merchant_name!\",\n       tran_merchant_city AS \"tran_merchant_city!\", tran_merchant_zip AS \"tran_merchant_zip!\",\n       tran_card_num AS \"tran_card_num!\", tran_orig_ts AS \"tran_orig_ts!\",\n       tran_proc_ts AS \"tran_proc_ts!\"\nFROM transaction_master\nWHERE tran_proc_ts >= $1\n  AND tran_proc_ts <= ($2 || repeat(chr(255), 16))\n  AND substr(tran_proc_ts, 1, 10) >= $1\n  AND substr(tran_proc_ts, 1, 10) <= $2\n  AND ($3::text IS NULL OR (rpad(tran_card_num, 16), rpad(tran_id, 16)) > ($3, $4))\nORDER BY rpad(tran_card_num, 16), rpad(tran_id, 16)\nLIMIT $5",
   "describe": {
     "columns": [
       {
@@ -77,7 +77,10 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text"
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
@@ -97,5 +100,5 @@
       true
     ]
   },
-  "hash": "7b4c2753a0b6a2462dc8d31aee2a62ac3b91962b9ff8146d649a4e6cd5357657"
+  "hash": "e3caef2da0f4b3a88414e9e4fc7df80ddcf7774a13b8b9ba1f96b0ad5d163738"
 }

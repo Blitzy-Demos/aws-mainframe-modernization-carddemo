@@ -20,7 +20,8 @@
 //!
 //! Every test starts its own container through `carddemo_testkit::TestStack`,
 //! so it needs a running Docker daemon (AAP 0.10.4), and loads it with
-//! `seed::run` in `SeedMode::Full`: the 50 fixture accounts, an empty
+//! `seed::prepare` and `seed::run` in `SeedMode::Full`, the preparation on the
+//! test thread before the async phase: the 50 fixture accounts, an empty
 //! transaction master (E-07) and the two seed rules of AAP 0.3.6. Rule 1 pairs
 //! type `01` Purchase [app/data/ASCII/trantype.txt:L1] with category `0001`
 //! Regular Sales Draft [app/data/ASCII/trancatg.txt:L1] at rate 1.0000, rule 2
@@ -47,7 +48,7 @@ use carddemo_domain::numeric::{
 use carddemo_domain::ports::{PortError, TransactionWriter};
 use carddemo_domain::rewards::{AccrualInput, RewardEngine, RewardError, RewardStore};
 use carddemo_persistence::repos::SoftDeleteOutcome;
-use carddemo_persistence::seed::{self, SeedMode, SeedSources};
+use carddemo_persistence::seed::{self, PreparedSeed, SeedMode, SeedSources};
 use carddemo_persistence::{Db, PersistenceError, PgRewardStore, UnitOfWork};
 use carddemo_testkit::{TestStack, block_on, fixtures};
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
@@ -137,13 +138,24 @@ fn travel_seed_rule() -> RewardRule {
     )
 }
 
-/// A fresh migrated database in the seeded state, and the pool on it. The
-/// stack must outlive the pool's use: dropping it removes the container.
-async fn seeded() -> (TestStack, Db) {
+/// The fixture seed of the repository's sources, prepared on the calling
+/// thread: each test calls it before [`block_on`], outside every runtime, as
+/// an adapter prepares the seed on its blocking pool, so the argon2id hashing
+/// never runs inside the async phase.
+fn fixture_seed() -> PreparedSeed {
+    seed::prepare(
+        SeedMode::Full,
+        &SeedSources::with_defaults(&fixtures::repo_root()),
+    )
+}
+
+/// A fresh migrated database in the seeded state `prepared` writes, and the
+/// pool on it. The stack must outlive the pool's use: dropping it removes the
+/// container.
+async fn seeded(prepared: PreparedSeed) -> (TestStack, Db) {
     let stack = TestStack::postgres().await;
     let db = Db::from_pool(stack.pool().clone());
-    let sources = SeedSources::with_defaults(&fixtures::repo_root());
-    let report = seed::run(&db, SeedMode::Full, &sources)
+    let report = seed::run(&db, prepared)
         .await
         .expect("the fixture seed loads");
     assert_eq!(
@@ -283,8 +295,9 @@ async fn stored_balance(db: &Db, account_id: AccountId) -> Option<(i64, i64, i64
 /// is bound to a transaction the caller holds directly.
 #[test]
 fn candidate_rules_returns_every_rule_for_the_pair() {
+    let prepared = fixture_seed();
     block_on(async {
-        let (_stack, db) = seeded().await;
+        let (_stack, db) = seeded(prepared).await;
         let mut uow = db.begin().await.expect("a unit of work");
         let mut store = uow.store();
         let ended = store
@@ -333,8 +346,9 @@ fn candidate_rules_returns_every_rule_for_the_pair() {
 /// unit stays usable and commits exactly the first accrual.
 #[test]
 fn duplicate_accrual_is_reported_and_tx_stays_usable() {
+    let prepared = fixture_seed();
     block_on(async {
-        let (_stack, db) = seeded().await;
+        let (_stack, db) = seeded(prepared).await;
         let tran = live_transaction(&db, account(1), "01", 1, 10_000).await;
         let other = live_transaction(&db, account(1), "01", 1, 2_000).await;
 
@@ -423,8 +437,9 @@ fn duplicate_accrual_is_reported_and_tx_stays_usable() {
 /// total_points_redeemed`.
 #[test]
 fn add_points_upserts_and_keeps_invariant() {
+    let prepared = fixture_seed();
     block_on(async {
-        let (_stack, db) = seeded().await;
+        let (_stack, db) = seeded(prepared).await;
         for (credit, total) in [(40, 40), (2, 42)] {
             let mut uow = db.begin().await.expect("a unit of work");
             let balance = uow
@@ -492,8 +507,9 @@ fn add_points_upserts_and_keeps_invariant() {
 /// it leaves the unit usable and, rolled back, the balance unchanged.
 #[test]
 fn large_points_round_trip_and_overflow_is_an_error() {
+    let prepared = fixture_seed();
     block_on(async {
-        let (_stack, db) = seeded().await;
+        let (_stack, db) = seeded(prepared).await;
         let mut uow = db.begin().await.expect("a unit of work");
         uow.rewards()
             .add_points(account(2), points(BEYOND_SAFE_INTEGER))
@@ -536,8 +552,9 @@ fn large_points_round_trip_and_overflow_is_an_error() {
 /// nothing; step (4) earns `ceil(amount × rate)` and credits the balance.
 #[test]
 fn engine_accrues_through_pg_store() {
+    let prepared = fixture_seed();
     block_on(async {
-        let (_stack, db) = seeded().await;
+        let (_stack, db) = seeded(prepared).await;
         let retail = live_transaction(&db, account(1), "01", 1, 10_000).await;
         let travel = live_transaction(&db, account(1), "04", 3, 1_001).await;
         let zero = live_transaction(&db, account(1), "01", 1, 0).await;
@@ -615,8 +632,9 @@ fn engine_accrues_through_pg_store() {
 /// atomicity the CT02 and POSTTRAN call sites rely on (AAP 0.3.5).
 #[test]
 fn engine_rollback_and_commit_are_atomic() {
+    let prepared = fixture_seed();
     block_on(async {
-        let (_stack, db) = seeded().await;
+        let (_stack, db) = seeded(prepared).await;
         let tran = live_transaction(&db, account(1), "01", 1, 10_000).await;
         let input = AccrualInput::for_transaction(&tran, account(1));
 
@@ -686,8 +704,9 @@ fn engine_rollback_and_commit_are_atomic() {
 /// unchanged (AAP 0.3.5).
 #[test]
 fn reward_rule_admin_methods() {
+    let prepared = fixture_seed();
     block_on(async {
-        let (_stack, db) = seeded().await;
+        let (_stack, db) = seeded(prepared).await;
         let mut uow = db.begin().await.expect("a unit of work");
         let mut store = uow.store();
         let draft = NewRewardRule {
@@ -788,8 +807,9 @@ fn reward_rule_admin_methods() {
 /// and an empty page for a start key that names no accrual of the account.
 #[test]
 fn reward_balance_and_history() {
+    let prepared = fixture_seed();
     block_on(async {
-        let (_stack, db) = seeded().await;
+        let (_stack, db) = seeded(prepared).await;
         let holder = account(3);
         let mut purchases = Vec::new();
         for cents in [1_000, 2_000, 3_000, 4_000] {

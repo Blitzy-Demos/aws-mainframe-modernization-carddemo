@@ -61,17 +61,33 @@
 //! merge it into its terminator; such a line is rejected, never trimmed, escaped or replaced,
 //! and nothing is written. The statement files are cataloged datasets, not GDGs, and are
 //! replaced whole by [`write_replacing`].
+//!
+//! # Execution
+//!
+//! Every file-system, codec and CPU operation of a generation is synchronous, and a job, a future
+//! on Tokio's multi-threaded runtime, runs each one on Tokio's blocking pool: through
+//! [`Generations::begin_next_async`], [`PendingGeneration::append_records_async`],
+//! [`PendingGeneration::append_lines_async`], [`PendingGeneration::catalog_async`],
+//! [`PendingGeneration::discard_async`] and [`read_records_async`], or through [`blocking`] for
+//! any other phase. The work runs inside the caller's span, so its events and span records land
+//! in the job span. The errors and outcomes are those of the synchronous operation each one runs;
+//! a blocking task the runtime cancels because it is shutting down is reported as a
+//! [`GenerationError::Io`] on the path the operation addressed. A job discards every generation it
+//! abandons with [`PendingGeneration::discard_async`]; dropping a [`PendingGeneration`]
+//! uncataloged stays the safety net of a panic.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use carddemo_codec::framing::{decode_ascii_lf, encode_ascii_lf};
 use carddemo_codec::{CodecError, Layout};
+use tracing::Dispatch;
 
 /// `LIMIT(5) SCRATCH`: the number of generations each GDG keeps [app/jcl/DEFGDGB.jcl:STEP05]
 /// [app/jcl/DALYREJS.jcl:STEP05].
@@ -90,6 +106,9 @@ const TEMP_ATTEMPTS: u32 = 64;
 
 /// The sequence number that makes each temporary name of this process unique.
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The error of a write to, or a catalog of, a generation whose temporary file is closed.
+const CLOSED: &str = "generation file is already closed";
 
 /// A GDG base that an in-scope job writes. `TCATBALF.BKUP`, also defined by DEFGDGB, has no
 /// variant because no in-scope job writes it.
@@ -352,6 +371,24 @@ impl Generations {
             _lock: lock,
         })
     }
+
+    /// [`Generations::begin_next`] on Tokio's blocking pool, inside the caller's span (see
+    /// [`blocking`]).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Generations::begin_next`], and a [`GenerationError::Io`] on the catalog
+    /// directory when the runtime cancels the allocation because it is shutting down; nothing
+    /// is then allocated.
+    pub(crate) async fn begin_next_async(
+        &self,
+        dataset: Dataset,
+    ) -> Result<PendingGeneration, GenerationError> {
+        let generations = self.clone();
+        blocking(move || generations.begin_next(dataset))
+            .await
+            .unwrap_or_else(|cancelled| Err(io_error(&self.root, io::Error::other(cancelled))))
+    }
 }
 
 /// A held lock file, which stands for the dataset enqueue JES takes for a job as the module's
@@ -427,7 +464,9 @@ fn allocation_lock(root: &Path, dataset: Dataset) -> Result<LockFile, Generation
 ///
 /// [`PendingGeneration::catalog`] is the normal end of the step. Dropping the value without
 /// cataloging it is the abnormal end: the temporary file is deleted and no generation is added.
-/// Either way the allocation lock of the GDG is released last.
+/// Either way the allocation lock of the GDG is released last. A job ends the step with
+/// [`PendingGeneration::catalog_async`] or [`PendingGeneration::discard_async`], which do the
+/// same on Tokio's blocking pool.
 #[must_use = "a pending generation is deleted unless it is cataloged"]
 #[derive(Debug)]
 pub(crate) struct PendingGeneration {
@@ -435,7 +474,10 @@ pub(crate) struct PendingGeneration {
     number: u16,
     temp_path: PathBuf,
     final_path: PathBuf,
-    /// Taken only by `catalog` and `drop`, both of which consume the generation.
+    /// Taken by `catalog` and `drop`, both of which consume the generation, and lent to the
+    /// blocking pool by an asynchronous append, which puts it back unless the runtime cancels the
+    /// append. `None` on a generation not consumed means the file is closed and possibly
+    /// incomplete: writes fail and `catalog` refuses it.
     writer: Option<BufWriter<File>>,
     root: PathBuf,
     cataloged: bool,
@@ -464,11 +506,15 @@ impl PendingGeneration {
     /// [`encode_fixed_lines`] encodes them. Nothing is written when a line has the wrong width or
     /// holds `LF` or `CR`.
     ///
+    /// Jobs append lines only through [`PendingGeneration::append_lines_async`]; this synchronous
+    /// form is the reference the tests hold it to.
+    ///
     /// # Errors
     ///
     /// [`GenerationError::LineWidth`] and [`GenerationError::LineDelimiter`] as
     /// [`encode_fixed_lines`] reports them, and [`GenerationError::Io`] when the temporary file
     /// cannot be written.
+    #[cfg(test)]
     pub(crate) fn append_lines(
         &mut self,
         lines: &[String],
@@ -476,6 +522,79 @@ impl PendingGeneration {
     ) -> Result<(), GenerationError> {
         let bytes = encode_fixed_lines(lines, width)?;
         self.write(&bytes)
+    }
+
+    /// [`PendingGeneration::append_records`] on Tokio's blocking pool, inside the caller's span
+    /// (see [`blocking`]): the records are encoded and written there.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`PendingGeneration::append_records`]. When the runtime cancels the append
+    /// because it is shutting down, a [`GenerationError::Io`] on the temporary file: its writer
+    /// is lost, so every later write fails and [`PendingGeneration::catalog`] refuses the
+    /// generation.
+    pub(crate) async fn append_records_async<L>(
+        &mut self,
+        records: Vec<L::Record>,
+    ) -> Result<(), GenerationError>
+    where
+        L: Layout + 'static,
+        L::Record: Send + 'static,
+    {
+        self.write_async(move || Ok(encode_ascii_lf::<L>(&records)))
+            .await
+    }
+
+    /// Appends fixed-width text lines of `width` bytes, each followed by `LF`, as
+    /// [`encode_fixed_lines`] encodes them, on Tokio's blocking pool, inside the caller's span
+    /// (see [`blocking`]): the lines are checked, encoded and written there. Nothing is written
+    /// when a line has the wrong width or holds `LF` or `CR`.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::LineWidth`] and [`GenerationError::LineDelimiter`] as
+    /// [`encode_fixed_lines`] reports them, [`GenerationError::Io`] when the temporary file
+    /// cannot be written, and a [`GenerationError::Io`] on the temporary file when the runtime
+    /// cancels the append, as [`PendingGeneration::append_records_async`] describes.
+    pub(crate) async fn append_lines_async(
+        &mut self,
+        lines: Vec<String>,
+        width: usize,
+    ) -> Result<(), GenerationError> {
+        self.write_async(move || encode_fixed_lines(&lines, width))
+            .await
+    }
+
+    /// [`PendingGeneration::catalog`] on Tokio's blocking pool, inside the caller's span (see
+    /// [`blocking`]), so its `generation cataloged` and roll-off events land there.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`PendingGeneration::catalog`], and a [`GenerationError::Io`] on
+    /// `<DATASET>.G<nnnn>V00` when the runtime cancels the catalog because it is shutting down.
+    /// The runtime then drops the generation uncataloged, which deletes its temporary file and
+    /// releases the lock.
+    pub(crate) async fn catalog_async(self) -> Result<Generation, GenerationError> {
+        let final_path = self.final_path.clone();
+        blocking(move || self.catalog())
+            .await
+            .unwrap_or_else(|cancelled| Err(io_error(&final_path, io::Error::other(cancelled))))
+    }
+
+    /// The abnormal end of the step on Tokio's blocking pool, inside the caller's span (see
+    /// [`blocking`]): drops the generation uncataloged, which deletes its temporary file and
+    /// then releases the allocation lock, as dropping it does. When the runtime cancels the
+    /// discard because it is shutting down, a warning is logged; the runtime still drops the
+    /// generation, with the same effect.
+    pub(crate) async fn discard_async(self) {
+        let generation = generation_name(self.dataset, self.number);
+        if let Err(cancelled) = blocking(move || drop(self)).await {
+            tracing::warn!(
+                %generation,
+                error = %cancelled,
+                "uncataloged generation discard cancelled by runtime shutdown"
+            );
+        }
     }
 
     /// Catalogs the generation at the normal end of its step: flushes and syncs the temporary
@@ -490,18 +609,20 @@ impl PendingGeneration {
     /// # Errors
     ///
     /// [`GenerationError::Io`] when the flush, the sync or the link fails, including when
-    /// `<DATASET>.G<nnnn>V00` already exists (`AlreadyExists`, reported on that path). The
-    /// temporary file is then deleted, an existing file of that name is left as it was, and no
-    /// generation is added.
+    /// `<DATASET>.G<nnnn>V00` already exists (`AlreadyExists`, reported on that path), and on the
+    /// temporary file when that file is already closed because a cancelled asynchronous append
+    /// lost its writer, so it may be incomplete. The temporary file is then deleted, an existing
+    /// file of that name is left as it was, and no generation is added.
     pub(crate) fn catalog(mut self) -> Result<Generation, GenerationError> {
-        if let Some(writer) = self.writer.take() {
-            let file = writer
-                .into_inner()
-                .map_err(|e| io_error(&self.temp_path, e.into_error()))?;
-            file.sync_all()
-                .map_err(|source| io_error(&self.temp_path, source))?;
-            drop(file);
-        }
+        let Some(writer) = self.writer.take() else {
+            return Err(io_error(&self.temp_path, io::Error::other(CLOSED)));
+        };
+        let file = writer
+            .into_inner()
+            .map_err(|e| io_error(&self.temp_path, e.into_error()))?;
+        file.sync_all()
+            .map_err(|source| io_error(&self.temp_path, source))?;
+        drop(file);
         fs::hard_link(&self.temp_path, &self.final_path)
             .map_err(|source| io_error(&self.final_path, source))?;
         self.cataloged = true;
@@ -522,11 +643,33 @@ impl PendingGeneration {
 
     /// Writes `bytes` to the temporary file through its buffer.
     fn write(&mut self, bytes: &[u8]) -> Result<(), GenerationError> {
-        let written = match self.writer.as_mut() {
-            Some(writer) => writer.write_all(bytes),
-            None => Err(io::Error::other("generation file is already closed")),
-        };
-        written.map_err(|source| io_error(&self.temp_path, source))
+        write_buffered(self.writer.as_mut(), &self.temp_path, bytes)
+    }
+
+    /// Runs `encode`, then writes the bytes it returns to the temporary file, both on Tokio's
+    /// blocking pool. The writer is lent to the blocking work and put back whatever its outcome,
+    /// so an encoding error writes nothing and a write error is the one
+    /// [`PendingGeneration::write`] returns. A cancelled blocking task loses the writer and is
+    /// reported as a [`GenerationError::Io`] on the temporary file.
+    async fn write_async<E>(&mut self, encode: E) -> Result<(), GenerationError>
+    where
+        E: FnOnce() -> Result<Vec<u8>, GenerationError> + Send + 'static,
+    {
+        let mut writer = self.writer.take();
+        let temp_path = self.temp_path.clone();
+        let lent = blocking(move || {
+            let written =
+                encode().and_then(|bytes| write_buffered(writer.as_mut(), &temp_path, &bytes));
+            (writer, written)
+        })
+        .await;
+        match lent {
+            Ok((writer, written)) => {
+                self.writer = writer;
+                written
+            }
+            Err(cancelled) => Err(io_error(&self.temp_path, io::Error::other(cancelled))),
+        }
     }
 }
 
@@ -564,6 +707,60 @@ impl Drop for PendingGeneration {
 pub(crate) fn read_records<L: Layout>(path: &Path) -> Result<Vec<L::Record>, GenerationError> {
     let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
     Ok(decode_ascii_lf::<L>(&bytes)?)
+}
+
+/// [`read_records`] on Tokio's blocking pool, inside the caller's span (see [`blocking`]): the
+/// whole file is read and decoded there.
+///
+/// # Errors
+///
+/// The errors of [`read_records`], and a [`GenerationError::Io`] on `path` when the runtime
+/// cancels the read because it is shutting down.
+pub(crate) async fn read_records_async<L>(path: PathBuf) -> Result<Vec<L::Record>, GenerationError>
+where
+    L: Layout + 'static,
+    L::Record: Send + 'static,
+{
+    let error_path = path.clone();
+    blocking(move || read_records::<L>(&path))
+        .await
+        .unwrap_or_else(|cancelled| Err(io_error(&error_path, io::Error::other(cancelled))))
+}
+
+/// Runs `work` on Tokio's blocking pool and returns its value: the boundary every synchronous
+/// file-system, codec and CPU phase of a batch job crosses, so that the job future itself only
+/// awaits.
+///
+/// `work` runs inside the caller's current span and under the caller's default dispatcher, both
+/// captured when this future is first polled, so every event it emits and every
+/// `tracing::Span::current().record(..)` it makes lands exactly where it would, had the caller
+/// run `work` inline: in the job span, on the job's subscriber.
+///
+/// # Errors
+///
+/// The [`tokio::task::JoinError`] of a blocking task the runtime cancelled because it is shutting
+/// down before `work` started; `work` is then dropped without running. That is the only error.
+///
+/// # Panics
+///
+/// Resumes, on the caller, the panic `work` raised, with its original payload, as the unwinding
+/// of an inline call would. Panics, as `tokio::task::spawn_blocking` does, when called outside a
+/// Tokio runtime.
+pub(crate) async fn blocking<T, F>(work: F) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let span = tracing::Span::current();
+    let dispatch = tracing::dispatcher::get_default(Dispatch::clone);
+    tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || span.in_scope(work))
+    })
+    .await
+    .or_else(|error| match error.try_into_panic() {
+        Ok(payload) => panic::resume_unwind(payload),
+        Err(cancelled) => Err(cancelled),
+    })
 }
 
 /// Encodes fixed-width text lines as a record file: each line, which must be exactly `width`
@@ -636,6 +833,20 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), Generatio
         remove_temp(&temp_path);
     }
     replaced
+}
+
+/// Writes `bytes` through `writer`, the buffer of the temporary file `temp_path`. A missing
+/// writer means the file is already closed, and the write fails on `temp_path`.
+fn write_buffered(
+    writer: Option<&mut BufWriter<File>>,
+    temp_path: &Path,
+    bytes: &[u8],
+) -> Result<(), GenerationError> {
+    let written = match writer {
+        Some(writer) => writer.write_all(bytes),
+        None => Err(io::Error::other(CLOSED)),
+    };
+    written.map_err(|source| io_error(temp_path, source))
 }
 
 /// Writes `bytes` to `file`, the newly created file at `path`, syncs it to disk and closes it.
@@ -802,13 +1013,18 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::process;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use carddemo_codec::{Charset, CodecError, CodecErrorKind, FieldKind, FieldSpec, Layout};
+    use carddemo_runtime::telemetry::subscriber_with_writer;
+    use tracing::field::Empty;
+    use tracing::{Instrument, Span};
 
     use super::{
-        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, create_temp,
-        encode_fixed_lines, read_records, remove_temp, write_replacing, write_synced,
+        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, blocking, create_temp,
+        encode_fixed_lines, read_records, read_records_async, remove_temp, write_replacing,
+        write_synced,
     };
 
     /// A test directory under the system temporary directory, removed when the test ends.
@@ -1460,5 +1676,278 @@ mod tests {
             assert!(payloads.contains(&content.as_slice()), "{content:?}");
         }
         assert_eq!(dir.names(), ["STATEMNT.PS"], "no temporary file is left");
+    }
+
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        /// The JSON lines written so far.
+        fn lines(&self) -> Vec<String> {
+            let bytes = self.0.lock().expect("capture buffer").clone();
+            String::from_utf8(bytes)
+                .expect("JSON lines are UTF-8")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_returns_the_value_of_work_run_on_the_blocking_pool() {
+        let caller = thread::current().id();
+        let (value, worker) = blocking(|| (6 * 7, thread::current().id()))
+            .await
+            .expect("the runtime is running");
+        assert_eq!(value, 42);
+        assert_ne!(worker, caller, "the work ran on another thread");
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_blocking_work_resumes_on_the_caller() {
+        let caller = tokio::spawn(blocking(|| -> u8 { panic!("blocking work failed") }));
+        let error = caller.await.expect_err("the caller unwinds");
+        assert!(error.is_panic(), "{error:?}");
+        assert_eq!(
+            error.into_panic().downcast_ref::<&str>(),
+            Some(&"blocking work failed"),
+            "the original payload is resumed"
+        );
+    }
+
+    /// Runs blocking work inside a job span under the batch telemetry subscriber, installed as
+    /// the default of the caller's thread only, and checks that the event and the span record the
+    /// work makes on its pool thread reach that subscriber inside that span. Only callsites of
+    /// this test are asserted on: a callsite shared with tests that run without a subscriber can
+    /// have its interest cached as `never` by a concurrent first registration.
+    #[tokio::test]
+    async fn blocking_work_runs_in_the_callers_span_and_dispatcher() {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let (subscriber, guard) = subscriber_with_writer("batch", "info", move || sink.clone())
+            .expect("valid directives");
+        let caller = thread::current().id();
+        let worker = {
+            let _default = tracing::subscriber::set_default(subscriber);
+            let span = tracing::info_span!("job", job = "blocking-test", written = Empty);
+            blocking(|| {
+                Span::current().record("written", 7);
+                tracing::info!("inside blocking work");
+                thread::current().id()
+            })
+            .instrument(span)
+            .await
+            .expect("the runtime is running")
+        };
+        guard.shutdown().expect("the tracer provider shuts down");
+        assert_ne!(worker, caller, "the work ran on another thread");
+
+        let lines = capture.lines();
+        let event = lines
+            .iter()
+            .find(|line| line.contains(r#""message":"inside blocking work""#))
+            .unwrap_or_else(|| panic!("no event from the blocking work: {lines:?}"));
+        assert!(
+            event.contains(r#""span":{"job":"blocking-test","written":7,"name":"job"}"#),
+            "{event}"
+        );
+        let span = lines
+            .iter()
+            .find(|line| line.contains(r#""type":"span""#))
+            .unwrap_or_else(|| panic!("no span line: {lines:?}"));
+        assert!(
+            span.contains(r#""job":"blocking-test""#) && span.contains(r#""written":7"#),
+            "{span}"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_methods_write_and_read_what_the_sync_methods_do() {
+        let sync_dir = TestDir::new("sync-path");
+        let async_dir = TestDir::new("async-path");
+        let sync = Generations::new(sync_dir.path());
+        let asynchronous = Generations::new(async_dir.path());
+
+        let mut sync_records = sync
+            .begin_next(Dataset::SysTran)
+            .expect("generation allocates");
+        let mut async_records = asynchronous
+            .begin_next_async(Dataset::SysTran)
+            .await
+            .expect("generation allocates");
+        for batch in [vec![*b"ABCDEF"], vec![*b"GHIJKL", *b"MNOPQR"]] {
+            sync_records
+                .append_records::<SixBytes>(&batch)
+                .expect("records append");
+            async_records
+                .append_records_async::<SixBytes>(batch)
+                .await
+                .expect("records append");
+        }
+
+        let mut sync_report = sync
+            .begin_next(Dataset::TranRept)
+            .expect("generation allocates");
+        let mut async_report = asynchronous
+            .begin_next_async(Dataset::TranRept)
+            .await
+            .expect("generation allocates");
+        let line_batches: [&[&str]; 3] = [&["HEAD"], &["BAD"], &["GOOD", "BA\nD"]];
+        for texts in line_batches {
+            let lines: Vec<String> = texts.iter().map(|text| (*text).to_owned()).collect();
+            let expected = format!("{:?}", sync_report.append_lines(&lines, 4));
+            let actual = format!("{:?}", async_report.append_lines_async(lines, 4).await);
+            assert_eq!(actual, expected, "{texts:?}");
+        }
+
+        let cataloged = [
+            (
+                sync_records.catalog().expect("generation catalogs"),
+                async_records
+                    .catalog_async()
+                    .await
+                    .expect("generation catalogs"),
+                &b"ABCDEF\nGHIJKL\nMNOPQR\n"[..],
+            ),
+            (
+                sync_report.catalog().expect("generation catalogs"),
+                async_report
+                    .catalog_async()
+                    .await
+                    .expect("generation catalogs"),
+                &b"HEAD\n"[..],
+            ),
+        ];
+        for (expected, actual, bytes) in &cataloged {
+            assert_eq!(
+                (actual.dataset, actual.number),
+                (expected.dataset, expected.number)
+            );
+            assert_eq!(actual.path, async_dir.path().join(expected.to_string()));
+            assert_eq!(
+                fs::read(&expected.path).expect("generation is readable"),
+                *bytes
+            );
+            assert_eq!(
+                fs::read(&actual.path).expect("generation is readable"),
+                *bytes
+            );
+        }
+        assert_eq!(
+            async_dir.names(),
+            sync_dir.names(),
+            "no lock or temporary file is left"
+        );
+
+        let long = async_dir.path().join("TRANSACT.BKUP.G0001V00");
+        fs::write(&long, b"ABCDEF\nGHIJKLM\n").expect("file writes");
+        let paths = [
+            cataloged[0].1.path.clone(),
+            async_dir.path().join("SYSTRAN.G0009V00"),
+            long,
+        ];
+        for path in paths {
+            let expected = format!("{:?}", read_records::<SixBytes>(&path));
+            let actual = format!("{:?}", read_records_async::<SixBytes>(path.clone()).await);
+            assert_eq!(actual, expected, "{}", path.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_async_deletes_the_temporary_file_and_releases_the_lock() {
+        let dir = TestDir::new("discard-async");
+        let generations = Generations::new(dir.path());
+        let first = catalog_empty(&generations, Dataset::DalyRejs);
+
+        let mut pending = generations
+            .begin_next_async(Dataset::DalyRejs)
+            .await
+            .expect("generation allocates");
+        pending
+            .append_records_async::<SixBytes>(vec![*b"REJECT"])
+            .await
+            .expect("record appends");
+        let names = dir.names();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names[0].starts_with(".DALYREJS.G0002V00.tmp-"), "{names:?}");
+        assert_eq!(names[1], ".DALYREJS.lock", "{names:?}");
+
+        pending.discard_async().await;
+        assert_eq!(
+            dir.names(),
+            ["DALYREJS.G0001V00"],
+            "the temporary file and the lock are removed"
+        );
+        assert_eq!(
+            generations
+                .current(Dataset::DalyRejs)
+                .expect("catalog lists"),
+            Some(first)
+        );
+        assert_eq!(
+            catalog_empty(&generations, Dataset::DalyRejs).to_string(),
+            "DALYREJS.G0002V00",
+            "the discarded number is allocated again"
+        );
+    }
+
+    /// A generation whose writer is gone, as a cancelled asynchronous append leaves it, is
+    /// refused by both catalog paths and deleted.
+    #[tokio::test]
+    async fn catalog_refuses_a_generation_whose_file_is_closed() {
+        for asynchronous in [false, true] {
+            let dir = TestDir::new(&format!("closed-{asynchronous}"));
+            let generations = Generations::new(dir.path());
+            let mut pending = generations
+                .begin_next(Dataset::SysTran)
+                .expect("generation allocates");
+            pending
+                .append_records::<SixBytes>(&[*b"PARTLY"])
+                .expect("record appends");
+            drop(pending.writer.take());
+            let temp = pending.temp_path.clone();
+
+            let result = if asynchronous {
+                pending.catalog_async().await
+            } else {
+                pending.catalog()
+            };
+            let error = result.expect_err("a closed generation is refused");
+            assert!(
+                matches!(
+                    &error,
+                    GenerationError::Io { path, source }
+                        if *path == temp && source.to_string() == "generation file is already closed"
+                ),
+                "{asynchronous}: {error:?}"
+            );
+            let left = dir.names();
+            assert!(
+                left.is_empty(),
+                "{asynchronous}: the temporary file and the lock are removed: {left:?}"
+            );
+            assert_eq!(
+                generations
+                    .current(Dataset::SysTran)
+                    .expect("catalog lists"),
+                None,
+                "{asynchronous}: nothing is cataloged"
+            );
+        }
     }
 }

@@ -7,8 +7,10 @@
 //! No carried program writes `CCXREF`. The online programs and the batch jobs
 //! only read it, and the `IDCAMS` `REPRO` that loads it
 //! [app/jcl/XREFFILE.jcl:L64] is replaced by `crate::seed`, the only writer of
-//! the table. Every method here is a plain read on the caller's transaction,
-//! with no savepoint and no lock.
+//! the table. Every method here is a read without a lock, each under its own
+//! savepoint of the caller's transaction, so a failed read leaves that
+//! transaction usable: INTCALC reads the cross-reference of an account after
+//! rewriting the previous one (P-CBACT04C-010).
 //!
 //! # Key order
 //!
@@ -35,8 +37,8 @@ use carddemo_domain::numeric::{AccountId, CardNumber};
 use carddemo_domain::ports::{PortError, PortResult, XrefReader};
 
 use super::{account_id, card_number, customer_id, limit_i64};
-use crate::tx::PgStore;
-use crate::{PersistenceError, port_error};
+use crate::PersistenceError;
+use crate::tx::{PgStore, savepoint, settle};
 
 /// The table every stored-value misfit names.
 const TABLE: &str = "card_xref";
@@ -96,14 +98,15 @@ impl XrefReader for PgStore<'_, '_> {
     /// The keyed `READ` of `CCXREF` by `XREF-CARD-NUM`. A key holding a
     /// `LOW-VALUES` byte, such as the card field of a low-values daily
     /// transaction record, is `NOTFND` without a statement: no stored key holds
-    /// that byte, and binding it would fail the statement and abort the
-    /// caller's transaction instead of answering `NOTFND` as the COBOL does.
+    /// that byte, and binding it would fail the statement with a server error
+    /// instead of answering `NOTFND` as the COBOL does.
     async fn read_xref_by_card(&mut self, card: CardNumber) -> PortResult<CardXref> {
         if card.as_bytes().contains(&LOW_VALUE) {
             return Err(PortError::NotFound);
         }
         let key = card.trimmed();
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             XrefRow,
             r#"SELECT xref_card_num AS card_num,
                       xref_cust_id  AS cust_id,
@@ -112,10 +115,9 @@ impl XrefReader for PgStore<'_, '_> {
                 WHERE xref_card_num = $1"#,
             &*key
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        found(row)
+        .fetch_optional(&mut *sp)
+        .await;
+        found(settle(sp, result).await?)
     }
 
     /// COACTVWC 9200-GETCARDXREF-BYACCT — P-COACTVWC-007, P-COACTVWC-008
@@ -141,7 +143,8 @@ impl XrefReader for PgStore<'_, '_> {
     /// `cardxref.txt`, where each account has exactly one cross-reference
     /// (P-CVACT03Y-006).
     async fn read_xref_by_account(&mut self, id: AccountId) -> PortResult<CardXref> {
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             XrefRow,
             r#"SELECT xref_card_num AS card_num,
                       xref_cust_id  AS cust_id,
@@ -152,10 +155,9 @@ impl XrefReader for PgStore<'_, '_> {
                 LIMIT 1"#,
             id.to_i64()
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        found(row)
+        .fetch_optional(&mut *sp)
+        .await;
+        found(settle(sp, result).await?)
     }
 
     /// CBSTM03B 2000-XREFFILE-PROC — P-CBSTM03B-003
@@ -174,7 +176,8 @@ impl XrefReader for PgStore<'_, '_> {
         limit: u16,
     ) -> PortResult<Vec<CardXref>> {
         let limit = limit_i64(limit)?;
-        let rows = match after {
+        let mut sp = savepoint(self.tx).await?;
+        let result = match after {
             None => {
                 sqlx::query_as!(
                     XrefRow,
@@ -186,7 +189,7 @@ impl XrefReader for PgStore<'_, '_> {
                         LIMIT $1"#,
                     limit
                 )
-                .fetch_all(&mut **self.tx)
+                .fetch_all(&mut *sp)
                 .await
             }
             Some(card) => {
@@ -203,12 +206,11 @@ impl XrefReader for PgStore<'_, '_> {
                     &*key,
                     limit
                 )
-                .fetch_all(&mut **self.tx)
+                .fetch_all(&mut *sp)
                 .await
             }
-        }
-        .map_err(|err| port_error(&err))?;
-        records(rows)
+        };
+        records(settle(sp, result).await?)
     }
 }
 

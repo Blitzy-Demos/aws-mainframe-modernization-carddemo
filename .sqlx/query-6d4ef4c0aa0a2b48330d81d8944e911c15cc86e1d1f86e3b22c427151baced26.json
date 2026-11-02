@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal\n                       FROM transaction_category_balances\n                       WHERE trancat_acct_id >= $1\n                         AND (trancat_acct_id > $1\n                              OR rpad(trancat_type_cd, 2) COLLATE \"C\" > rpad($2, 2) COLLATE \"C\"\n                              OR (trancat_type_cd = $2 AND trancat_cd > $3))\n                       ORDER BY trancat_acct_id, rpad(trancat_type_cd, 2) COLLATE \"C\", trancat_cd\n                       LIMIT $4",
+  "query": "SELECT trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal\n                       FROM transaction_category_balances\n                       WHERE (trancat_acct_id, rpad(trancat_type_cd, 2) COLLATE \"C\", trancat_cd)\n                             > ($1, rpad($2, 2) COLLATE \"C\", $3)\n                       ORDER BY trancat_acct_id, rpad(trancat_type_cd, 2) COLLATE \"C\", trancat_cd\n                       LIMIT $4",
   "describe": {
     "columns": [
       {
@@ -39,5 +39,5 @@
       false
     ]
   },
-  "hash": "32e631da88b6851ae4a2874496677b1ecc2bb44a6793787be502226fe5e034d2"
+  "hash": "6d4ef4c0aa0a2b48330d81d8944e911c15cc86e1d1f86e3b22c427151baced26"
 }

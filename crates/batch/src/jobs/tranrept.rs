@@ -19,6 +19,11 @@
 //! Each `(+1)` generation is cataloged when its step ends normally. A step that fails leaves its
 //! own generation uncataloged and deleted, as `DISP=(NEW,CATLG,DELETE)` does, while the
 //! generations of the steps before it stay cataloged.
+//!
+//! Every file-system, codec and sorting phase of the three steps runs on Tokio's blocking pool,
+//! inside the job span: the whole SORT step through [`blocking`], and the generation allocation,
+//! reads, appends, catalogs and discards of the other two through the asynchronous methods of
+//! [`crate::generations`].
 
 use std::collections::BTreeMap;
 
@@ -38,7 +43,10 @@ use tracing::Span;
 use super::{JobContext, backup_live_master, setup_failure};
 use crate::cli::TranreptArgs;
 use crate::exit::ExitStatus;
-use crate::generations::{Dataset, Generation, GenerationError, PendingGeneration, read_records};
+use crate::generations::{
+    Dataset, Generation, GenerationError, Generations, PendingGeneration, blocking, read_records,
+    read_records_async,
+};
 
 /// `ABCODE` 999, which CBTRN03C `9999-ABEND-PROGRAM` passes to `CEE3ABD`
 /// [app/cbl/CBTRN03C.cbl:L626-630] — P-CBTRN03C-484.
@@ -65,6 +73,9 @@ const PERMANENT_ERROR_STATUS: [u8; 2] = *b"30";
 /// - REPROC and SORT: a generation or database failure, or a record the sort cannot place, exit 16.
 /// - CBTRN03C: an abend, exit 16 with its `DISPLAY` lines and `ABEND 999`, or a generation or
 ///   database failure outside the program, exit 16.
+///
+/// The SORT step runs on Tokio's blocking pool; a runtime that shuts down before it starts ends
+/// the job with a setup failure (exit 16) and allocates nothing.
 pub(super) async fn run(ctx: &JobContext, db: &Db, args: &TranreptArgs) -> ExitStatus {
     let start = Alnum::<10>::move_from(&args.start_date);
     let end = Alnum::<10>::move_from(&args.end_date);
@@ -72,9 +83,14 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &TranreptArgs) -> ExitS
         Ok(backup) => backup,
         Err(status) => return status,
     };
-    let daly = match sort_step(ctx, &backup.generation, &start, &end) {
-        Ok(daly) => daly,
-        Err(status) => return status,
+    let generations = ctx.generations.clone();
+    let bkup = backup.generation.clone();
+    let daly = match blocking(move || sort_step(&generations, &bkup, &start, &end)).await {
+        Ok(Ok(daly)) => daly,
+        Ok(Err(status)) => return status,
+        Err(cancelled) => {
+            return setup_failure("TRANSACT.DALY(+1) sort did not complete", cancelled);
+        }
     };
     match report_step(ctx, db, &daly, start, end).await {
         Ok(()) => backup.status(),
@@ -87,9 +103,12 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &TranreptArgs) -> ExitS
 /// PARM-END-DATE)` with `TRAN-PROC-DT,305,10,CH`, `SORT FIELDS=(TRAN-CARD-NUM,A)` with
 /// `TRAN-CARD-NUM,263,16,ZD`, and `SORTOUT` `TRANSACT.DALY(+1)` `DCB=(*.SORTIN)`.
 ///
-/// Allocates `TRANSACT.DALY(+1)`, reads every record of `bkup`, writes the records [`select`]
-/// keeps and catalogs the generation. The number of backup records is recorded in `read` and the
-/// number of sorted records in `written` on the current span.
+/// Allocates `TRANSACT.DALY(+1)` in `generations`, reads every record of `bkup`, writes the
+/// records [`select`] keeps and catalogs the generation. The number of backup records is recorded
+/// in `read` and the number of sorted records in `written` on the current span.
+///
+/// The step is synchronous from the allocation to the catalog: [`run`] runs it on Tokio's
+/// blocking pool, inside the job span, so an uncataloged `TRANSACT.DALY(+1)` is deleted there.
 ///
 /// # Errors
 ///
@@ -98,13 +117,12 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &TranreptArgs) -> ExitS
 ///   because the audit records no condition code for it. `TRANSACT.DALY(+1)` is then not
 ///   cataloged, and `TRANSACT.BKUP(+1)` stays cataloged.
 fn sort_step(
-    ctx: &JobContext,
+    generations: &Generations,
     bkup: &Generation,
     start: &Alnum<10>,
     end: &Alnum<10>,
 ) -> Result<Generation, ExitStatus> {
-    let mut sortout = ctx
-        .generations
+    let mut sortout = generations
         .begin_next(Dataset::TransactDaly)
         .map_err(|err| setup_failure("TRANSACT.DALY(+1) allocation failed", err))?;
     let sortin = read_records::<TransactionLayout>(&bkup.path)
@@ -182,13 +200,12 @@ fn unpinned_sort_key(err: &UnpinnedSortKey) -> ExitStatus {
 /// TRANREPT `STEP10R` `EXEC PGM=CBTRN03C` [app/jcl/TRANREPT.jcl:L59-80] — P-TRANREPT-003,
 /// P-CBTRN03C-001, P-CBTRN03C-002: the report of `daly` over `start` to `end`.
 ///
-/// Allocates `TRANREPT(+1)` (`LRECL=133`), reads the records of `daly`, the program's `TRANFILE`
-/// and its only input of transactions, opens a read-only unit of work for the `CARDXREF`,
-/// `TRANTYPE` and `TRANCATG` lookups, and starts the [`ReportRun`] with the `DATEPARM` dates
-/// (`0550-DATEPARM-READ`). [`report_records`] reports every record and [`ReportRun::finish`] adds
-/// the end-of-input totals. The unit of work is then rolled back, since it writes nothing, before
-/// `TRANREPT(+1)` is cataloged, so a failure while the files close leaves no report cataloged, as
-/// the abnormal end of the step deletes it.
+/// Allocates `TRANREPT(+1)` (`LRECL=133`), writes the report into it ([`report_program`]), and
+/// catalogs it once the program has closed its files, so a failure while the files close leaves
+/// no report cataloged, as the abnormal end of the step deletes it.
+///
+/// The allocation, the catalog and the deletion of an uncataloged `TRANREPT(+1)` run on Tokio's
+/// blocking pool, inside the job span, as do the reads and appends of [`report_program`].
 ///
 /// # Errors
 ///
@@ -198,7 +215,11 @@ fn unpinned_sort_key(err: &UnpinnedSortKey) -> ExitStatus {
 /// - A failure to allocate `TRANREPT(+1)` or to begin or end the unit of work is a setup failure
 ///   (exit 16): neither has a COBOL counterpart.
 ///
-/// On every error `TRANREPT(+1)` is left uncataloged and deleted.
+/// On every error `TRANREPT(+1)` is left uncataloged and deleted, with every line already written
+/// to it, since `DISP=(NEW,CATLG,DELETE)` [app/jcl/TRANREPT.jcl:L76-80] catalogs it only when the
+/// step ends normally. The header blocks of CBTRN03C `1120-WRITE-HEADERS`
+/// [app/cbl/CBTRN03C.cbl:L324-341] — P-CBTRN03C-475, four writes each ([`write_lines`]), are
+/// therefore deleted with the rest of the report on a later failure.
 async fn report_step(
     ctx: &JobContext,
     db: &Db,
@@ -208,10 +229,60 @@ async fn report_step(
 ) -> Result<(), ExitStatus> {
     let mut reptfile = ctx
         .generations
-        .begin_next(Dataset::TranRept)
+        .begin_next_async(Dataset::TranRept)
+        .await
         .map_err(|err| setup_failure("TRANREPT(+1) allocation failed", err))?;
-    let tranfile =
-        read_records::<TransactionLayout>(&daly.path).map_err(|err| tranfile_abend(&err))?;
+    let (records, lines) = match report_program(db, daly, start, end, &mut reptfile).await {
+        Ok(counts) => counts,
+        Err(status) => {
+            reptfile.discard_async().await;
+            return Err(status);
+        }
+    };
+    let report = reptfile
+        .catalog_async()
+        .await
+        .map_err(|err| file_abend(ERROR_CLOSING_REPORT_FILE, "TRANREPT(+1) close failed", &err))?;
+    tracing::info!(
+        generation = %report,
+        records,
+        lines,
+        "{END_OF_EXECUTION_OF_PROGRAM_CBTRN03C}"
+    );
+    Ok(())
+}
+
+/// CBTRN03C `PROCEDURE DIVISION` [app/cbl/CBTRN03C.cbl:L159-217] — P-CBTRN03C-001,
+/// P-CBTRN03C-002: the report of `daly` over `start` to `end`, written to `reptfile`, from the
+/// opens to the closes. Returns the number of `TRANFILE` records and of report lines written.
+///
+/// Reads the records of `daly`, the program's `TRANFILE` and its only input of transactions,
+/// opens a read-only unit of work for the `CARDXREF`, `TRANTYPE` and `TRANCATG` lookups, and
+/// starts the [`ReportRun`] with the `DATEPARM` dates (CBTRN03C `0550-DATEPARM-READ`
+/// [app/cbl/CBTRN03C.cbl:L220-243] — P-CBTRN03C-467). The repository holds no content for the
+/// `DATEPARM` dataset [app/jcl/TRANREPT.jcl:L73-74], so `start` and `end`, the job's
+/// `--start-date` and `--end-date`, stand in for its record: the same dates the `STEP05R` sort
+/// selects by, as the CR00 job writes them into both `SYMNAMES` and `DATEPARM` (E-34, resolved,
+/// whose disposition uses the start and end dates).
+///
+/// [`report_records`] reports every record and [`ReportRun::finish`] adds the end-of-input
+/// totals. The unit of work is then rolled back, since it writes nothing, before the caller
+/// catalogs `reptfile`.
+///
+/// # Errors
+///
+/// The errors [`report_step`] lists, except the allocation and the catalog of `TRANREPT(+1)`.
+/// `reptfile` is left to the caller, which discards it.
+async fn report_program(
+    db: &Db,
+    daly: &Generation,
+    start: Alnum<10>,
+    end: Alnum<10>,
+    reptfile: &mut PendingGeneration,
+) -> Result<(usize, usize), ExitStatus> {
+    let tranfile = read_records_async::<TransactionLayout>(daly.path.clone())
+        .await
+        .map_err(|err| tranfile_abend(&err))?;
     let mut uow = db
         .begin()
         .await
@@ -223,23 +294,14 @@ async fn report_step(
     );
     let mut run = ReportRun::new(start, end);
     let records = tranfile.len();
-    let mut lines = report_records(&mut run, &mut uow, tranfile, &mut reptfile).await?;
+    let mut lines = report_records(&mut run, &mut uow, tranfile, reptfile).await?;
     let totals = run.finish();
-    write_lines(&mut reptfile, &totals)?;
     lines += totals.len();
+    write_lines(reptfile, totals).await?;
     uow.rollback()
         .await
         .map_err(|err| setup_failure("CARDXREF, TRANTYPE and TRANCATG close failed", err))?;
-    let report = reptfile
-        .catalog()
-        .map_err(|err| file_abend(ERROR_CLOSING_REPORT_FILE, "TRANREPT(+1) close failed", &err))?;
-    tracing::info!(
-        generation = %report,
-        records,
-        lines,
-        "{END_OF_EXECUTION_OF_PROGRAM_CBTRN03C}"
-    );
-    Ok(())
+    Ok((records, lines))
 }
 
 /// CBTRN03C main loop [app/cbl/CBTRN03C.cbl:L170-206] — P-CBTRN03C-003, P-CBTRN03C-004,
@@ -248,6 +310,10 @@ async fn report_step(
 ///
 /// Each record becomes a [`Transaction`] whose row identity is its record number, counted from 1:
 /// the file holds `CVTRA05Y` bytes only, and CBTRN03C reads no row identity.
+///
+/// The run reads each distinct `TRANTYPE` and `TRANCATG` key once (`1500-B-LOOKUP-TRANTYPE`,
+/// `1500-C-LOOKUP-TRANCATG` — P-CBTRN03C-005) and each card's `CARDXREF` record once at its card
+/// break, so the job issues one lookup per distinct key rather than two per record.
 ///
 /// # Errors
 ///
@@ -266,21 +332,33 @@ async fn report_records(
             .process(&mut store, &tran)
             .await
             .map_err(|abend| lookup_abend(&abend))?;
-        write_lines(reptfile, &lines)?;
-        written += lines.len();
+        let count = lines.len();
+        write_lines(reptfile, lines).await?;
+        written += count;
     }
     Ok(written)
 }
 
 /// CBTRN03C `1111-WRITE-REPORT-REC` [app/cbl/CBTRN03C.cbl:L343-359] — P-CBTRN03C-476: `lines`
-/// appended to `TRANREPT(+1)` as 133-byte records.
+/// appended to `TRANREPT(+1)` as 133-byte records, checked, encoded and written on Tokio's
+/// blocking pool.
+///
+/// `lines` are the lines a [`ReportRun`] returns, header blocks included, so this is also where
+/// the job writes CBTRN03C `1120-WRITE-HEADERS` [app/cbl/CBTRN03C.cbl:L324-341] —
+/// P-CBTRN03C-475: the four writes `REPORT-NAME-HEADER`, `WS-BLANK-LINE`, `TRANSACTION-HEADER-1`
+/// and `TRANSACTION-HEADER-2` of each block. Like every other line they reach only the
+/// uncataloged `TRANREPT(+1)`, which a later failure of the step deletes ([`report_step`]).
 ///
 /// # Errors
 ///
 /// The `ERROR WRITING REPTFILE` abend ([`file_abend`]) when a line cannot be written.
-fn write_lines(reptfile: &mut PendingGeneration, lines: &[String]) -> Result<(), ExitStatus> {
+async fn write_lines(
+    reptfile: &mut PendingGeneration,
+    lines: Vec<String>,
+) -> Result<(), ExitStatus> {
     reptfile
-        .append_lines(lines, REPORT_RECORD_LEN)
+        .append_lines_async(lines, REPORT_RECORD_LEN)
+        .await
         .map_err(|err| file_abend(ERROR_WRITING_REPTFILE, "TRANREPT(+1) write failed", &err))
 }
 
@@ -538,17 +616,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_report_line_that_cannot_be_written_abends_and_catalogs_no_report() {
+    #[tokio::test]
+    async fn a_report_line_that_cannot_be_written_abends_and_catalogs_no_report() {
         let dir =
             std::env::temp_dir().join(format!("carddemo-tranrept-write-{}", std::process::id()));
         let generations = Generations::new(dir.clone());
         let mut reptfile = generations
-            .begin_next(Dataset::TranRept)
+            .begin_next_async(Dataset::TranRept)
+            .await
             .unwrap_or_else(|e| panic!("allocate TRANREPT(+1) under {}: {e}", dir.display()));
-        let full_width = write_lines(&mut reptfile, &[" ".repeat(REPORT_RECORD_LEN)]);
-        let short = write_lines(&mut reptfile, &["short".to_owned()]);
-        drop(reptfile);
+        let full_width = write_lines(&mut reptfile, vec![" ".repeat(REPORT_RECORD_LEN)]).await;
+        let short = write_lines(&mut reptfile, vec!["short".to_owned()]).await;
+        reptfile.discard_async().await;
         let cataloged = generations.current(Dataset::TranRept);
         fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("remove {}: {e}", dir.display()));
         assert_eq!(full_width, Ok(()));

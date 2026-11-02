@@ -39,8 +39,9 @@ use crate::exit::ExitStatus;
 /// 3. The unit of work is committed whether the sweep ends normally or abends. `EXEC DLI CHKP`
 ///    (P-CBPAUP0C-008), the normal end and the `GOBACK` of `9999-ABEND` all commit the deletes
 ///    made so far (P-CBPAUP0C-005, P-CBPAUP0C-009), so one commit after the rule returns leaves
-///    the same rows as the COBOL's checkpoints. The rule therefore takes no checkpoint, and the
-///    checkpoint frequencies are only reported.
+///    the same rows as the COBOL's checkpoints. Every store statement, the failed one included,
+///    runs under its own savepoint, so an abend leaves the unit committable. The rule therefore
+///    takes no checkpoint, and the checkpoint frequencies are only reported.
 ///
 /// A normal end exits 0 after logging the four counts the COBOL displays
 /// [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L171-178]. An abend exits 16 with the

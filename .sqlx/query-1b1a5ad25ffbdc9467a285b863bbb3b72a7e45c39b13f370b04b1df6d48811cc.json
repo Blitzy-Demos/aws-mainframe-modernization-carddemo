@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type\n                       FROM users\n                       WHERE rpad(user_id, 8) COLLATE \"C\" <= rpad($1, 8)\n                       ORDER BY rpad(user_id, 8) COLLATE \"C\" DESC\n                       LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "sec_usr_fname",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "sec_usr_lname",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "password_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "sec_usr_type",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1b1a5ad25ffbdc9467a285b863bbb3b72a7e45c39b13f370b04b1df6d48811cc"
+}

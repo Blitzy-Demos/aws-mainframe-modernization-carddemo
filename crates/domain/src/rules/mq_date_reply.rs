@@ -5,7 +5,9 @@
 //! and time [app/app-vsam-mq/cbl/CODATE01.cbl:L339-364]; it reads none of the
 //! request body. This module decides the bytes: the 1000-byte reply text, and
 //! the data of the `MQ-ERR-DISPLAY` record written to `CARD.DEMO.ERROR` when
-//! the reply put fails [app/app-vsam-mq/cbl/CODATE01.cbl:L392-403]. It is pure:
+//! the reply put fails [app/app-vsam-mq/cbl/CODATE01.cbl:L392-403] or when a
+//! request longer than the 1000-byte get buffer fails its get
+//! [app/app-vsam-mq/cbl/CODATE01.cbl:L329-335]. It is pure:
 //! the instant comes from the caller's clock, and the record's bytes are laid
 //! out by the messaging crate's error-queue module.
 //!
@@ -78,6 +80,68 @@ pub struct ErrorRecordSpec {
     pub queue_name: String,
 }
 
+/// CODATE01 3000-GET-REQUEST — P-CODATE01-012.
+///
+/// The byte length of the request buffer: the `MQGET` reads into `MQ-BUFFER
+/// PIC X(1000)` [app/app-vsam-mq/cbl/CODATE01.cbl:L50] with `MQ-BUFFER-LENGTH`
+/// 1000 [app/app-vsam-mq/cbl/CODATE01.cbl:L291], the buffer the reply is put
+/// from, so it is [`REPLY_BUFFER_LEN`]. `COACCT01` gets its requests the same
+/// way [app/app-vsam-mq/cbl/COACCT01.cbl:L342].
+pub const GET_BUFFER_LEN: usize = REPLY_BUFFER_LEN;
+
+/// The IBM MQ completion code `MQCC_WARNING`, which `MQGET` returns with
+/// [`MQRC_TRUNCATED_MSG_FAILED`] — P-CODATE01-012.
+pub const MQCC_WARNING: u32 = 1;
+
+/// The IBM MQ reason code `MQRC_TRUNCATED_MSG_FAILED`: the message is longer
+/// than the buffer and the get options lack `MQGMO-ACCEPT-TRUNCATED-MSG`, as
+/// those of `3000-GET-REQUEST` do
+/// [app/app-vsam-mq/cbl/CODATE01.cbl:L296-299] — P-CODATE01-012.
+pub const MQRC_TRUNCATED_MSG_FAILED: u32 = 2080;
+
+/// CODATE01 3000-GET-REQUEST — P-CODATE01-012.
+///
+/// The error record of a get that failed other than with no message
+/// available [app/app-vsam-mq/cbl/CODATE01.cbl:L329-335]: the get's condition
+/// and reason codes, `INPUT-QUEUE-NAME` as the queue and `'INP MQGET ERR:'` as
+/// the return message. `9000-ERROR` then puts it to `CARD.DEMO.ERROR` and
+/// `8000-TERMINATION` ends the task; no reply is put. `MQ-ERROR-PARA` keeps
+/// the spaces of `INITIALIZE MQ-ERR-DISPLAY`, as in [`put_reply_failure`].
+#[must_use]
+pub fn get_request_failure(
+    condition_code: u32,
+    reason_code: u32,
+    input_queue: &str,
+) -> ErrorRecordSpec {
+    ErrorRecordSpec {
+        error_para: "",
+        return_message: messages::INP_MQGET_ERR,
+        condition_code,
+        reason_code,
+        queue_name: input_queue.to_owned(),
+    }
+}
+
+/// CODATE01 3000-GET-REQUEST — P-CODATE01-012: the outcome of a request
+/// `body` longer than [`GET_BUFFER_LEN`], or `None` for one that fits.
+///
+/// The `MQGET` options are `MQGMO-SYNCPOINT`, `MQGMO-FAIL-IF-QUIESCING`,
+/// `MQGMO-CONVERT` and `MQGMO-WAIT`, without `MQGMO-ACCEPT-TRUNCATED-MSG`
+/// [app/app-vsam-mq/cbl/CODATE01.cbl:L296-299], so IBM MQ fails the get of
+/// such a message with [`MQCC_WARNING`] and [`MQRC_TRUNCATED_MSG_FAILED`]. That
+/// is not `MQRC-NO-MSG-AVAILABLE`, so the request gets no reply but the
+/// [`get_request_failure`] record for `input_queue`.
+///
+/// IBM MQ leaves a message whose get fails this way on its queue. The
+/// consumer cannot: it publishes the record and rejects the request without
+/// requeue, the only settlement it has for a request without a reply, so the
+/// request is consumed once, as single delivery assumes.
+#[must_use]
+pub fn oversize_request_record(body: &[u8], input_queue: &str) -> Option<ErrorRecordSpec> {
+    (body.len() > GET_BUFFER_LEN)
+        .then(|| get_request_failure(MQCC_WARNING, MQRC_TRUNCATED_MSG_FAILED, input_queue))
+}
+
 /// CODATE01 4100-PUT-REPLY — P-CODATE01-015, P-CODATE01-019.
 ///
 /// The error record of a reply put that failed, `WHEN OTHER` of the `MQPUT`
@@ -112,7 +176,10 @@ pub fn put_reply_failure(
 mod tests {
     use chrono::{DateTime, Utc};
 
-    use super::{ErrorRecordSpec, REPLY_BUFFER_LEN, put_reply_failure, reply_body};
+    use super::{
+        ErrorRecordSpec, GET_BUFFER_LEN, REPLY_BUFFER_LEN, get_request_failure,
+        oversize_request_record, put_reply_failure, reply_body,
+    };
     use crate::messages;
 
     fn at(text: &str) -> DateTime<Utc> {
@@ -177,6 +244,37 @@ mod tests {
                     queue_name: queue.to_owned(),
                 },
                 "{condition_code} {reason_code} {queue}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_longer_than_the_get_buffer_is_the_inp_mqget_err_record() {
+        // P-CODATE01-012: MQ-BUFFER-LENGTH 1000 without ACCEPT-TRUNCATED-MSG;
+        // the failed get's codes (MQCC_WARNING 1, MQRC_TRUNCATED_MSG_FAILED
+        // 2080), INPUT-QUEUE-NAME and 'INP MQGET ERR:'.
+        assert_eq!(GET_BUFFER_LEN, 1000);
+        let queue = "CARD.DEMO.REQUEST.DATE";
+        let expected = ErrorRecordSpec {
+            error_para: "",
+            return_message: messages::INP_MQGET_ERR,
+            condition_code: 1,
+            reason_code: 2080,
+            queue_name: queue.to_owned(),
+        };
+        assert_eq!(get_request_failure(1, 2080, queue), expected);
+        for len in [1001, 4096] {
+            assert_eq!(
+                oversize_request_record(&vec![b'X'; len], queue),
+                Some(expected.clone()),
+                "{len}"
+            );
+        }
+        for len in [0, 4, 999, 1000] {
+            assert_eq!(
+                oversize_request_record(&vec![b' '; len], queue),
+                None,
+                "{len}"
             );
         }
     }

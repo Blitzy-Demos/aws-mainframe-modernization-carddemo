@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT accrual_id, account_id, transaction_id, rule_id, points_earned, created_at FROM reward_accruals WHERE account_id = $1 ORDER BY created_at DESC, accrual_id DESC LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "accrual_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "rule_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "points_earned",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0e3b8b41117606fb150b02a9dde4f62a7ddabf2af0ef93a1ce7565e6c7ae030e"
+}

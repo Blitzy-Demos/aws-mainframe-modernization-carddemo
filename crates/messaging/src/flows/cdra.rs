@@ -11,6 +11,13 @@
 //! - every result comes from `carddemo_domain::rules::mq_account_reply`: the
 //!   account response, the not-found and invalid-request texts, or the error
 //!   record of a failed account read (P-COACCT01-011 to P-COACCT01-016);
+//! - a request longer than the 1000-byte get buffer gets no reply: its get
+//!   fails, and the `INP MQGET ERR:` record goes to `CARD.DEMO.ERROR` before
+//!   the request is rejected without requeue (P-COACCT01-011);
+//! - an `INQA` request whose key holds a byte other than a digit gets neither
+//!   a reply nor a record: `WS-KEY > ZEROES` has no pinned result for it
+//!   (E-28, halt), so it is logged with the escalation and rejected without
+//!   requeue;
 //! - the account is read through `carddemo-persistence`, in a unit of work
 //!   that only reads `accounts` and is rolled back once the read is done;
 //! - a reply goes to [`REPLY_QUEUE`] with the request's `message_id` and
@@ -35,10 +42,11 @@ use std::future::{self, Future};
 use carddemo_domain::entities::Account;
 use carddemo_domain::numeric::AccountId;
 use carddemo_domain::ports::{AccountReader, PortError, PortResult};
-use carddemo_domain::rules::mq_account_reply::{self, ReplyOutcome};
+use carddemo_domain::rules::mq_account_reply::{self, AccountRequest, ReplyOutcome};
 use carddemo_persistence::{Db, UnitOfWork};
 
 use crate::consumer::{Disposition, FailureAction, Flow, PublishFailure, Reply, Request};
+use crate::db_deadline::bounded;
 use crate::error_queue;
 
 /// COACCT01 1000-CONTROL / 2400-OPEN-OUTPUT-QUEUE — P-COACCT01-010,
@@ -49,6 +57,11 @@ use crate::error_queue;
 /// so it is a constant here and not a setting. `infra/rabbitmq/definitions.json`
 /// declares it as a durable queue.
 pub const REPLY_QUEUE: &str = "CARD.DEMO.REPLY.ACCT";
+
+/// COACCT01 4000-PROCESS-REQUEST-REPLY — P-COACCT01-011: the paragraph a
+/// request whose key test the audit cannot pin (E-28) is rejected at,
+/// recorded as the message span's `location`.
+const PROCESS_PARAGRAPH: &str = "4000-PROCESS-REQUEST-REPLY";
 
 /// The CDRA flow: the `COACCT01` rules adapted to [`Flow`].
 #[derive(Debug, Clone)]
@@ -79,15 +92,29 @@ impl Flow for CdraFlow {
     /// COACCT01 3000-GET-REQUEST / 4000-PROCESS-REQUEST-REPLY — P-COACCT01-011
     /// to P-COACCT01-016.
     ///
-    /// Copies the function and key out of the request (P-COACCT01-011), lets
-    /// [`mq_account_reply::process`] read the account through an
-    /// `AccountFile` and decide the outcome
-    /// [app/app-vsam-mq/cbl/COACCT01.cbl:L390-460], closes the file, and
-    /// adapts the outcome to a [`Disposition`]. Only an `INQA` inquiry with a
+    /// A request longer than the 1000-byte `MQ-BUFFER` fails its get
+    /// [app/app-vsam-mq/cbl/COACCT01.cbl:L342-385]: it gets no reply but the
+    /// `INP MQGET ERR:` record for the input queue, published to
+    /// `CARD.DEMO.ERROR` before the request is rejected without requeue. IBM
+    /// MQ would leave such a message on its queue; the consumer has no
+    /// settlement that keeps a request without a reply, and requeues none.
+    ///
+    /// Otherwise copies the function and key out of the request
+    /// (P-COACCT01-011). An `INQA` request whose key holds a byte other than a
+    /// digit is held at `halt` (E-28): `WS-KEY > ZEROES` has no pinned result
+    /// for it, so it is logged with the escalation and rejected without a
+    /// reply or a record. Every other request goes to
+    /// [`mq_account_reply::process`], which reads the account through an
+    /// `AccountFile` and decides the outcome
+    /// [app/app-vsam-mq/cbl/COACCT01.cbl:L390-460]; the file is closed and
+    /// the outcome adapted to a [`Disposition`]. Only an `INQA` inquiry with a
     /// key above zero reads the file (P-COACCT01-012); every other request is
     /// answered without touching the database (P-COACCT01-016).
     async fn handle(&self, req: &Request) -> Disposition<()> {
-        let request = mq_account_reply::parse_request(&req.body);
+        let request = match receive(req, &self.input_queue) {
+            Ok(request) => request,
+            Err(disposition) => return disposition,
+        };
         let mut file = AccountFile::new(&self.db);
         let outcome = mq_account_reply::process(&mut file, &request, &self.input_queue).await;
         file.close().await;
@@ -132,6 +159,13 @@ impl Flow for CdraFlow {
 /// be begun fails the read like any other non-`NOTFND` failure: the domain
 /// rule turns it into the `ERROR WHILE READING ACCTFILE` record and no reply
 /// (P-COACCT01-015).
+///
+/// The `BEGIN`, the read and the `ROLLBACK` each run under the limits of
+/// `crate::db_deadline`. A read the server cancels at the statement timeout,
+/// or a `BEGIN` or read that outlives the database deadline, fails the read
+/// the same way, so a stalled database ends in the error record rather than
+/// stopping the consumer; a `ROLLBACK` that outlives the deadline is logged
+/// and the unit of work is dropped, which sqlx rolls back on the connection.
 struct AccountFile<'d> {
     /// The pool the unit of work is begun on.
     db: &'d Db,
@@ -150,28 +184,63 @@ impl<'d> AccountFile<'d> {
     /// # Errors
     ///
     /// The [`PortError`] mapping of the `Db::begin` failure, in practice
-    /// [`PortError::Unavailable`]: no connection, or a failed `BEGIN`.
+    /// [`PortError::Unavailable`]: no connection, a failed `BEGIN`, or a
+    /// `BEGIN` past the database deadline.
     async fn unit_of_work(&mut self) -> PortResult<&mut UnitOfWork> {
         let uow = match self.uow.take() {
             Some(uow) => uow,
-            None => self.db.begin().await.map_err(|err| {
+            None => bounded("begin", self.db.begin()).await.inspect_err(|err| {
                 tracing::warn!(error = %err, "account unit of work could not begin");
-                PortError::from(err)
             })?,
         };
         Ok(self.uow.insert(uow))
     }
 
     /// Ends the unit of work, if one was begun. It only read, so it is rolled
-    /// back; a rollback that fails is logged and changes no outcome, because
-    /// nothing was written.
+    /// back; a rollback that fails or outlives the database deadline is logged
+    /// and changes no outcome, because nothing was written.
     async fn close(self) {
         if let Some(uow) = self.uow
-            && let Err(err) = uow.rollback().await
+            && let Err(err) = bounded("rollback", uow.rollback()).await
         {
             tracing::warn!(error = %err, "read-only account unit of work did not roll back");
         }
     }
+}
+
+/// COACCT01 3000-GET-REQUEST — P-COACCT01-010, P-COACCT01-011.
+///
+/// The function and key of `req`, or the disposition that ends it before the
+/// account file is touched: the `INP MQGET ERR:` record for `input_queue` of
+/// a body longer than the 1000-byte get buffer, or the rejection of an `INQA`
+/// key the audit cannot pin (E-28), logged here.
+fn receive(req: &Request, input_queue: &str) -> Result<AccountRequest, Disposition<()>> {
+    if let Some(spec) = mq_account_reply::oversize_request_record(&req.body, input_queue) {
+        return Err(Disposition::ErrorRecord {
+            record: error_queue::record_bytes(&spec),
+        });
+    }
+    let request = mq_account_reply::parse_request(&req.body);
+    if let Some(escalation) = mq_account_reply::unproven_escalation(&request) {
+        log_unproven(req, escalation);
+        return Err(Disposition::Reject {
+            location: PROCESS_PARAGRAPH,
+        });
+    }
+    Ok(request)
+}
+
+/// COACCT01 4000-PROCESS-REQUEST-REPLY — P-COACCT01-011: logs a request whose
+/// outcome the audit cannot pin, with the escalation that holds it at `halt`
+/// and the paragraph whose output is skipped for it (AAP 0.9.6).
+fn log_unproven(req: &Request, escalation: &'static str) {
+    tracing::error!(
+        flow = CdraFlow::NAME,
+        message_id = req.message_id.as_deref().unwrap_or(""),
+        escalation,
+        paragraph = PROCESS_PARAGRAPH,
+        "COACCT01 result unproven: the paragraph's output is skipped"
+    );
 }
 
 /// Logs a read failure other than `NOTFND`. The domain rule keeps only its
@@ -190,14 +259,20 @@ impl AccountReader for AccountFile<'_> {
     /// [app/app-vsam-mq/cbl/COACCT01.cbl:L396-404] — P-COACCT01-012.
     async fn read_account(&mut self, id: AccountId) -> PortResult<Account> {
         let uow = self.unit_of_work().await?;
-        log_read_failure(uow.store().read_account(id).await)
+        log_read_failure(bounded("read_account", uow.store().read_account(id)).await)
     }
 
     /// Never called by `COACCT01`, which reads without `UPDATE`; it reads the
     /// same file in the same unit of work so the port stays complete.
     async fn read_account_for_update(&mut self, id: AccountId) -> PortResult<Account> {
         let uow = self.unit_of_work().await?;
-        log_read_failure(uow.store().read_account_for_update(id).await)
+        log_read_failure(
+            bounded(
+                "read_account_for_update",
+                uow.store().read_account_for_update(id),
+            )
+            .await,
+        )
     }
 }
 
@@ -258,7 +333,9 @@ mod tests {
     use carddemo_domain::messages;
     use carddemo_domain::rules::mq_account_reply::{self, ReplyOutcome};
 
-    use super::{CdraFlow, REPLY_QUEUE, map_outcome, reply_failure_record};
+    use super::{
+        CdraFlow, PROCESS_PARAGRAPH, REPLY_QUEUE, map_outcome, receive, reply_failure_record,
+    };
     use crate::consumer::{Disposition, Flow, PublishFailure, Reply, Request};
     use crate::error_queue;
 
@@ -370,7 +447,11 @@ mod tests {
         assert_eq!(record, error_queue::record_bytes(&spec));
         assert_eq!(
             &record[error_queue::RETURN_MESSAGE],
-            b"ERROR WHILE READING ACCTF"
+            format::move_alnum(messages::ERROR_WHILE_READING_ACCTFILE, 25).as_bytes()
+        );
+        assert_eq!(
+            &record[error_queue::RETURN_MESSAGE],
+            &messages::ERROR_WHILE_READING_ACCTFILE.as_bytes()[..25]
         );
         assert_eq!(&record[error_queue::QUEUE_NAME], field(INPUT_QUEUE, 48));
         assert_eq!(&record[error_queue::CONDITION_CODE], b"00");
@@ -404,7 +485,10 @@ mod tests {
                 )),
                 "{failure:?}"
             );
-            assert_eq!(&record[error_queue::RETURN_MESSAGE], field("MQPUT ERR", 25));
+            assert_eq!(
+                &record[error_queue::RETURN_MESSAGE],
+                field(messages::MQPUT_ERR, 25)
+            );
             assert_eq!(
                 &record[error_queue::QUEUE_NAME],
                 field("CARD.DEMO.REPLY.ACCT", 48)
@@ -423,7 +507,76 @@ mod tests {
                     .iter()
                     .all(|b| *b == b' ')
             );
-            assert!(error_queue::display_text(&record).contains("MQPUT ERR"));
+            assert!(error_queue::display_text(&record).contains(messages::MQPUT_ERR));
+        }
+    }
+
+    #[test]
+    fn a_request_longer_than_the_get_buffer_gets_the_inp_mqget_err_record() {
+        // P-COACCT01-010 (as CODATE01), P-COACCT01-011: MQ-BUFFER-LENGTH 1000
+        // without ACCEPT-TRUNCATED-MSG; the failed get (MQCC_WARNING 1,
+        // MQRC_TRUNCATED_MSG_FAILED 2080) puts 'INP MQGET ERR:' naming
+        // INPUT-QUEUE-NAME, and no account is read.
+        let body = [b"INQA00000000001".as_slice(), &[b' '; 986]].concat();
+        let Err(disposition) = receive(&request(&body), INPUT_QUEUE) else {
+            panic!("a request longer than 1000 bytes is not processed");
+        };
+        let record = record_of(disposition);
+        assert_eq!(record.len(), error_queue::ERROR_BUFFER_LEN);
+        assert_eq!(
+            record,
+            error_queue::record_bytes(
+                &mq_account_reply::oversize_request_record(&body, INPUT_QUEUE)
+                    .expect("an oversize request")
+            )
+        );
+        assert_eq!(
+            &record[error_queue::RETURN_MESSAGE],
+            field(messages::INP_MQGET_ERR, 25)
+        );
+        assert_eq!(&record[error_queue::CONDITION_CODE], b"01");
+        assert_eq!(&record[error_queue::REASON_CODE], b"02080");
+        assert_eq!(&record[error_queue::QUEUE_NAME], field(INPUT_QUEUE, 48));
+        assert!(record[error_queue::ERROR_PARA].iter().all(|b| *b == b' '));
+        assert!(
+            record[error_queue::ERR_DISPLAY_LEN..]
+                .iter()
+                .all(|b| *b == b' ')
+        );
+        let fits = receive(&request(&body[..1000]), INPUT_QUEUE);
+        assert!(matches!(fits, Ok(parsed) if parsed == mq_account_reply::parse_request(&body)));
+    }
+
+    #[test]
+    fn an_inqa_key_with_a_non_digit_is_rejected_without_a_reply() {
+        // P-COACCT01-011, E-28 (halt): no reply and no error record is guessed
+        // for WS-KEY > ZEROES on a key that is not numeric.
+        for body in [&b"INQA0000000000A"[..], b"INQA123", b"INQA 0000000001"] {
+            let outcome = receive(&request(body), INPUT_QUEUE);
+            assert!(
+                matches!(outcome, Err(Disposition::Reject { location }) if location == PROCESS_PARAGRAPH),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_requests_go_on_to_the_account_rule() {
+        // P-COACCT01-012 (INQA, key above zero), P-COACCT01-016 and
+        // P-COACCT01-027 (another function), P-COACCT01-028 (key zero),
+        // P-COACCT01-026 (NOTFND key).
+        for body in [
+            &b"INQA00000000001"[..],
+            b"INQA00000000000",
+            b"INQA99999999999",
+            b"INQX00000000001",
+            b"INQXABCDEFGHIJK",
+        ] {
+            let outcome = receive(&request(body), INPUT_QUEUE);
+            assert!(
+                matches!(outcome, Ok(parsed) if parsed == mq_account_reply::parse_request(body)),
+                "{body:?}"
+            );
         }
     }
 }

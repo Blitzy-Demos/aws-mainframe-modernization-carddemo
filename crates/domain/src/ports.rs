@@ -534,24 +534,33 @@ pub trait TransactionReader {
         limit: u16,
     ) -> impl Future<Output = PortResult<Vec<Transaction>>> + Send + '_;
 
-    /// The `TRANREPT` selection: the live transactions whose processing date,
-    /// the first 10 bytes of `TRAN-PROC-TS`, lies from `start` to `end`
-    /// inclusive, compared as `CH` byte strings, the `STEP05R` `INCLUDE COND`
-    /// (P-TRANREPT-002). The same selection serves the CR00 report.
+    /// One page of the `TRANREPT` selection that serves the CR00 report: the
+    /// live transactions whose processing date, the first 10 bytes of
+    /// `TRAN-PROC-TS`, lies from `start` to `end` inclusive, compared as `CH`
+    /// byte strings, the `STEP05R` `INCLUDE COND` (P-TRANREPT-002), read as
+    /// `CBTRN03C` `1000-TRANFILE-GET-NEXT` reads the sorted file
+    /// (P-CBTRN03C-474).
     ///
-    /// Rows come back in TRAN-ID order, the order of the `TRANSACT.BKUP(+1)`
-    /// backup the sort reads (P-TRANREPT-001, P-TRANBKP-001). The sort by card
-    /// number and the order it leaves within one card, which the COBOL does not
-    /// define (E-38), belong to the report rule.
+    /// Rows come back in the `STEP05R` order the report rule sorts by: card
+    /// number, then TRAN-ID within a card (the order E-38 decides), each
+    /// compared as its space-padded `X(16)` bytes, the order of the
+    /// `(CardNumber, TranId)` pair. Only rows whose pair is greater than
+    /// `after` are returned, from the first row when `after` is `None`, and at
+    /// most `limit` of them; an empty page ends the selection. The rule
+    /// (`transaction_report::ReportSelection`) checks the order and applies
+    /// the exact date compare again, so a caller pages through the whole
+    /// selection with the last pair of each page as the next `after`.
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; an empty selection is `Ok`
-    /// with no rows.
+    /// [`PortError::Unavailable`] on any failure; the end of the selection is
+    /// `Ok` with no rows.
     fn transactions_by_proc_date(
         &mut self,
         start: Alnum<10>,
         end: Alnum<10>,
+        after: Option<(CardNumber, TranId)>,
+        limit: u16,
     ) -> impl Future<Output = PortResult<Vec<Transaction>>> + Send + '_;
 }
 

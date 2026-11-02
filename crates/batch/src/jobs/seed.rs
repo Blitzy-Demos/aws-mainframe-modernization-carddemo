@@ -6,11 +6,13 @@
 //! | `--if-empty` | The same, on a first start only: nothing happens when the account master holds rows |
 //! | `--only tranextr` | `TRANEXTR` STEP40/STEP50 (DSNTIAUL) [app/app-transaction-type-db2/jcl/TRANEXTR.jcl:L62-122] and the `TRANTYPE`/`TRANCATG` loads of its unload: the Db2 masters copied over the processing copies |
 //!
-//! The loading itself is `carddemo_persistence::seed::run`, one database transaction per run
-//! that decodes every fixture through the `carddemo-codec` layouts, so the database holds the
-//! bytes the codec round-trips (o4). This job only locates the sources and turns the outcome
-//! into an exit status. Seed jobs are replaced, not parity-tested (AAP 0.3.2), so no audit row
-//! gates this module.
+//! The loading itself is `carddemo_persistence::seed`, which decodes every fixture through the
+//! `carddemo-codec` layouts, so the database holds the bytes the codec round-trips (o4). It runs
+//! in two steps: `seed::prepare` reads, decodes and hashes the sources, blocking file I/O and
+//! argon2id work that this job runs on Tokio's blocking pool before any transaction is open;
+//! `seed::run` then writes the prepared rows in one database transaction. This job only locates
+//! the sources, runs the two steps and turns the outcome into an exit status. Seed jobs are
+//! replaced, not parity-tested (AAP 0.3.2), so no audit row gates this module.
 
 use std::path::Path;
 
@@ -22,6 +24,7 @@ use tracing::Span;
 use super::{JobContext, setup_failure};
 use crate::cli::SeedArgs;
 use crate::exit::ExitStatus;
+use crate::generations::blocking;
 
 /// Runs the seed `args` selects against `db` and records the rows it wrote in `written` on
 /// the job span.
@@ -31,16 +34,28 @@ use crate::exit::ExitStatus;
 /// `app/data/ASCII`), and the `DUSRSECJ` job and the `CREADB21` load statements stay at their
 /// repository paths. `--if-empty` on a seeded database writes nothing and ends normally.
 ///
+/// The sources are prepared on Tokio's blocking pool, inside the job span, and only then is the
+/// seed's transaction opened, so no worker thread and no connection is held while the files are
+/// read and the passwords hashed. A source that cannot be read or decoded fails the run at the
+/// point the load reaches it, so `--if-empty` on a seeded database still ends normally whatever
+/// the sources hold.
+///
 /// A source that cannot be read or decoded, or a failed statement, is a setup failure
 /// (exit 16): the seed jobs have no condition code the work reproduces. The seed's single
-/// transaction is then rolled back, so the database is left as it was.
+/// transaction is then rolled back, so the database is left as it was. A preparation the
+/// runtime cancels because it is shutting down is a setup failure too, before any transaction.
 pub(crate) async fn run(ctx: &JobContext, db: &Db, args: &SeedArgs) -> ExitStatus {
     let repo_root = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(err) => return setup_failure("current directory unavailable", err),
     };
     let sources = seed_sources(&repo_root, &ctx.settings);
-    match seed::run(db, args.mode(), &sources).await {
+    let mode = args.mode();
+    let prepared = match blocking(move || seed::prepare(mode, &sources)).await {
+        Ok(prepared) => prepared,
+        Err(err) => return setup_failure("seed preparation did not complete", err),
+    };
+    match seed::run(db, prepared).await {
         Ok(report) => {
             // `seed::run` already emits the per-table counts and the refreshed,
             // masters-loaded and skipped flags as one event inside this span, so the job adds

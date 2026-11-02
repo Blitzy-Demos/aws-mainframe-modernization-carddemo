@@ -245,6 +245,108 @@ impl ReportResponse {
     }
 }
 
+/// The `lines` member of a [`ReportResponse`] without lines, as `serde_json`
+/// writes it. Every quote inside a JSON string is escaped, so this text can
+/// only be the member itself, and the struct has one `lines` member.
+const EMPTY_LINES: &[u8] = b"\"lines\":[]";
+
+/// Where the array of [`EMPTY_LINES`] opens: the bytes before its `]`.
+const LINES_OPEN: usize = EMPTY_LINES.len() - 1;
+
+/// Why the JSON frame of a report could not be built.
+#[derive(Debug, thiserror::Error)]
+pub enum ReportJsonError {
+    /// `serde_json` failed to write the response or a line.
+    #[error("the report response cannot be serialized: {0}")]
+    Serialize(#[from] serde_json::Error),
+    /// The serialized response holds no `lines` member to split at.
+    #[error("the serialized report response holds no empty lines array")]
+    NoLines,
+}
+
+/// CORPT00C PROCESS-ENTER-KEY — P-CORPT00C-012, P-CORPT00C-014,
+/// P-CORPT00C-017
+///
+/// The JSON text of a [`ReportResponse`] around its `lines` array, so the
+/// report records can be encoded into the response as they are written,
+/// without a vector of every line.
+///
+/// [`ReportJson::head`] is the `serde_json` text of the response without lines
+/// up to the `[` of its `lines` array and [`ReportJson::tail`] the rest from
+/// the `]`. Between them go the lines, as [`ReportLines`] encodes them; head,
+/// elements and tail together are byte for byte the `serde_json` text of the
+/// [`ReportResponse`] holding those lines, escaping included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportJson {
+    /// The response text up to and including `"lines":[`.
+    head: Vec<u8>,
+    /// The response text from the `]` of `lines` to the end.
+    tail: Vec<u8>,
+}
+
+impl ReportJson {
+    /// The frame of the response of a run over `range` with the submission
+    /// `message`, as [`ReportResponse::generated`] names them.
+    ///
+    /// # Errors
+    ///
+    /// [`ReportJsonError`] when `serde_json` fails on the response or its text
+    /// lacks the `lines` member; neither happens for this struct of strings.
+    pub fn new(range: &ReportRange, message: String) -> Result<Self, ReportJsonError> {
+        let empty = serde_json::to_vec(&ReportResponse::generated(range, Vec::new(), message))?;
+        let at = empty
+            .windows(EMPTY_LINES.len())
+            .position(|window| window == EMPTY_LINES)
+            .ok_or(ReportJsonError::NoLines)?;
+        let (head, tail) = empty.split_at(at + LINES_OPEN);
+        Ok(Self {
+            head: head.to_vec(),
+            tail: tail.to_vec(),
+        })
+    }
+
+    /// The response text before the first line.
+    #[must_use]
+    pub fn head(&self) -> &[u8] {
+        &self.head
+    }
+
+    /// The response text after the last line.
+    #[must_use]
+    pub fn tail(&self) -> &[u8] {
+        &self.tail
+    }
+}
+
+/// The elements of the `lines` array of a [`ReportJson`], encoded in as many
+/// pieces as the report is written in: each line as `serde_json` writes a
+/// string, with the comma `serde_json` puts between two elements.
+#[derive(Debug, Clone, Default)]
+pub struct ReportLines {
+    /// An element has been encoded, so the next one follows a comma.
+    started: bool,
+}
+
+impl ReportLines {
+    /// The array elements of `lines`, which follow every line encoded before.
+    ///
+    /// # Errors
+    ///
+    /// [`ReportJsonError::Serialize`] when `serde_json` fails on a line, which
+    /// it does not for a string.
+    pub fn encode(&mut self, lines: &[String]) -> Result<Vec<u8>, ReportJsonError> {
+        let mut elements = Vec::new();
+        for line in lines {
+            if self.started {
+                elements.push(b',');
+            }
+            serde_json::to_writer(&mut elements, line)?;
+            self.started = true;
+        }
+        Ok(elements)
+    }
+}
+
 /// A BMS field of `CORPT0A` that a CR00 error body names: the distinct
 /// `BMS field` values of the `V-CORPT00C` rows. `YEARLY` and `CUSTOM` are no
 /// error's field: a missing report type and the confirmation `N` place the
@@ -345,7 +447,8 @@ mod tests {
     use utoipa::openapi::path::ParameterIn;
 
     use super::{
-        BmsField, ReportQuery, ReportRequestField, ReportResponse, ReportTypeParam, split_date,
+        BmsField, ReportJson, ReportLines, ReportQuery, ReportRequestField, ReportResponse,
+        ReportTypeParam, split_date,
     };
     use crate::error::ApiError;
 
@@ -693,6 +796,45 @@ mod tests {
         assert_eq!(lengths, [133, 0, 3, 133]);
         let back: ReportResponse = serde_json::from_value(wire).expect("deserializes");
         assert_eq!(back, response);
+    }
+
+    #[test]
+    fn report_json_in_pieces_is_the_serde_json_text_of_the_response() {
+        let range = ReportRange {
+            report_name: messages::REPORT_NAME_CUSTOM,
+            start: Alnum::move_from("2022-01-01"),
+            end: Alnum::move_from("2022-07-06"),
+        };
+        let message = messages::report_submitted_message(messages::REPORT_NAME_CUSTOM);
+        let escaped = vec![
+            format!("{:<20}{}", "DALYREPT", " ".repeat(113)),
+            "a \"quoted\" name, \\ and / and \"lines\":[]".to_owned(),
+            "\u{1}\u{8}\t\n\u{c}\r\u{1f}\u{7f} control characters".to_owned(),
+            "Müller ÿ € 😀 non-ASCII".to_owned(),
+            String::new(),
+            "   ".to_owned(),
+        ];
+        for lines in [Vec::new(), vec!["one line".to_owned()], escaped] {
+            let response = ReportResponse::generated(&range, lines.clone(), message.clone());
+            let expected = serde_json::to_vec(&response).expect("the response serializes");
+            let json = ReportJson::new(&range, message.clone()).expect("a frame");
+            for piece in [1, 2, lines.len().max(1)] {
+                let mut elements = ReportLines::default();
+                let mut body = json.head().to_vec();
+                body.extend(elements.encode(&[]).expect("no lines"));
+                for chunk in lines.chunks(piece) {
+                    body.extend(elements.encode(chunk).expect("the lines encode"));
+                }
+                body.extend(json.tail());
+                assert_eq!(
+                    String::from_utf8_lossy(&body),
+                    String::from_utf8_lossy(&expected),
+                    "{} lines in pieces of {piece}",
+                    lines.len()
+                );
+                assert_eq!(body, expected);
+            }
+        }
     }
 
     #[test]

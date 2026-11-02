@@ -37,10 +37,20 @@
 //! only on a control character inside a key, which no allocated TRAN-ID, no
 //! fixture record and no CT00 start key (numeric, P-COTRN00C-005) holds.
 //!
+//! The CR00 date selection, [`TransactionReader::transactions_by_proc_date`],
+//! orders and pages by the padded keys instead: `rpad(tran_card_num, 16)` and
+//! `rpad(tran_id, 16)`, the space-padded `X(16)` text, against its keyset bound
+//! as the same padded text. In the UTF8 database `COLLATE "C"` compares UTF-8
+//! bytes, whose order is the code-point order, and the column `CHECK` admits
+//! only U+0001..U+00FF, each the one Latin-1 byte the key holds, so that order
+//! is exactly the byte order of the `(CardNumber, TranId)` pair, control
+//! characters included, which the report rule checks page by page. No index
+//! holds it: each page sorts the rows of the date range.
+//!
 //! # Writes
 //!
-//! Each write runs under its own savepoint through `crate::tx::savepoint` and
-//! `crate::tx::settle`; reads run on the transaction directly. A unique
+//! Each write, and each read, runs under its own savepoint through
+//! `crate::tx::savepoint` and `crate::tx::settle`. A unique
 //! violation on `transactions_master_tran_id`, a second live row with one
 //! TRAN-ID, is the `DUPKEY`/`DUPREC` of the COBOL writes and maps to
 //! [`PortError::Duplicate`]. TRAN-IDs are allocated by
@@ -55,7 +65,7 @@
 //! [`PersistenceError::Corrupt`] naming `transaction_master` and the column.
 
 use carddemo_domain::entities::{NewTransaction, Transaction};
-use carddemo_domain::numeric::{AccountId, Alnum, TranId, TransactionRowId};
+use carddemo_domain::numeric::{AccountId, Alnum, CardNumber, TranId, TransactionRowId};
 use carddemo_domain::ports::{
     Browse, Direction, PortError, PortResult, TransactionReader, TransactionWriter,
 };
@@ -65,9 +75,9 @@ use sqlx::PgConnection;
 use super::{
     alnum, card_number, limit_i64, merchant_id, money, tran_category_code, tran_id, tran_type_code,
 };
+use crate::PersistenceError;
 use crate::ids::TRAN_ID_LOCK_KEY;
 use crate::tx::{PgStore, savepoint, settle};
-use crate::{PersistenceError, port_error};
 
 /// The view every read selects from, as [`PersistenceError::Corrupt`] names it.
 const MASTER_VIEW: &str = "transaction_master";
@@ -432,12 +442,13 @@ WHERE NOT t.in_master
 impl TransactionReader for PgStore<'_, '_> {
     /// COTRN01C READ-TRANSACT-FILE — P-COTRN01C-004
     /// [app/cbl/COTRN01C.cbl:L267-296]: the live row with the TRAN-ID. The
-    /// COBOL reads `UPDATE` and rewrites nothing, so a plain read gives the same
-    /// result. No row is the `NOTFND` the rule turns into "Transaction ID NOT
-    /// found...".
+    /// COBOL reads `UPDATE` and rewrites nothing, so a read without a lock
+    /// gives the same result. No row is the `NOTFND` the rule turns into
+    /// "Transaction ID NOT found...".
     async fn read_transaction(&mut self, id: TranId) -> PortResult<Transaction> {
         let key = id.trimmed();
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             TransactionRow,
             r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
        tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
@@ -450,9 +461,9 @@ FROM transaction_master
 WHERE tran_id = $1"#,
             key.as_ref()
         )
-        .fetch_one(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_one(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?;
         Transaction::try_from(row).map_err(PortError::from)
     }
 
@@ -477,8 +488,9 @@ WHERE tran_id = $1"#,
         let limit = limit_i64(browse.limit)?;
         let account = account_id.map(AccountId::to_i64);
         let start = browse.start_key.as_ref().map(TranId::trimmed);
-        let conn = &mut **self.tx;
-        let rows = match (browse.direction, start.as_deref()) {
+        let mut sp = savepoint(self.tx).await?;
+        let conn = &mut *sp;
+        let result = match (browse.direction, start.as_deref()) {
             (Direction::Forward, start) => {
                 select_forward(conn, start.unwrap_or(LOW_VALUES), account, limit).await
             }
@@ -486,9 +498,8 @@ WHERE tran_id = $1"#,
                 select_backward_from(conn, start, account, limit).await
             }
             (Direction::Backward, None) => select_backward_from_end(conn, account, limit).await,
-        }
-        .map_err(|err| port_error(&err))?;
-        into_transactions(rows)
+        };
+        into_transactions(settle(sp, result).await?)
     }
 
     /// COTRN02C ADD-TRANSACTION and COPY-LAST-TRAN-DATA — P-COTRN02C-020,
@@ -499,10 +510,9 @@ WHERE tran_id = $1"#,
     /// account. `None` on an empty live master, the `STARTBR` `NOTFND` of
     /// P-COTRN02C-021 and P-COBIL00C-013.
     async fn highest_transaction(&mut self) -> PortResult<Option<Transaction>> {
-        let rows = select_backward_from_end(self.tx, None, 1)
-            .await
-            .map_err(|err| port_error(&err))?;
-        Ok(into_transactions(rows)?.pop())
+        let mut sp = savepoint(self.tx).await?;
+        let result = select_backward_from_end(&mut sp, None, 1).await;
+        Ok(into_transactions(settle(sp, result).await?)?.pop())
     }
 
     /// CREASTMT STEP010 — P-CREASTMT-002 [app/jcl/CREASTMT.JCL:L44-55]:
@@ -516,7 +526,8 @@ WHERE tran_id = $1"#,
     /// `statement::TRNXFILE_READ_LIMIT`, past which no record changes the load.
     async fn transactions_by_card(&mut self, limit: u16) -> PortResult<Vec<Transaction>> {
         let limit = limit_i64(limit)?;
-        let rows = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             TransactionRow,
             r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
        tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
@@ -530,30 +541,56 @@ ORDER BY tran_card_num, tran_id
 LIMIT $1"#,
             limit
         )
-        .fetch_all(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        into_transactions(rows)
+        .fetch_all(&mut *sp)
+        .await;
+        into_transactions(settle(sp, result).await?)
     }
 
-    /// TRANREPT STEP05R — P-TRANREPT-002 [app/proc/TRANREPT.prc:L35-53]: the
-    /// `INCLUDE COND=(TRAN-PROC-DT,GE,start,AND,TRAN-PROC-DT,LE,end)` over
-    /// `TRAN-PROC-DT`, bytes 305 to 314, the first 10 characters of
-    /// `tran_proc_ts`, compared as `CH` text with both bounds inclusive. The
-    /// selected rows are read by CBTRN03C 1000-TRANFILE-GET-NEXT —
-    /// P-CBTRN03C-474 [app/cbl/CBTRN03C.cbl:L248-272], and the same selection
-    /// serves CR00.
+    /// TRANREPT STEP05R — P-TRANREPT-002 [app/proc/TRANREPT.prc:L35-53]: one
+    /// page of the `INCLUDE COND=(TRAN-PROC-DT,GE,start,AND,TRAN-PROC-DT,LE,end)`
+    /// over `TRAN-PROC-DT`, bytes 305 to 314, the first 10 characters of
+    /// `tran_proc_ts`, compared as `CH` text with both bounds inclusive, sorted
+    /// by card number then TRAN-ID. The rows are read as CBTRN03C
+    /// 1000-TRANFILE-GET-NEXT — P-CBTRN03C-474 [app/cbl/CBTRN03C.cbl:L248-272]
+    /// reads the sorted file; the selection serves CR00.
+    ///
+    /// Up to `limit` rows whose padded card number and TRAN-ID follow `after`,
+    /// the keyset of the page before, in the padded-key order of the module
+    /// documentation, which is the `(CardNumber, TranId)` order the port
+    /// declares. The date range is bounded on the raw column as well, so the
+    /// partial index `transactions_master_proc_ts` limits the rows each page
+    /// reads to the range.
     async fn transactions_by_proc_date(
         &mut self,
         start: Alnum<10>,
         end: Alnum<10>,
+        after: Option<(CardNumber, TranId)>,
+        limit: u16,
     ) -> PortResult<Vec<Transaction>> {
+        let limit = limit_i64(limit)?;
         let (from, to) = (start.trimmed(), end.trimmed());
-        // TRAN-ID order, the order of the TRANSACT.BKUP(+1) backup the sort reads
-        // (P-TRANREPT-001), as the port declares. The STEP05R sort by card number,
-        // and the order it leaves within one card (E-38), belong to the report
-        // rule, so this read does not sort by card number.
-        let rows = sqlx::query_as!(
+        // The keyset as the space-padded X(16) text of both keys, the form
+        // rpad(…, 16) gives the stored keys below; NULL reads from the first row.
+        let (card, id) = after.map_or((None, None), |(card, id)| {
+            (
+                Some(card.as_alnum().as_text().into_owned()),
+                Some(id.as_alnum().as_text().into_owned()),
+            )
+        });
+        // The substr() pair is the INCLUDE COND itself, the only test that
+        // decides which rows are selected. The raw-column pair adds index bounds
+        // that keep exactly those rows, given |$1| <= 10 and |$2| <= 10 (a
+        // trimmed Alnum<10>), the C collation of the column, and its CHECK, which
+        // admits only U+0001..U+00FF in at most 26 characters:
+        // - tran_proc_ts >= $1 holds exactly when substr(tran_proc_ts, 1, 10) >=
+        //   $1. A value is at least its own prefix; and a prefix below $1 that is
+        //   shorter than 10 characters is the whole value.
+        // - substr(tran_proc_ts, 1, 10) <= $2 implies tran_proc_ts <= $2 followed
+        //   by 16 U+00FF: a value whose prefix is $2 carries at most 16 more
+        //   characters, none above U+00FF, and a prefix below $2 keeps the value
+        //   below it.
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             TransactionRow,
             r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
        tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
@@ -563,16 +600,22 @@ LIMIT $1"#,
        tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
        tran_proc_ts AS "tran_proc_ts!"
 FROM transaction_master
-WHERE substr(tran_proc_ts, 1, 10) >= $1
+WHERE tran_proc_ts >= $1
+  AND tran_proc_ts <= ($2 || repeat(chr(255), 16))
+  AND substr(tran_proc_ts, 1, 10) >= $1
   AND substr(tran_proc_ts, 1, 10) <= $2
-ORDER BY tran_id"#,
+  AND ($3::text IS NULL OR (rpad(tran_card_num, 16), rpad(tran_id, 16)) > ($3, $4))
+ORDER BY rpad(tran_card_num, 16), rpad(tran_id, 16)
+LIMIT $5"#,
             from.as_ref(),
-            to.as_ref()
+            to.as_ref(),
+            card.as_deref(),
+            id.as_deref(),
+            limit
         )
-        .fetch_all(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        into_transactions(rows)
+        .fetch_all(&mut *sp)
+        .await;
+        into_transactions(settle(sp, result).await?)
     }
 }
 
@@ -634,7 +677,8 @@ impl PgStore<'_, '_> {
         // Two statements rather than `None` bound as "": an all-space TRAN-ID
         // is stored as "", which `tran_id > ''` would leave out of the first
         // page.
-        let rows = match after {
+        let mut sp = savepoint(self.tx).await?;
+        let result = match after {
             None => {
                 sqlx::query_as!(
                     TransactionRow,
@@ -650,7 +694,7 @@ ORDER BY tran_id
 LIMIT $1"#,
                     limit
                 )
-                .fetch_all(&mut **self.tx)
+                .fetch_all(&mut *sp)
                 .await
             }
             Some(last) => {
@@ -671,12 +715,11 @@ LIMIT $2"#,
                     key.as_ref(),
                     limit
                 )
-                .fetch_all(&mut **self.tx)
+                .fetch_all(&mut *sp)
                 .await
             }
-        }
-        .map_err(|err| port_error(&err))?;
-        into_transactions(rows)
+        };
+        into_transactions(settle(sp, result).await?)
     }
 
     /// TRANBKP STEP05R to STEP10 — P-TRANBKP-001, P-TRANBKP-003,
@@ -706,27 +749,30 @@ LIMIT $2"#,
     /// The unit of work runs at `READ COMMITTED`, the `PostgreSQL` default,
     /// where each statement takes its own snapshot. Every later statement
     /// therefore starts after both locks are granted and sees one stable
-    /// committed master, the rows of the last writer included. The locks
-    /// write nothing, so they run on the transaction itself, with no
-    /// savepoint.
+    /// committed master, the rows of the last writer included. Each lock
+    /// statement runs under its own savepoint, as every store statement does;
+    /// releasing the savepoint hands its lock to the unit of work, so both
+    /// locks stay held until the unit ends.
     ///
     /// # Errors
     ///
-    /// The [`port_error`] mapping of a failed lock statement:
+    /// The mapped error of a failed lock statement:
     /// [`PortError::Contention`] when the wait ends in a deadlock or a lock
     /// timeout, [`PortError::Unavailable`] on any other failure.
     pub async fn exclude_master_writers(&mut self) -> PortResult<()> {
-        sqlx::query_scalar!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_scalar!(
             r#"SELECT 1 AS "locked!" FROM pg_advisory_xact_lock($1)"#,
             TRAN_ID_LOCK_KEY
         )
-        .fetch_one(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        sqlx::query!("LOCK TABLE transactions IN SHARE ROW EXCLUSIVE MODE")
-            .execute(&mut **self.tx)
-            .await
-            .map_err(|err| port_error(&err))?;
+        .fetch_one(&mut *sp)
+        .await;
+        settle(sp, result).await?;
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query!("LOCK TABLE transactions IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *sp)
+            .await;
+        settle(sp, result).await?;
         Ok(())
     }
 

@@ -18,7 +18,8 @@
 //! the stack's `PgPool`, or a pool of its own on the stack's database URL.
 
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,7 @@ use carddemo_domain::ports::{
     TranCatBalanceStore, TransactionWriter, XrefReader,
 };
 use carddemo_domain::rewards::{AccrualInput, RewardEngine};
-use carddemo_persistence::seed::{SeedMode, SeedReport, SeedSources, run};
+use carddemo_persistence::seed::{SeedMode, SeedReport, SeedSources, prepare, run};
 use carddemo_persistence::{Db, PersistenceError, PgStore, UnitOfWork};
 use carddemo_testkit::{TestStack, block_on, fixtures};
 use chrono::{DateTime, TimeZone, Utc};
@@ -189,13 +190,16 @@ fn stack() -> (TestStack, Db) {
     (stack, db)
 }
 
-/// One seed run on the shared test runtime.
+/// One seed run: the sources prepared on the test thread, outside every
+/// runtime, as an adapter prepares them on its blocking pool, then written on
+/// the shared test runtime.
 fn run_seed(
     db: &Db,
     mode: SeedMode,
     sources: &SeedSources,
 ) -> Result<SeedReport, PersistenceError> {
-    block_on(Box::pin(run(db, mode, sources)))
+    let prepared = prepare(mode, sources);
+    block_on(Box::pin(run(db, prepared)))
 }
 
 /// The report of a first seed: every fixture record and `CREADB21` row
@@ -727,6 +731,137 @@ fn assert_last_tcatbal_sign_rejected(err: &PersistenceError, sources: &SeedSourc
         source.kind,
         CodecErrorKind::PlainDigitInSigned { byte: b'0' }
     );
+}
+
+/// A directory under `CARGO_TARGET_TMPDIR`, named after `test`, that is never
+/// created, so every source read from it is missing.
+fn missing_dir(test: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("seed-missing-{test}"));
+    assert!(!dir.exists(), "{} must not exist", dir.display());
+    dir
+}
+
+/// `err` is the read failure of the missing source `path`.
+fn assert_missing_source(err: &PersistenceError, path: &Path) {
+    let PersistenceError::Io {
+        path: failed,
+        source,
+    } = err
+    else {
+        panic!("expected the read error of {}, got {err}", path.display());
+    };
+    assert_eq!(failed, path);
+    assert_eq!(source.kind(), io::ErrorKind::NotFound);
+}
+
+/// Test-only statements that make every insert into `accounts` fail, the
+/// first table the load writes.
+const REJECT_ACCOUNT_INSERTS: &str = r"
+    CREATE FUNCTION seed_test_reject_account() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        RAISE EXCEPTION 'account insert rejected by the test';
+    END $$;
+    CREATE TRIGGER seed_test_reject_account BEFORE INSERT ON accounts
+        FOR EACH ROW EXECUTE FUNCTION seed_test_reject_account();
+";
+
+/// Removes what [`REJECT_ACCOUNT_INSERTS`] installed.
+const ACCEPT_ACCOUNT_INSERTS: &str = "
+    DROP TRIGGER seed_test_reject_account ON accounts;
+    DROP FUNCTION seed_test_reject_account();
+";
+
+/// The sources are prepared before the run's transaction opens, yet a source
+/// error is returned only where the load reaches that source, as an inline
+/// read returns it, and every failed run changes nothing:
+///
+/// - on an empty database the missing `DB2LTTYP.ctl` fails the run after the
+///   nine file loads, unless a failed `accounts` insert comes first;
+/// - on a seeded, edited database `--if-empty` writes nothing and succeeds with
+///   every fixture missing, a refresh with every fixture missing fails at
+///   `acctdata.txt`, and a refresh with the `DB2LT*.ctl` statements missing
+///   succeeds, because the Db2 masters are not empty and are not reloaded.
+#[test]
+fn source_errors_surface_only_where_the_load_reaches_them() {
+    let (test_stack, db) = stack();
+    let pool = db.pool();
+    let missing = missing_dir("source_errors_surface_only_where_the_load_reaches_them");
+    let no_fixtures = SeedSources {
+        fixture_dir: missing.clone(),
+        ..sources()
+    };
+    let no_ctl = SeedSources {
+        db2_ctl_dir: missing.clone(),
+        ..sources()
+    };
+
+    block_on(test_stack.exec_sql(REJECT_ACCOUNT_INSERTS));
+    let err = run_seed(&db, SeedMode::Full, &no_ctl).expect_err("a rejected account insert");
+    assert!(
+        matches!(&err, PersistenceError::Sqlx(_))
+            && err
+                .to_string()
+                .contains("account insert rejected by the test"),
+        "expected the failed accounts insert, got {err}"
+    );
+    block_on(test_stack.exec_sql(ACCEPT_ACCOUNT_INSERTS));
+    let err = run_seed(&db, SeedMode::Full, &no_ctl).expect_err("a missing DB2LTTYP.ctl");
+    assert_missing_source(&err, &missing.join("DB2LTTYP.ctl"));
+    assert_eq!(block_on(counts(pool)), Counts::default());
+
+    run_seed(&db, SeedMode::Full, &sources()).expect("first seed");
+    block_on(set_account_one_balance(pool, EDITED_BALANCE_CENTS));
+    let cases: [(SeedMode, &SeedSources, Result<SeedReport, PathBuf>); 3] = [
+        (
+            SeedMode::IfEmpty,
+            &no_fixtures,
+            Ok(SeedReport {
+                skipped: true,
+                ..SeedReport::default()
+            }),
+        ),
+        (
+            SeedMode::Full,
+            &no_fixtures,
+            Err(missing.join("acctdata.txt")),
+        ),
+        (
+            SeedMode::Full,
+            &no_ctl,
+            Ok(SeedReport {
+                transaction_types: 0,
+                transaction_categories: 0,
+                masters_loaded: false,
+                refreshed: true,
+                ..first_seed_report()
+            }),
+        ),
+    ];
+    for (mode, sources, expected) in cases {
+        let before = block_on(snapshot(pool));
+        let result = run_seed(&db, mode, sources);
+        let after = block_on(snapshot(pool));
+        let wrote = match (&result, &expected) {
+            (Ok(report), Ok(want)) => {
+                assert_eq!(report, want, "{mode:?}");
+                !report.skipped
+            }
+            (Err(err), Err(path)) => {
+                assert_missing_source(err, path);
+                false
+            }
+            (other, _) => panic!("{mode:?}: expected {expected:?}, got {other:?}"),
+        };
+        assert_eq!(
+            (&after.transaction_types, &after.transaction_categories),
+            (&before.transaction_types, &before.transaction_categories),
+            "{mode:?} keeps the Db2 masters"
+        );
+        if !wrote {
+            assert_eq!(after, before, "{mode:?} changes nothing");
+        }
+    }
+    assert_eq!(block_on(counts(pool)), fixture_counts());
 }
 
 /// A pool of two sessions named [`CONTENDERS`] on the stack's database: one

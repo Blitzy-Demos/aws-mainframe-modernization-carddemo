@@ -45,8 +45,8 @@ use std::fmt::Display;
 use std::process::ExitCode;
 
 use carddemo_domain::clock::AnyClock;
-use carddemo_messaging::{MessagingError, run};
-use carddemo_persistence::connect;
+use carddemo_messaging::{MessagingError, STATEMENT_TIMEOUT, run};
+use carddemo_persistence::connect_with_statement_timeout;
 use carddemo_runtime::config::Settings;
 use carddemo_runtime::telemetry;
 
@@ -120,6 +120,10 @@ fn report_startup_failure(stage: &'static str, error: &dyn Display) {
 /// database pool on `CARDDEMO_DATABASE_URL`, then runs the CDRD, CDRA and
 /// CP00 consumers on that clock until the first one stops.
 ///
+/// The pool's connections carry [`STATEMENT_TIMEOUT`], so the server cancels
+/// a statement blocked behind another session's lock before the flow's own
+/// deadline gives up on it.
+///
 /// The clock is parsed first, and only here, so an invalid override is
 /// reported before any connection attempt and an unreachable database cannot
 /// mask it. The startup event names the request queues only; the URLs carry
@@ -139,7 +143,7 @@ async fn serve(settings: &Settings) -> Result<(), MessagingError> {
         "mq starting"
     );
     let clock = AnyClock::from_override(settings.clock_override.as_deref())?;
-    let db = connect(&settings.database_url)
+    let db = connect_with_statement_timeout(&settings.database_url, STATEMENT_TIMEOUT)
         .await
         .map_err(MessagingError::Persistence)?;
     run(settings, clock, db).await

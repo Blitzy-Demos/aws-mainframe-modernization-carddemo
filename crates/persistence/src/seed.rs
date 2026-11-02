@@ -1,10 +1,10 @@
 //! The fixture seed, its refresh and the `TRANEXTR` copy: the jobs that build
 //! and reload the `CardDemo` files, as one database transaction per run.
 //!
-//! [`run`] replaces these jobs. Every fixture is read through the record codec
-//! of `carddemo-codec`, so the database is seeded from the same bytes the codec
-//! round-trips (o4), framing included (CRLF, LF and the 36-byte `cardxref.txt`
-//! records, E-04).
+//! [`prepare`] and [`run`] replace these jobs. Every fixture is read through
+//! the record codec of `carddemo-codec`, so the database is seeded from the
+//! same bytes the codec round-trips (o4), framing included (CRLF, LF and the
+//! 36-byte `cardxref.txt` records, E-04).
 //!
 //! | Job | Step replaced | Source → table | Audit rows |
 //! |---|---|---|---|
@@ -40,6 +40,31 @@
 //! failure drops the transaction, which rolls it back, so the database is left
 //! exactly as it was.
 //!
+//! # Two steps
+//!
+//! A run is split in two, because reading and decoding the sources is
+//! blocking file I/O and hashing the ten `DUSRSECJ` passwords is memory-hard,
+//! CPU-bound argon2id work, and neither ever yields:
+//!
+//! 1. [`prepare`], synchronous: reads and decodes every source the mode needs
+//!    and hashes the passwords. It touches no database and answers with a
+//!    [`PreparedSeed`].
+//! 2. [`run`], asynchronous: the one database transaction that writes the
+//!    prepared rows. It does no file I/O and no argon2 work.
+//!
+//! An asynchronous caller runs [`prepare`] on a blocking thread pool, such as
+//! tokio's `spawn_blocking`, never inline on the executor, and before [`run`]
+//! opens the transaction, so no connection is held while the sources are read
+//! and hashed. This crate names no async runtime; the pool is the caller's.
+//!
+//! A source that cannot be read or decoded does not fail [`prepare`]: its
+//! error is kept in the [`PreparedSeed`] and [`run`] returns it at the point
+//! where it would have read that source, so every outcome is the one an
+//! inline read gives. [`SeedMode::IfEmpty`] on a seeded database still writes
+//! nothing and succeeds whatever the sources hold, the `DB2LT*.ctl` statements
+//! fail a run only when both Db2 masters are empty, and a database error in an
+//! earlier table's inserts comes before a later source's error.
+//!
 //! # What the seed never writes
 //!
 //! - The transaction master: `transactions` starts empty (P-CVTRA05Y-015,
@@ -57,13 +82,16 @@
 //! stored as the argon2id hash of the 8 bytes `DUSRSECJ` holds, case
 //! unchanged (E-20); no plaintext or hash is ever logged or returned.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use carddemo_codec::framing::decode_ascii_file;
 use carddemo_codec::{
-    AccountLayout, CardLayout, CardXrefLayout, Charset, CustomerLayout, DisclosureGroupLayout,
-    Layout, TranCatBalanceLayout, TranCategoryLayout, TranTypeLayout, UserSecurityLayout,
+    AccountLayout, AccountRecord, CardLayout, CardRecord, CardXrefLayout, CardXrefRecord, Charset,
+    CustomerLayout, CustomerRecord, DisclosureGroupLayout, DisclosureGroupRecord, Layout,
+    TranCatBalanceLayout, TranCatBalanceRecord, TranCategoryFileRecord, TranCategoryLayout,
+    TranTypeFileRecord, TranTypeLayout, UserSecurityLayout,
 };
 use carddemo_domain::auth::hash_stored_password;
 use carddemo_domain::entities::{NewRewardRule, TranCategoryMaster, TranTypeMaster};
@@ -133,7 +161,7 @@ pub enum SeedMode {
     OnlyTranextr,
 }
 
-/// Where a [`run`] reads its sources.
+/// Where [`prepare`] reads the sources of a run.
 ///
 /// The caller decides every path; this crate reads no environment. `batch`
 /// takes `fixture_dir` from `CARDDEMO_FIXTURE_DIR`.
@@ -199,38 +227,282 @@ pub struct SeedReport {
     pub skipped: bool,
 }
 
-/// Seeds, refreshes or copies the reference data as `mode` says, in one
-/// database transaction.
+/// The sources of a run, read, decoded and hashed by [`prepare`] and not yet
+/// written: what [`run`] writes in its one database transaction.
+///
+/// Every field is owned, so the prepared seed is `Send + 'static` and an
+/// asynchronous caller can move it out of the blocking thread pool that
+/// prepared it. `Debug` shows the mode and, per source, its row count or its
+/// error text; no row, password or password hash reaches a log line.
+#[must_use = "the seed is written only by `run`"]
+pub struct PreparedSeed {
+    /// What the mode needs.
+    plan: Plan,
+}
+
+impl PreparedSeed {
+    /// The mode [`prepare`] was given.
+    fn mode(&self) -> SeedMode {
+        match &self.plan {
+            Plan::OnlyTranextr => SeedMode::OnlyTranextr,
+            Plan::Load { if_empty: true, .. } => SeedMode::IfEmpty,
+            Plan::Load {
+                if_empty: false, ..
+            } => SeedMode::Full,
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSeed {
+    /// The mode and, for a load, each source as `Ok(<rows>)` or
+    /// `Err(<error text>)`, in the order [`run`] writes them.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("PreparedSeed");
+        debug.field("mode", &self.mode());
+        if let Plan::Load { sources, .. } = &self.plan {
+            debug
+                .field("accounts", &Outcome::of(&sources.accounts))
+                .field("cards", &Outcome::of(&sources.cards))
+                .field("card_xref", &Outcome::of(&sources.card_xref))
+                .field("customers", &Outcome::of(&sources.customers))
+                .field(
+                    "disclosure_groups",
+                    &Outcome::of(&sources.disclosure_groups),
+                )
+                .field(
+                    "tran_cat_balances",
+                    &Outcome::of(&sources.tran_cat_balances),
+                )
+                .field("trantype_file", &Outcome::of(&sources.trantype_file))
+                .field("trancatg_file", &Outcome::of(&sources.trancatg_file))
+                .field("users", &Outcome::of_users(&sources.users))
+                .field(
+                    "transaction_types",
+                    &Outcome::of(&sources.transaction_types),
+                )
+                .field(
+                    "transaction_categories",
+                    &Outcome::of(&sources.transaction_categories),
+                );
+        }
+        debug.finish()
+    }
+}
+
+/// What a [`PreparedSeed`] holds for its mode.
+enum Plan {
+    /// [`SeedMode::OnlyTranextr`]: the copy reads only the database, so no
+    /// source is read.
+    OnlyTranextr,
+    /// [`SeedMode::Full`] or, with `if_empty`, [`SeedMode::IfEmpty`]: every
+    /// source is read.
+    Load {
+        /// The mode is [`SeedMode::IfEmpty`].
+        if_empty: bool,
+        /// The outcome of each source.
+        sources: Box<PreparedSources>,
+    },
+}
+
+/// The outcome of each source of a load: its rows, or the error reading,
+/// decoding, parsing or hashing it gave.
+struct PreparedSources {
+    /// `acctdata.txt`.
+    accounts: Result<Vec<AccountRecord>, PersistenceError>,
+    /// `carddata.txt`.
+    cards: Result<Vec<CardRecord>, PersistenceError>,
+    /// `cardxref.txt`.
+    card_xref: Result<Vec<CardXrefRecord>, PersistenceError>,
+    /// `custdata.txt`.
+    customers: Result<Vec<CustomerRecord>, PersistenceError>,
+    /// `discgrp.txt`.
+    disclosure_groups: Result<Vec<DisclosureGroupRecord>, PersistenceError>,
+    /// `tcatbal.txt`.
+    tran_cat_balances: Result<Vec<TranCatBalanceRecord>, PersistenceError>,
+    /// `trantype.txt`.
+    trantype_file: Result<Vec<TranTypeFileRecord>, PersistenceError>,
+    /// `trancatg.txt`.
+    trancatg_file: Result<Vec<TranCategoryFileRecord>, PersistenceError>,
+    /// The `DUSRSECJ` `SYSUT1` rows.
+    users: Result<PreparedUsers, PersistenceError>,
+    /// `DB2LTTYP.ctl`.
+    transaction_types: Result<Vec<TranTypeMaster>, PersistenceError>,
+    /// `DB2LTCAT.ctl`.
+    transaction_categories: Result<Vec<TranCategoryMaster>, PersistenceError>,
+}
+
+/// The `DUSRSECJ` users, prepared row by row in `SYSUT1` order as the load
+/// inserts them: every row up to the first that does not decode or hash, and
+/// that row's error, which the load returns after inserting the rows before
+/// it.
+struct PreparedUsers {
+    /// The rows prepared, in order.
+    rows: Vec<SeedUser>,
+    /// The error of the first row that could not be prepared, if any; no row
+    /// after it is decoded or hashed.
+    failure: Option<PersistenceError>,
+}
+
+/// One `DUSRSECJ` user as its `users` row binds it, the password only as its
+/// argon2id hash. `Debug` shows the user ID only.
+struct SeedUser {
+    /// `SEC-USR-ID`, right-trimmed.
+    user_id: String,
+    /// `SEC-USR-FNAME`, right-trimmed.
+    first_name: String,
+    /// `SEC-USR-LNAME`, right-trimmed.
+    last_name: String,
+    /// The argon2id PHC string of `SEC-USR-PWD` as stored.
+    password_hash: String,
+    /// `SEC-USR-TYPE`, right-trimmed.
+    usr_type: String,
+}
+
+impl fmt::Debug for SeedUser {
+    /// The user ID only, ended with `..` to show that the rest of the row,
+    /// the password hash included, is left out.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SeedUser")
+            .field("user_id", &self.user_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A source's outcome as the `Debug` of a [`PreparedSeed`] shows it:
+/// `Ok(<rows>)`, or `Err(<error text>)`. Error texts name files, lines,
+/// records and fields, never a password or a hash.
+struct Outcome<'a>(Result<usize, &'a PersistenceError>);
+
+impl<'a> Outcome<'a> {
+    /// The outcome of a source read into rows.
+    fn of<T>(source: &'a Result<Vec<T>, PersistenceError>) -> Self {
+        Self(source.as_ref().map(Vec::len))
+    }
+
+    /// The outcome of the users: their row count when every row was prepared,
+    /// else the error that stopped them.
+    fn of_users(users: &'a Result<PreparedUsers, PersistenceError>) -> Self {
+        match users {
+            Ok(PreparedUsers {
+                failure: Some(err), ..
+            })
+            | Err(err) => Self(Err(err)),
+            Ok(PreparedUsers {
+                rows,
+                failure: None,
+            }) => Self(Ok(rows.len())),
+        }
+    }
+}
+
+impl fmt::Debug for Outcome<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Ok(rows) => formatter.debug_tuple("Ok").field(&rows).finish(),
+            Err(err) => formatter
+                .debug_tuple("Err")
+                .field(&format_args!("{err}"))
+                .finish(),
+        }
+    }
+}
+
+/// The first step of a run: reads, decodes and hashes the sources a run in
+/// `mode` writes, without a database.
+///
+/// - [`SeedMode::Full`] and [`SeedMode::IfEmpty`] read every fixture file of
+///   `sources.fixture_dir` through its codec layout, the `DUSRSECJ` `SYSUT1`
+///   rows, each decoded and its stored password hashed with
+///   [`hash_stored_password`], and both `DB2LT*.ctl` statements.
+///   [`SeedMode::IfEmpty`] prepares as much as [`SeedMode::Full`], because
+///   whether `accounts` holds a row is decided only inside the run's
+///   transaction.
+/// - [`SeedMode::OnlyTranextr`] reads nothing: the copy reads only the Db2
+///   masters.
+///
+/// The plaintext of each password lives only until it is hashed; the
+/// prepared seed keeps the user ID, names, type and hash.
+///
+/// Synchronous: the file reads block and argon2id hashing is memory-hard and
+/// CPU-bound, and neither yields. An asynchronous caller runs this on a
+/// blocking thread pool, such as tokio's `spawn_blocking`, before [`run`],
+/// never inline on the executor.
+///
+/// A source that cannot be read, decoded, parsed or hashed fails nothing
+/// here: its error is kept, and [`run`] returns it where it reaches that
+/// source.
+pub fn prepare(mode: SeedMode, sources: &SeedSources) -> PreparedSeed {
+    let plan = match mode {
+        SeedMode::OnlyTranextr => Plan::OnlyTranextr,
+        SeedMode::Full | SeedMode::IfEmpty => Plan::Load {
+            if_empty: mode == SeedMode::IfEmpty,
+            sources: Box::new(read_sources(sources)),
+        },
+    };
+    PreparedSeed { plan }
+}
+
+/// Every source of a load, each read on its own, so that a failing source
+/// leaves the outcomes of the others as they are.
+fn read_sources(sources: &SeedSources) -> PreparedSources {
+    let dir = &sources.fixture_dir;
+    let ctl = &sources.db2_ctl_dir;
+    PreparedSources {
+        accounts: read_fixture::<AccountLayout>(&dir.join(ACCTDATA)),
+        cards: read_fixture::<CardLayout>(&dir.join(CARDDATA)),
+        card_xref: read_fixture::<CardXrefLayout>(&dir.join(CARDXREF)),
+        customers: read_fixture::<CustomerLayout>(&dir.join(CUSTDATA)),
+        disclosure_groups: read_fixture::<DisclosureGroupLayout>(&dir.join(DISCGRP)),
+        tran_cat_balances: read_fixture::<TranCatBalanceLayout>(&dir.join(TCATBAL)),
+        trantype_file: read_fixture::<TranTypeLayout>(&dir.join(TRANTYPE)),
+        trancatg_file: read_fixture::<TranCategoryLayout>(&dir.join(TRANCATG)),
+        users: prepare_users(&sources.dusrsecj_jcl),
+        transaction_types: read_tran_type_masters(&ctl.join(DB2LTTYP)),
+        transaction_categories: read_tran_category_masters(&ctl.join(DB2LTCAT)),
+    }
+}
+
+/// The second step of a run: writes `prepared` as its mode says, seeding,
+/// refreshing or copying the reference data in one database transaction. It
+/// reads no file and does no argon2 work.
 ///
 /// The transaction commits only when every step has succeeded. On any error
 /// it is dropped, which rolls it back, so the database is unchanged.
 ///
+/// A source error [`prepare`] kept is returned where the load reaches that
+/// source, after the statements before it and before any insert of its own,
+/// so the outcome is the one an inline read gives:
+///
+/// - a [`SeedMode::IfEmpty`] run that finds rows in `accounts` writes nothing
+///   and succeeds, whatever the sources held;
+/// - a `DB2LT*.ctl` error fails the run only when both Db2 masters are empty;
+/// - a failed statement of an earlier table, or of an earlier `DUSRSECJ` row,
+///   is returned instead of a later source's error.
+///
 /// # Errors
 ///
-/// - [`PersistenceError::Io`] when a source file cannot be read.
+/// - [`PersistenceError::Io`] when a source file could not be read.
 /// - [`PersistenceError::Codec`] when a fixture record or a `DUSRSECJ` row
-///   does not decode through its copybook layout.
+///   did not decode through its copybook layout.
 /// - [`PersistenceError::Fixture`] when the `DUSRSECJ` in-stream data or a
-///   `DB2LT*.ctl` statement does not parse.
-/// - [`PersistenceError::Password`] when a password cannot be hashed.
+///   `DB2LT*.ctl` statement did not parse.
+/// - [`PersistenceError::Password`] when a password could not be hashed.
 /// - [`PersistenceError::Corrupt`] when a value does not fit its column, a
 ///   Db2 category code has no four-digit processing-copy form, or a seed
 ///   reward rule is not generated under its fixed ID.
 /// - [`PersistenceError::Sqlx`] when a statement or the commit fails, for
 ///   example a duplicate key in a fixture.
-pub async fn run(
-    db: &Db,
-    mode: SeedMode,
-    sources: &SeedSources,
-) -> Result<SeedReport, PersistenceError> {
+pub async fn run(db: &Db, prepared: PreparedSeed) -> Result<SeedReport, PersistenceError> {
+    let mode = prepared.mode();
     let mut tx = db.pool().begin().await?;
-    let report = match mode {
-        SeedMode::OnlyTranextr => tranextr(&mut tx).await?,
-        SeedMode::IfEmpty if has_accounts(&mut tx).await? => SeedReport {
+    let report = match prepared.plan {
+        Plan::OnlyTranextr => tranextr(&mut tx).await?,
+        Plan::Load { if_empty: true, .. } if has_accounts(&mut tx).await? => SeedReport {
             skipped: true,
             ..SeedReport::default()
         },
-        SeedMode::Full | SeedMode::IfEmpty => full(&mut tx, sources).await?,
+        Plan::Load { sources, .. } => full(&mut tx, *sources).await?,
     };
     if report.skipped {
         tx.rollback().await?;
@@ -265,32 +537,44 @@ fn log_report(mode: SeedMode, report: &SeedReport) {
 }
 
 /// [`SeedMode::Full`]: clear, reload every file, load the Db2 masters while
-/// they are empty, re-insert the seed reward rules.
+/// they are empty, re-insert the seed reward rules. Each source's error, if
+/// [`prepare`] kept one, is returned just before that source's inserts.
 async fn full(
     conn: &mut PgConnection,
-    sources: &SeedSources,
+    sources: PreparedSources,
 ) -> Result<SeedReport, PersistenceError> {
+    let PreparedSources {
+        accounts,
+        cards,
+        card_xref,
+        customers,
+        disclosure_groups,
+        tran_cat_balances,
+        trantype_file,
+        trancatg_file,
+        users,
+        transaction_types,
+        transaction_categories,
+    } = sources;
     let refreshed = has_accounts(conn).await?;
     clear(conn).await?;
-    let dir = &sources.fixture_dir;
     let mut report = SeedReport {
-        accounts: load_accounts(conn, &dir.join(ACCTDATA)).await?,
-        cards: load_cards(conn, &dir.join(CARDDATA)).await?,
-        card_xref: load_card_xref(conn, &dir.join(CARDXREF)).await?,
-        customers: load_customers(conn, &dir.join(CUSTDATA)).await?,
-        disclosure_groups: load_disclosure_groups(conn, &dir.join(DISCGRP)).await?,
-        tran_cat_balances: load_tran_cat_balances(conn, &dir.join(TCATBAL)).await?,
-        trantype_file: load_trantype_file(conn, &dir.join(TRANTYPE)).await?,
-        trancatg_file: load_trancatg_file(conn, &dir.join(TRANCATG)).await?,
-        users: load_users(conn, &sources.dusrsecj_jcl).await?,
+        accounts: load_accounts(conn, &accounts?).await?,
+        cards: load_cards(conn, &cards?).await?,
+        card_xref: load_card_xref(conn, &card_xref?).await?,
+        customers: load_customers(conn, &customers?).await?,
+        disclosure_groups: load_disclosure_groups(conn, &disclosure_groups?).await?,
+        tran_cat_balances: load_tran_cat_balances(conn, &tran_cat_balances?).await?,
+        trantype_file: load_trantype_file(conn, &trantype_file?).await?,
+        trancatg_file: load_trancatg_file(conn, &trancatg_file?).await?,
+        users: load_users(conn, users?).await?,
         refreshed,
         ..SeedReport::default()
     };
     if masters_empty(conn).await? {
-        report.transaction_types =
-            load_tran_type_masters(conn, &sources.db2_ctl_dir.join(DB2LTTYP)).await?;
+        report.transaction_types = load_tran_type_masters(conn, &transaction_types?).await?;
         report.transaction_categories =
-            load_tran_category_masters(conn, &sources.db2_ctl_dir.join(DB2LTCAT)).await?;
+            load_tran_category_masters(conn, &transaction_categories?).await?;
         report.masters_loaded = true;
     }
     report.reward_rules = load_reward_rules(conn).await?;
@@ -438,9 +722,11 @@ fn integer(table: &'static str, column: &'static str, value: u32) -> Result<i32,
 /// Columns P-CVACT01Y-001 to P-CVACT01Y-012; the `FILLER X(178)`
 /// P-CVACT01Y-013 is not stored. `ACCT-GROUP-ID` is blank in every fixture
 /// record and is stored empty (E-06).
-async fn load_accounts(conn: &mut PgConnection, path: &Path) -> Result<usize, PersistenceError> {
-    let records = read_fixture::<AccountLayout>(path)?;
-    for record in &records {
+async fn load_accounts(
+    conn: &mut PgConnection,
+    records: &[AccountRecord],
+) -> Result<usize, PersistenceError> {
+    for record in records {
         let account = &record.account;
         sqlx::query!(
             r#"INSERT INTO accounts (
@@ -474,9 +760,11 @@ async fn load_accounts(conn: &mut PgConnection, path: &Path) -> Result<usize, Pe
 /// Columns P-CVACT02Y-001 to P-CVACT02Y-006; the `FILLER X(59)`
 /// P-CVACT02Y-007 is not stored. The alternate index `CARDAIX`
 /// [app/jcl/CARDFILE.jcl:L80-85] is the `cardaix` index of the table.
-async fn load_cards(conn: &mut PgConnection, path: &Path) -> Result<usize, PersistenceError> {
-    let records = read_fixture::<CardLayout>(path)?;
-    for record in &records {
+async fn load_cards(
+    conn: &mut PgConnection,
+    records: &[CardRecord],
+) -> Result<usize, PersistenceError> {
+    for record in records {
         let card = &record.card;
         sqlx::query!(
             r#"INSERT INTO cards (
@@ -504,9 +792,11 @@ async fn load_cards(conn: &mut PgConnection, path: &Path) -> Result<usize, Persi
 /// P-CVACT03Y-004, which the fixture does not even store (E-04), is not
 /// stored. The alternate index `CXACAIX` [app/jcl/XREFFILE.jcl:L69-74] is the
 /// `cxacaix` index of the table.
-async fn load_card_xref(conn: &mut PgConnection, path: &Path) -> Result<usize, PersistenceError> {
-    let records = read_fixture::<CardXrefLayout>(path)?;
-    for record in &records {
+async fn load_card_xref(
+    conn: &mut PgConnection,
+    records: &[CardXrefRecord],
+) -> Result<usize, PersistenceError> {
+    for record in records {
         let xref = &record.xref;
         sqlx::query!(
             r#"INSERT INTO card_xref (xref_card_num, xref_cust_id, xref_acct_id)
@@ -527,9 +817,11 @@ async fn load_card_xref(conn: &mut PgConnection, path: &Path) -> Result<usize, P
 ///
 /// Columns P-CVCUS01Y-001 to P-CVCUS01Y-018; the `FILLER X(168)`
 /// P-CVCUS01Y-019 is not stored.
-async fn load_customers(conn: &mut PgConnection, path: &Path) -> Result<usize, PersistenceError> {
-    let records = read_fixture::<CustomerLayout>(path)?;
-    for record in &records {
+async fn load_customers(
+    conn: &mut PgConnection,
+    records: &[CustomerRecord],
+) -> Result<usize, PersistenceError> {
+    for record in records {
         let customer = &record.customer;
         sqlx::query!(
             r#"INSERT INTO customers (
@@ -575,10 +867,9 @@ async fn load_customers(conn: &mut PgConnection, path: &Path) -> Result<usize, P
 /// the one seeded (E-05).
 async fn load_disclosure_groups(
     conn: &mut PgConnection,
-    path: &Path,
+    records: &[DisclosureGroupRecord],
 ) -> Result<usize, PersistenceError> {
-    let records = read_fixture::<DisclosureGroupLayout>(path)?;
-    for record in &records {
+    for record in records {
         let group = &record.group;
         sqlx::query!(
             r#"INSERT INTO disclosure_groups (
@@ -603,10 +894,9 @@ async fn load_disclosure_groups(
 /// characters, P-CVTRA01Y-005, is not stored.
 async fn load_tran_cat_balances(
     conn: &mut PgConnection,
-    path: &Path,
+    records: &[TranCatBalanceRecord],
 ) -> Result<usize, PersistenceError> {
-    let records = read_fixture::<TranCatBalanceLayout>(path)?;
-    for record in &records {
+    for record in records {
         let balance = &record.balance;
         sqlx::query!(
             r#"INSERT INTO transaction_category_balances (
@@ -631,10 +921,9 @@ async fn load_tran_cat_balances(
 /// P-CVTRA03Y-003 is not stored.
 async fn load_trantype_file(
     conn: &mut PgConnection,
-    path: &Path,
+    records: &[TranTypeFileRecord],
 ) -> Result<usize, PersistenceError> {
-    let records = read_fixture::<TranTypeLayout>(path)?;
-    for record in &records {
+    for record in records {
         let tran_type = &record.tran_type;
         sqlx::query!(
             r#"INSERT INTO trantype_file (tran_type, tran_type_desc) VALUES ($1, $2)"#,
@@ -655,10 +944,9 @@ async fn load_trantype_file(
 /// P-CVTRA04Y-004 is not stored.
 async fn load_trancatg_file(
     conn: &mut PgConnection,
-    path: &Path,
+    records: &[TranCategoryFileRecord],
 ) -> Result<usize, PersistenceError> {
-    let records = read_fixture::<TranCategoryLayout>(path)?;
-    for record in &records {
+    for record in records {
         let category = &record.tran_category;
         sqlx::query!(
             r#"INSERT INTO trancatg_file (tran_type_cd, tran_cat_cd, tran_cat_type_desc)
@@ -673,40 +961,105 @@ async fn load_trancatg_file(
     Ok(records.len())
 }
 
-/// `DUSRSECJ` STEP01 `IEBGENER` and STEP03 `REPRO INFILE(IN) OUTFILE(OUT)`
-/// [app/jcl/DUSRSECJ.jcl:L32-45] [app/jcl/DUSRSECJ.jcl:L80-87]: the ten
-/// `SYSUT1` in-stream rows → `users` (P-CSUSR01Y-007).
+/// `DUSRSECJ` STEP01 `IEBGENER` [app/jcl/DUSRSECJ.jcl:L32-45]: the ten
+/// `SYSUT1` in-stream rows of the job at `path`, each prepared as its `users`
+/// row (P-CSUSR01Y-007), in order.
 ///
 /// Each row is one `CSUSR01Y` record, decoded with its layout: columns
 /// P-CSUSR01Y-001 to P-CSUSR01Y-003 and P-CSUSR01Y-005, the user type taken
-/// from the row's own type byte. `SEC-USR-PWD` (P-CSUSR01Y-004) is stored as
-/// the argon2id hash of its 8 bytes as stored, case unchanged (E-20); the
-/// plaintext lives only until it is hashed. `SEC-USR-FILLER` (P-CSUSR01Y-006)
-/// is not stored.
-async fn load_users(conn: &mut PgConnection, path: &Path) -> Result<usize, PersistenceError> {
+/// from the row's own type byte. `SEC-USR-PWD` (P-CSUSR01Y-004) is kept only
+/// as the argon2id hash of its 8 bytes as stored, case unchanged (E-20); the
+/// decoded record holding the plaintext is dropped as soon as it is hashed.
+/// `SEC-USR-FILLER` (P-CSUSR01Y-006) is not stored.
+///
+/// The rows are prepared one by one, as the load inserts them: preparation
+/// stops at the first row that does not decode or hash, and
+/// [`PreparedUsers::failure`] holds that row's error.
+///
+/// # Errors
+///
+/// [`PersistenceError::Io`] when the job cannot be read, and the
+/// [`parse_sysut1`] error when its in-stream data does not parse.
+fn prepare_users(path: &Path) -> Result<PreparedUsers, PersistenceError> {
     let jcl = read_text(path)?;
     let rows = parse_sysut1(&jcl, path)?;
+    let mut prepared = Vec::with_capacity(rows.len());
     for (record_number, (_line, row)) in (1..).zip(&rows) {
-        let user = UserSecurityLayout::decode(row, Charset::Ascii).map_err(|source| {
-            PersistenceError::Codec {
-                path: path.to_path_buf(),
-                source: source.at_record(record_number),
+        match prepare_user(path, record_number, row) {
+            Ok(user) => prepared.push(user),
+            Err(failure) => {
+                return Ok(PreparedUsers {
+                    rows: prepared,
+                    failure: Some(failure),
+                });
             }
-        })?;
-        let password_hash = hash_stored_password(&user.sec_usr_pwd.as_text())?;
+        }
+    }
+    Ok(PreparedUsers {
+        rows: prepared,
+        failure: None,
+    })
+}
+
+/// The `users` row of the `SYSUT1` row `row`, record `record_number` of the
+/// job at `path`: decoded through `CSUSR01Y`, its password hashed with
+/// [`hash_stored_password`].
+///
+/// # Errors
+///
+/// - [`PersistenceError::Codec`] at the record when the row does not decode.
+/// - [`PersistenceError::Password`] when the password cannot be hashed.
+fn prepare_user(
+    path: &Path,
+    record_number: usize,
+    row: &[u8],
+) -> Result<SeedUser, PersistenceError> {
+    let user = UserSecurityLayout::decode(row, Charset::Ascii).map_err(|source| {
+        PersistenceError::Codec {
+            path: path.to_path_buf(),
+            source: source.at_record(record_number),
+        }
+    })?;
+    let password_hash = hash_stored_password(&user.sec_usr_pwd.as_text())?;
+    Ok(SeedUser {
+        user_id: user.sec_usr_id.trimmed().into_owned(),
+        first_name: text(&user.sec_usr_fname),
+        last_name: text(&user.sec_usr_lname),
+        password_hash,
+        usr_type: text(&user.sec_usr_type),
+    })
+}
+
+/// `DUSRSECJ` STEP03 `REPRO INFILE(IN) OUTFILE(OUT)`
+/// [app/jcl/DUSRSECJ.jcl:L80-87]: the prepared `SYSUT1` rows → `users`
+/// (P-CSUSR01Y-007), in order, each with the hash [`prepare_users`] computed.
+///
+/// # Errors
+///
+/// The error of a failed insert; else, after the rows before it are
+/// inserted, the error of the first row [`prepare_users`] could not prepare.
+async fn load_users(
+    conn: &mut PgConnection,
+    users: PreparedUsers,
+) -> Result<usize, PersistenceError> {
+    let PreparedUsers { rows, failure } = users;
+    for user in &rows {
         sqlx::query!(
             r#"INSERT INTO users (user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type)
                VALUES ($1, $2, $3, $4, $5)"#,
-            user.sec_usr_id.trimmed().into_owned(),
-            text(&user.sec_usr_fname),
-            text(&user.sec_usr_lname),
-            password_hash,
-            text(&user.sec_usr_type)
+            user.user_id.as_str(),
+            user.first_name.as_str(),
+            user.last_name.as_str(),
+            user.password_hash.as_str(),
+            user.usr_type.as_str()
         )
         .execute(&mut *conn)
         .await?;
     }
-    Ok(rows.len())
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(rows.len()),
+    }
 }
 
 /// The `SYSUT1` in-stream records of the `DUSRSECJ` job text `text`, each with
@@ -781,10 +1134,9 @@ fn is_sysut1_dd_star(line: &str) -> bool {
 /// `06` included as written. Columns P-TRNTYPE-001 and P-TRNTYPE-002.
 async fn load_tran_type_masters(
     conn: &mut PgConnection,
-    path: &Path,
+    masters: &[TranTypeMaster],
 ) -> Result<usize, PersistenceError> {
-    let masters = parse_tran_type_masters(&read_text(path)?, path)?;
-    for master in &masters {
+    for master in masters {
         sqlx::query!(
             r#"INSERT INTO transaction_types (tr_type, tr_description) VALUES ($1, $2)"#,
             master.tr_type.trimmed().into_owned(),
@@ -802,10 +1154,9 @@ async fn load_tran_type_masters(
 /// keeps its `CHAR(4)` text, the zero-padded form of its code.
 async fn load_tran_category_masters(
     conn: &mut PgConnection,
-    path: &Path,
+    masters: &[TranCategoryMaster],
 ) -> Result<usize, PersistenceError> {
-    let masters = parse_tran_category_masters(&read_text(path)?, path)?;
-    for master in &masters {
+    for master in masters {
         sqlx::query!(
             r#"INSERT INTO transaction_categories (trc_type_code, trc_type_category, trc_cat_data)
                VALUES ($1, $2, $3)"#,
@@ -817,6 +1168,26 @@ async fn load_tran_category_masters(
         .await?;
     }
     Ok(masters.len())
+}
+
+/// The masters of the `DB2LTTYP.ctl` statement at `path`.
+///
+/// # Errors
+///
+/// [`PersistenceError::Io`] when the file cannot be read, and the
+/// [`parse_tran_type_masters`] error when it does not parse.
+fn read_tran_type_masters(path: &Path) -> Result<Vec<TranTypeMaster>, PersistenceError> {
+    parse_tran_type_masters(&read_text(path)?, path)
+}
+
+/// The masters of the `DB2LTCAT.ctl` statement at `path`.
+///
+/// # Errors
+///
+/// [`PersistenceError::Io`] when the file cannot be read, and the
+/// [`parse_tran_category_masters`] error when it does not parse.
+fn read_tran_category_masters(path: &Path) -> Result<Vec<TranCategoryMaster>, PersistenceError> {
+    parse_tran_category_masters(&read_text(path)?, path)
 }
 
 /// The masters of `DB2LTTYP.ctl`, one per `SELECT '<type>','<description>'`
@@ -1139,14 +1510,23 @@ async fn load_reward_rules(conn: &mut PgConnection) -> Result<usize, Persistence
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use carddemo_codec::{Charset, Layout, UserSecurityLayout, UserSecurityRecord};
+    use carddemo_codec::{Charset, CodecErrorKind, Layout, UserSecurityLayout, UserSecurityRecord};
+    use carddemo_domain::auth::verify_as_entered;
     use carddemo_domain::numeric::{TranCategoryCode, TranTypeCode};
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
 
     use super::{
-        PersistenceError, SeedSources, parse_sysut1, parse_tran_category_masters,
-        parse_tran_type_masters, quoted_literals, seed_rules,
+        PersistenceError, PreparedSeed, SeedMode, SeedSources, parse_sysut1,
+        parse_tran_category_masters, parse_tran_type_masters, prepare, prepare_user, prepare_users,
+        quoted_literals, seed_rules,
+    };
+
+    /// A prepared seed moves from the blocking thread pool that prepared it to
+    /// the task that writes it, so it must be `Send + 'static`.
+    const _: () = {
+        const fn send_and_static<T: Send + 'static>() {}
+        send_and_static::<PreparedSeed>();
     };
 
     const DUSRSECJ: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app/jcl/DUSRSECJ.jcl");
@@ -1161,6 +1541,11 @@ mod tests {
 
     fn source(path: &str) -> String {
         std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"))
+    }
+
+    /// The repository root, two levels above this crate.
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
     fn decode_user(row: &[u8]) -> UserSecurityRecord {
@@ -1427,5 +1812,122 @@ mod tests {
             ]
         );
         assert_eq!(summary[0].3.to_string(), "1.0000");
+    }
+
+    /// `Debug` of a prepared seed: the mode and, per source, its row count or
+    /// the error text reading it gave, never a password or a hash.
+    /// `OnlyTranextr` reads no source, so a missing one does not show.
+    #[test]
+    fn debug_of_a_prepared_seed_shows_the_mode_and_each_source_outcome() {
+        let defaults = SeedSources::with_defaults(&repo_root());
+        let missing = repo_root().join("app/data/no-such-seed-source");
+        assert!(!missing.exists(), "{} must not exist", missing.display());
+        let unreadable = SeedSources {
+            fixture_dir: missing.clone(),
+            dusrsecj_jcl: missing.join("DUSRSECJ.jcl"),
+            db2_ctl_dir: missing.clone(),
+        };
+        let error_of = |name: &str| {
+            let path = missing.join(name);
+            let err = std::fs::read(&path).expect_err("a missing source");
+            format!("Err(cannot read {}: {err})", path.display())
+        };
+        let full = "PreparedSeed { mode: Full, accounts: Ok(50), cards: Ok(50), \
+                    card_xref: Ok(50), customers: Ok(50), disclosure_groups: Ok(51), \
+                    tran_cat_balances: Ok(50), trantype_file: Ok(7), trancatg_file: Ok(18), \
+                    users: Ok(10), transaction_types: Ok(7), transaction_categories: Ok(18) }";
+        let if_empty = format!(
+            "PreparedSeed {{ mode: IfEmpty, accounts: {}, cards: {}, card_xref: {}, \
+             customers: {}, disclosure_groups: {}, tran_cat_balances: {}, \
+             trantype_file: {}, trancatg_file: {}, users: {}, transaction_types: {}, \
+             transaction_categories: {} }}",
+            error_of("acctdata.txt"),
+            error_of("carddata.txt"),
+            error_of("cardxref.txt"),
+            error_of("custdata.txt"),
+            error_of("discgrp.txt"),
+            error_of("tcatbal.txt"),
+            error_of("trantype.txt"),
+            error_of("trancatg.txt"),
+            error_of("DUSRSECJ.jcl"),
+            error_of("DB2LTTYP.ctl"),
+            error_of("DB2LTCAT.ctl"),
+        );
+        let cases = [
+            (SeedMode::Full, &defaults, full.to_owned()),
+            (SeedMode::IfEmpty, &unreadable, if_empty),
+            (
+                SeedMode::OnlyTranextr,
+                &unreadable,
+                "PreparedSeed { mode: OnlyTranextr }".to_owned(),
+            ),
+        ];
+        for (mode, sources, expected) in cases {
+            let rendered = format!("{:?}", prepare(mode, sources));
+            assert_eq!(rendered, expected, "{mode:?}");
+            for hidden in ["PASSWORD", "argon2"] {
+                assert!(!rendered.contains(hidden), "{hidden} in {rendered}");
+            }
+        }
+    }
+
+    /// DUSRSECJ SYSUT1 (P-CSUSR01Y-004, E-20): each prepared user keeps its
+    /// stored password only as an argon2id hash of the 8 bytes as stored, and
+    /// `Debug` of a user shows its ID only.
+    #[test]
+    fn prepared_users_keep_only_the_hash_and_debug_shows_the_user_id() {
+        let users = prepare_users(Path::new(DUSRSECJ)).expect("the DUSRSECJ users");
+        assert!(users.failure.is_none());
+        let ids: Vec<&str> = users
+            .rows
+            .iter()
+            .map(|user| user.user_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "ADMIN001", "ADMIN002", "ADMIN003", "ADMIN004", "ADMIN005", "USER0001", "USER0002",
+                "USER0003", "USER0004", "USER0005"
+            ]
+        );
+        for user in &users.rows {
+            assert!(
+                user.password_hash
+                    .starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+                "{user:?}"
+            );
+            let rendered = format!("{user:?}");
+            assert_eq!(
+                rendered,
+                format!("SeedUser {{ user_id: {:?}, .. }}", user.user_id)
+            );
+            assert!(!rendered.contains(&user.password_hash));
+        }
+        let first = &users.rows[0];
+        assert_eq!(
+            (first.first_name.as_str(), first.last_name.as_str()),
+            ("MARGARET", "GOLD")
+        );
+        assert_eq!(first.usr_type, "A");
+        assert!(
+            verify_as_entered("PASSWORD", &first.password_hash).expect("a parseable argon2id hash")
+        );
+    }
+
+    #[test]
+    fn a_user_row_that_does_not_decode_names_its_record() {
+        let err = prepare_user(Path::new("t.jcl"), 4, &[b' '; 79]).expect_err("a 79-byte row");
+        let PersistenceError::Codec { path, source } = err else {
+            panic!("expected a Codec error, got {err:?}");
+        };
+        assert_eq!(path, Path::new("t.jcl"));
+        assert_eq!(source.record, Some(4));
+        assert_eq!(
+            source.kind,
+            CodecErrorKind::Length {
+                expected: UserSecurityLayout::LEN,
+                actual: 79
+            }
+        );
     }
 }

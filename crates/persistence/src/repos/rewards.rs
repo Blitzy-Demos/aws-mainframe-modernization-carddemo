@@ -41,10 +41,13 @@
 //!
 //! The rule writes are not legacy writes: no `RECOVERY(NONE)` file stands
 //! behind them, and the admin handler rolls its unit of work back on any error
-//! and commits only on success. They therefore run on the transaction
-//! directly, without the savepoint each legacy write takes. No column defaults
-//! to the current time: the soft-delete instant is the caller's processing
-//! clock (`CARDDEMO_CLOCK_OVERRIDE` pins it, AAP 0.6.4), never SQL `now()`.
+//! and commits only on success. Each statement, reads and writes alike, still
+//! runs under its own savepoint through `crate::tx::savepoint` and
+//! `crate::tx::settle`, as every store statement does, so a failed one never
+//! leaves the transaction aborted before the handler decides. No column
+//! defaults to the current time: the soft-delete instant is the caller's
+//! processing clock (`CARDDEMO_CLOCK_OVERRIDE` pins it, AAP 0.6.4), never SQL
+//! `now()`.
 //!
 //! The methods carry no message text and emit no span: the handlers choose the
 //! `carddemo_domain::messages` text of a missing rule or account and record the
@@ -59,9 +62,9 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use super::{account_id, limit_i64, reward_points};
+use crate::PersistenceError;
 use crate::rewards::{RewardBalanceRow, RewardRuleRow};
-use crate::tx::PgStore;
-use crate::{PersistenceError, port_error};
+use crate::tx::{PgStore, savepoint, settle};
 
 /// The accrual table, as [`PersistenceError::Corrupt`] names it.
 const ACCRUALS_TABLE: &str = "reward_accruals";
@@ -153,8 +156,8 @@ fn rule_from_row(row: RewardRuleRow) -> PortResult<RewardRule> {
 }
 
 /// The reward rule administration and the reward reads (request Rewards
-/// system; AAP 0.3.5). Every method runs on the store's transaction; the
-/// caller commits or rolls back.
+/// system; AAP 0.3.5). Every statement runs under its own savepoint of the
+/// store's transaction; the caller commits or rolls back.
 impl PgStore<'_, '_> {
     /// Every reward rule, active, future and soft-deleted alike, in `rule_id`
     /// order: the `GET /admin/reward-rules` list. No rules is an empty `Vec`.
@@ -164,16 +167,17 @@ impl PgStore<'_, '_> {
     /// [`PortError::Unavailable`] when the read fails or a stored rule does not
     /// fit its domain type.
     pub async fn list_reward_rules(&mut self) -> PortResult<Vec<RewardRule>> {
-        let rows = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             RewardRuleRow,
             "SELECT rule_id, transaction_type_cd, transaction_category_cd, reward_rate, \
                     min_transaction_amount, max_transaction_amount, active_from, active_to \
              FROM reward_rules \
              ORDER BY rule_id"
         )
-        .fetch_all(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_all(&mut *sp)
+        .await;
+        let rows = settle(sp, result).await?;
         rows.into_iter().map(rule_from_row).collect()
     }
 
@@ -184,7 +188,8 @@ impl PgStore<'_, '_> {
     /// [`PortError::Unavailable`] when the read fails or the stored rule does
     /// not fit its domain type.
     pub async fn reward_rule(&mut self, id: RuleId) -> PortResult<Option<RewardRule>> {
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             RewardRuleRow,
             "SELECT rule_id, transaction_type_cd, transaction_category_cd, reward_rate, \
                     min_transaction_amount, max_transaction_amount, active_from, active_to \
@@ -192,9 +197,9 @@ impl PgStore<'_, '_> {
              WHERE rule_id = $1",
             id.get(),
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?;
         row.map(rule_from_row).transpose()
     }
 
@@ -210,7 +215,8 @@ impl PgStore<'_, '_> {
     /// does not fit its domain type.
     pub async fn insert_reward_rule(&mut self, rule: NewRewardRule) -> PortResult<RewardRule> {
         let binds = RuleBinds::from(&rule);
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             RewardRuleRow,
             "INSERT INTO reward_rules \
                  (transaction_type_cd, transaction_category_cd, reward_rate, \
@@ -226,10 +232,9 @@ impl PgStore<'_, '_> {
             binds.active_from,
             binds.active_to,
         )
-        .fetch_one(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        rule_from_row(row)
+        .fetch_one(&mut *sp)
+        .await;
+        rule_from_row(settle(sp, result).await?)
     }
 
     /// Replaces every column of the rule `id` but its `rule_id` with `rule`,
@@ -250,7 +255,8 @@ impl PgStore<'_, '_> {
         rule: NewRewardRule,
     ) -> PortResult<Option<RewardRule>> {
         let binds = RuleBinds::from(&rule);
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             RewardRuleRow,
             "UPDATE reward_rules SET \
                  transaction_type_cd = $2, transaction_category_cd = $3, reward_rate = $4, \
@@ -268,9 +274,9 @@ impl PgStore<'_, '_> {
             binds.active_from,
             binds.active_to,
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?;
         row.map(rule_from_row).transpose()
     }
 
@@ -297,7 +303,8 @@ impl PgStore<'_, '_> {
         id: RuleId,
         at: DateTime<Utc>,
     ) -> PortResult<SoftDeleteOutcome> {
-        let ended = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             RewardRuleRow,
             "UPDATE reward_rules SET active_to = $2 \
              WHERE rule_id = $1 AND (active_to IS NULL OR active_to > $2) \
@@ -306,10 +313,9 @@ impl PgStore<'_, '_> {
             id.get(),
             at,
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        if let Some(row) = ended {
+        .fetch_optional(&mut *sp)
+        .await;
+        if let Some(row) = settle(sp, result).await? {
             return rule_from_row(row).map(SoftDeleteOutcome::Deleted);
         }
         Ok(self
@@ -334,16 +340,17 @@ impl PgStore<'_, '_> {
         &mut self,
         account: AccountId,
     ) -> PortResult<Option<RewardBalance>> {
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             RewardBalanceRow,
             "SELECT account_id, total_points_earned, total_points_redeemed, available_points \
              FROM reward_balances \
              WHERE account_id = $1",
             account.to_i64(),
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?;
         row.map(RewardBalance::try_from)
             .transpose()
             .map_err(PortError::from)
@@ -358,8 +365,16 @@ impl PgStore<'_, '_> {
     /// accrual inclusive, and continues with the older ones. A start key that
     /// names no accrual of `account` gives an empty page, as the comparison
     /// with its missing row is `NULL`; the API answers it 200 with
-    /// `items: []`. `reward_accruals_account_created_idx` serves the account
-    /// filter and the time order.
+    /// `items: []`.
+    ///
+    /// Each case is its own static statement, so the start row's
+    /// `(created_at, accrual_id)`, read once by an uncorrelated sub-select, is
+    /// a bound of the index scan in a generic prepared plan too, where a
+    /// `$2 IS NULL OR …` predicate would leave it a filter.
+    /// `reward_accruals_account_created_accrual_idx`, scanned backward, serves
+    /// the account filter, the newest-first order and that bound, so a page
+    /// reads about `limit + 1` index entries even inside a tie group of equal
+    /// `created_at`.
     ///
     /// # Errors
     ///
@@ -374,24 +389,44 @@ impl PgStore<'_, '_> {
         let rows_with_look_ahead = limit_i64(limit)?.checked_add(1).ok_or_else(|| {
             PortError::Unavailable("row limit exceeds the BIGINT range".to_owned())
         })?;
-        let rows = sqlx::query_as!(
-            RewardAccrualRow,
-            "SELECT accrual_id, account_id, transaction_id, rule_id, points_earned, created_at \
-             FROM reward_accruals \
-             WHERE account_id = $1 \
-               AND ($2::bigint IS NULL \
-                    OR (created_at, accrual_id) <= \
-                       (SELECT created_at, accrual_id FROM reward_accruals \
-                        WHERE accrual_id = $2 AND account_id = $1)) \
-             ORDER BY created_at DESC, accrual_id DESC \
-             LIMIT $3",
-            account.to_i64(),
-            start_key.map(AccrualId::get),
-            rows_with_look_ahead,
-        )
-        .fetch_all(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        let mut sp = savepoint(self.tx).await?;
+        let result = match start_key {
+            None => {
+                sqlx::query_as!(
+                    RewardAccrualRow,
+                    "SELECT accrual_id, account_id, transaction_id, rule_id, points_earned, \
+                            created_at \
+                     FROM reward_accruals \
+                     WHERE account_id = $1 \
+                     ORDER BY created_at DESC, accrual_id DESC \
+                     LIMIT $2",
+                    account.to_i64(),
+                    rows_with_look_ahead,
+                )
+                .fetch_all(&mut *sp)
+                .await
+            }
+            Some(start) => {
+                sqlx::query_as!(
+                    RewardAccrualRow,
+                    "SELECT accrual_id, account_id, transaction_id, rule_id, points_earned, \
+                            created_at \
+                     FROM reward_accruals \
+                     WHERE account_id = $1 \
+                       AND (created_at, accrual_id) <= \
+                           (SELECT created_at, accrual_id FROM reward_accruals \
+                            WHERE accrual_id = $2 AND account_id = $1) \
+                     ORDER BY created_at DESC, accrual_id DESC \
+                     LIMIT $3",
+                    account.to_i64(),
+                    start.get(),
+                    rows_with_look_ahead,
+                )
+                .fetch_all(&mut *sp)
+                .await
+            }
+        };
+        let rows = settle(sp, result).await?;
         rows.into_iter()
             .map(|row| RewardAccrual::try_from(row).map_err(PortError::from))
             .collect()

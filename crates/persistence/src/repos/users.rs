@@ -16,9 +16,9 @@
 //!
 //! | Method | COBOL access | SQL | Savepoint |
 //! |---|---|---|---|
-//! | `read_user` | `READ` (P-COSGN00C-008, P-COUSR03C-003) | `WHERE user_id = $1` | no |
+//! | `read_user` | `READ` (P-COSGN00C-008, P-COUSR03C-003) | `WHERE user_id = $1` | yes |
 //! | `read_user_for_update` | `READ … UPDATE` (P-COUSR02C-002, P-COUSR02C-003, P-COUSR03C-004) | `… FOR UPDATE` | yes |
-//! | `browse_users` | `STARTBR`, `READNEXT`, `READPREV` (P-COUSR00C-003, P-COUSR00C-009) | padded-key bound, `ORDER BY`, `LIMIT` | no |
+//! | `browse_users` | `STARTBR`, `READNEXT`, `READPREV` (P-COUSR00C-003, P-COUSR00C-009) | padded-key bound, `ORDER BY`, `LIMIT` | yes |
 //! | `insert_user` | `WRITE` (P-COUSR01C-004, P-COUSR01C-005) | `INSERT`; SQLSTATE 23505 is `Duplicate` | yes |
 //! | `update_user` | `REWRITE` (P-COUSR02C-006) | `UPDATE … WHERE user_id = $1`; no row is `NotFound` | yes |
 //! | `delete_user` | `DELETE` (P-COUSR03C-005) | `DELETE … WHERE user_id = $1`; no row is `NotFound` | yes |
@@ -32,17 +32,19 @@
 //! the store; the store never converts a key.
 //!
 //! A key holding a NUL byte names no stored user, because `PostgreSQL` text
-//! cannot hold NUL. Binding one would fail on the server and abort the
-//! transaction of a read that runs without a savepoint, so the keyed methods
-//! answer `NotFound` for it without a query, and a browse cannot position on
-//! it.
+//! cannot hold NUL. Binding one would fail on the server with an encoding
+//! error rather than find no row, so the keyed methods answer `NotFound` for it
+//! without a query, as the COBOL `READ` answers `NOTFND`, and a browse cannot
+//! position on it.
 //!
 //! # Credentials
 //!
 //! The store never hashes, verifies, upper-cases or pads a password: that is
 //! `carddemo_domain::auth::password` and the rules (E-20, E-21).
-//! `password_hash` is written and read back verbatim. The module logs nothing,
-//! so no hash, password or row reaches a log line, and the private row type
+//! `password_hash` is written and read back verbatim. The module logs nothing
+//! itself, and the failure event of a statement (`crate::port_error_at`)
+//! carries its SQLSTATE and primary message only, never the server's detail
+//! line, so no hash, password or row reaches a log line; the private row type
 //! has no `Debug`.
 
 use std::borrow::Cow;
@@ -52,8 +54,8 @@ use carddemo_domain::numeric::UserId;
 use carddemo_domain::ports::{Browse, Direction, PortError, PortResult, UserStore};
 
 use super::{alnum, expect_affected, limit_i64, user_id};
+use crate::PersistenceError;
 use crate::tx::{PgStore, savepoint, settle};
-use crate::{PersistenceError, port_error};
 
 /// The table every statement here reads or writes.
 const TABLE: &str = "users";
@@ -119,22 +121,22 @@ impl UserStore for PgStore<'_, '_> {
     /// [app/cbl/COSGN00C.cbl:L209-219]; COUSR03C READ-USER-SEC-FILE —
     /// P-COUSR03C-003 [app/cbl/COUSR03C.cbl:L267-300].
     ///
-    /// `READ` by the 8-byte `SEC-USR-ID`: a plain read on the transaction, no
+    /// `READ` by the 8-byte `SEC-USR-ID`, without a lock, under its own
     /// savepoint.
     async fn read_user(&mut self, id: UserId) -> PortResult<UserSecurity> {
         let Some(key) = key_text(&id) else {
             return Err(PortError::NotFound);
         };
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             UserRow,
             "SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type \
              FROM users WHERE user_id = $1",
             &*key
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        found(row)
+        .fetch_optional(&mut *sp)
+        .await;
+        found(settle(sp, result).await?)
     }
 
     /// COUSR02C READ-USER-SEC-FILE — P-COUSR02C-002, P-COUSR02C-003
@@ -182,38 +184,73 @@ impl UserStore for PgStore<'_, '_> {
         // order of `UserId`'s `Ord`. The right-trimmed column alone would
         // sort `AB` before `AB` followed by a byte below the space, where the
         // COBOL compares its padding space with that byte and sorts it after.
-        let rows = match browse.direction {
-            Direction::Forward => {
+        // The expression index `users_padded_user_id` holds exactly that
+        // padded key under `COLLATE "C"`, so each statement reads it in
+        // order, from the start bound or from either end, with no sort.
+        // There is one static statement per direction with and without a
+        // start key, because a nullable bound such as `$1::text IS NULL OR
+        // rpad(user_id, 8) COLLATE "C" >= rpad($1, 8)` folds away only in a
+        // custom plan. Under the generic plan `PostgreSQL` may adopt for the
+        // prepared statement it stays an `OR` that no index condition can
+        // use, so a deep page would read every preceding key.
+        let mut sp = savepoint(self.tx).await?;
+        let result = match (browse.direction, start) {
+            (Direction::Forward, None) => {
                 sqlx::query_as!(
                     UserRow,
                     r#"SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type
                        FROM users
-                       WHERE $1::text IS NULL OR rpad(user_id, 8) COLLATE "C" >= rpad($1, 8)
+                       ORDER BY rpad(user_id, 8) COLLATE "C" ASC
+                       LIMIT $1"#,
+                    limit
+                )
+                .fetch_all(&mut *sp)
+                .await
+            }
+            (Direction::Forward, Some(start)) => {
+                sqlx::query_as!(
+                    UserRow,
+                    r#"SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type
+                       FROM users
+                       WHERE rpad(user_id, 8) COLLATE "C" >= rpad($1, 8)
                        ORDER BY rpad(user_id, 8) COLLATE "C" ASC
                        LIMIT $2"#,
                     start,
                     limit
                 )
-                .fetch_all(&mut **self.tx)
+                .fetch_all(&mut *sp)
                 .await
             }
-            Direction::Backward => {
+            (Direction::Backward, None) => {
                 sqlx::query_as!(
                     UserRow,
                     r#"SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type
                        FROM users
-                       WHERE $1::text IS NULL OR rpad(user_id, 8) COLLATE "C" <= rpad($1, 8)
+                       ORDER BY rpad(user_id, 8) COLLATE "C" DESC
+                       LIMIT $1"#,
+                    limit
+                )
+                .fetch_all(&mut *sp)
+                .await
+            }
+            (Direction::Backward, Some(start)) => {
+                sqlx::query_as!(
+                    UserRow,
+                    r#"SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type
+                       FROM users
+                       WHERE rpad(user_id, 8) COLLATE "C" <= rpad($1, 8)
                        ORDER BY rpad(user_id, 8) COLLATE "C" DESC
                        LIMIT $2"#,
                     start,
                     limit
                 )
-                .fetch_all(&mut **self.tx)
+                .fetch_all(&mut *sp)
                 .await
             }
-        }
-        .map_err(|err| port_error(&err))?;
-        rows.into_iter()
+        };
+        settle(sp, result)
+            .await?
+            .into_iter()
             .map(|row| UserSecurity::try_from(row).map_err(PortError::from))
             .collect()
     }

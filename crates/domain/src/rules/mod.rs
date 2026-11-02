@@ -1039,17 +1039,23 @@ pub(crate) mod test_support {
             &mut self,
             start: Alnum<10>,
             end: Alnum<10>,
+            after: Option<(CardNumber, TranId)>,
+            limit: u16,
         ) -> PortResult<Vec<Transaction>> {
             self.enter("transactions_by_proc_date").await?;
-            Ok(self
+            let mut rows: Vec<Transaction> = self
                 .transactions
                 .values()
                 .filter(|tran| {
                     let date = tran.tran_proc_ts.prefix(10);
                     date >= start.as_bytes().as_slice() && date <= end.as_bytes().as_slice()
                 })
+                .filter(|tran| after.is_none_or(|key| (tran.tran_card_num, tran.tran_id) > key))
                 .cloned()
-                .collect())
+                .collect();
+            rows.sort_by_key(|tran| (tran.tran_card_num, tran.tran_id));
+            rows.truncate(usize::from(limit));
+            Ok(rows)
         }
     }
 
@@ -1985,7 +1991,7 @@ mod tests {
         fails_as_injected!(
             store,
             "transactions_by_proc_date",
-            store.transactions_by_proc_date(from, to)
+            store.transactions_by_proc_date(from, to, None, 10)
         );
         fails_as_injected!(store, "write_transaction", store.write_transaction(added));
         fails_as_injected!(
@@ -2385,22 +2391,69 @@ mod tests {
             });
             assert_eq!(order, expected, "limit {limit}");
         }
+    }
 
+    #[test]
+    fn the_date_selection_pages_in_card_then_tran_id_order() {
+        // Rows after the `after` pair only, at most `limit` of them.
+        let mut store = seeded();
+        let key = |card: &str, id: &str| Some((CardNumber::move_from(card), TranId::move_from(id)));
+        let (a3, b1, c2) = (
+            format!("{CARD_A}/0000000000000003"),
+            format!("{CARD_B}/0000000000000001"),
+            format!("{CARD_C}/0000000000000002"),
+        );
+        let (a3, b1, c2) = (a3.as_str(), b1.as_str(), c2.as_str());
         let ranges = [
+            ("2022-07-02", "2022-07-03", None, 10, vec![a3, c2]),
+            ("2022-07-01", "2022-07-01", None, 10, vec![b1]),
+            ("2022-07-05", "2022-07-09", None, 10, vec![]),
+            ("2022-07-01", "2022-07-03", None, 2, vec![a3, b1]),
+            ("2022-07-01", "2022-07-03", None, 0, vec![]),
             (
-                "2022-07-02",
+                "2022-07-01",
                 "2022-07-03",
-                vec!["0000000000000002", "0000000000000003"],
+                key(CARD_A, "0000000000000003"),
+                1,
+                vec![b1],
             ),
-            ("2022-07-01", "2022-07-01", vec!["0000000000000001"]),
-            ("2022-07-05", "2022-07-09", vec![]),
+            (
+                "2022-07-01",
+                "2022-07-03",
+                key(CARD_B, "0000000000000001"),
+                10,
+                vec![c2],
+            ),
+            (
+                "2022-07-01",
+                "2022-07-03",
+                key(CARD_B, "0000000000000000"),
+                10,
+                vec![b1, c2],
+            ),
+            (
+                "2022-07-01",
+                "2022-07-03",
+                key(CARD_C, "0000000000000002"),
+                10,
+                vec![],
+            ),
         ];
-        for (start, end, expected) in ranges {
-            let rows = block_on(
-                store.transactions_by_proc_date(Alnum::move_from(start), Alnum::move_from(end)),
-            )
+        for (start, end, after, limit, expected) in ranges {
+            let rows = block_on(store.transactions_by_proc_date(
+                Alnum::move_from(start),
+                Alnum::move_from(end),
+                after,
+                limit,
+            ))
             .expect("a date selection");
-            assert_eq!(texts(&rows, |row| row.tran_id), expected, "{start}..={end}");
+            let order = texts(&rows, |row| {
+                format!("{}/{}", row.tran_card_num, row.tran_id)
+            });
+            assert_eq!(
+                order, expected,
+                "{start}..={end} after {after:?} limit {limit}"
+            );
         }
     }
 

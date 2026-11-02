@@ -20,6 +20,18 @@
 //! through `tracing` inside the job span [`dispatch`] opens. The REPROC backup that TRANBKP and
 //! TRANREPT share lives here, in [`backup_live_master`] and [`backup_live_master_in`], and nowhere
 //! else.
+//!
+//! # Execution model
+//!
+//! Jobs run on Tokio's multi-threaded runtime, and a job future itself only awaits: database work
+//! and work on Tokio's blocking pool. Every synchronous file-system, codec and CPU phase of a job
+//! (generation allocation, appends, catalogs, whole-file reads, sorting, encoding, PDF rendering,
+//! fixture preparation) runs through [`crate::generations::blocking`] or the asynchronous methods
+//! of [`crate::generations`], inside the job span, so its events and its span records land there
+//! as an inline call's would. A blocking task that the runtime cancels because it is shutting
+//! down is a setup failure (exit 16), unless the generation API maps it to the I/O error of the
+//! operation it cancelled. A panic in blocking work propagates to the job as an inline call's
+//! would.
 
 mod cbpaup0j;
 mod combtran;
@@ -246,21 +258,26 @@ impl Backup {
 /// catalog. TRANREPT backs up this way; TRANBKP, which empties the master after the backup, runs
 /// [`backup_live_master_in`] inside its own unit of work instead.
 ///
+/// The allocation, every append and the catalog run on Tokio's blocking pool, inside the current
+/// span. The generation is allocated, and its lock taken, before the first page is read.
+///
 /// # Errors
 ///
 /// A failure to allocate, read, write or catalog is a setup failure (exit 16): the audit records
-/// no condition code for it. The generation is then not cataloged and the previous one stays
-/// `(0)`.
+/// no condition code for it. The generation is then discarded on the blocking pool, not
+/// cataloged, and the previous one stays `(0)`.
 pub(super) async fn backup_live_master(ctx: &JobContext, db: &Db) -> Result<Backup, ExitStatus> {
     let mut uow = db
         .begin_snapshot()
         .await
         .map_err(|err| setup_failure("live transaction master read failed", err))?;
     let (pending, records) = write_backup(ctx, &mut uow).await?;
-    uow.rollback()
-        .await
-        .map_err(|err| setup_failure("live transaction master read failed", err))?;
-    catalog_backup(pending, records)
+    if let Err(err) = uow.rollback().await {
+        let status = setup_failure("live transaction master read failed", err);
+        pending.discard_async().await;
+        return Err(status);
+    }
+    catalog_backup(pending, records).await
 }
 
 /// The REPROC step of [`backup_live_master`] inside the caller's unit of work `uow`: TRANBKP
@@ -280,7 +297,7 @@ pub(super) async fn backup_live_master_in(
     uow: &mut UnitOfWork,
 ) -> Result<Backup, ExitStatus> {
     let (pending, records) = write_backup(ctx, uow).await?;
-    catalog_backup(pending, records)
+    catalog_backup(pending, records).await
 }
 
 /// REPROC `PRC001` `REPRO INFILE(FILEIN) OUTFILE(FILEOUT)` [app/proc/REPROC.prc:L21-28] —
@@ -288,20 +305,43 @@ pub(super) async fn backup_live_master_in(
 /// `TRANSACT.BKUP(+1)` and appends every live record to it in TRAN-ID order, one page of
 /// [`BACKUP_PAGE_SIZE`] records at a time, so the job holds one page however large the master
 /// grows. A page shorter than [`BACKUP_PAGE_SIZE`] is the end of the master. Returns the
-/// generation, still uncataloged, and the number of records written to it.
+/// generation, still uncataloged, and the number of records written to it. The allocation and
+/// every append run on Tokio's blocking pool, inside the current span.
 ///
 /// # Errors
 ///
 /// A setup failure (exit 16) when the generation cannot be allocated or written or a page cannot
-/// be read. The pending generation is then dropped, which deletes it.
+/// be read. The pending generation is then discarded on the blocking pool, which deletes it.
 async fn write_backup(
     ctx: &JobContext,
     uow: &mut UnitOfWork,
 ) -> Result<(PendingGeneration, usize), ExitStatus> {
     let mut pending = ctx
         .generations
-        .begin_next(Dataset::TransactBkup)
+        .begin_next_async(Dataset::TransactBkup)
+        .await
         .map_err(|err| setup_failure("TRANSACT.BKUP(+1) allocation failed", err))?;
+    match copy_live_master(uow, &mut pending).await {
+        Ok(records) => Ok((pending, records)),
+        Err(status) => {
+            pending.discard_async().await;
+            Err(status)
+        }
+    }
+}
+
+/// The page loop of [`write_backup`]: reads the live master in TRAN-ID order, one page of
+/// [`BACKUP_PAGE_SIZE`] records at a time, appends each page to `pending` on the blocking pool,
+/// and returns the number of records appended.
+///
+/// # Errors
+///
+/// A setup failure (exit 16) when a page cannot be read or appended; `pending` is left to the
+/// caller to discard.
+async fn copy_live_master(
+    uow: &mut UnitOfWork,
+    pending: &mut PendingGeneration,
+) -> Result<usize, ExitStatus> {
     let mut records = 0;
     let mut after = None;
     loop {
@@ -314,31 +354,34 @@ async fn write_backup(
             .iter()
             .map(|row| TransactionRecord::new(row.to_new()))
             .collect();
+        let appended = page_records.len();
         pending
-            .append_records::<TransactionLayout>(&page_records)
+            .append_records_async::<TransactionLayout>(page_records)
+            .await
             .map_err(|err| setup_failure("TRANSACT.BKUP(+1) write failed", err))?;
-        records += page_records.len();
+        records += appended;
         match page.last() {
             Some(last) if page.len() == usize::from(BACKUP_PAGE_SIZE) => {
                 after = Some(last.tran_id);
             }
-            _ => return Ok((pending, records)),
+            _ => return Ok(records),
         }
     }
 }
 
 /// REPROC `FILEOUT` `DISP=(NEW,CATLG,DELETE)` [app/jcl/TRANBKP.jcl:L23-33] — P-TRANBKP-001,
 /// P-TRANBKP-002, P-TRANREPT-001: catalogs `pending`, the backup [`write_backup`] filled with
-/// `records` records, at the normal end of the step, records `written` on the current span and
-/// reports the step's condition code.
+/// `records` records, at the normal end of the step, on Tokio's blocking pool inside the current
+/// span, records `written` on the current span and reports the step's condition code.
 ///
 /// # Errors
 ///
 /// A setup failure (exit 16) when the catalog fails: the generation is then not cataloged and the
 /// previous one stays `(0)`.
-fn catalog_backup(pending: PendingGeneration, records: usize) -> Result<Backup, ExitStatus> {
+async fn catalog_backup(pending: PendingGeneration, records: usize) -> Result<Backup, ExitStatus> {
     let generation = pending
-        .catalog()
+        .catalog_async()
+        .await
         .map_err(|err| setup_failure("TRANSACT.BKUP(+1) catalog failed", err))?;
     let backup = Backup {
         generation,

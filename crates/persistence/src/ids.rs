@@ -117,8 +117,11 @@ const KEY_COLUMN: &str = "tran_id";
 /// that would give `0000000000000001` (P-COTRN02C-022, P-COBIL00C-014) is
 /// unreachable after a successful `STARTBR`, so it has no counterpart here.
 ///
-/// The function only reads, so it needs no savepoint; the caller commits or
-/// rolls back the transaction that holds the lock.
+/// The two statements run on the transaction itself, without the savepoint
+/// every store statement takes: both callers allocate before their first write
+/// and roll back their whole unit of work when the allocation fails, so no
+/// earlier write has to survive the failure. The caller commits or rolls back
+/// the transaction that holds the lock.
 ///
 /// # Errors
 ///
@@ -162,9 +165,9 @@ pub async fn next_tran_id(tx: &mut Transaction<'_, Postgres>) -> Result<TranId, 
 /// that has not ended, and for a seed refresh that holds `accounts` in
 /// `EXCLUSIVE` mode.
 ///
-/// Like [`next_tran_id`], the function takes no savepoint: it writes nothing,
-/// and on an error the caller rolls back the transaction that would hold the
-/// lock.
+/// Like [`next_tran_id`], the function takes no savepoint: CT02 calls it
+/// before its first write and rolls back the transaction that would hold the
+/// lock when it fails, so no earlier write has to survive the failure.
 ///
 /// # Errors
 ///

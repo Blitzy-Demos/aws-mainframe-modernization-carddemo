@@ -14,6 +14,30 @@
 //!    `CBTRN03C` rules `batch tranrept` shares: the `STEP05R` selection and
 //!    sort, then `ReportRun` record by record.
 //!
+//! # Bounded reading and the answer
+//!
+//! The report runs in one pass that never holds the whole selection and holds
+//! the report once, however wide the range:
+//!
+//! 1. The unit of work is one read-only snapshot (`Db::begin_snapshot`), so
+//!    every page and lookup sees the master in the one state the first read
+//!    saw, as one read of the whole selection did; a `TRANBKP`, `COMBTRAN` or
+//!    CT02 commit meanwhile changes nothing the report reads.
+//! 2. The selection is read through `ReportSelection` in pages of
+//!    [`PAGE_ROWS`] records, in the `STEP05R` order, and each page is fed to
+//!    `ReportRun` before the next one is read.
+//! 3. Each record's lines are encoded straight into the response JSON: the
+//!    `ReportJson` head, the lines as `ReportLines` array elements, the
+//!    end-of-input lines and the tail, byte for byte the `serde_json` text of
+//!    the whole `ReportResponse`. No vector of all the lines and no second
+//!    copy of the body is built.
+//! 4. The body is answered as one piece once the report has run and the unit
+//!    of work is rolled back, so every outcome that answers 500 is known
+//!    before any byte of the answer is sent: a store failure, the `STEP05R`
+//!    stop on a card number with a non-digit byte, which wins over a lookup
+//!    abend because the sort ends before `CBTRN03C` starts, and a lookup
+//!    abend.
+//!
 //! The report reads only the live master (the view `transaction_master`),
 //! `card_xref`, and the processing copies `trantype_file` and `trancatg_file`.
 //! It never reads the Db2 masters `transaction_types` and
@@ -24,17 +48,22 @@
 //! `TRANREPT(+1)` report dataset belong to `batch tranrept`; here the report
 //! records are the response body.
 
-use axum::Json;
+use axum::body::Body;
 use axum::extract::State;
+use axum::http::HeaderValue;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Response};
 use carddemo_domain::clock::Clock;
 use carddemo_domain::ports::{TranTypeFileReader, TransactionReader, XrefReader};
 use carddemo_domain::rules::report_request::{self, ReportRange, ReportRequestOutcome};
-use carddemo_domain::rules::transaction_report::{ReportRun, select_for_report};
+use carddemo_domain::rules::transaction_report::{ReportRun, ReportSelection};
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
 use crate::auth::AuthUser;
-use crate::dto::reports::{ReportQuery, ReportResponse, ReportTypeParam};
+use crate::dto::reports::{
+    ReportJson, ReportJsonError, ReportLines, ReportQuery, ReportResponse, ReportTypeParam,
+};
 use crate::error::{ApiError, ApiQuery, ErrorBody};
 use crate::state::AppState;
 
@@ -52,6 +81,11 @@ const OUTCOME_REJECTED: &str = "rejected";
 
 /// Span `outcome` of a request answered with a 500 error body.
 const OUTCOME_FAILED: &str = "failed";
+
+/// The most transactions one read of the selection returns. Besides the
+/// report's JSON, the pass holds one page of `CVTRA05Y` records at a time, a
+/// few hundred kilobytes at most, whatever the range selects.
+const PAGE_ROWS: u16 = 1_000;
 
 /// CORPT00C PROCESS-ENTER-KEY / SUBMIT-JOB-TO-INTRDR — P-CORPT00C-002 to
 /// P-CORPT00C-012, P-CORPT00C-014, P-CORPT00C-017, V-CORPT00C-001 to
@@ -94,7 +128,7 @@ pub async fn transaction_report(
     user: AuthUser,
     State(state): State<AppState>,
     ApiQuery(query): ApiQuery<ReportQuery>,
-) -> Result<Json<ReportResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
         "handler",
         transaction = TRANSACTION,
@@ -108,22 +142,22 @@ pub async fn transaction_report(
     if let Some(report_type) = query.report_type {
         span.record("report_type", report_type_name(report_type));
     }
+    // Every error listed above is answered before any byte of a 200, as the
+    // module documentation describes; the doc comment above is the OpenAPI
+    // description.
     let result = respond(&state, query, &span).instrument(span.clone()).await;
     span.record("outcome", outcome(&result));
-    result.map(Json)
+    result
 }
 
 /// CORPT00C PROCESS-ENTER-KEY / SUBMIT-JOB-TO-INTRDR — P-CORPT00C-012,
 /// P-CORPT00C-014, P-CORPT00C-017
 ///
-/// The request edits, then the report of the confirmed range. The range and
-/// the number of report records are recorded on `span` as soon as they are
-/// known.
-async fn respond(
-    state: &AppState,
-    query: ReportQuery,
-    span: &Span,
-) -> Result<ReportResponse, ApiError> {
+/// The request edits, then the report of the confirmed range: one pass over
+/// one read-only snapshot writes the response JSON, answered as one
+/// `application/json` body. The range and the number of report records are
+/// recorded on `span` as soon as they are known.
+async fn respond(state: &AppState, query: ReportQuery, span: &Span) -> Result<Response, ApiError> {
     query.check()?;
     let input = query.into_input();
     // FUNCTION CURRENT-DATE [app/cbl/CORPT00C.cbl:L215] [app/cbl/CORPT00C.cbl:L241]:
@@ -139,33 +173,47 @@ async fn respond(
         report_request::request(&input, today)?;
     span.record("start_date", &*range.start.trimmed());
     span.record("end_date", &*range.end.trimmed());
+    let frame = ReportJson::new(&range, message).map_err(|error| unserializable(&error))?;
 
     // The report only reads, so its unit of work is always rolled back. The
     // rollback runs before the report's own result is looked at, so an abend
     // leaves no transaction open either.
-    let mut uow = state.db().begin().await?;
-    let lines = report_lines(&mut uow.store(), &range).await;
+    let mut uow = state.db().begin_snapshot().await?;
+    let report = write_report(&mut uow.store(), &range, &frame).await;
     uow.rollback().await?;
-    let lines = lines?;
+    let report = report?;
     // tracing-opentelemetry exports an unsigned field through its Debug text,
-    // a JSON string; an i64 exports as a JSON integer. No vector holds more
+    // a JSON string; an i64 exports as a JSON integer. No report holds more
     // than i64::MAX lines, so the saturation never applies.
-    span.record("line_count", i64::try_from(lines.len()).unwrap_or(i64::MAX));
-    Ok(ReportResponse::generated(&range, lines, message))
+    span.record(
+        "line_count",
+        i64::try_from(report.line_count).unwrap_or(i64::MAX),
+    );
+    // The body is assembled whole rather than streamed: a streamed body needs
+    // a futures `Stream`, a package the api crate graph does not give this
+    // crate. Whole, it is also sent with its content-length.
+    Ok((
+        [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+        Body::from(report.json),
+    )
+        .into_response())
 }
 
 /// TRANREPT STEP05R — P-TRANREPT-002; CBTRN03C 1000-TRANFILE-GET-NEXT /
 /// 1100-WRITE-TRANSACTION-REPORT — P-CBTRN03C-003 to P-CBTRN03C-013,
 /// P-CBTRN03C-474, P-CBTRN03C-477
 ///
-/// The `CVTRA07Y` records `CBTRN03C` writes over `range`, in order: the live
-/// transactions whose processing date lies in the range, sorted by card number
-/// (`STEP05R`), each fed to the run, then the end-of-input lines. The end of
-/// input adds the last amount a second time and never writes the last card's
-/// account total, as the COBOL does (P-CBTRN03C-009, P-CBTRN03C-013).
+/// The pass: the response JSON, `frame` around the `CVTRA07Y` records
+/// `CBTRN03C` writes over `range` in order, and the number of records. The
+/// live transactions whose processing date lies in the range, sorted by card
+/// number (`STEP05R`), are read page by page and each fed to the run, then the
+/// end-of-input lines follow; each record's lines are encoded into the JSON as
+/// the run writes them. The end of input adds the last amount a second time
+/// and never writes the last card's account total, as the COBOL does
+/// (P-CBTRN03C-009, P-CBTRN03C-013).
 ///
-/// The selection is read into memory first, so `store` is free for the
-/// cross-reference, type and category lookups of each record.
+/// Each page is read whole before its records are reported, so `store` is
+/// free for the cross-reference, type and category lookups of each record.
 ///
 /// # Errors
 ///
@@ -173,34 +221,84 @@ async fn respond(
 ///
 /// - the store fails;
 /// - a selected record's card number holds a non-digit byte, whose `STEP05R`
-///   sort position no audit row pins;
-/// - a lookup abends the run (P-CBTRN03C-005).
-async fn report_lines<S>(store: &mut S, range: &ReportRange) -> Result<Vec<String>, ApiError>
+///   sort position no audit row pins. The sort ends before `CBTRN03C` starts,
+///   so after an abend the pages are still read to the end, and this stop is
+///   the one answered;
+/// - a lookup abends the run (P-CBTRN03C-005);
+/// - a line cannot be written as JSON.
+async fn write_report<S>(
+    store: &mut S,
+    range: &ReportRange,
+    frame: &ReportJson,
+) -> Result<WrittenReport, ApiError>
 where
     S: TransactionReader + XrefReader + TranTypeFileReader,
 {
-    let records = store
-        .transactions_by_proc_date(range.start, range.end)
-        .await?;
-    let selected = select_for_report(&range.start, &range.end, records).map_err(|unpinned| {
-        tracing::error!(error = %unpinned, "report selection cannot be sorted");
-        ApiError::unexpected()
-    })?;
+    let mut selection = ReportSelection::new(range.start, range.end, PAGE_ROWS);
     let mut run = ReportRun::new(range.start, range.end);
-    let mut lines = Vec::new();
-    for tran in &selected {
+    let mut elements = ReportLines::default();
+    let mut json = frame.head().to_vec();
+    let mut abend = None;
+    let mut line_count = 0_usize;
+    while let Some(page) = selection.next_page(store).await? {
+        if abend.is_some() {
+            continue;
+        }
+        for tran in &page {
+            match run.process(store, tran).await {
+                Ok(written) => {
+                    line_count += written.len();
+                    json.extend(
+                        elements
+                            .encode(&written)
+                            .map_err(|error| unserializable(&error))?,
+                    );
+                }
+                Err(error) => {
+                    abend = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(unpinned) = selection.unpinned() {
+        tracing::error!(error = %unpinned, "report selection cannot be sorted");
+        return Err(ApiError::unexpected());
+    }
+    if let Some(abend) = abend {
         // The abend's DISPLAY goes to the job log, never to the CR00 screen,
         // which had already shown the submission text: the COBOL has no message
         // for the user here, so the answer is the generic 500. The error's
         // Display leaves the card number out of the log.
-        let written = run.process(store, tran).await.map_err(|abend| {
-            tracing::error!(error = %abend, "transaction report abended");
-            ApiError::unexpected()
-        })?;
-        lines.extend(written);
+        tracing::error!(error = %abend, "transaction report abended");
+        return Err(ApiError::unexpected());
     }
-    lines.extend(run.finish());
-    Ok(lines)
+    // CBTRN03C end of input — P-CBTRN03C-009, P-CBTRN03C-013, P-CBTRN03C-477:
+    // the end-of-input lines, then the text after the lines array.
+    let written = run.finish();
+    line_count += written.len();
+    json.extend(
+        elements
+            .encode(&written)
+            .map_err(|error| unserializable(&error))?,
+    );
+    json.extend_from_slice(frame.tail());
+    Ok(WrittenReport { json, line_count })
+}
+
+/// The report one pass wrote.
+struct WrittenReport {
+    /// The complete `ReportResponse` JSON: the head, the lines and the tail.
+    json: Vec<u8>,
+    /// The number of `CVTRA07Y` records in `json`.
+    line_count: usize,
+}
+
+/// The generic 500 of a report whose response JSON cannot be written, with
+/// `error` logged. `serde_json` does not fail on the strings a report holds.
+fn unserializable(error: &ReportJsonError) -> ApiError {
+    tracing::error!(error = %error, "report response cannot be serialized");
+    ApiError::unexpected()
 }
 
 /// The `report_type` query value the span records, as the query carries it.
@@ -214,7 +312,7 @@ const fn report_type_name(report_type: ReportTypeParam) -> &'static str {
 
 /// The span `outcome` of a result: [`OUTCOME_SUBMITTED`] for a report,
 /// [`OUTCOME_FAILED`] for a 5xx error, [`OUTCOME_REJECTED`] for any other.
-fn outcome(result: &Result<ReportResponse, ApiError>) -> &'static str {
+fn outcome(result: &Result<Response, ApiError>) -> &'static str {
     match result {
         Ok(_) => OUTCOME_SUBMITTED,
         Err(error) if error.status().is_server_error() => OUTCOME_FAILED,
@@ -228,8 +326,10 @@ mod tests {
     use carddemo_domain::messages;
     use serde_json::Value;
 
+    use axum::response::Response;
+
     use super::{OUTCOME_FAILED, OUTCOME_REJECTED, OUTCOME_SUBMITTED, outcome, report_type_name};
-    use crate::dto::reports::{ReportResponse, ReportTypeParam};
+    use crate::dto::reports::ReportTypeParam;
     use crate::error::ApiError;
 
     #[test]
@@ -246,15 +346,9 @@ mod tests {
 
     #[test]
     fn outcome_follows_the_answer() {
-        let report = ReportResponse {
-            report_name: messages::REPORT_NAME_MONTHLY.to_owned(),
-            start_date: "2022-07-01".to_owned(),
-            end_date: "2022-07-31".to_owned(),
-            lines: Vec::new(),
-            message: messages::report_submitted_message(messages::REPORT_NAME_MONTHLY),
-        };
-        let cases: [(Result<ReportResponse, ApiError>, &str); 4] = [
-            (Ok(report), OUTCOME_SUBMITTED),
+        // A report is answered with a 200 response carrying its JSON body.
+        let cases: [(Result<Response, ApiError>, &str); 4] = [
+            (Ok(Response::default()), OUTCOME_SUBMITTED),
             (
                 Err(ApiError::from(DomainError::empty(
                     messages::SELECT_A_REPORT_TYPE_TO_PRINT_REPORT,

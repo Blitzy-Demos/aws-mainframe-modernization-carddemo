@@ -1,10 +1,14 @@
-//! [`Db`], the `PostgreSQL` connection pool, and [`connect`], which opens it.
+//! [`Db`], the `PostgreSQL` connection pool, and [`connect`], which opens it,
+//! or [`connect_with_statement_timeout`], which also has the server cancel any
+//! statement that runs too long.
 //!
 //! A process opens one pool at start-up and shares it: `api` and `mq` clone
 //! the [`Db`] into every request handler and consumer, and each `batch`
-//! subcommand opens one for its run. Adapters hold a [`Db`] and begin their
-//! [`UnitOfWork`] through [`Db::begin`], or [`Db::begin_snapshot`] for a
-//! read-only unit on one snapshot, so none of them names sqlx.
+//! subcommand opens one for its run. `mq` opens its pool with a statement
+//! timeout, so a statement blocked behind another session's lock cannot hold
+//! a consumer. Adapters hold a [`Db`] and begin their [`UnitOfWork`] through
+//! [`Db::begin`], or [`Db::begin_snapshot`] for a read-only unit on one
+//! snapshot, so none of them names sqlx.
 //!
 //! The database URL comes from the caller. `CARDDEMO_DATABASE_URL` is read by
 //! the settings of `carddemo-runtime`; this crate reads no environment. The
@@ -13,15 +17,18 @@
 //!
 //! sqlx logs every query parameter of the URL that it does not read, at
 //! `WARN` and with the parameter's value, and that value can be a credential:
-//! libpq's `sslpassword`, or a misspelt `password`. [`connect`] therefore
-//! refuses a URL whose query holds such a parameter before sqlx parses it,
-//! naming the parameter but never its value.
+//! libpq's `sslpassword`, or a misspelt `password`. [`connect`] and
+//! [`connect_with_statement_timeout`] therefore refuse a URL whose query holds
+//! such a parameter before sqlx parses it, naming the parameter but never its
+//! value.
 //!
 //! The pool runs on the caller's tokio runtime through sqlx's `runtime-tokio`
 //! feature; this module starts none.
 
+use std::time::Duration;
+
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use crate::PersistenceError;
 use crate::tx::UnitOfWork;
@@ -106,7 +113,10 @@ impl Db {
     /// committed when the first of them began, so a read spread over several
     /// statements is one consistent read, as a single `SELECT` is. Nothing can
     /// be written in it, and it blocks no writer. The TRANREPT backup reads
-    /// the pages of the live transaction master this way.
+    /// the pages of the live transaction master this way, and so does the CR00
+    /// report, whose pages and lookups between them must see one state: a
+    /// `TRANBKP`, `COMBTRAN` or CT02 commit between two pages would otherwise
+    /// tear the report.
     ///
     /// # Errors
     ///
@@ -156,6 +166,44 @@ pub async fn connect(url: &str) -> Result<Db, PersistenceError> {
         .await?;
     // The URL is left out of the event: it carries the password.
     tracing::debug!(max_connections = MAX_CONNECTIONS, "database pool connected");
+    Ok(Db::from_pool(pool))
+}
+
+/// Opens the process's pool as [`connect`] does, with the server's
+/// `statement_timeout` set on every connection the pool opens: `PostgreSQL`
+/// cancels any statement of the process that runs longer than
+/// `statement_timeout`, a lock wait included, and fails it with SQLSTATE
+/// `57014`, which maps to `PortError::Unavailable`.
+///
+/// A statement the server cancels fails like any other statement error: a
+/// write rolls back to its savepoint and the unit of work stays usable, so
+/// the writes before it can still be committed. The timeout is whole
+/// milliseconds, rounded down, and never below one millisecond, because `0`
+/// would turn the timeout off.
+///
+/// # Errors
+///
+/// Every error [`connect`] returns, the refusal of a query parameter sqlx
+/// does not read included, checked before sqlx parses `url`.
+pub async fn connect_with_statement_timeout(
+    url: &str,
+    statement_timeout: Duration,
+) -> Result<Db, PersistenceError> {
+    check_query_parameters(url)?;
+    let timeout_ms = statement_timeout.as_millis().max(1);
+    let options = url
+        .parse::<PgConnectOptions>()?
+        .options([("statement_timeout", timeout_ms)]);
+    let pool = PgPoolOptions::new()
+        .max_connections(MAX_CONNECTIONS)
+        .connect_with(options)
+        .await?;
+    // The URL is left out of the event: it carries the password.
+    tracing::debug!(
+        max_connections = MAX_CONNECTIONS,
+        statement_timeout_ms = u64::try_from(timeout_ms).unwrap_or(u64::MAX),
+        "database pool connected"
+    );
     Ok(Db::from_pool(pool))
 }
 
@@ -263,13 +311,16 @@ mod tests {
     use std::pin::pin;
     use std::sync::{Arc, Mutex, PoisonError};
     use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
 
     use sqlx::postgres::PgConnectOptions;
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata, Subscriber};
 
-    use super::{PersistenceError, check_query_parameters, connect};
+    use super::{
+        PersistenceError, check_query_parameters, connect, connect_with_statement_timeout,
+    };
 
     /// A stand-in for a credential written into a connection URL.
     const SECRET: &str = "not-a-real-secret";
@@ -457,23 +508,33 @@ mod tests {
         );
 
         for url in [logged, "postgres://u:p@h/db?not-a-real-secret"] {
-            let (poll, fields) = captured(|| {
-                let mut future = pin!(connect(url));
-                future
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-            });
-            assert!(
-                matches!(
-                    poll,
-                    Poll::Ready(Err(PersistenceError::Sqlx(sqlx::Error::Configuration(_))))
-                ),
-                "{url:?}: {poll:?}"
-            );
-            assert!(
-                !fields.iter().any(|field| field.contains(SECRET)),
-                "{url:?}: {fields:?}"
-            );
+            let openers = [
+                captured(|| poll_once(connect(url))),
+                captured(|| {
+                    poll_once(connect_with_statement_timeout(url, Duration::from_secs(25)))
+                }),
+            ];
+            for (poll, fields) in openers {
+                assert!(
+                    matches!(
+                        poll,
+                        Poll::Ready(Err(PersistenceError::Sqlx(sqlx::Error::Configuration(_))))
+                    ),
+                    "{url:?}: {poll:?}"
+                );
+                assert!(
+                    !fields.iter().any(|field| field.contains(SECRET)),
+                    "{url:?}: {fields:?}"
+                );
+            }
         }
+    }
+
+    /// Polls `future` once, with a waker that does nothing.
+    fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
+        let mut future = pin!(future);
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
     }
 }

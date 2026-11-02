@@ -13,6 +13,10 @@
 //! | `cards_for_account` | `READ CARDAIX` by `CARD-ACCT-ID` | `WHERE card_acct_id = $1 ORDER BY card_number` |
 //! | `rewrite_card` | `REWRITE CARDDAT` | `UPDATE` of every non-key column, under a savepoint |
 //!
+//! Every statement, the reads included, runs under its own savepoint through
+//! `crate::tx::savepoint` and `crate::tx::settle`, so a failed one leaves the
+//! caller's transaction usable.
+//!
 //! # Key order
 //!
 //! `card_number` is `VARCHAR(16) COLLATE "C"` (`migrations/0002_master_data.sql`),
@@ -35,8 +39,8 @@ use carddemo_domain::ports::{
 };
 
 use super::{account_id, alnum, card_number, cvv, expect_affected, limit_i64};
+use crate::PersistenceError;
 use crate::tx::{PgStore, savepoint, settle};
-use crate::{PersistenceError, port_error};
 
 /// The table every column below is read from, as
 /// [`PersistenceError::Corrupt`] names it.
@@ -89,7 +93,8 @@ impl CardReader for PgStore<'_, '_> {
     /// number alone: both programs leave the account out of the key (E-55).
     async fn read_card(&mut self, card: CardNumber) -> PortResult<Card> {
         let key = card.trimmed();
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             CardRow,
             "SELECT card_number AS num, card_acct_id AS acct_id, card_cvv_cd AS cvv_cd,
                     card_embossed_name AS embossed_name,
@@ -99,9 +104,9 @@ impl CardReader for PgStore<'_, '_> {
               WHERE card_number = $1",
             key.as_ref()
         )
-        .fetch_one(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_one(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?;
         Card::try_from(row).map_err(PortError::from)
     }
 
@@ -141,6 +146,27 @@ impl CardReader for PgStore<'_, '_> {
     /// The filter is part of the statement, so an excluded card is skipped and
     /// never counted against the limit, as `9500-FILTER-RECORDS` excludes a
     /// record before `WS-SCRN-COUNTER` is incremented.
+    ///
+    /// Each direction has four static statements, one per row below, chosen by
+    /// which inputs are present (`cards_forward`, `cards_backward`):
+    ///
+    /// | Card filter | Account filter | Start key | Read through |
+    /// |---|---|---|---|
+    /// | given | either | either | `cards_pkey`, `card_number = card` |
+    /// | absent | given | either | `cardaix`, `card_acct_id = account` |
+    /// | absent | absent | given | `cards_pkey`, the range from the start key |
+    /// | absent | absent | absent | `cards_pkey`, from the first or last key |
+    ///
+    /// The statements are static because a nullable-parameter predicate such
+    /// as `$1::text IS NULL OR card_number >= $1` is folded away only in a
+    /// custom plan. Under the generic plan `PostgreSQL` may adopt for the
+    /// prepared statement, it stays an `OR` that no index condition can use, so
+    /// a deep page would read every preceding key and the account filter would
+    /// not reach `cardaix`. The filters left as `$n IS NULL OR …` (the start
+    /// key and the account inside a single-card read, the start key inside one
+    /// account's cards) only test the rows the index has already selected: at
+    /// most one card, or the cards of one account, which `cardaix` holds on
+    /// `card_acct_id` alone, so a direct start bound could not narrow its scan.
     async fn browse_cards(
         &mut self,
         browse: Browse<CardNumber>,
@@ -150,52 +176,13 @@ impl CardReader for PgStore<'_, '_> {
         let account = filter.account_id.map(AccountId::to_i64);
         let only_card = filter.card_number.as_ref().map(CardNumber::trimmed);
         let limit = limit_i64(browse.limit)?;
-        let rows = match browse.direction {
-            Direction::Forward => {
-                sqlx::query_as!(
-                    CardRow,
-                    "SELECT card_number AS num, card_acct_id AS acct_id,
-                            card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
-                            card_expiraion_date AS expiraion_date,
-                            card_active_status AS active_status
-                       FROM cards
-                      WHERE ($1::text IS NULL OR card_number >= $1)
-                        AND ($2::bigint IS NULL OR card_acct_id = $2)
-                        AND ($3::text IS NULL OR card_number = $3)
-                      ORDER BY card_number ASC
-                      LIMIT $4",
-                    start.as_deref(),
-                    account,
-                    only_card.as_deref(),
-                    limit
-                )
-                .fetch_all(&mut **self.tx)
-                .await
-            }
-            Direction::Backward => {
-                sqlx::query_as!(
-                    CardRow,
-                    "SELECT card_number AS num, card_acct_id AS acct_id,
-                            card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
-                            card_expiraion_date AS expiraion_date,
-                            card_active_status AS active_status
-                       FROM cards
-                      WHERE ($1::text IS NULL OR card_number <= $1)
-                        AND ($2::bigint IS NULL OR card_acct_id = $2)
-                        AND ($3::text IS NULL OR card_number = $3)
-                      ORDER BY card_number DESC
-                      LIMIT $4",
-                    start.as_deref(),
-                    account,
-                    only_card.as_deref(),
-                    limit
-                )
-                .fetch_all(&mut **self.tx)
-                .await
-            }
-        }
-        .map_err(|err| port_error(&err))?;
-        cards_of(rows)
+        let (only_card, start) = (only_card.as_deref(), start.as_deref());
+        let mut sp = savepoint(self.tx).await?;
+        let result = match browse.direction {
+            Direction::Forward => cards_forward(&mut sp, only_card, account, start, limit).await,
+            Direction::Backward => cards_backward(&mut sp, only_card, account, start, limit).await,
+        };
+        cards_of(settle(sp, result).await?)
     }
 
     /// `COCRDSLC` `9150-GETCARD-BYACCT` — P-COCRDSLC-017
@@ -204,7 +191,8 @@ impl CardReader for PgStore<'_, '_> {
     /// serves the account's cards in base-key order, the first of them being
     /// the record that `READ` returns.
     async fn cards_for_account(&mut self, id: AccountId) -> PortResult<Vec<Card>> {
-        let rows = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             CardRow,
             "SELECT card_number AS num, card_acct_id AS acct_id, card_cvv_cd AS cvv_cd,
                     card_embossed_name AS embossed_name,
@@ -215,10 +203,187 @@ impl CardReader for PgStore<'_, '_> {
               ORDER BY card_number ASC",
             id.to_i64()
         )
-        .fetch_all(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        cards_of(rows)
+        .fetch_all(&mut *sp)
+        .await;
+        cards_of(settle(sp, result).await?)
+    }
+}
+
+/// The rows of a [`Direction::Forward`] [`CardReader::browse_cards`] page:
+/// `COCRDLIC` `9000-READ-FORWARD` — P-COCRDLIC-003
+/// [app/cbl/COCRDLIC.cbl:L1123-1160], with `9500-FILTER-RECORDS` —
+/// P-COCRDLIC-004 [app/cbl/COCRDLIC.cbl:L1382-1406]. Up to `limit` cards in
+/// ascending key order from `start` inclusive, or from the first key, read
+/// on `conn` by the static statement of the inputs present.
+async fn cards_forward(
+    conn: &mut sqlx::PgConnection,
+    card: Option<&str>,
+    account: Option<i64>,
+    start: Option<&str>,
+    limit: i64,
+) -> Result<Vec<CardRow>, sqlx::Error> {
+    match (card, account, start) {
+        (Some(card), account, start) => {
+            sqlx::query_as!(
+                CardRow,
+                "SELECT card_number AS num, card_acct_id AS acct_id,
+                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
+                        card_expiraion_date AS expiraion_date,
+                        card_active_status AS active_status
+                   FROM cards
+                  WHERE card_number = $1
+                    AND ($2::text IS NULL OR card_number >= $2)
+                    AND ($3::bigint IS NULL OR card_acct_id = $3)
+                  ORDER BY card_number ASC
+                  LIMIT $4",
+                card,
+                start,
+                account,
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+        (None, Some(account), start) => {
+            sqlx::query_as!(
+                CardRow,
+                "SELECT card_number AS num, card_acct_id AS acct_id,
+                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
+                        card_expiraion_date AS expiraion_date,
+                        card_active_status AS active_status
+                   FROM cards
+                  WHERE card_acct_id = $1
+                    AND ($2::text IS NULL OR card_number >= $2)
+                  ORDER BY card_number ASC
+                  LIMIT $3",
+                account,
+                start,
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+        (None, None, Some(start)) => {
+            sqlx::query_as!(
+                CardRow,
+                "SELECT card_number AS num, card_acct_id AS acct_id,
+                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
+                        card_expiraion_date AS expiraion_date,
+                        card_active_status AS active_status
+                   FROM cards
+                  WHERE card_number >= $1
+                  ORDER BY card_number ASC
+                  LIMIT $2",
+                start,
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+        (None, None, None) => {
+            sqlx::query_as!(
+                CardRow,
+                "SELECT card_number AS num, card_acct_id AS acct_id,
+                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
+                        card_expiraion_date AS expiraion_date,
+                        card_active_status AS active_status
+                   FROM cards
+                  ORDER BY card_number ASC
+                  LIMIT $1",
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+    }
+}
+
+/// The rows of a [`Direction::Backward`] [`CardReader::browse_cards`] page:
+/// `COCRDLIC` `9100-READ-BACKWARDS` — P-COCRDLIC-013
+/// [app/cbl/COCRDLIC.cbl:L1264-1340], with `9500-FILTER-RECORDS` —
+/// P-COCRDLIC-004 [app/cbl/COCRDLIC.cbl:L1382-1406]. Up to `limit` cards in
+/// descending key order from `start` inclusive, or from the last key, read
+/// on `conn` by the static statement of the inputs present.
+async fn cards_backward(
+    conn: &mut sqlx::PgConnection,
+    card: Option<&str>,
+    account: Option<i64>,
+    start: Option<&str>,
+    limit: i64,
+) -> Result<Vec<CardRow>, sqlx::Error> {
+    match (card, account, start) {
+        (Some(card), account, start) => {
+            sqlx::query_as!(
+                CardRow,
+                "SELECT card_number AS num, card_acct_id AS acct_id,
+                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
+                        card_expiraion_date AS expiraion_date,
+                        card_active_status AS active_status
+                   FROM cards
+                  WHERE card_number = $1
+                    AND ($2::text IS NULL OR card_number <= $2)
+                    AND ($3::bigint IS NULL OR card_acct_id = $3)
+                  ORDER BY card_number DESC
+                  LIMIT $4",
+                card,
+                start,
+                account,
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+        (None, Some(account), start) => {
+            sqlx::query_as!(
+                CardRow,
+                "SELECT card_number AS num, card_acct_id AS acct_id,
+                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
+                        card_expiraion_date AS expiraion_date,
+                        card_active_status AS active_status
+                   FROM cards
+                  WHERE card_acct_id = $1
+                    AND ($2::text IS NULL OR card_number <= $2)
+                  ORDER BY card_number DESC
+                  LIMIT $3",
+                account,
+                start,
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+        (None, None, Some(start)) => {
+            sqlx::query_as!(
+                CardRow,
+                "SELECT card_number AS num, card_acct_id AS acct_id,
+                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
+                        card_expiraion_date AS expiraion_date,
+                        card_active_status AS active_status
+                   FROM cards
+                  WHERE card_number <= $1
+                  ORDER BY card_number DESC
+                  LIMIT $2",
+                start,
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+        (None, None, None) => {
+            sqlx::query_as!(
+                CardRow,
+                "SELECT card_number AS num, card_acct_id AS acct_id,
+                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,
+                        card_expiraion_date AS expiraion_date,
+                        card_active_status AS active_status
+                   FROM cards
+                  ORDER BY card_number DESC
+                  LIMIT $1",
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
     }
 }
 

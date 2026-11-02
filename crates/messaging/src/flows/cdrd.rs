@@ -8,8 +8,12 @@
 //! (`CARDDEMO_QUEUE_DATE_REQUEST`), and it decides only what to send:
 //!
 //! - every byte of the reply comes from
-//!   `carddemo_domain::rules::mq_date_reply::reply_body`, and the request body
-//!   is never read (P-CODATE01-012, P-CODATE01-013);
+//!   `carddemo_domain::rules::mq_date_reply::reply_body`, and the content of
+//!   the request body is never read (P-CODATE01-012, P-CODATE01-013);
+//! - a request longer than the 1000-byte get buffer gets no reply: its get
+//!   fails, and the `INP MQGET ERR:` record of `3000-GET-REQUEST` goes to
+//!   `CARD.DEMO.ERROR` before the request is rejected without requeue
+//!   (P-CODATE01-012);
 //! - the reply goes to [`REPLY_QUEUE`] with the request's `message_id` and
 //!   `correlation_id`; the request's `reply_to` is ignored, as the COBOL never
 //!   reads its saved `REPLYTOQ` (P-CODATE01-014);
@@ -41,18 +45,24 @@ use crate::error_queue;
 pub const REPLY_QUEUE: &str = "CARD.DEMO.REPLY.DATE";
 
 /// The CDRD flow: the `CODATE01` rules adapted to [`Flow`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CdrdFlow {
     /// The `EXEC CICS ASKTIME` instant source: the host clock, or the
     /// `CARDDEMO_CLOCK_OVERRIDE` pin.
     clock: AnyClock,
+    /// `INPUT-QUEUE-NAME`, the queue the request came from, which `CODATE01`
+    /// takes from `MQTM-QNAME` [app/app-vsam-mq/cbl/CODATE01.cbl:L146]. The
+    /// record of a failed get names it [app/app-vsam-mq/cbl/CODATE01.cbl:L332].
+    input_queue: String,
 }
 
 impl CdrdFlow {
-    /// A flow that dates its replies with `clock`.
+    /// A flow that dates its replies with `clock` and serves `input_queue`,
+    /// the request queue the settings name (`CARDDEMO_QUEUE_DATE_REQUEST`,
+    /// default `CARD.DEMO.REQUEST.DATE`).
     #[must_use]
-    pub const fn new(clock: AnyClock) -> Self {
-        Self { clock }
+    pub const fn new(clock: AnyClock, input_queue: String) -> Self {
+        Self { clock, input_queue }
     }
 }
 
@@ -61,16 +71,26 @@ impl Flow for CdrdFlow {
 
     type AfterAck = ();
 
-    /// CODATE01 4000-PROCESS-REQUEST-REPLY / 4100-PUT-REPLY — P-CODATE01-012,
-    /// P-CODATE01-013, P-CODATE01-014, P-CODATE01-020, P-CODATE01-021.
+    /// CODATE01 3000-GET-REQUEST / 4000-PROCESS-REQUEST-REPLY / 4100-PUT-REPLY —
+    /// P-CODATE01-012, P-CODATE01-013, P-CODATE01-014, P-CODATE01-020,
+    /// P-CODATE01-021.
     ///
-    /// Answers every request with the reply `4000-PROCESS-REQUEST-REPLY`
-    /// builds at the clock's instant [app/app-vsam-mq/cbl/CODATE01.cbl:L339-364]:
-    /// `SYSTEM DATE : ` with `mm-dd-yyyy`, then `SYSTEM TIME : ` with
-    /// `hh:mm:ss`, space-filled to the 1000 bytes `4100-PUT-REPLY` puts
+    /// A request longer than the 1000-byte `MQ-BUFFER` fails its get
+    /// [app/app-vsam-mq/cbl/CODATE01.cbl:L291-335]: it gets no reply but the
+    /// `INP MQGET ERR:` record for the input queue, which the consumer
+    /// publishes to `CARD.DEMO.ERROR` before it rejects the request without
+    /// requeue. IBM MQ would leave such a message on its queue; the consumer
+    /// has no settlement that keeps a request without a reply, and requeues
+    /// none.
+    ///
+    /// Every other request is answered with the reply
+    /// `4000-PROCESS-REQUEST-REPLY` builds at the clock's instant
+    /// [app/app-vsam-mq/cbl/CODATE01.cbl:L339-364]: `SYSTEM DATE : ` with
+    /// `mm-dd-yyyy`, then `SYSTEM TIME : ` with `hh:mm:ss`, space-filled to the
+    /// 1000 bytes `4100-PUT-REPLY` puts
     /// [app/app-vsam-mq/cbl/CODATE01.cbl:L371-372]. The domain rule pads the
-    /// body; it is sent unchanged. `req.body` is not read, because the
-    /// paragraph reads none of the request.
+    /// body; it is sent unchanged. Only the length of `req.body` is checked,
+    /// because the paragraph reads none of the request.
     ///
     /// The reply goes to [`REPLY_QUEUE`] and echoes the request's
     /// `message_id` (`MQMD-MSGID`) and `correlation_id` (`MQMD-CORRELID`)
@@ -80,15 +100,22 @@ impl Flow for CdrdFlow {
         &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Disposition<Self::AfterAck>> + Send + 'a {
-        future::ready(Disposition::Reply {
-            reply: Reply {
-                queue: REPLY_QUEUE.to_owned(),
-                body: mq_date_reply::reply_body(self.clock.now()).into_bytes(),
-                message_id: req.message_id.clone(),
-                correlation_id: req.correlation_id.clone(),
+        let disposition = match mq_date_reply::oversize_request_record(&req.body, &self.input_queue)
+        {
+            Some(spec) => Disposition::ErrorRecord {
+                record: error_queue::record_bytes(&spec),
             },
-            after_ack: (),
-        })
+            None => Disposition::Reply {
+                reply: Reply {
+                    queue: REPLY_QUEUE.to_owned(),
+                    body: mq_date_reply::reply_body(self.clock.now()).into_bytes(),
+                    message_id: req.message_id.clone(),
+                    correlation_id: req.correlation_id.clone(),
+                },
+                after_ack: (),
+            },
+        };
+        future::ready(disposition)
     }
 
     /// CODATE01 4100-PUT-REPLY `WHEN OTHER` `'MQPUT ERR'` — P-CODATE01-015,
@@ -128,6 +155,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use carddemo_domain::clock::{AnyClock, Clock};
+    use carddemo_domain::messages;
     use carddemo_domain::rules::mq_date_reply;
 
     use super::{CdrdFlow, REPLY_QUEUE};
@@ -136,6 +164,9 @@ mod tests {
 
     /// The section F pin used throughout the parity tests.
     const PINNED: &str = "2022-07-01T12:00:00Z";
+
+    /// `INPUT-QUEUE-NAME`, the request queue's local default.
+    const INPUT_QUEUE: &str = "CARD.DEMO.REQUEST.DATE";
 
     fn pinned_clock() -> AnyClock {
         AnyClock::from_override(Some(PINNED)).expect("the pin is RFC 3339")
@@ -215,7 +246,7 @@ mod tests {
         // P-CODATE01-013, P-CODATE01-014: the domain body unchanged, the IDs
         // echoed, the request's reply_to ignored.
         let clock = pinned_clock();
-        let flow = CdrdFlow::new(clock);
+        let flow = CdrdFlow::new(clock, INPUT_QUEUE.to_owned());
         let req = request(b"DATE");
         let reply = reply_of(&flow, &req);
         assert_eq!(reply.queue, REPLY_QUEUE);
@@ -235,7 +266,7 @@ mod tests {
     #[test]
     fn the_request_body_is_never_read() {
         // P-CODATE01-012: the body is ignored, so any body gets the same reply.
-        let flow = CdrdFlow::new(pinned_clock());
+        let flow = CdrdFlow::new(pinned_clock(), INPUT_QUEUE.to_owned());
         let expected = reply_of(&flow, &request(b"DATE"));
         for body in [&b""[..], b"INQA00000000001", &[0xFF; 1000][..]] {
             assert_eq!(reply_of(&flow, &request(body)), expected, "{body:?}");
@@ -245,7 +276,7 @@ mod tests {
     #[test]
     fn absent_ids_stay_absent_in_the_reply() {
         // P-CODATE01-014: the descriptor IDs are echoed as received.
-        let flow = CdrdFlow::new(pinned_clock());
+        let flow = CdrdFlow::new(pinned_clock(), INPUT_QUEUE.to_owned());
         let bare = Request {
             body: Vec::new(),
             message_id: None,
@@ -261,7 +292,10 @@ mod tests {
     #[test]
     fn the_system_clock_reply_has_the_audited_format() {
         // P-CODATE01-020, P-CODATE01-021: time fields compared by format.
-        let flow = CdrdFlow::new(AnyClock::from_override(None).expect("no override"));
+        let flow = CdrdFlow::new(
+            AnyClock::from_override(None).expect("no override"),
+            INPUT_QUEUE.to_owned(),
+        );
         assert_reply_format(&reply_of(&flow, &request(b"DATE")).body);
     }
 
@@ -269,7 +303,7 @@ mod tests {
     fn an_unconfirmed_reply_becomes_the_mqput_err_record() {
         // P-CODATE01-015, P-CODATE01-016, P-CODATE01-019: MQPUT ERR, the codes
         // of the publish failure (E-39) and REPLY-QUEUE-NAME, in 1000 bytes.
-        let flow = CdrdFlow::new(pinned_clock());
+        let flow = CdrdFlow::new(pinned_clock(), INPUT_QUEUE.to_owned());
         let req = request(b"DATE");
         for failure in [
             PublishFailure::Returned,
@@ -292,7 +326,7 @@ mod tests {
             );
             assert_eq!(
                 &record[error_queue::RETURN_MESSAGE],
-                format!("{:<25}", "MQPUT ERR").as_bytes()
+                format!("{:<25}", messages::MQPUT_ERR).as_bytes()
             );
             assert_eq!(
                 &record[error_queue::QUEUE_NAME],
@@ -308,14 +342,44 @@ mod tests {
             );
             assert!(record[error_queue::ERROR_PARA].iter().all(|b| *b == b' '));
             assert!(record[113..].iter().all(|byte| *byte == b' '));
-            assert!(error_queue::display_text(&record).contains("MQPUT ERR"));
+            assert!(error_queue::display_text(&record).contains(messages::MQPUT_ERR));
         }
+    }
+
+    #[test]
+    fn a_request_longer_than_the_get_buffer_gets_the_inp_mqget_err_record() {
+        // P-CODATE01-012: MQ-BUFFER-LENGTH 1000 without ACCEPT-TRUNCATED-MSG,
+        // so the get fails (MQCC_WARNING 1, MQRC_TRUNCATED_MSG_FAILED 2080) and
+        // 'INP MQGET ERR:' names INPUT-QUEUE-NAME; no reply is put.
+        let flow = CdrdFlow::new(pinned_clock(), INPUT_QUEUE.to_owned());
+        let Disposition::ErrorRecord { record } = ready_now(flow.handle(&request(&[b'D'; 1001])))
+        else {
+            panic!("a request longer than 1000 bytes gets no reply");
+        };
+        assert_eq!(record.len(), error_queue::ERROR_BUFFER_LEN);
+        assert_eq!(
+            record,
+            error_queue::record_bytes(&mq_date_reply::get_request_failure(1, 2080, INPUT_QUEUE))
+        );
+        assert_eq!(
+            &record[error_queue::RETURN_MESSAGE],
+            format!("{:<25}", messages::INP_MQGET_ERR).as_bytes()
+        );
+        assert_eq!(&record[error_queue::CONDITION_CODE], b"01");
+        assert_eq!(&record[error_queue::REASON_CODE], b"02080");
+        assert_eq!(
+            &record[error_queue::QUEUE_NAME],
+            format!("{INPUT_QUEUE:<48}").as_bytes()
+        );
+        assert!(record[error_queue::ERROR_PARA].iter().all(|b| *b == b' '));
+        assert!(record[113..].iter().all(|byte| *byte == b' '));
+        assert_eq!(reply_of(&flow, &request(&[b'D'; 1000])).queue, REPLY_QUEUE);
     }
 
     #[test]
     fn after_ack_completes_at_once() {
         // P-CODATE01-024: no work follows a confirmed reply.
-        let flow = CdrdFlow::new(pinned_clock());
+        let flow = CdrdFlow::new(pinned_clock(), INPUT_QUEUE.to_owned());
         let req = request(b"DATE");
         ready_now(flow.after_ack(&req, ()));
     }

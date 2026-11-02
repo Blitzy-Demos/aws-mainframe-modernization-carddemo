@@ -48,6 +48,10 @@ const FUNC_LEN: usize = 4;
 /// [app/app-vsam-mq/cbl/COACCT01.cbl:L111] — P-COACCT01-011.
 const KEY_LEN: usize = 11;
 
+/// The escalation that holds the `WS-KEY > ZEROES` test of a key with a byte
+/// other than a digit at `halt` (E-28).
+const KEY_TEST_UNPROVEN: &str = "E-28";
+
 /// `MQ-APPL-CONDITION-CODE` of the read-error record, the `RESP` of the failed
 /// read in the COBOL (P-COACCT01-015). The database reports no CICS response
 /// code: 00 is the value escalation E-39 proposes for an account read error
@@ -141,9 +145,11 @@ pub fn parse_request(body: &[u8]) -> AccountRequest {
 /// Every reply text is padded with spaces to the 1000 bytes the put sends.
 ///
 /// A key holding any byte other than a digit makes `WS-KEY > ZEROES`
-/// unpredictable (E-28, halt). The escalation decides that such a request is
+/// unpredictable (E-28, halt). The escalation proposes that such a request is
 /// answered with the invalid-parameters reply and reads nothing, so it takes
-/// the second branch whatever its function.
+/// the second branch whatever its function. That reply is a proposal: for an
+/// `INQA` request [`unproven_escalation`] reports the case, and the CDRA flow
+/// rejects the request before calling this function.
 pub async fn process<S: AccountReader>(
     store: &mut S,
     request: &AccountRequest,
@@ -166,6 +172,25 @@ pub async fn process<S: AccountReader>(
     }
 }
 
+/// COACCT01 3000-GET-REQUEST / 4000-PROCESS-REQUEST-REPLY `IF WS-FUNC = 'INQA'
+/// AND WS-KEY > ZEROES` [app/app-vsam-mq/cbl/COACCT01.cbl:L393] —
+/// P-COACCT01-011, P-COACCT01-012.
+///
+/// The escalation that holds `request` at `halt`, or `None` when the audit
+/// pins its outcome. An `INQA` request whose key holds any byte that is not a
+/// digit, such as a letter or a space, the space-filled key of a body shorter
+/// than 15 bytes (E-25) included, tests `WS-KEY PIC 9(11) > ZEROES` on data
+/// that is not numeric, whose result IBM Enterprise COBOL leaves unpredictable:
+/// `E-28`. No outcome may be guessed for it, so the CDRA flow sends it no reply
+/// and no error record. Every other request is pinned: an `INQA` key of eleven
+/// digits, zero included, and any request of another function, which takes
+/// the `ELSE` branch.
+#[must_use]
+pub fn unproven_escalation(request: &AccountRequest) -> Option<&'static str> {
+    let inquiry = request.func.as_bytes() == messages::CDRA_FUNCTION_INQA.as_bytes();
+    (inquiry && !request.key.iter().all(u8::is_ascii_digit)).then_some(KEY_TEST_UNPROVEN)
+}
+
 /// COACCT01 4000-PROCESS-REQUEST-REPLY `IF WS-FUNC = 'INQA' AND WS-KEY >
 /// ZEROES` [app/app-vsam-mq/cbl/COACCT01.cbl:L393] — P-COACCT01-012,
 /// P-COACCT01-016, P-COACCT01-028.
@@ -174,8 +199,9 @@ pub async fn process<S: AccountReader>(
 /// compared byte for byte with `INQA`, case included. A key of eleven digits
 /// compares by its value, so all zeros is not above zero. A key holding any
 /// other byte does not parse as an [`AccountId`], which accepts digits only,
-/// and is `None` as well: E-28 (halt) answers it with the `ELSE` branch's
-/// reply rather than a guessed comparison result.
+/// and is `None` as well, the `ELSE` branch E-28 proposes. That comparison is
+/// held at `halt`, so for an `INQA` request [`unproven_escalation`] reports it
+/// and the CDRA flow sends no reply.
 fn inquiry_key(request: &AccountRequest) -> Option<AccountId> {
     if request.func.as_bytes() != messages::CDRA_FUNCTION_INQA.as_bytes() {
         return None;
@@ -273,13 +299,31 @@ pub fn put_reply_failure(
     mq_date_reply::put_reply_failure(condition_code, reason_code, reply_queue)
 }
 
+/// COACCT01 3000-GET-REQUEST — P-COACCT01-010, P-COACCT01-011: the outcome of
+/// a request `body` longer than the 1000-byte get buffer, or `None` for one
+/// that fits.
+///
+/// `COACCT01` gets its request as `CODATE01` does: `MQ-BUFFER-LENGTH` 1000
+/// [app/app-vsam-mq/cbl/COACCT01.cbl:L342] and no
+/// `MQGMO-ACCEPT-TRUNCATED-MSG` [app/app-vsam-mq/cbl/COACCT01.cbl:L347-350],
+/// and a failed get other than `MQRC-NO-MSG-AVAILABLE` puts the `INP MQGET
+/// ERR:` record with `INPUT-QUEUE-NAME` and ends the task
+/// [app/app-vsam-mq/cbl/COACCT01.cbl:L377-385]. The record is the one
+/// [`mq_date_reply::oversize_request_record`] builds, so this is that rule: no
+/// account is read and no reply is put.
+#[must_use]
+pub fn oversize_request_record(body: &[u8], input_queue: &str) -> Option<ErrorRecordSpec> {
+    mq_date_reply::oversize_request_record(body, input_queue)
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
     use std::ops::Range;
 
     use super::{
-        AccountRequest, ReplyOutcome, parse_request, process, put_reply_failure, read_error_record,
+        AccountRequest, ReplyOutcome, oversize_request_record, parse_request, process,
+        put_reply_failure, read_error_record, unproven_escalation,
     };
     use crate::entities::Account;
     use crate::format::{self, REPLY_BUFFER_LEN};
@@ -669,5 +713,59 @@ mod tests {
         assert_send(&future);
         assert!(matches!(block_on(future), ReplyOutcome::Reply(_)));
         Ok(())
+    }
+
+    #[test]
+    fn an_inqa_key_holding_a_non_digit_is_held_at_e28() {
+        // P-COACCT01-011, E-28: WS-KEY > ZEROES on a key that is not numeric
+        // is unpredictable, short space-filled keys included (E-25).
+        for body in [
+            &b"INQA0000000000A"[..],
+            b"INQA0000000001 ",
+            b"INQA 0000000001",
+            b"INQA123",
+            b"INQA",
+            b"INQA-0000000001",
+        ] {
+            assert_eq!(
+                unproven_escalation(&parse_request(body)),
+                Some("E-28"),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn digit_keys_and_other_functions_are_pinned() {
+        // P-COACCT01-012 (INQA and a key above zero), P-COACCT01-016 (function
+        // not INQA or key 0, whatever its key), P-COACCT01-028 (key zero).
+        for body in [
+            &b"INQA00000000001"[..],
+            b"INQA00000000000",
+            b"INQA99999999999",
+            b"INQX00000000001",
+            b"INQXABCDEFGHIJK",
+            b"inqa0000000000A",
+            b"",
+        ] {
+            assert_eq!(unproven_escalation(&parse_request(body)), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_longer_than_the_get_buffer_is_the_codate01_get_record() {
+        // P-COACCT01-010 ("as CODATE01"), P-COACCT01-011: MQ-BUFFER-LENGTH 1000,
+        // INP MQGET ERR: with the failed get's codes and INPUT-QUEUE-NAME.
+        let long = [b"INQA00000000001".as_slice(), &[b' '; 986]].concat();
+        assert_eq!(long.len(), 1001);
+        assert_eq!(
+            oversize_request_record(&long, INPUT_QUEUE),
+            Some(mq_date_reply::get_request_failure(1, 2080, INPUT_QUEUE))
+        );
+        assert_eq!(
+            oversize_request_record(&long, INPUT_QUEUE).map(|spec| spec.return_message),
+            Some(messages::INP_MQGET_ERR)
+        );
+        assert_eq!(oversize_request_record(&long[..1000], INPUT_QUEUE), None);
     }
 }

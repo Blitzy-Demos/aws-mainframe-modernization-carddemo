@@ -9,12 +9,18 @@
 //! the program: the caller feeds it the selected records in order through
 //! [`ReportRun::process`] and ends it with [`ReportRun::finish`], writing every
 //! returned line as one 133-byte `TRANREPT` record. Both callers share both
-//! steps, so the report and `batch tranrept` cannot drift apart.
+//! steps, so the report and `batch tranrept` cannot drift apart. The CR00
+//! report reads the selection from the live master through
+//! [`ReportSelection`], which yields the records of [`select_for_report`] in
+//! bounded pages.
 //!
 //! The lookups read the VSAM processing copies `TRANTYPE` and `TRANCATG`
 //! through [`TranTypeFileReader`], never the Db2 masters, so an admin edit of a
 //! type reaches the report only after `batch seed --only tranextr` (AAP 0.3.2).
-//! Every line comes from the `CVTRA07Y` builders of [`crate::format`].
+//! A run reads each type and category key the first time a record carries it
+//! and keeps the record for the rest of that run only, so the next report reads
+//! the copies again. Every line comes from the `CVTRA07Y` builders of
+//! [`crate::format`].
 //!
 //! Behaviour the COBOL defines and the port keeps:
 //!
@@ -29,13 +35,14 @@
 //!   falls where `MOD(WS-LINE-COUNTER, 20) = 0` happens to hold before a detail
 //!   line, not every 20 details (P-CBTRN03C-006).
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::entities::{CardXref, TranCategoryRecord, TranTypeRecord, Transaction};
 use crate::format::{self, ReportDetail};
 use crate::messages;
 use crate::numeric::{Alnum, CardNumber, Money, TranCategoryCode, TranId, TranTypeCode};
-use crate::ports::{PortError, TranTypeFileReader, XrefReader};
+use crate::ports::{PortError, PortResult, TranTypeFileReader, TransactionReader, XrefReader};
 
 /// `WS-PAGE-SIZE PIC 9(03) COMP-3 VALUE 20` [app/cbl/CBTRN03C.cbl:L131-132]:
 /// a page break is due when the line counter is a multiple of it
@@ -173,6 +180,122 @@ pub fn select_for_report(
     Ok(selected)
 }
 
+/// TRANREPT `STEP05R` [app/jcl/TRANREPT.jcl:L37-55] — P-TRANREPT-002, read as
+/// CBTRN03C `1000-TRANFILE-GET-NEXT` reads the sorted file — P-CBTRN03C-474:
+/// [`select_for_report`] in bounded pages from a [`TransactionReader`], so the
+/// caller holds one page of the selection at a time, never all of it.
+///
+/// Each [`ReportSelection::next_page`] asks the store for the records after the
+/// last one it returned, in the `STEP05R` order the port declares (card number,
+/// then TRAN-ID, E-38), checks that order, and keeps the records the exact
+/// `CH` date compare of [`select_for_report`] keeps. Concatenated, the pages
+/// are exactly the records [`select_for_report`] returns for the records the
+/// store selects, in its order. Where [`select_for_report`] would stop on a
+/// card number with a non-digit byte, [`ReportSelection::unpinned`] names the
+/// same record once the pages are exhausted: the lowest such TRAN-ID, the
+/// first in the TRAN-ID order of the backup the sort reads.
+#[derive(Debug, Clone)]
+pub struct ReportSelection {
+    /// The first processing date selected, the `DATEPARM` start (E-34).
+    start: Alnum<10>,
+    /// The last processing date selected.
+    end: Alnum<10>,
+    /// The most records one read asks for, at least 1.
+    page_rows: u16,
+    /// The key of the last record the store returned; `None` before the first
+    /// read.
+    after: Option<(CardNumber, TranId)>,
+    /// The store has returned its last page.
+    exhausted: bool,
+    /// The lowest TRAN-ID of the kept records whose card number holds a
+    /// non-digit byte.
+    unpinned: Option<TranId>,
+}
+
+impl ReportSelection {
+    /// TRANREPT `STEP05R` — P-TRANREPT-002: the selection of the processing
+    /// dates `start` to `end` inclusive, read `page_rows` records at a time; a
+    /// `page_rows` of 0 reads one record at a time.
+    #[must_use]
+    pub fn new(start: Alnum<10>, end: Alnum<10>, page_rows: u16) -> Self {
+        Self {
+            start,
+            end,
+            page_rows: page_rows.max(1),
+            after: None,
+            exhausted: false,
+            unpinned: None,
+        }
+    }
+
+    /// TRANREPT `STEP05R` — P-TRANREPT-002; CBTRN03C `1000-TRANFILE-GET-NEXT`
+    /// — P-CBTRN03C-474: the next page of the selection, or `None` once the
+    /// store has none left.
+    ///
+    /// A page may be empty when every record the store returned fails the
+    /// exact date compare: such records are dropped and never end the
+    /// selection. A store page shorter than the page size is the last one.
+    ///
+    /// # Errors
+    ///
+    /// The store's [`PortError`]; and [`PortError::Unavailable`] when the
+    /// store returns a record whose card number and TRAN-ID are not greater
+    /// than those of the record before it. A store that broke that order would
+    /// misorder the report, or return the same page forever. The selection is
+    /// exhausted after either error.
+    pub async fn next_page<S: TransactionReader>(
+        &mut self,
+        store: &mut S,
+    ) -> PortResult<Option<Vec<Transaction>>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        let page = store
+            .transactions_by_proc_date(self.start, self.end, self.after, self.page_rows)
+            .await
+            .inspect_err(|_| self.exhausted = true)?;
+        self.exhausted = page.len() < usize::from(self.page_rows);
+        if page.is_empty() {
+            return Ok(None);
+        }
+        for tran in &page {
+            let key = (tran.tran_card_num, tran.tran_id);
+            if self.after.is_some_and(|after| key <= after) {
+                self.exhausted = true;
+                return Err(PortError::Unavailable(format!(
+                    "TRANREPT STEP05R: the selection returned transaction {} out of card number \
+                     and TRAN-ID order",
+                    tran.tran_id
+                )));
+            }
+            self.after = Some(key);
+        }
+        let kept: Vec<Transaction> = page
+            .into_iter()
+            .filter(|tran| in_date_range(&self.start, &self.end, tran))
+            .collect();
+        let unpinned = kept
+            .iter()
+            .filter(|tran| !tran.tran_card_num.as_alnum().is_numeric())
+            .map(|tran| tran.tran_id)
+            .chain(self.unpinned)
+            .min();
+        self.unpinned = unpinned;
+        Ok(Some(kept))
+    }
+
+    /// TRANREPT `STEP05R` — P-TRANREPT-002: the record [`select_for_report`]
+    /// stops on, a kept record whose card number holds a non-digit byte, with
+    /// the lowest TRAN-ID of those the pages have returned so far. Complete
+    /// once [`ReportSelection::next_page`] has returned `None`; the stop
+    /// applies before any report line, as the sort ends before `CBTRN03C`
+    /// starts.
+    #[must_use]
+    pub fn unpinned(&self) -> Option<UnpinnedSortKey> {
+        self.unpinned.map(|tran_id| UnpinnedSortKey { tran_id })
+    }
+}
+
 /// One run of CBTRN03C over the selected records: the `WS-REPORT-VARS`
 /// [app/cbl/CBTRN03C.cbl:L127-137] and the record areas the program carries
 /// from one record to the next.
@@ -182,6 +305,11 @@ pub fn select_for_report(
 /// range (P-CBTRN03C-003) or a lookup fails (P-CBTRN03C-005): from then on
 /// `process` and `finish` return no lines, as the COBOL writes none after
 /// leaving its loop or abending.
+///
+/// The run also keeps the `TRANTYPE` and `TRANCATG` records it has read, so
+/// each distinct key costs one read per run however many records carry it
+/// (P-CBTRN03C-005). The memo belongs to the run and ends with it: a new run,
+/// and so every report, reads the processing copies again.
 #[derive(Debug, Clone)]
 pub struct ReportRun {
     /// `WS-START-DATE X(10)`, from `DATEPARM` (P-CBTRN03C-002, E-34).
@@ -197,6 +325,15 @@ pub struct ReportRun {
     curr_card: Option<CardNumber>,
     /// `CARD-XREF-RECORD` as `1500-A-LOOKUP-XREF` last read it.
     xref: Option<CardXref>,
+    /// CBTRN03C `1500-B-LOOKUP-TRANTYPE` — P-CBTRN03C-005: the `TRANTYPE`
+    /// records this run has read, by `FD-TRAN-TYPE`, one per distinct code
+    /// and so bounded by the processing copy, not by the input. Filled and
+    /// served by `ReportRun::tran_type`.
+    tran_types: BTreeMap<TranTypeCode, TranTypeRecord>,
+    /// CBTRN03C `1500-C-LOOKUP-TRANCATG` — P-CBTRN03C-005: the `TRANCATG`
+    /// records this run has read, by `FD-TRAN-CAT-KEY`, one per distinct key.
+    /// Filled and served by `ReportRun::tran_category`.
+    tran_categories: BTreeMap<(TranTypeCode, TranCategoryCode), TranCategoryRecord>,
     /// `TRAN-AMT` of the last record read, which the end of the input adds
     /// again (P-CBTRN03C-013).
     last_amount: Option<Money<9>>,
@@ -227,6 +364,8 @@ impl ReportRun {
             first_time: true,
             curr_card: None,
             xref: None,
+            tran_types: BTreeMap::new(),
+            tran_categories: BTreeMap::new(),
             last_amount: None,
             page_total: Money::ZERO,
             account_total: Money::ZERO,
@@ -246,7 +385,9 @@ impl ReportRun {
     /// Otherwise a new card number writes the account totals of the previous
     /// card, unless no header has been written yet, and reads its
     /// cross-reference; the type and category are read from the processing
-    /// copies; and `1100-WRITE-TRANSACTION-REPORT` writes the detail line.
+    /// copies, or taken from the run's memo when an earlier record of the run
+    /// read the same key; and `1100-WRITE-TRANSACTION-REPORT` writes the detail
+    /// line.
     ///
     /// A first record whose card number is all spaces, the `VALUE SPACES` of
     /// `WS-CURR-CARD-NUM`, is looked up like any other: the COBOL would detect
@@ -311,8 +452,8 @@ impl ReportRun {
     }
 
     /// The in-range path of the main loop [app/cbl/CBTRN03C.cbl:L179-196] —
-    /// P-CBTRN03C-004: the card break, the three lookups and
-    /// `1100-WRITE-TRANSACTION-REPORT`.
+    /// P-CBTRN03C-004: the card break, the three lookups in the COBOL order
+    /// (cross-reference, type, category) and `1100-WRITE-TRANSACTION-REPORT`.
     async fn report_record<S>(
         &mut self,
         store: &mut S,
@@ -324,10 +465,61 @@ impl ReportRun {
         let mut lines = Vec::new();
         self.last_amount = Some(tran.tran_amt);
         let xref = self.card_break(store, tran, &mut lines).await?;
-        let tran_type = lookup_tran_type(store, tran.tran_type_cd).await?;
-        let category = lookup_tran_category(store, tran.tran_type_cd, tran.tran_cat_cd).await?;
+        let tran_type = self.tran_type(store, tran.tran_type_cd).await?;
+        let category = self
+            .tran_category(store, tran.tran_type_cd, tran.tran_cat_cd)
+            .await?;
         self.write_transaction_report(tran, &xref, &tran_type, &category, &mut lines);
         Ok(lines)
+    }
+
+    /// CBTRN03C `1500-B-LOOKUP-TRANTYPE` [app/cbl/CBTRN03C.cbl:L494-502] —
+    /// P-CBTRN03C-005: the `TRANTYPE` record of `code`, read from the
+    /// processing copy the first time this run meets the code and taken from
+    /// the run's `tran_types` every later time.
+    ///
+    /// The report is unchanged by the memo. CBTRN03C opens `TRANTYPE` `INPUT`
+    /// [app/cbl/CBTRN03C.cbl:L432] and never writes it, so a repeated random
+    /// `READ` of a code returns the record the first one did. The first record
+    /// that carries a code still reads it at the point the COBOL does, so a
+    /// missing code abends at its first occurrence with the same paragraph,
+    /// display and key. Only a record that was read is kept: a failed read
+    /// spends the run, which reads nothing more.
+    async fn tran_type<S: TranTypeFileReader>(
+        &mut self,
+        store: &mut S,
+        code: TranTypeCode,
+    ) -> Result<TranTypeRecord, ReportAbend> {
+        if let Some(record) = self.tran_types.get(&code) {
+            return Ok(record.clone());
+        }
+        let record = lookup_tran_type(store, code).await?;
+        self.tran_types.insert(code, record.clone());
+        Ok(record)
+    }
+
+    /// CBTRN03C `1500-C-LOOKUP-TRANCATG` [app/cbl/CBTRN03C.cbl:L504-512] —
+    /// P-CBTRN03C-005: the `TRANCATG` record of `code` and `category`, read
+    /// from the processing copy the first time this run meets the key and taken
+    /// from the run's `tran_categories` every later time.
+    ///
+    /// The report is unchanged for the reasons `ReportRun::tran_type` gives:
+    /// `TRANCATG` is opened `INPUT` [app/cbl/CBTRN03C.cbl:L450], the first
+    /// occurrence of a key reads it where the COBOL does, and a missing key
+    /// abends there with the same paragraph, display and key.
+    async fn tran_category<S: TranTypeFileReader>(
+        &mut self,
+        store: &mut S,
+        code: TranTypeCode,
+        category: TranCategoryCode,
+    ) -> Result<TranCategoryRecord, ReportAbend> {
+        if let Some(record) = self.tran_categories.get(&(code, category)) {
+            return Ok(record.clone());
+        }
+        let record = lookup_tran_category(store, code, category).await?;
+        self.tran_categories
+            .insert((code, category), record.clone());
+        Ok(record)
     }
 
     /// The card break of the main loop [app/cbl/CBTRN03C.cbl:L181-188] —
@@ -337,6 +529,12 @@ impl ReportRun {
     /// of the previous card are written unless `WS-FIRST-TIME` is still `Y`,
     /// the card is remembered and `1500-A-LOOKUP-XREF` reads its
     /// cross-reference. Otherwise the cross-reference read for the card stays.
+    ///
+    /// The run keeps only the current card's cross-reference, not a memo of
+    /// every card: the `STEP05R` sort puts all records of a card next to each
+    /// other, so one read per card break is already one read per distinct
+    /// card, and a map of every card would grow with the input and save no
+    /// read.
     async fn card_break<S>(
         &mut self,
         store: &mut S,
@@ -533,6 +731,7 @@ async fn lookup_tran_category<S: TranTypeFileReader>(
 mod tests {
     use super::{LookupKey, PAGE_SIZE, ReportAbend, ReportRun, UnpinnedSortKey, select_for_report};
     use crate::entities::{CardXref, TranCategoryRecord, TranTypeRecord, Transaction};
+    use crate::entities::{TranCategoryMaster, TranTypeMaster};
     use crate::format::{self, REPORT_RECORD_LEN, ReportDetail};
     use crate::messages;
     use crate::numeric::{
@@ -964,6 +1163,204 @@ mod tests {
         assert_eq!(card.to_string(), CARD_A);
     }
 
+    /// A purchase record of `id` changed to type `type_cd` and category `cat`.
+    fn tran_of(id: &str, card: &str, cents: i64, type_cd: &str, cat: u16) -> Transaction {
+        Transaction {
+            tran_type_cd: TranTypeCode::move_from(type_cd),
+            tran_cat_cd: category(cat),
+            ..tran(id, card, cents)
+        }
+    }
+
+    /// The detail line of `tran` with the given account and descriptions.
+    fn detail_of(tran: &Transaction, account: u64, type_desc: &str, cat_desc: &str) -> String {
+        format::report_detail_line(&ReportDetail {
+            tran_id: &tran.tran_id.trimmed(),
+            account_id: account,
+            type_cd: &tran.tran_type_cd.to_string(),
+            type_desc,
+            cat_cd: tran.tran_cat_cd.get(),
+            cat_desc,
+            source: "POS TERM",
+            amount: tran.tran_amt,
+        })
+    }
+
+    #[test]
+    fn each_distinct_type_category_and_card_is_read_once_per_run() {
+        // P-CBTRN03C-004, -005: three cards carrying two types and three
+        // (type, category) keys, most of them repeated. The first record with
+        // a key reads it where the COBOL does; every later one takes the
+        // record the run has kept, and the lines are those of a read per
+        // record.
+        let card_c = "4111000000000013";
+        let mut store = store()
+            .with_xref(xref(card_c, 13))
+            .with_tran_category_record(TranCategoryRecord {
+                tran_type_cd: TranTypeCode::move_from("01"),
+                tran_cat_cd: category(2),
+                tran_cat_type_desc: Alnum::move_from("Regular Cash Advance"),
+            });
+        let trans = [
+            tran_of("0000000000000001", CARD_A, 100, "01", 1),
+            tran_of("0000000000000002", CARD_A, 200, "03", 1),
+            tran_of("0000000000000003", CARD_A, 300, "01", 2),
+            tran_of("0000000000000004", CARD_B, 400, "01", 1),
+            tran_of("0000000000000005", CARD_B, 500, "03", 1),
+            tran_of("0000000000000006", card_c, 600, "01", 2),
+            tran_of("0000000000000007", card_c, 700, "01", 1),
+        ];
+        let lines = report(&mut store, &trans).expect("a report");
+
+        let mut expected = headers();
+        expected.extend([
+            detail_of(&trans[0], 50, "Purchase", "Regular Sales Draft"),
+            detail_of(&trans[1], 50, "Credit", "Credit to Account"),
+            detail_of(&trans[2], 50, "Purchase", "Regular Cash Advance"),
+            format::report_account_total(money(600)),
+            format::report_header_2(),
+            detail_of(&trans[3], 27, "Purchase", "Regular Sales Draft"),
+            detail_of(&trans[4], 27, "Credit", "Credit to Account"),
+            format::report_account_total(money(900)),
+            format::report_header_2(),
+            detail_of(&trans[5], 13, "Purchase", "Regular Cash Advance"),
+            detail_of(&trans[6], 13, "Purchase", "Regular Sales Draft"),
+            format::report_page_total(money(3_500)),
+            format::report_header_2(),
+            format::report_grand_total(money(3_500)),
+        ]);
+        assert_eq!(lines, expected);
+        assert_eq!(
+            store.calls,
+            [
+                // Record 1: card A, type 01, key 01/0001.
+                "read_xref_by_card",
+                "read_tran_type_file",
+                "read_tran_category_file",
+                // Record 2: type 03, key 03/0001.
+                "read_tran_type_file",
+                "read_tran_category_file",
+                // Record 3: key 01/0002.
+                "read_tran_category_file",
+                // Records 4 and 6: the card breaks of B and C.
+                "read_xref_by_card",
+                "read_xref_by_card",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_run_reads_the_processing_copies_again() {
+        // AAP 0.3.2: `batch seed --only tranextr` copies an edited master over
+        // TRANTYPE between two reports; the second report shows the new
+        // description, because nothing a run kept outlives it.
+        let trans = [
+            tran("0000000000000001", CARD_A, 100),
+            tran("0000000000000002", CARD_A, 200),
+        ];
+        let mut store = store();
+        let first = report(&mut store, &trans).expect("a report");
+        assert!(first.contains(&detail(&trans[1], 50)));
+
+        store = store.with_tran_type_record(TranTypeRecord {
+            tran_type: TranTypeCode::move_from("01"),
+            tran_type_desc: Alnum::move_from("PURCHASE"),
+        });
+        store.calls.clear();
+        let second = report(&mut store, &trans).expect("a report");
+        assert!(second.contains(&detail_of(&trans[1], 50, "PURCHASE", "Regular Sales Draft")));
+        assert_eq!(
+            store.calls,
+            [
+                "read_xref_by_card",
+                "read_tran_type_file",
+                "read_tran_category_file",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_first_met_after_kept_keys_abends_at_its_first_occurrence() {
+        // P-CBTRN03C-005: records 1 to 3 leave types 01 and 03 and keys
+        // 01/0001 and 03/0001 kept. A key none of them carried is read at its
+        // first occurrence, from the processing copy only (AAP 0.3.2), and
+        // abends there; the spent run reads and writes nothing more.
+        let type_master = TranTypeMaster {
+            tr_type: TranTypeCode::move_from("02"),
+            tr_description: "PAYMENT".to_owned(),
+        };
+        let category_master = TranCategoryMaster {
+            trc_type_code: TranTypeCode::move_from("01"),
+            trc_type_category: category(2),
+            trc_cat_data: Alnum::move_from("REGULAR CASH ADVANCE"),
+        };
+        let category_key = LookupKey::TranCategory(TranTypeCode::move_from("01"), category(2));
+        let cases = [
+            // In neither version.
+            (
+                store(),
+                ("01", 2),
+                "1500-C-LOOKUP-TRANCATG",
+                messages::INVALID_TRAN_CATG_KEY,
+                category_key,
+                "read_tran_category_file",
+            ),
+            // Only in the Db2 category master.
+            (
+                store().with_tran_category(category_master),
+                ("01", 2),
+                "1500-C-LOOKUP-TRANCATG",
+                messages::INVALID_TRAN_CATG_KEY,
+                category_key,
+                "read_tran_category_file",
+            ),
+            // Only in the Db2 type master.
+            (
+                store().with_tran_type(type_master),
+                ("02", 1),
+                "1500-B-LOOKUP-TRANTYPE",
+                messages::INVALID_TRANSACTION_TYPE,
+                LookupKey::TranType(TranTypeCode::move_from("02")),
+                "read_tran_type_file",
+            ),
+        ];
+        for (mut store, (type_cd, cat), paragraph, display, key, failed_read) in cases {
+            let mut run = run();
+            for record in [
+                tran("0000000000000001", CARD_A, 100),
+                tran_of("0000000000000002", CARD_A, 100, "03", 1),
+                tran("0000000000000003", CARD_A, 100),
+            ] {
+                block_on(run.process(&mut store, &record)).expect("a detail");
+            }
+            store.calls.clear();
+
+            let first = tran_of("0000000000000004", CARD_B, 100, type_cd, cat);
+            let abend = block_on(run.process(&mut store, &first)).expect_err("an abend");
+            assert_eq!(
+                abend,
+                ReportAbend {
+                    paragraph,
+                    display,
+                    key,
+                    cause: PortError::NotFound,
+                }
+            );
+            assert_eq!(
+                store.calls,
+                ["read_xref_by_card", failed_read],
+                "{paragraph}: only the card break and the new key are read"
+            );
+
+            store.calls.clear();
+            let later = block_on(run.process(&mut store, &tran("0000000000000005", CARD_B, 100)))
+                .expect("a spent run");
+            assert!(later.is_empty(), "{paragraph}: no lines after the abend");
+            assert!(store.calls.is_empty(), "{paragraph}: no reads after it");
+            assert!(run.finish().is_empty(), "{paragraph}: no totals");
+        }
+    }
+
     #[test]
     fn an_empty_input_writes_zero_page_and_grand_totals() {
         // E-25 decides the empty input; P-CBTRN03C-012: a zero total edits to
@@ -1042,6 +1439,250 @@ mod tests {
                 tran_id: TranId::move_from("0000000000000002"),
             })
         );
+    }
+
+    use super::ReportSelection;
+    use crate::ports::{Browse, PortResult, TransactionReader};
+
+    /// How [`Adapter`] bends the date selection of the fake store it wraps.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Bend {
+        /// Every call passes through unchanged.
+        Exact,
+        /// The date range is ignored, as by an adapter whose SQL keeps records
+        /// the `CH` compare rejects.
+        Widened,
+        /// Each page comes back in reverse order.
+        Reversed,
+        /// `after` is ignored, so every read returns the first page again.
+        Restarts,
+    }
+
+    /// The fake store as a selection adapter that may break the port contract.
+    struct Adapter {
+        store: FakeStore,
+        bend: Bend,
+    }
+
+    impl Adapter {
+        /// The fake store holding `records`, the cross-references and the
+        /// processing copies of [`store`].
+        fn new(records: &[Transaction], bend: Bend) -> Self {
+            let store = records
+                .iter()
+                .fold(store(), |store, tran| store.with_transaction(tran.to_new()));
+            Self { store, bend }
+        }
+
+        /// The number of date selection reads made.
+        fn reads(&self) -> usize {
+            self.store
+                .calls
+                .iter()
+                .filter(|call| **call == "transactions_by_proc_date")
+                .count()
+        }
+    }
+
+    impl TransactionReader for Adapter {
+        async fn read_transaction(&mut self, id: TranId) -> PortResult<Transaction> {
+            self.store.read_transaction(id).await
+        }
+
+        async fn browse_transactions(
+            &mut self,
+            browse: Browse<TranId>,
+            account_id: Option<AccountId>,
+        ) -> PortResult<Vec<Transaction>> {
+            self.store.browse_transactions(browse, account_id).await
+        }
+
+        async fn highest_transaction(&mut self) -> PortResult<Option<Transaction>> {
+            self.store.highest_transaction().await
+        }
+
+        async fn transactions_by_card(&mut self, limit: u16) -> PortResult<Vec<Transaction>> {
+            self.store.transactions_by_card(limit).await
+        }
+
+        async fn transactions_by_proc_date(
+            &mut self,
+            start: Alnum<10>,
+            end: Alnum<10>,
+            after: Option<(CardNumber, TranId)>,
+            limit: u16,
+        ) -> PortResult<Vec<Transaction>> {
+            let (start, end) = if self.bend == Bend::Widened {
+                (Alnum::move_from(""), Alnum::move_from_bytes(&[0xFF; 10]))
+            } else {
+                (start, end)
+            };
+            let after = after.filter(|_| self.bend != Bend::Restarts);
+            let mut page = self
+                .store
+                .transactions_by_proc_date(start, end, after, limit)
+                .await?;
+            if self.bend == Bend::Reversed {
+                page.reverse();
+            }
+            Ok(page)
+        }
+    }
+
+    /// Every page of a selection of the default range over `store`, `rows`
+    /// records per read, concatenated.
+    fn all_pages(
+        store: &mut Adapter,
+        rows: u16,
+    ) -> (PortResult<Vec<Transaction>>, ReportSelection) {
+        let mut selection = ReportSelection::new(date(START), date(END), rows);
+        let mut selected = Vec::new();
+        loop {
+            match block_on(selection.next_page(store)) {
+                Ok(Some(page)) => selected.extend(page),
+                Ok(None) => return (Ok(selected), selection),
+                Err(error) => return (Err(error), selection),
+            }
+        }
+    }
+
+    /// The `STEP05R` sort key of each record: card number, then TRAN-ID.
+    fn keys(records: &[Transaction]) -> Vec<(CardNumber, TranId)> {
+        records
+            .iter()
+            .map(|tran| (tran.tran_card_num, tran.tran_id))
+            .collect()
+    }
+
+    /// Records of three cards in no order, with the range bounds and records
+    /// either side of the range.
+    fn mixed_records() -> Vec<Transaction> {
+        vec![
+            tran("0000000000000007", CARD_A, 100),
+            tran("0000000000000002", CARD_B, 200),
+            tran_on("0000000000000003", CARD_A, 300, "2022-07-07"),
+            tran_on("0000000000000004", CARD_B, 400, END),
+            tran_on("0000000000000005", CARD_B, 500, "2021-12-31"),
+            tran("0000000000000001", CARD_A, 600),
+            tran_on("0000000000000008", "4111000000000099", 700, START),
+            tran("0000000000000006", "4111000000000099", 800),
+            tran_on("0000000000000009", "4111000000000001", 900, "          "),
+        ]
+    }
+
+    #[test]
+    fn the_selection_pages_concatenate_to_the_selection_in_its_order() {
+        let records = mixed_records();
+        let expected =
+            select_for_report(&date(START), &date(END), records.clone()).expect("all digits");
+        assert_eq!(expected.len(), 6);
+        for bend in [Bend::Exact, Bend::Widened] {
+            for rows in [1, 2, 3, 6, 100] {
+                let mut store = Adapter::new(&records, bend);
+                let (pages, selection) = all_pages(&mut store, rows);
+                let pages = pages.expect("a well-behaved store");
+                assert_eq!(keys(&pages), keys(&expected), "{bend:?}, {rows} per read");
+                assert_eq!(selection.unpinned(), None, "{bend:?}, {rows} per read");
+                // One read per full page, and the short or empty read that ends
+                // the selection.
+                let returned = if bend == Bend::Widened {
+                    records.len()
+                } else {
+                    expected.len()
+                };
+                let reads = returned / usize::from(rows) + 1;
+                assert_eq!(store.reads(), reads, "{bend:?}, {rows} per read");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unpinned_card_on_a_later_page_stops_with_the_lowest_tran_id() {
+        // P-TRANREPT-002: the non-digit card numbers sort after the digit ones,
+        // so they come on the last pages; the out-of-range one never counts.
+        let mut records = mixed_records();
+        records.extend([
+            tran("0000000000000012", "41110000000000AB", 100),
+            tran("0000000000000011", "41110000000000AC", 100),
+            tran("0000000000000013", "41110000000000AB", 100),
+            tran_on("0000000000000010", "41110000000000AA", 100, "2021-12-31"),
+        ]);
+        let mut in_tran_id_order = records.clone();
+        in_tran_id_order.sort_by_key(|tran| tran.tran_id);
+        let expected = select_for_report(&date(START), &date(END), in_tran_id_order).err();
+        assert_eq!(
+            expected,
+            Some(UnpinnedSortKey {
+                tran_id: TranId::move_from("0000000000000011"),
+            })
+        );
+        for bend in [Bend::Exact, Bend::Widened] {
+            for rows in [1, 2, 3] {
+                let mut store = Adapter::new(&records, bend);
+                let (pages, selection) = all_pages(&mut store, rows);
+                assert!(pages.is_ok(), "{bend:?}, {rows} per read");
+                assert_eq!(selection.unpinned(), expected, "{bend:?}, {rows} per read");
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_selection_has_no_page() {
+        let outside = [
+            tran_on("0000000000000001", CARD_A, 100, "2021-12-31"),
+            tran_on("0000000000000002", CARD_B, 100, "2022-07-07"),
+        ];
+        for records in [&[][..], &outside[..]] {
+            let mut store = Adapter::new(records, Bend::Exact);
+            let mut selection = ReportSelection::new(date(START), date(END), 10);
+            assert_eq!(block_on(selection.next_page(&mut store)), Ok(None));
+            assert_eq!(block_on(selection.next_page(&mut store)), Ok(None));
+            assert_eq!(store.reads(), 1, "{} records", records.len());
+        }
+    }
+
+    #[test]
+    fn a_store_failure_or_a_broken_order_ends_the_selection_with_an_error() {
+        let failure = PortError::Unavailable("connection reset".to_owned());
+        for pages_before in [0, 2] {
+            let mut store = Adapter::new(&mixed_records(), Bend::Exact);
+            let mut selection = ReportSelection::new(date(START), date(END), 1);
+            for _ in 0..pages_before {
+                assert!(matches!(
+                    block_on(selection.next_page(&mut store)),
+                    Ok(Some(_))
+                ));
+            }
+            store
+                .store
+                .fail_next("transactions_by_proc_date", failure.clone());
+            let result = block_on(selection.next_page(&mut store));
+            assert_eq!(result, Err(failure.clone()), "after {pages_before} pages");
+            assert_eq!(block_on(selection.next_page(&mut store)), Ok(None));
+        }
+        for (bend, rows) in [(Bend::Reversed, 3), (Bend::Restarts, 1)] {
+            let mut store = Adapter::new(&mixed_records(), bend);
+            let (pages, mut selection) = all_pages(&mut store, rows);
+            match pages {
+                Err(PortError::Unavailable(text)) => assert!(
+                    text.contains("out of card number and TRAN-ID order"),
+                    "{bend:?}: {text}"
+                ),
+                other => panic!("{bend:?}: a contract breach, not {other:?}"),
+            }
+            assert_eq!(block_on(selection.next_page(&mut store)), Ok(None));
+        }
+    }
+
+    #[test]
+    fn the_page_future_is_send_for_a_send_store() {
+        fn assert_send<T: Send>(_: &T) {}
+        let mut store = Adapter::new(&mixed_records(), Bend::Exact);
+        let mut selection = ReportSelection::new(date(START), date(END), 0);
+        let future = selection.next_page(&mut store);
+        assert_send(&future);
+        let page = block_on(future).expect("a page").expect("not the end");
+        assert_eq!(keys(&page).len(), 1, "a page size of 0 reads one record");
     }
 
     #[test]

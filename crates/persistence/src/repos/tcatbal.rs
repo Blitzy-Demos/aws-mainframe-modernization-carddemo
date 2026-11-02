@@ -41,8 +41,19 @@
 //!   bytes keep their code point order). Equality needs no padding: one COBOL
 //!   key has exactly one stored form.
 //!
-//! The browse also bounds the account alone (`trancat_acct_id >= $1`), so the
-//! primary key index narrows the scan to the remaining accounts.
+//! The index `transaction_category_balances_padded_key`
+//! (`migrations/0003_transactions.sql`) holds exactly these three key
+//! expressions: `trancat_acct_id`, `rpad(trancat_type_cd, 2) COLLATE "C"` and
+//! `trancat_cd`. The browse orders by them, and the browse after a key bounds
+//! them with one row comparison,
+//! `(trancat_acct_id, rpad(trancat_type_cd, 2) COLLATE "C", trancat_cd) >
+//! ($1, rpad($2, 2) COLLATE "C", $3)`. A row comparison is lexicographic and
+//! strict, so it selects exactly the keys greater than the one given, and the
+//! planner uses it as the index condition: each page starts at the key and
+//! reads the next records in index order, with no filter and no sort. Inside
+//! the row the type codes compare padded for equality too, which matches the
+//! raw equality: both sides are right-trimmed, and padding two right-trimmed
+//! codes of at most two characters gives equal values only for equal codes.
 //!
 //! # Writes
 //!
@@ -50,7 +61,8 @@
 //! `crate::tx::savepoint` and `crate::tx::settle`. `TCATBALF` is
 //! `RECOVERY(NONE)` [app/csd/CARDDEMO.CSD:L1-96]: POSTTRAN keeps a balance
 //! write in place when a later write of the same record fails, and commits
-//! each record on its own. The reads need no savepoint.
+//! each record on its own. The reads run under their own savepoints too, so a
+//! failed read leaves the transaction usable as well.
 //!
 //! No arithmetic happens here: `rules::posting` adds `DALYTRAN-AMT` to the
 //! balance (section C) and the store writes the `Money<9>` it is given.
@@ -62,8 +74,8 @@ use carddemo_domain::ports::{PortError, PortResult, TranCatBalanceStore};
 use rust_decimal::Decimal;
 
 use super::{account_id, expect_affected, limit_i64, money, tran_category_code, tran_type_code};
+use crate::PersistenceError;
 use crate::tx::{PgStore, savepoint, settle};
-use crate::{PersistenceError, port_error};
 
 /// The table, as [`PersistenceError::Corrupt`] names it.
 const TABLE: &str = "transaction_category_balances";
@@ -117,7 +129,8 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
     /// `INVALID KEY` (status 23) on which the rule creates the record.
     async fn read_tcatbal(&mut self, key: TranCatBalanceKey) -> PortResult<TranCatBalance> {
         let (acct_id, type_cd, cat_cd) = key_binds(&key);
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             TcatbalRow,
             "SELECT trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal \
              FROM transaction_category_balances \
@@ -126,10 +139,9 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
             &*type_cd,
             cat_cd
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?
-        .ok_or(PortError::NotFound)?;
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?.ok_or(PortError::NotFound)?;
         Ok(TranCatBalance::try_from(row)?)
     }
 
@@ -188,7 +200,11 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
         let limit = limit_i64(limit)?;
         // `rpad(..) COLLATE "C"` rather than the bare column: the order is the
         // padded X(02) byte order of the key, as "Key order" above explains.
-        let rows = match after {
+        // The bound after a key is one row comparison over the same three
+        // expressions, the key of `transaction_category_balances_padded_key`,
+        // so the index seeks to the key instead of filtering the account.
+        let mut sp = savepoint(self.tx).await?;
+        let result = match after {
             None => {
                 sqlx::query_as!(
                     TcatbalRow,
@@ -198,7 +214,7 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
                        LIMIT $1"#,
                     limit
                 )
-                .fetch_all(&mut **self.tx)
+                .fetch_all(&mut *sp)
                 .await
             }
             Some(key) => {
@@ -207,10 +223,8 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
                     TcatbalRow,
                     r#"SELECT trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal
                        FROM transaction_category_balances
-                       WHERE trancat_acct_id >= $1
-                         AND (trancat_acct_id > $1
-                              OR rpad(trancat_type_cd, 2) COLLATE "C" > rpad($2, 2) COLLATE "C"
-                              OR (trancat_type_cd = $2 AND trancat_cd > $3))
+                       WHERE (trancat_acct_id, rpad(trancat_type_cd, 2) COLLATE "C", trancat_cd)
+                             > ($1, rpad($2, 2) COLLATE "C", $3)
                        ORDER BY trancat_acct_id, rpad(trancat_type_cd, 2) COLLATE "C", trancat_cd
                        LIMIT $4"#,
                     acct_id,
@@ -218,12 +232,11 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
                     cat_cd,
                     limit
                 )
-                .fetch_all(&mut **self.tx)
+                .fetch_all(&mut *sp)
                 .await
             }
-        }
-        .map_err(|err| port_error(&err))?;
-        records(rows)
+        };
+        records(settle(sp, result).await?)
     }
 }
 

@@ -46,6 +46,15 @@
 //! plain `GU`, succeeds is decided by the audit and reproduced by the rules
 //! `auth_detail` and `auth_decision`, not by this adapter.
 //!
+//! Every read runs under its own savepoint too, so a failed `GU`, `GN` or
+//! `GNP` leaves the deletes `CBPAUP0C` made before it committable
+//! (P-CBPAUP0C-005, P-CBPAUP0C-009), and a failed CPVD summary read
+//! [`AuthorizationStore::read_summary_of_detail`], which `READ-AUTH-RECORD`
+//! follows with the detail read (P-COPAUS1C-014), leaves the transaction
+//! usable for that read. No statement writes the current date or time: the
+//! `AUTHFRDS` report date is the value the rule takes from the processing
+//! clock.
+//!
 //! # Locks
 //!
 //! One read locks: the CPVD fraud mark's detail read,
@@ -56,14 +65,6 @@
 //! committed, and no toggle is lost. `COPAUS1C` takes no lock of its own;
 //! this one is the concurrency safeguard of the replacement. Every other read,
 //! the CPVD view and its PF8 step included, takes no lock.
-//!
-//! Two reads run under their own savepoint: that locking read, and the CPVD
-//! summary read [`AuthorizationStore::read_summary_of_detail`], whose failure
-//! `READ-AUTH-RECORD` follows with the detail read (P-COPAUS1C-014), so the
-//! failed statement is rolled back to its savepoint and leaves the
-//! transaction usable for that read. Every other read runs on the transaction
-//! itself. No statement writes the current date or time: the `AUTHFRDS`
-//! report date is the value the rule takes from the processing clock.
 
 use carddemo_domain::entities::{
     AuthFraud, FraudFlag, MatchStatus, NewPendingAuthDetail, PA_ACCOUNT_STATUS_OCCURS,
@@ -73,13 +74,14 @@ use carddemo_domain::numeric::{AccountId, Alnum, AuthId, CardNumber, CustomerId,
 use carddemo_domain::ports::{AuthorizationStore, Browse, Direction, PortError, PortResult};
 use chrono::{NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
+use sqlx::{Postgres, Transaction};
 
 use super::{
     account_id, alnum, auth_count, card_number, customer_id, expect_affected, limit_i64, money,
     numeric_code, opt_alnum, opt_money,
 };
+use crate::PersistenceError;
 use crate::tx::{PgStore, savepoint, settle};
-use crate::{PersistenceError, port_error};
 
 /// The table of the `PAUTSUM0` root segments, as a misfit names it.
 const SUMMARIES: &str = "pending_auth_summaries";
@@ -299,7 +301,8 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L966-997]:
     /// `GU PAUTSUM0 WHERE (ACCNTID = PA-ACCT-ID)`. No row is the `GE` status.
     async fn read_summary(&mut self, id: AccountId) -> PortResult<PendingAuthSummary> {
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             SummaryRow,
             r#"SELECT pa_acct_id AS acct_id, pa_cust_id AS cust_id,
                       pa_auth_status AS auth_status, pa_account_status AS account_status,
@@ -313,10 +316,9 @@ impl AuthorizationStore for PgStore<'_, '_> {
                 WHERE pa_acct_id = $1"#,
             id.to_i64()
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?
-        .ok_or(PortError::NotFound)?;
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?.ok_or(PortError::NotFound)?;
         Ok(summary_from_row(row)?)
     }
 
@@ -455,33 +457,63 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// CBPAUP0C 2000-FIND-NEXT-AUTH-SUMMARY — P-CBPAUP0C-002
     /// [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L216-242]: the
     /// unqualified `GN PAUTSUM0` sweep, up to `limit` summaries whose account
-    /// is greater than `after`, in `ACCNTID` order. The end of the database
-    /// (`GB`) is an empty page.
+    /// is greater than `after`, in `ACCNTID` order, from the first summary
+    /// when `after` is `None`. The end of the database (`GB`) is an empty
+    /// page.
+    ///
+    /// The two cases are separate statements, so each page is a range scan of
+    /// the primary key, under custom and generic prepared plans alike, rather
+    /// than a filtered scan from the first summary.
     async fn summaries_after(
         &mut self,
         after: Option<AccountId>,
         limit: u16,
     ) -> PortResult<Vec<PendingAuthSummary>> {
-        let rows = sqlx::query_as!(
-            SummaryRow,
-            r#"SELECT pa_acct_id AS acct_id, pa_cust_id AS cust_id,
-                      pa_auth_status AS auth_status, pa_account_status AS account_status,
-                      pa_credit_limit AS credit_limit, pa_cash_limit AS cash_limit,
-                      pa_credit_balance AS credit_balance, pa_cash_balance AS cash_balance,
-                      pa_approved_auth_cnt AS approved_auth_cnt,
-                      pa_declined_auth_cnt AS declined_auth_cnt,
-                      pa_approved_auth_amt AS approved_auth_amt,
-                      pa_declined_auth_amt AS declined_auth_amt
-                 FROM pending_auth_summaries
-                WHERE ($1::BIGINT IS NULL OR pa_acct_id > $1)
-                ORDER BY pa_acct_id
-                LIMIT $2"#,
-            after.map(AccountId::to_i64),
-            limit_i64(limit)?
-        )
-        .fetch_all(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        let limit = limit_i64(limit)?;
+        let mut sp = savepoint(self.tx).await?;
+        let result = match after {
+            None => {
+                sqlx::query_as!(
+                    SummaryRow,
+                    r#"SELECT pa_acct_id AS acct_id, pa_cust_id AS cust_id,
+                              pa_auth_status AS auth_status, pa_account_status AS account_status,
+                              pa_credit_limit AS credit_limit, pa_cash_limit AS cash_limit,
+                              pa_credit_balance AS credit_balance, pa_cash_balance AS cash_balance,
+                              pa_approved_auth_cnt AS approved_auth_cnt,
+                              pa_declined_auth_cnt AS declined_auth_cnt,
+                              pa_approved_auth_amt AS approved_auth_amt,
+                              pa_declined_auth_amt AS declined_auth_amt
+                         FROM pending_auth_summaries
+                        ORDER BY pa_acct_id
+                        LIMIT $1"#,
+                    limit
+                )
+                .fetch_all(&mut *sp)
+                .await
+            }
+            Some(after) => {
+                sqlx::query_as!(
+                    SummaryRow,
+                    r#"SELECT pa_acct_id AS acct_id, pa_cust_id AS cust_id,
+                              pa_auth_status AS auth_status, pa_account_status AS account_status,
+                              pa_credit_limit AS credit_limit, pa_cash_limit AS cash_limit,
+                              pa_credit_balance AS credit_balance, pa_cash_balance AS cash_balance,
+                              pa_approved_auth_cnt AS approved_auth_cnt,
+                              pa_declined_auth_cnt AS declined_auth_cnt,
+                              pa_approved_auth_amt AS approved_auth_amt,
+                              pa_declined_auth_amt AS declined_auth_amt
+                         FROM pending_auth_summaries
+                        WHERE pa_acct_id > $1
+                        ORDER BY pa_acct_id
+                        LIMIT $2"#,
+                    after.to_i64(),
+                    limit
+                )
+                .fetch_all(&mut *sp)
+                .await
+            }
+        };
+        let rows = settle(sp, result).await?;
         rows.into_iter()
             .map(|row| summary_from_row(row).map_err(PortError::from))
             .collect()
@@ -558,7 +590,8 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// detail `GNP PAUTDTL1 WHERE (PAUT9CTS = PA-AUTHORIZATION-KEY)` reaches,
     /// addressed by its identity. No row is the `GE` status.
     async fn read_detail(&mut self, id: AuthId) -> PortResult<PendingAuthDetail> {
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             DetailRow,
             r#"SELECT auth_id, pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,
                       pa_auth_orig_date, pa_auth_orig_time, pa_card_num, pa_auth_type,
@@ -573,10 +606,9 @@ impl AuthorizationStore for PgStore<'_, '_> {
                 WHERE auth_id = $1"#,
             id.get()
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?
-        .ok_or(PortError::NotFound)?;
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?.ok_or(PortError::NotFound)?;
         Ok(detail_from_row(&row)?)
     }
 
@@ -658,7 +690,8 @@ impl AuthorizationStore for PgStore<'_, '_> {
         auth_time_9c: i32,
         direction: Direction,
     ) -> PortResult<Option<PendingAuthDetail>> {
-        let row = match direction {
+        let mut sp = savepoint(self.tx).await?;
+        let result = match direction {
             Direction::Forward => {
                 sqlx::query_as!(
                     DetailRow,
@@ -681,7 +714,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
                     auth_date_9c,
                     auth_time_9c
                 )
-                .fetch_optional(&mut **self.tx)
+                .fetch_optional(&mut *sp)
                 .await
             }
             Direction::Backward => {
@@ -706,11 +739,11 @@ impl AuthorizationStore for PgStore<'_, '_> {
                     auth_date_9c,
                     auth_time_9c
                 )
-                .fetch_optional(&mut **self.tx)
+                .fetch_optional(&mut *sp)
                 .await
             }
-        }
-        .map_err(|err| port_error(&err))?;
+        };
+        let row = settle(sp, result).await?;
         row.as_ref()
             .map(detail_from_row)
             .transpose()
@@ -915,7 +948,8 @@ impl PgStore<'_, '_> {
         card_num: CardNumber,
         auth_ts: NaiveDateTime,
     ) -> PortResult<AuthFraud> {
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             FraudRow,
             r#"SELECT card_num, auth_ts, auth_type, card_expiry_date, message_type,
                       message_source, auth_id_code, auth_resp_code, auth_resp_reason,
@@ -929,33 +963,70 @@ impl PgStore<'_, '_> {
             card_num.trimmed().into_owned(),
             auth_ts
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?
-        .ok_or(PortError::NotFound)?;
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?.ok_or(PortError::NotFound)?;
         Ok(fraud_from_row(&row)?)
     }
 }
 
-/// One page of the details of the account `acct_id` in twin order, read on
-/// `conn`: [`AuthorizationStore::details_for_account`].
+/// One page of the details of the account `acct_id` in twin order, read under
+/// a savepoint of its own in `tx`: [`AuthorizationStore::details_for_account`],
+/// the `GNP PAUTDTL1` loop of COPAUS0C PROCESS-PAGE-FORWARD — P-COPAUS0C-010
+/// and CBPAUP0C 3000-FIND-NEXT-AUTH-DTL — P-CBPAUP0C-003.
 ///
 /// `start`, when given, is the identity of a detail of the account, and the
 /// page begins at its key inclusive; an identity that names no detail of the
-/// account makes the row comparison `NULL`, so the page is empty, as the
-/// qualified `GNP` ends with `GE`. [`Direction::Forward`] reads ascending
-/// (`pa_auth_date_9c`, `pa_auth_time_9c`), the twin order; backward reads
-/// descending. Both key parts are `INTEGER`, so the row comparison orders as
-/// the packed `PAUT9CTS` bytes do.
+/// account leaves the start-row sub-select empty, which makes the row
+/// comparison `NULL`, so the page is empty, as the qualified `GNP` ends with
+/// `GE`. Without `start` the page begins at the first twin, or for backward
+/// at the last. [`Direction::Forward`] reads ascending (`pa_auth_date_9c`,
+/// `pa_auth_time_9c`), the twin order; backward reads descending. Both key
+/// parts are `INTEGER`, so the row comparison orders as the packed
+/// `PAUT9CTS` bytes do.
+///
+/// Each of the four cases, with or without `start` in either direction, is
+/// its own statement, so no optional-parameter `OR` keeps the start key out
+/// of the plan. The start-row sub-select is uncorrelated and runs once,
+/// before the scan, and its key then bounds the scan of `pautdtl1_key` as an
+/// index condition, under custom and generic prepared plans alike, instead
+/// of filtering out every twin that precedes it.
 async fn details_page(
-    conn: &mut sqlx::PgConnection,
+    tx: &mut Transaction<'_, Postgres>,
     acct_id: i64,
     start: Option<i64>,
     direction: Direction,
     limit: i64,
 ) -> PortResult<Vec<PendingAuthDetail>> {
-    let rows = match direction {
-        Direction::Forward => {
+    let mut sp = savepoint(tx).await?;
+    let result = match direction {
+        Direction::Forward => details_forward(&mut sp, acct_id, start, limit).await,
+        Direction::Backward => details_backward(&mut sp, acct_id, start, limit).await,
+    };
+    let rows = settle(sp, result).await?;
+    rows.iter()
+        .map(|row| detail_from_row(row).map_err(PortError::from))
+        .collect()
+}
+
+/// COPAUS0C PROCESS-PAGE-FORWARD and REPOSITION-AUTHORIZATIONS —
+/// P-COPAUS0C-010 [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L415-454]
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L488-519]; CBPAUP0C
+/// 3000-FIND-NEXT-AUTH-DTL — P-CBPAUP0C-003
+/// [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L248-272]: the
+/// `GNP PAUTDTL1` reads in twin order.
+///
+/// The rows of a [`Direction::Forward`] [`details_page`]: up to `limit`
+/// twins of `acct_id` in ascending key order, from the first twin, or from
+/// the key of the detail `start` inclusive.
+async fn details_forward(
+    conn: &mut sqlx::PgConnection,
+    acct_id: i64,
+    start: Option<i64>,
+    limit: i64,
+) -> Result<Vec<DetailRow>, sqlx::Error> {
+    match start {
+        None => {
             sqlx::query_as!(
                 DetailRow,
                 r#"SELECT d.auth_id, d.pa_acct_id, d.pa_auth_date_9c, d.pa_auth_time_9c,
@@ -970,11 +1041,33 @@ async fn details_page(
                           d.pa_auth_fraud, d.pa_fraud_rpt_date
                      FROM pending_auth_details d
                     WHERE d.pa_acct_id = $1
-                      AND ($2::BIGINT IS NULL
-                           OR (d.pa_auth_date_9c, d.pa_auth_time_9c) >= (
-                                  SELECT s.pa_auth_date_9c, s.pa_auth_time_9c
-                                    FROM pending_auth_details s
-                                   WHERE s.auth_id = $2 AND s.pa_acct_id = $1))
+                    ORDER BY d.pa_auth_date_9c, d.pa_auth_time_9c
+                    LIMIT $2"#,
+                acct_id,
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+        Some(start) => {
+            sqlx::query_as!(
+                DetailRow,
+                r#"SELECT d.auth_id, d.pa_acct_id, d.pa_auth_date_9c, d.pa_auth_time_9c,
+                          d.pa_auth_orig_date, d.pa_auth_orig_time, d.pa_card_num,
+                          d.pa_auth_type, d.pa_card_expiry_date, d.pa_message_type,
+                          d.pa_message_source, d.pa_auth_id_code, d.pa_auth_resp_code,
+                          d.pa_auth_resp_reason, d.pa_processing_code, d.pa_transaction_amt,
+                          d.pa_approved_amt, d.pa_merchant_catagory_code,
+                          d.pa_acqr_country_code, d.pa_pos_entry_mode, d.pa_merchant_id,
+                          d.pa_merchant_name, d.pa_merchant_city, d.pa_merchant_state,
+                          d.pa_merchant_zip, d.pa_transaction_id, d.pa_match_status,
+                          d.pa_auth_fraud, d.pa_fraud_rpt_date
+                     FROM pending_auth_details d
+                    WHERE d.pa_acct_id = $1
+                      AND (d.pa_auth_date_9c, d.pa_auth_time_9c) >= (
+                              SELECT s.pa_auth_date_9c, s.pa_auth_time_9c
+                                FROM pending_auth_details s
+                               WHERE s.auth_id = $2 AND s.pa_acct_id = $1)
                     ORDER BY d.pa_auth_date_9c, d.pa_auth_time_9c
                     LIMIT $3"#,
                 acct_id,
@@ -984,7 +1077,27 @@ async fn details_page(
             .fetch_all(&mut *conn)
             .await
         }
-        Direction::Backward => {
+    }
+}
+
+/// COPAUS0C PROCESS-PF7-KEY — P-COPAUS0C-011
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L362-385], with
+/// REPOSITION-AUTHORIZATIONS — P-COPAUS0C-010
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L488-519], for the
+/// previous page, read back from the first key shown instead of
+/// repositioning on the first key of the previous page.
+///
+/// The rows of a [`Direction::Backward`] [`details_page`]: up to `limit`
+/// twins of `acct_id` in descending key order, from the last twin, or from
+/// the key of the detail `start` inclusive.
+async fn details_backward(
+    conn: &mut sqlx::PgConnection,
+    acct_id: i64,
+    start: Option<i64>,
+    limit: i64,
+) -> Result<Vec<DetailRow>, sqlx::Error> {
+    match start {
+        None => {
             sqlx::query_as!(
                 DetailRow,
                 r#"SELECT d.auth_id, d.pa_acct_id, d.pa_auth_date_9c, d.pa_auth_time_9c,
@@ -999,11 +1112,33 @@ async fn details_page(
                           d.pa_auth_fraud, d.pa_fraud_rpt_date
                      FROM pending_auth_details d
                     WHERE d.pa_acct_id = $1
-                      AND ($2::BIGINT IS NULL
-                           OR (d.pa_auth_date_9c, d.pa_auth_time_9c) <= (
-                                  SELECT s.pa_auth_date_9c, s.pa_auth_time_9c
-                                    FROM pending_auth_details s
-                                   WHERE s.auth_id = $2 AND s.pa_acct_id = $1))
+                    ORDER BY d.pa_auth_date_9c DESC, d.pa_auth_time_9c DESC
+                    LIMIT $2"#,
+                acct_id,
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
+        Some(start) => {
+            sqlx::query_as!(
+                DetailRow,
+                r#"SELECT d.auth_id, d.pa_acct_id, d.pa_auth_date_9c, d.pa_auth_time_9c,
+                          d.pa_auth_orig_date, d.pa_auth_orig_time, d.pa_card_num,
+                          d.pa_auth_type, d.pa_card_expiry_date, d.pa_message_type,
+                          d.pa_message_source, d.pa_auth_id_code, d.pa_auth_resp_code,
+                          d.pa_auth_resp_reason, d.pa_processing_code, d.pa_transaction_amt,
+                          d.pa_approved_amt, d.pa_merchant_catagory_code,
+                          d.pa_acqr_country_code, d.pa_pos_entry_mode, d.pa_merchant_id,
+                          d.pa_merchant_name, d.pa_merchant_city, d.pa_merchant_state,
+                          d.pa_merchant_zip, d.pa_transaction_id, d.pa_match_status,
+                          d.pa_auth_fraud, d.pa_fraud_rpt_date
+                     FROM pending_auth_details d
+                    WHERE d.pa_acct_id = $1
+                      AND (d.pa_auth_date_9c, d.pa_auth_time_9c) <= (
+                              SELECT s.pa_auth_date_9c, s.pa_auth_time_9c
+                                FROM pending_auth_details s
+                               WHERE s.auth_id = $2 AND s.pa_acct_id = $1)
                     ORDER BY d.pa_auth_date_9c DESC, d.pa_auth_time_9c DESC
                     LIMIT $3"#,
                 acct_id,
@@ -1014,10 +1149,6 @@ async fn details_page(
             .await
         }
     }
-    .map_err(|err| port_error(&err))?;
-    rows.iter()
-        .map(|row| detail_from_row(row).map_err(PortError::from))
-        .collect()
 }
 
 /// The summary a stored row holds, each column held to its section A row

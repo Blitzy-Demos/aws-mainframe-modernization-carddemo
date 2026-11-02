@@ -300,14 +300,26 @@ impl TestStack {
     /// 10 `DUSRSECJ` users and the 2 reward seed rules. The transaction master
     /// stays empty (E-07), as do the reward accruals and balances.
     ///
+    /// As `batch seed` does, the sources are read, decoded and hashed by
+    /// `seed::prepare` on tokio's blocking pool before the transaction opens,
+    /// so the argon2id hashing never holds a runtime worker or a connection.
+    ///
     /// # Errors
     ///
     /// Returns the seed's error, after rolling its transaction back, when a
     /// fixture cannot be read or decoded, a password cannot be hashed, or a
-    /// statement or the commit fails.
+    /// statement or the commit fails; and the join error, before any
+    /// transaction, when the preparation panics or the runtime cancels it.
+    ///
+    /// # Panics
+    ///
+    /// Panics, as `tokio::task::spawn_blocking` does, when called outside a
+    /// tokio runtime; [`crate::block_on`] and `#[tokio::test]` provide one.
     pub async fn seed(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let sources = SeedSources::with_defaults(&fixtures::repo_root());
-        seed::run(&Db::from_pool(self.pool.clone()), SeedMode::Full, &sources).await?;
+        let prepared =
+            tokio::task::spawn_blocking(move || seed::prepare(SeedMode::Full, &sources)).await?;
+        seed::run(&Db::from_pool(self.pool.clone()), prepared).await?;
         Ok(())
     }
 

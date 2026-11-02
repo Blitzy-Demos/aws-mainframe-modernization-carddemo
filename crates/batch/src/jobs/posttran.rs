@@ -19,6 +19,11 @@
 //! P-CBTRN02C-224, P-CBTRN02C-225) have no step of their own: those files are tables reached
 //! through the pool `jobs::dispatch` opened, and a failure to open it is a setup failure.
 //!
+//! The file work of these paragraphs runs on Tokio's blocking pool, inside the job span, in the
+//! order above: the open and the whole-file read and decode of `DALYTRAN`, and the allocation,
+//! every reject append, the catalog and the discard of `DALYREJS(+1)`. A blocking task the
+//! runtime cancels while shutting down is a setup failure.
+//!
 //! # Units of work
 //!
 //! Every record runs in its own database transaction. A posted record commits its CBTRN02C
@@ -51,9 +56,8 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
-use std::slice;
 
 use carddemo_codec::framing::{Framed, decode_ascii_file};
 use carddemo_codec::layouts::{DailyTranLayout, DailyTranRecord, RejectRecord, RejectRecordLayout};
@@ -73,7 +77,7 @@ use tracing::field::display;
 use super::{JobContext, setup_failure};
 use crate::cli::PosttranArgs;
 use crate::exit::ExitStatus;
-use crate::generations::{Dataset, PendingGeneration};
+use crate::generations::{Dataset, PendingGeneration, blocking};
 
 /// The `ABCODE` that `9999-ABEND-PROGRAM` passes to `CEE3ABD` — P-CBTRN02C-021
 /// [app/cbl/CBTRN02C.cbl:L707-711].
@@ -89,30 +93,45 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &PosttranArgs) -> ExitS
 
 /// CBTRN02C PROCEDURE DIVISION — P-CBTRN02C-004, P-CBTRN02C-006, P-CBTRN02C-020
 /// [app/cbl/CBTRN02C.cbl:L193-234]: the opens, the main loop, the close of `DALYREJS` and the
-/// end-of-job counts. `Err` carries the status of a run that stopped early.
+/// end-of-job counts. `Err` carries the status of a run that stopped early; once `DALYREJS(+1)`
+/// is allocated, such a run discards it on the blocking pool after its status is reported.
 async fn post_daily_file(
     ctx: &JobContext,
     db: &Db,
     input: &Path,
 ) -> Result<ExitStatus, ExitStatus> {
-    let file = open_daily(input)?;
+    let file = open_daily(input).await?;
     open_tranfile(db).await?;
-    let mut rejects = open_rejects(ctx)?;
-    let records = read_daily(file, input)?;
+    let mut rejects = open_rejects(ctx).await?;
+    let records = match read_daily(file, input).await {
+        Ok(records) => records,
+        Err(status) => {
+            rejects.discard_async().await;
+            return Err(status);
+        }
+    };
     let mut tally = Tally::default();
     let outcome = post_records(ctx, db, &records, &mut rejects, &mut tally).await;
     tally.record_on_span();
-    outcome?;
-    close_rejects(rejects)?;
+    if let Err(status) = outcome {
+        rejects.discard_async().await;
+        return Err(status);
+    }
+    close_rejects(rejects).await?;
     tally.display_counts();
     Ok(ExitStatus::ReturnCode(tally.counts.return_code()))
 }
 
 /// CBTRN02C 0000-DALYTRAN-OPEN — P-CBTRN02C-221 [app/cbl/CBTRN02C.cbl:L236-252]: `OPEN INPUT`
-/// of DD `DALYTRAN`, the `--input` file. A file that cannot be opened abends before any other
-/// file is touched. The operating-system error is logged, never shown as a file status.
-fn open_daily(input: &Path) -> Result<File, ExitStatus> {
-    File::open(input).map_err(|err| {
+/// of DD `DALYTRAN`, the `--input` file, on the blocking pool. A file that cannot be opened
+/// abends before any other file is touched. The operating-system error is logged, never shown
+/// as a file status.
+async fn open_daily(input: &Path) -> Result<File, ExitStatus> {
+    let path = input.to_path_buf();
+    let opened = blocking(move || File::open(path))
+        .await
+        .map_err(|err| setup_failure("daily transaction file open did not complete", err))?;
+    opened.map_err(|err| {
         let cause = format!("{}: {err}", input.display());
         abend_status(&PostingAbend::dalytran_open(), None, Some(&cause))
     })
@@ -148,11 +167,12 @@ async fn open_tranfile(db: &Db) -> Result<(), ExitStatus> {
 }
 
 /// CBTRN02C 0300-DALYREJS-OPEN — P-CBTRN02C-223 [app/cbl/CBTRN02C.cbl:L291-307]: `OPEN OUTPUT`
-/// of DD `DALYREJS`, the new generation `DALYREJS(+1)` [app/jcl/POSTTRAN.jcl:L34-38]. Any
-/// failure to allocate it abends.
-fn open_rejects(ctx: &JobContext) -> Result<PendingGeneration, ExitStatus> {
+/// of DD `DALYREJS`, the new generation `DALYREJS(+1)` [app/jcl/POSTTRAN.jcl:L34-38],
+/// allocated on the blocking pool. Any failure to allocate it abends.
+async fn open_rejects(ctx: &JobContext) -> Result<PendingGeneration, ExitStatus> {
     ctx.generations
-        .begin_next(Dataset::DalyRejs)
+        .begin_next_async(Dataset::DalyRejs)
+        .await
         .map_err(|err| abend_status(&PostingAbend::dalyrejs_open(), None, Some(&err)))
 }
 
@@ -160,11 +180,20 @@ fn open_rejects(ctx: &JobContext) -> Result<PendingGeneration, ExitStatus> {
 /// records of DD `DALYTRAN` in file order, decoded with the `CVTRA06Y` layout. End of file is
 /// the end of the returned list.
 ///
-/// The file is read whole at the first `READ`, so a read failure abends before any record is
-/// processed.
-fn read_daily(mut file: File, input: &Path) -> Result<Vec<Framed<DailyTranRecord>>, ExitStatus> {
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|err| {
+/// The file is read whole and decoded on the blocking pool at the first `READ`, so a read
+/// failure abends before any record is processed.
+async fn read_daily(
+    mut file: File,
+    input: &Path,
+) -> Result<Vec<Framed<DailyTranRecord>>, ExitStatus> {
+    let read = blocking(move || -> io::Result<_> {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(decode_ascii_file::<DailyTranLayout>(&bytes))
+    })
+    .await
+    .map_err(|err| setup_failure("daily transaction file read did not complete", err))?;
+    let decoded = read.map_err(|err| {
         let cause = format!("{}: {err}", input.display());
         abend_status(&PostingAbend::dalytran_read(), None, Some(&cause))
     })?;
@@ -173,8 +202,7 @@ fn read_daily(mut file: File, input: &Path) -> Result<Vec<Framed<DailyTranRecord
     // bytes, with results its compiler options decide. Decoding the whole file first stops
     // such a run before any record is posted, as a setup failure (exit 16) whose text names
     // the 1-based record number, rather than guessing what CBTRN02C would do with it.
-    decode_ascii_file::<DailyTranLayout>(&bytes)
-        .map_err(|err| setup_failure("daily transaction record does not decode", err))
+    decoded.map_err(|err| setup_failure("daily transaction record does not decode", err))
 }
 
 /// CBTRN02C main loop — P-CBTRN02C-006 [app/cbl/CBTRN02C.cbl:L202-219]: each record in file
@@ -211,7 +239,7 @@ async fn post_records(
                 uow.rollback()
                     .await
                     .map_err(|err| setup_failure("read-only unit of work rollback failed", err))?;
-                write_reject(rejects, daily, record_number, reason, description)?;
+                write_reject(rejects, daily, record_number, reason, description).await?;
                 tally.counts.rejected += 1;
             }
             Err(abend) => {
@@ -327,8 +355,9 @@ async fn post_record(
 /// CBTRN02C 2500-WRITE-REJECT-REC — P-CBTRN02C-001 to P-CBTRN02C-003, P-CBTRN02C-012
 /// [app/cbl/CBTRN02C.cbl:L446-464]: appends the 430-byte `REJECT-RECORD` of `daily` to
 /// `DALYREJS(+1)`, the 350 bytes of the input record as read, the reason as `9(04)` and the
-/// description moved into `X(76)`, and logs the reject. A failure to write it abends.
-fn write_reject(
+/// description moved into `X(76)`, and logs the reject. The append runs on the blocking pool.
+/// A failure to write it abends.
+async fn write_reject(
     rejects: &mut PendingGeneration,
     daily: &DailyTranRecord,
     record_number: usize,
@@ -342,7 +371,8 @@ fn write_reject(
         .map_err(|err| abend_status(&PostingAbend::reject_write(), record, Some(&err)))?;
     let reject = RejectRecord::new(daily, reason_code, Alnum::move_from(description));
     rejects
-        .append_records::<RejectRecordLayout>(slice::from_ref(&reject))
+        .append_records_async::<RejectRecordLayout>(vec![reject])
+        .await
         .map_err(|err| abend_status(&PostingAbend::reject_write(), record, Some(&err)))?;
     tracing::warn!(
         record_number,
@@ -357,7 +387,7 @@ fn write_reject(
 /// The reward-engine halt (AAP 0.3.5, 0.5.3.5): the record's unit of work is rolled back, so
 /// neither its CBTRN02C updates nor its accrual persist, and the run stops with exit 8. The
 /// records before it stay committed, and nothing is added to `DALYREJS`, because the caller
-/// drops its pending generation uncataloged.
+/// discards its pending generation uncataloged.
 async fn reward_halt(
     uow: UnitOfWork,
     err: &RewardError,
@@ -407,11 +437,12 @@ async fn posting_abend(
 
 /// CBTRN02C 9300-DALYREJS-CLOSE — P-CBTRN02C-020 [app/cbl/CBTRN02C.cbl:L637-653]: the normal
 /// end of the step, where `DISP=(NEW,CATLG,DELETE)` catalogs `DALYREJS(+1)`, empty after a run
-/// without rejects. A failure abends and adds no generation, while every posted record stays
-/// committed, as the COBOL's VSAM updates do.
-fn close_rejects(rejects: PendingGeneration) -> Result<(), ExitStatus> {
+/// without rejects, on the blocking pool. A failure abends and adds no generation, while every
+/// posted record stays committed, as the COBOL's VSAM updates do.
+async fn close_rejects(rejects: PendingGeneration) -> Result<(), ExitStatus> {
     rejects
-        .catalog()
+        .catalog_async()
+        .await
         .map_err(|err| abend_status(&PostingAbend::dalyrejs_close(), None, Some(&err)))?;
     Ok(())
 }
@@ -475,11 +506,24 @@ impl Tally {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use carddemo_codec::framing::decode_ascii_file;
+    use carddemo_codec::layouts::DailyTranLayout;
+    use carddemo_domain::clock::{AnyClock, SystemClock};
     use carddemo_domain::entities::{Account, CardXref};
+    use carddemo_domain::messages::INVALID_CARD_NUMBER_FOUND;
     use carddemo_domain::numeric::{AccountId, CardNumber};
     use carddemo_domain::ports::{AccountReader, PortError, PortResult, XrefReader};
+    use carddemo_domain::rules::posting::PostingAbend;
+    use carddemo_runtime::config::Settings;
 
-    use super::PostingReads;
+    use super::{
+        ABCODE, PostingReads, close_rejects, open_daily, open_rejects, read_daily, write_reject,
+    };
+    use crate::exit::ExitStatus;
+    use crate::jobs::JobContext;
 
     /// A store that records which of its reads ran and answers each with `NotFound`.
     #[derive(Default)]
@@ -556,5 +600,151 @@ mod tests {
                 "read_account_for_update",
             ]
         );
+    }
+
+    /// The POSTTRAN fixture input, 300 records of 350 bytes, each followed by `LF`.
+    const DAILY: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../app/data/ASCII/dailytran.txt"
+    ));
+
+    /// The width of a `CVTRA06Y` record followed by its `LF`.
+    const FRAMED: usize = 351;
+
+    /// A directory of its own for one test, removed when the test ends.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("carddemo-posttran-{test}-{}", std::process::id()));
+            // Best effort: a directory left by an earlier run of this process id is replaced.
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+            Self(dir)
+        }
+
+        fn context(&self) -> JobContext {
+            let settings = Settings {
+                batch_dir: self.0.clone(),
+                ..Settings::default()
+            };
+            JobContext::new(settings, AnyClock::System(SystemClock))
+        }
+
+        /// The names of the files in the directory, hidden ones included, sorted.
+        fn names(&self) -> Vec<String> {
+            let entries =
+                fs::read_dir(&self.0).unwrap_or_else(|e| panic!("list {}: {e}", self.0.display()));
+            let mut names: Vec<String> = entries
+                .map(|entry| {
+                    let entry = entry.unwrap_or_else(|e| panic!("list {}: {e}", self.0.display()));
+                    entry.file_name().to_string_lossy().into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            // Best effort: a directory left behind holds only this test's files.
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `0000-DALYTRAN-OPEN` and the first `1000-DALYTRAN-GET-NEXT` on `path`: the number of
+    /// records decoded, or the status the run stops with.
+    async fn open_and_read(path: &Path) -> Result<usize, ExitStatus> {
+        let file = open_daily(path).await?;
+        read_daily(file, path).await.map(|records| records.len())
+    }
+
+    #[tokio::test]
+    async fn the_daily_file_is_opened_read_and_decoded_on_the_blocking_pool() {
+        let dir = TestDir::new("daily");
+        let mut undecodable = DAILY[..2 * FRAMED].to_vec();
+        // DALYTRAN-AMT of the second record starts at byte 132 of its 350; a letter there is
+        // not a zoned digit.
+        undecodable[FRAMED + 132] = b'X';
+        let codec_error = decode_ascii_file::<DailyTranLayout>(&undecodable)
+            .expect_err("the second record does not decode");
+        assert_eq!(codec_error.record, Some(2), "{codec_error}");
+
+        let fixture = dir.0.join("dailytran.txt");
+        let corrupt = dir.0.join("undecodable.txt");
+        fs::write(&fixture, DAILY).unwrap_or_else(|e| panic!("write {}: {e}", fixture.display()));
+        fs::write(&corrupt, &undecodable)
+            .unwrap_or_else(|e| panic!("write {}: {e}", corrupt.display()));
+        let cases = [
+            ("every fixture record decodes", fixture, Ok(300)),
+            (
+                "a missing file abends in 0000-DALYTRAN-OPEN",
+                dir.0.join("absent.txt"),
+                Err(ExitStatus::abend_from(
+                    &PostingAbend::dalytran_open(),
+                    Some(ABCODE),
+                )),
+            ),
+            (
+                "a file that opens but cannot be read abends in 1000-DALYTRAN-GET-NEXT",
+                dir.0.clone(),
+                Err(ExitStatus::abend_from(
+                    &PostingAbend::dalytran_read(),
+                    Some(ABCODE),
+                )),
+            ),
+            (
+                "an undecodable record is a setup failure naming it",
+                corrupt,
+                Err(ExitStatus::setup(&codec_error)),
+            ),
+        ];
+        for (case, path, expected) in cases {
+            assert_eq!(open_and_read(&path).await, expected, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_are_written_then_cataloged_or_discarded_on_the_blocking_pool() {
+        let records = decode_ascii_file::<DailyTranLayout>(DAILY)
+            .unwrap_or_else(|e| panic!("the fixture decodes: {e}"));
+        let daily = &records[0].record;
+        for catalog in [true, false] {
+            let dir = TestDir::new(&format!("rejects-{catalog}"));
+            let ctx = dir.context();
+            let mut rejects = open_rejects(&ctx)
+                .await
+                .unwrap_or_else(|status| panic!("DALYREJS(+1) allocates: {status:?}"));
+            write_reject(&mut rejects, daily, 1, 100, INVALID_CARD_NUMBER_FOUND)
+                .await
+                .unwrap_or_else(|status| panic!("the reject is written: {status:?}"));
+            if !catalog {
+                rejects.discard_async().await;
+                assert!(
+                    dir.names().is_empty(),
+                    "the temporary file and the lock are removed: {:?}",
+                    dir.names()
+                );
+                continue;
+            }
+            close_rejects(rejects)
+                .await
+                .unwrap_or_else(|status| panic!("DALYREJS(+1) catalogs: {status:?}"));
+            assert_eq!(
+                dir.names(),
+                ["DALYREJS.G0001V00"],
+                "no lock or temporary file"
+            );
+            let path = dir.0.join("DALYREJS.G0001V00");
+            let written =
+                fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let expected = format!(
+                "{}0100{INVALID_CARD_NUMBER_FOUND:<76}\n",
+                std::str::from_utf8(&DAILY[..350]).expect("the fixture is ASCII")
+            );
+            assert_eq!(written, expected.as_bytes());
+        }
     }
 }

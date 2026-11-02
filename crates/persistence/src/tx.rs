@@ -1,13 +1,16 @@
 //! The unit of work: the database transaction an adapter opens, hands to the
 //! rules and commits; [`PgStore`], the single port adapter bound to it; and
-//! the savepoint around each legacy write.
+//! the savepoint around each statement of a store.
 //!
 //! No other module begins, commits or rolls back a transaction or a
 //! savepoint. `carddemo-api`, `carddemo-batch` and `carddemo-messaging` open a
 //! [`UnitOfWork`] with `Db::begin`, pass [`UnitOfWork::store`] to the rules and
-//! finish with [`UnitOfWork::commit`]; the port implementations in
-//! [`crate::repos`] and the reward store in [`crate::rewards`] wrap each write
-//! in the crate-internal `savepoint` and `settle`.
+//! finish with [`UnitOfWork::commit`]. A reader whose statements must all see
+//! one state, the CR00 report and the TRANREPT backup, opens it with
+//! `Db::begin_snapshot` instead and finishes with [`UnitOfWork::rollback`].
+//! The port implementations in [`crate::repos`] and the reward store in
+//! [`crate::rewards`] wrap each statement in the crate-internal `savepoint`
+//! and `settle`.
 //!
 //! # Write persistence
 //!
@@ -28,28 +31,46 @@
 //!   outcome of the transaction write before it [app/cbl/COBIL00C.cbl:L233-235]
 //!   (P-COBIL00C-018, E-19).
 //!
-//! The replacement keeps those outcomes inside one `PostgreSQL` transaction:
+//! The replacement keeps those outcomes inside one `PostgreSQL` transaction,
+//! which fails in two ways:
 //!
-//! - Every legacy write, and every locking read (`SELECT ... FOR UPDATE`, the
-//!   CICS `READ UPDATE`), runs under its own savepoint. Success releases it
-//!   (`RELEASE SAVEPOINT`). Failure rolls back to it (`ROLLBACK TO SAVEPOINT`)
-//!   and returns the mapped [`PortError`](carddemo_domain::ports::PortError).
+//! - A client-side outcome leaves the transaction usable: a key that names no
+//!   row comes back as `RowNotFound` or `None` and maps to `NotFound`, and a
+//!   stored value that does not fit its domain type is
+//!   [`PersistenceError::Corrupt`] once the row is read.
+//! - Any server-side statement error, whatever its SQLSTATE (`42P01`,
+//!   `57014`, `55P03`, `40001`, ...) and whether the statement reads or
+//!   writes, aborts the whole transaction: every later statement fails with
+//!   `25P02`, and `COMMIT` ends as `ROLLBACK`. A failed read would therefore
+//!   undo every write the unit made before it, such as the INTCALC account
+//!   rewrite before the next account's reads (P-CBACT04C-010) or the CBPAUP0J
+//!   deletes before the later summary and detail reads (P-CBPAUP0C-005,
+//!   P-CBPAUP0C-009), or turn the next legacy read into a false error, such as
+//!   the `CUSTDAT` read after a failed `ACCTDAT` read of `COACTVWC` and
+//!   `COACTUPC` (V-COACTVWC-006, V-COACTUPC-007).
+//!
+//! Hence:
+//!
+//! - Every statement a store method issues, legacy write, locking read
+//!   (`SELECT ... FOR UPDATE`, the CICS `READ UPDATE`) or read alike, runs
+//!   under its own savepoint. Success releases it (`RELEASE SAVEPOINT`).
+//!   Failure rolls back to it (`ROLLBACK TO SAVEPOINT`), which undoes that
+//!   statement alone and clears the aborted state, and returns the mapped
+//!   [`PortError`](carddemo_domain::ports::PortError).
 //! - A failed statement therefore never leaves the outer transaction aborted.
-//!   The writes before it survive, and the writes after it still run, as the
-//!   COBOL carries on after a `RESP` other than `NORMAL`.
+//!   The writes before it survive, and the statements after it still run, as
+//!   the COBOL carries on after a `RESP` other than `NORMAL`.
 //! - The adapter commits what the "Persists on later failure" column of
 //!   section B of `docs/parity/parity-oracle-audit.md` says persists, and
 //!   returns the COBOL message with its mapped status. It never rolls back a
 //!   whole request by default.
-//! - Plain reads run on the transaction itself, with no savepoint. They change
-//!   nothing, and a key that names no row comes back as `RowNotFound` or
-//!   `None` on the client side, not as a server error, so the transaction
-//!   stays usable.
-//! - A plain read whose failure the COBOL follows with another read of the
-//!   same unit runs under its own savepoint too, so a server error it meets
-//!   does not abort the transaction for that read: the `COPAUS1C`
-//!   `READ-AUTH-RECORD` summary read, after which the detail read is still
-//!   issued (P-COPAUS1C-014).
+//! - The one exception is the `TRAN-ID` allocation in [`crate::ids`]: the
+//!   advisory lock and highest-key read of [`crate::ids::next_tran_id`], and
+//!   the account-reference lock CT02 takes before it
+//!   ([`crate::ids::lock_account_reference`]), run on the transaction itself,
+//!   because their callers, CT02 and CB00, run them before their first write
+//!   and roll back the whole unit when one fails, so no earlier write has to
+//!   survive it.
 //!
 //! # Whole-transaction rollback
 //!
@@ -75,17 +96,26 @@
 //! # Tracing
 //!
 //! Spans belong to the adapters, which record the outcome of each request,
-//! job record or message. This module emits only `debug` events.
+//! job record or message. Besides its `debug` events for a commit and a
+//! rollback, this module logs every failure `savepoint` and `settle` map, once,
+//! through `crate::port_error_at`: one `database statement failed` event with
+//! the SQLSTATE, the outcome, the sanitized error text, the table and
+//! constraint names, and the code location of the store method that ran the
+//! statement (`code.filepath`, `code.lineno`). `NotFound` is not logged.
+
+use std::future::Future;
+use std::panic::Location;
 
 use carddemo_domain::numeric::{AccountId, TranId};
 use carddemo_domain::ports::PortResult;
 use sqlx::{Acquire, Postgres, Transaction};
 
-use crate::{PersistenceError, port_error};
+use crate::{PersistenceError, port_error_at};
 
 /// One `PostgreSQL` transaction an adapter opens, works in and finishes.
 ///
-/// Opened by `Db::begin`; finished by [`UnitOfWork::commit`] or
+/// Opened by `Db::begin`, or read-only on one snapshot by
+/// `Db::begin_snapshot`; finished by [`UnitOfWork::commit`] or
 /// [`UnitOfWork::rollback`]. Dropping it unfinished rolls it back. The reward
 /// store bound to the same transaction comes from `UnitOfWork::rewards`,
 /// declared beside [`crate::rewards::PgRewardStore`].
@@ -205,8 +235,8 @@ impl<'t, 'c> PgStore<'t, 'c> {
     }
 }
 
-/// Opens a savepoint inside `tx`, for exactly one legacy write, locking read,
-/// or read whose failure the rules follow with another statement.
+/// Opens a savepoint inside `tx`, for exactly one statement of a store method:
+/// a legacy write, a locking read or a read.
 ///
 /// sqlx issues `SAVEPOINT` rather than `BEGIN` because the connection is
 /// already in a transaction. The savepoint borrows `tx` until [`settle`]
@@ -225,51 +255,69 @@ impl<'t, 'c> PgStore<'t, 'c> {
 /// Plain functions rather than a helper taking an async closure keep every
 /// port future concretely typed and `Send`.
 ///
+/// The function is not `async`: it takes the caller's code location first,
+/// through `#[track_caller]`, and returns the future that opens the
+/// savepoint, so a failure is logged at the store method's line rather than
+/// here. Callers still write `savepoint(self.tx).await?`.
+///
 /// # Errors
 ///
-/// The [`port_error`] mapping of a failed `SAVEPOINT`, in practice
+/// The [`port_error_at`] mapping of a failed `SAVEPOINT`, in practice
 /// `PortError::Unavailable` for a broken connection.
-pub(crate) async fn savepoint<'a>(
+#[track_caller]
+pub(crate) fn savepoint<'a>(
     tx: &'a mut Transaction<'_, Postgres>,
-) -> PortResult<Transaction<'a, Postgres>> {
-    Acquire::begin(tx).await.map_err(|err| port_error(&err))
+) -> impl Future<Output = PortResult<Transaction<'a, Postgres>>> + Send {
+    let location = Location::caller();
+    async move {
+        Acquire::begin(tx)
+            .await
+            .map_err(|err| port_error_at(&err, location))
+    }
 }
 
 /// Ends the savepoint `sp` according to the `result` of the statement run
 /// under it.
 ///
 /// - `Ok`: releases the savepoint (`RELEASE SAVEPOINT`) and returns the value.
-///   The write stays part of the outer transaction.
+///   What the statement did stays part of the outer transaction.
 /// - `Err`: rolls back to the savepoint (`ROLLBACK TO SAVEPOINT`), which undoes
 ///   the statement and clears the aborted state it left on the server, then
-///   returns the [`port_error`] mapping of the statement's error.
+///   returns the [`port_error_at`] mapping of the statement's error.
+///
+/// As [`savepoint`], the function takes the caller's code location through
+/// `#[track_caller]` before it returns its future, so every failure it maps
+/// is logged once with the line of the store method that ran the statement.
+/// Callers still write `settle(sp, result).await?`.
 ///
 /// # Errors
 ///
 /// - The mapped statement error, as above.
 /// - The mapped error of the `RELEASE SAVEPOINT` or `ROLLBACK TO SAVEPOINT`
 ///   itself when that fails. sqlx then still queues the rollback to the
-///   savepoint for the connection's next use, and a statement error that a
-///   failed rollback hides is logged as a `debug` event.
-pub(crate) async fn settle<T>(
-    sp: Transaction<'_, Postgres>,
+///   savepoint for the connection's next use. The statement error a failed
+///   rollback hides is logged too, by its own mapping.
+#[track_caller]
+pub(crate) fn settle<'s, T: Send + 's>(
+    sp: Transaction<'s, Postgres>,
     result: Result<T, sqlx::Error>,
-) -> PortResult<T> {
-    match result {
-        Ok(value) => {
-            sp.commit().await.map_err(|err| port_error(&err))?;
-            Ok(value)
-        }
-        Err(err) => {
-            let outcome = port_error(&err);
-            if let Err(rollback) = sp.rollback().await {
-                tracing::debug!(
-                    statement_error = %outcome,
-                    "rollback to savepoint failed"
-                );
-                return Err(port_error(&rollback));
+) -> impl Future<Output = PortResult<T>> + Send + 's {
+    let location = Location::caller();
+    async move {
+        match result {
+            Ok(value) => {
+                sp.commit()
+                    .await
+                    .map_err(|err| port_error_at(&err, location))?;
+                Ok(value)
             }
-            Err(outcome)
+            Err(err) => {
+                let outcome = port_error_at(&err, location);
+                if let Err(rollback) = sp.rollback().await {
+                    return Err(port_error_at(&rollback, location));
+                }
+                Err(outcome)
+            }
         }
     }
 }

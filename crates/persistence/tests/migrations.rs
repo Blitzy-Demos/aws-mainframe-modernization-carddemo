@@ -156,6 +156,14 @@ impl IndexRow {
             .map_or(method_and_keys, |(keys, _)| keys)
     }
 
+    /// The first key of [`Self::key_list`]: a column name, or the text of a key
+    /// expression up to its first comma.
+    fn leading_key(&self) -> &str {
+        let keys = self.key_list();
+        let keys = keys.strip_prefix('(').unwrap_or(keys);
+        keys.split([',', ')']).next().unwrap_or(keys)
+    }
+
     /// The predicate text of the definition after `WHERE`, `None` for an index
     /// over every row.
     fn definition_predicate(&self) -> Option<&str> {
@@ -734,7 +742,7 @@ fn foreign_keys_and_delete_rules() {
 
 /// The indexes that replace the keys and alternate indexes of the COBOL
 /// files and tables, checked on their key lists, uniqueness and predicates.
-const EXPECTED_INDEXES: [ExpectedIndex; 13] = [
+const EXPECTED_INDEXES: [ExpectedIndex; 17] = [
     ExpectedIndex {
         table: "transaction_types",
         name: "xtran_type",
@@ -771,6 +779,18 @@ const EXPECTED_INDEXES: [ExpectedIndex; 13] = [
         predicate: None,
         replaces: "CXACAIX, AIX KEYS(11,25) NONUNIQUEKEY (XREFFILE.jcl:L72-75)",
     },
+    // The definitions of the two padded-key indexes print no COLLATE: "C" is the collation
+    // each rpad expression takes from its column, and pg_indexes prints only a differing
+    // one, so these key lists also pin the byte order.
+    ExpectedIndex {
+        table: "users",
+        name: "users_padded_user_id",
+        keys: "(rpad((user_id)::text, 8))",
+        unique: false,
+        primary: false,
+        predicate: None,
+        replaces: "USRSEC KSDS KEYS(8,0) browse order, SEC-USR-ID padded to 8 (DUSRSECJ.jcl:L64-66)",
+    },
     ExpectedIndex {
         table: "transactions",
         name: "transactions_pkey",
@@ -797,6 +817,25 @@ const EXPECTED_INDEXES: [ExpectedIndex; 13] = [
         primary: false,
         predicate: Some("in_master"),
         replaces: "TRANSACT AIX KEYS(26 304) NONUNIQUEKEY (TRANFILE.jcl:L82-86, STEP20)",
+    },
+    ExpectedIndex {
+        table: "transactions",
+        name: "transactions_retained_tran_id",
+        keys: "(tran_id, transaction_id)",
+        unique: false,
+        primary: false,
+        predicate: Some("(NOT in_master)"),
+        replaces: "the COMBTRAN revive lookup of a non-live row by TRAN-ID and content (E-09)",
+    },
+    ExpectedIndex {
+        table: "transaction_category_balances",
+        name: "transaction_category_balances_padded_key",
+        keys: "(trancat_acct_id, rpad((trancat_type_cd)::text, 2), trancat_cd)",
+        unique: false,
+        primary: false,
+        predicate: None,
+        replaces: "TCATBALF KSDS KEYS(17 0) sequential order, type code padded to X(02) \
+                   (TCATBALF.jcl:L36-41)",
     },
     ExpectedIndex {
         table: "pending_auth_details",
@@ -852,12 +891,24 @@ const EXPECTED_INDEXES: [ExpectedIndex; 13] = [
         predicate: None,
         replaces: "the reward history of one account (AAP 0.3.5)",
     },
+    ExpectedIndex {
+        table: "reward_accruals",
+        name: "reward_accruals_account_created_accrual_idx",
+        keys: "(account_id, created_at, accrual_id)",
+        unique: false,
+        primary: false,
+        predicate: None,
+        replaces: "the newest-first reward history page and its (created_at, accrual_id) cursor",
+    },
 ];
 
 /// Every index of [`EXPECTED_INDEXES`] exists on its table with its key list,
-/// uniqueness and predicate. The `TRAN-ID` key holds among live rows only: no
-/// other index on `transactions` keys `tran_id`, so a `TRAN-ID` held by non-live
-/// rows may be issued again (E-09).
+/// uniqueness and predicate. The `TRAN-ID` key holds among live rows only: of
+/// the indexes on `transactions` led by `tran_id`, the partial live-row key
+/// `transactions_master_tran_id` is the only unique one, and
+/// `transactions_retained_tran_id`, which serves the COMBTRAN revive lookup
+/// over the non-live rows, is not unique. A `TRAN-ID` held by non-live rows may
+/// therefore be issued again, and several non-live rows may share it (E-09).
 #[test]
 fn indexes_exist_with_expected_shape() {
     let stack = block_on(TestStack::postgres());
@@ -894,15 +945,29 @@ fn indexes_exist_with_expected_shape() {
             expected.name, expected.replaces, index.definition
         );
     }
-    let tran_id_keys: Vec<&str> = actual
+    let tran_id_led: Vec<(&str, bool, Option<&str>)> = actual
         .iter()
-        .filter(|index| index.table == "transactions" && index.key_list() == "(tran_id)")
-        .map(|index| index.name.as_str())
+        .filter(|index| index.table == "transactions" && index.leading_key() == "tran_id")
+        .map(|index| {
+            (
+                index.name.as_str(),
+                index.unique,
+                index.predicate.as_deref(),
+            )
+        })
         .collect();
     assert_eq!(
-        tran_id_keys,
-        ["transactions_master_tran_id"],
-        "tran_id must be keyed by the partial live-row index only"
+        tran_id_led,
+        [
+            ("transactions_master_tran_id", true, Some("in_master")),
+            (
+                "transactions_retained_tran_id",
+                false,
+                Some("(NOT in_master)")
+            ),
+        ],
+        "tran_id must be unique among live rows only: the partial live-row key is the one \
+         unique index led by tran_id, and the retained-row index is not unique"
     );
 }
 

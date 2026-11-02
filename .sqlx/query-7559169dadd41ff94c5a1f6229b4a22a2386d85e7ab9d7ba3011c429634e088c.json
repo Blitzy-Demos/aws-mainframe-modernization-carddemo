@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT d.auth_id, d.pa_acct_id, d.pa_auth_date_9c, d.pa_auth_time_9c,\n                          d.pa_auth_orig_date, d.pa_auth_orig_time, d.pa_card_num,\n                          d.pa_auth_type, d.pa_card_expiry_date, d.pa_message_type,\n                          d.pa_message_source, d.pa_auth_id_code, d.pa_auth_resp_code,\n                          d.pa_auth_resp_reason, d.pa_processing_code, d.pa_transaction_amt,\n                          d.pa_approved_amt, d.pa_merchant_catagory_code,\n                          d.pa_acqr_country_code, d.pa_pos_entry_mode, d.pa_merchant_id,\n                          d.pa_merchant_name, d.pa_merchant_city, d.pa_merchant_state,\n                          d.pa_merchant_zip, d.pa_transaction_id, d.pa_match_status,\n                          d.pa_auth_fraud, d.pa_fraud_rpt_date\n                     FROM pending_auth_details d\n                    WHERE d.pa_acct_id = $1\n                      AND ($2::BIGINT IS NULL\n                           OR (d.pa_auth_date_9c, d.pa_auth_time_9c) >= (\n                                  SELECT s.pa_auth_date_9c, s.pa_auth_time_9c\n                                    FROM pending_auth_details s\n                                   WHERE s.auth_id = $2 AND s.pa_acct_id = $1))\n                    ORDER BY d.pa_auth_date_9c, d.pa_auth_time_9c\n                    LIMIT $3",
+  "query": "SELECT d.auth_id, d.pa_acct_id, d.pa_auth_date_9c, d.pa_auth_time_9c,\n                          d.pa_auth_orig_date, d.pa_auth_orig_time, d.pa_card_num,\n                          d.pa_auth_type, d.pa_card_expiry_date, d.pa_message_type,\n                          d.pa_message_source, d.pa_auth_id_code, d.pa_auth_resp_code,\n                          d.pa_auth_resp_reason, d.pa_processing_code, d.pa_transaction_amt,\n                          d.pa_approved_amt, d.pa_merchant_catagory_code,\n                          d.pa_acqr_country_code, d.pa_pos_entry_mode, d.pa_merchant_id,\n                          d.pa_merchant_name, d.pa_merchant_city, d.pa_merchant_state,\n                          d.pa_merchant_zip, d.pa_transaction_id, d.pa_match_status,\n                          d.pa_auth_fraud, d.pa_fraud_rpt_date\n                     FROM pending_auth_details d\n                    WHERE d.pa_acct_id = $1\n                      AND (d.pa_auth_date_9c, d.pa_auth_time_9c) >= (\n                              SELECT s.pa_auth_date_9c, s.pa_auth_time_9c\n                                FROM pending_auth_details s\n                               WHERE s.auth_id = $2 AND s.pa_acct_id = $1)\n                    ORDER BY d.pa_auth_date_9c, d.pa_auth_time_9c\n                    LIMIT $3",
   "describe": {
     "columns": [
       {
@@ -188,5 +188,5 @@
       false
     ]
   },
-  "hash": "d81f548eba3d2331f0c29889626c1809ab4561a4233587d9dbc4500d76faf18b"
+  "hash": "7559169dadd41ff94c5a1f6229b4a22a2386d85e7ab9d7ba3011c429634e088c"
 }

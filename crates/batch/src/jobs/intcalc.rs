@@ -13,7 +13,7 @@
 //! | the loop body, `1050-UPDATE-ACCOUNT` to `1300-COMPUTE-INTEREST` | P-CBACT04C-002 to P-CBACT04C-010 | `InterestRun::process_record`, called by `IntcalcJob::process` |
 //! | `1300-B-WRITE-TX` `WRITE FD-TRANFILE-REC` | P-CBACT04C-008, P-CBACT04C-009 | `IntcalcJob::write_systran` |
 //! | end of file, the last account never updated (E-14) | P-CBACT04C-003, P-CBACT04C-174 | `InterestRun::finish`, called by `IntcalcJob::end_of_file` |
-//! | `9400-TRANFILE-CLOSE`, `DISP=(NEW,CATLG,DELETE)` | P-CBACT04C-187 | `PendingGeneration::catalog` in `IntcalcJob::end_of_file` |
+//! | `9400-TRANFILE-CLOSE`, `DISP=(NEW,CATLG,DELETE)` | P-CBACT04C-187 | `PendingGeneration::catalog_async` in `IntcalcJob::end_of_file` |
 //! | `9999-ABEND-PROGRAM`, `9910-DISPLAY-IO-STATUS` | P-CBACT04C-188, P-CBACT04C-189 | `abend_status`, `systran_abend` |
 //!
 //! # Files and units of work
@@ -46,8 +46,13 @@
 //! counts its `DEFAULT` fallbacks (P-CBACT04C-004, P-CBACT04C-005, P-CBACT04C-193); a read that
 //! fails otherwise is never kept and abends as before.
 //!
+//! The allocation, every write and the catalog or discard of `SYSTRAN(+1)` run on Tokio's
+//! blocking pool, inside the job span; a record's write still completes while its unit of work
+//! is open, before that unit is committed.
+//!
 //! On an abend the record's unit of work is still committed, because the rule's account rewrite
-//! ran under its own savepoint and persists, and the pending `SYSTRAN(+1)` is dropped
+//! ran under its own savepoint and persists: the failed read after it ran under its own savepoint
+//! too, so it left the unit committable. The pending `SYSTRAN(+1)` is discarded
 //! uncataloged, as `DISP=(NEW,CATLG,DELETE)` deletes it. The stderr lines are the `DISPLAY`
 //! lines of the abending paragraph and `ABEND 999`; the adapter detail goes to the log only.
 //!
@@ -56,7 +61,6 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::slice;
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
 use carddemo_domain::entities::{
@@ -101,7 +105,7 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &IntcalcArgs) -> ExitSt
         Ok(parm) => parm,
         Err(status) => return status,
     };
-    let systran = match open_systran(ctx) {
+    let systran = match open_systran(ctx).await {
         Ok(pending) => pending,
         Err(status) => return status,
     };
@@ -117,10 +121,11 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &IntcalcArgs) -> ExitSt
     let outcome = job.read_file().await;
     job.record_counts();
     match outcome {
-        Ok(()) => job.end_of_file(),
+        Ok(()) => job.end_of_file().await,
         Err(status) => {
             // The abnormal end of the step: `DISP=(NEW,CATLG,DELETE)` deletes `SYSTRAN(+1)`.
-            drop(job);
+            let IntcalcJob { systran, .. } = job;
+            systran.discard_async().await;
             status
         }
     }
@@ -141,17 +146,21 @@ fn parm_date(args: &IntcalcArgs) -> Result<Alnum<10>, ExitStatus> {
 
 /// CBACT04C 0400-TRANFILE-OPEN [app/cbl/CBACT04C.cbl:L307-323] — P-CBACT04C-181:
 /// `OPEN OUTPUT TRANSACT-FILE`, the new generation `SYSTRAN(+1)`, `RECFM=F,LRECL=350`
-/// [app/jcl/INTCALC.jcl:L37-41]. Nothing has been read or written yet.
+/// [app/jcl/INTCALC.jcl:L37-41], allocated on the blocking pool. Nothing has been read or
+/// written yet.
 ///
 /// # Errors
 ///
 /// The 0400-TRANFILE-OPEN abend when the generation cannot be allocated; the allocation error
 /// is logged.
-fn open_systran(ctx: &JobContext) -> Result<PendingGeneration, ExitStatus> {
-    ctx.generations.begin_next(Dataset::SysTran).map_err(|err| {
-        tracing::error!(error = %err, "SYSTRAN(+1) allocation failed");
-        systran_abend(ERROR_OPENING_TRANSACTION_FILE)
-    })
+async fn open_systran(ctx: &JobContext) -> Result<PendingGeneration, ExitStatus> {
+    ctx.generations
+        .begin_next_async(Dataset::SysTran)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "SYSTRAN(+1) allocation failed");
+            systran_abend(ERROR_OPENING_TRANSACTION_FILE)
+        })
 }
 
 /// CBACT04C 1000-TCATBALF-GET-NEXT [app/cbl/CBACT04C.cbl:L325-348] — P-CBACT04C-182: the next
@@ -342,7 +351,7 @@ impl IntcalcJob<'_> {
             )
             .await;
         let written = match processed {
-            Ok(Some(tran)) => self.write_systran(tran),
+            Ok(Some(tran)) => self.write_systran(tran).await,
             Ok(None) => Ok(()),
             Err(abend) => Err(abend),
         };
@@ -357,17 +366,20 @@ impl IntcalcJob<'_> {
 
     /// CBACT04C 1300-B-WRITE-TX `WRITE FD-TRANFILE-REC FROM TRAN-RECORD`
     /// [app/cbl/CBACT04C.cbl:L500-515] — P-CBACT04C-008, P-CBACT04C-009, P-CBACT04C-173: the
-    /// interest record as a 350-byte `CVTRA05Y` record, its FILLER spaces (E-25).
+    /// interest record as a 350-byte `CVTRA05Y` record, its FILLER spaces (E-25), encoded and
+    /// written on the blocking pool.
     ///
     /// # Errors
     ///
     /// The 1300-B-WRITE-TX abend, status 30, when the generation cannot be written; the write
     /// error is logged.
-    fn write_systran(&mut self, tran: NewTransaction) -> Result<(), InterestAbend> {
+    async fn write_systran(&mut self, tran: NewTransaction) -> Result<(), InterestAbend> {
         let record = TransactionRecord::new(tran);
+        let tran_id = record.transaction.tran_id;
         match self
             .systran
-            .append_records::<TransactionLayout>(slice::from_ref(&record))
+            .append_records_async::<TransactionLayout>(vec![record])
+            .await
         {
             Ok(()) => {
                 self.written += 1;
@@ -376,7 +388,7 @@ impl IntcalcJob<'_> {
             Err(err) => {
                 tracing::error!(
                     error = %err,
-                    tran_id = %record.transaction.tran_id,
+                    tran_id = %tran_id,
                     "SYSTRAN(+1) write failed"
                 );
                 Err(InterestAbend::SystranWrite {
@@ -395,7 +407,7 @@ impl IntcalcJob<'_> {
 
     /// CBACT04C end of file and closes [app/cbl/CBACT04C.cbl:L188-230] — P-CBACT04C-003,
     /// P-CBACT04C-174, P-CBACT04C-187, E-14: the run ends with the last account not updated,
-    /// and `9400-TRANFILE-CLOSE` catalogs `SYSTRAN(+1)`.
+    /// and `9400-TRANFILE-CLOSE` catalogs `SYSTRAN(+1)` on the blocking pool.
     ///
     /// The loop leaves before the `ELSE` that would perform `1050-UPDATE-ACCOUNT`, so the last
     /// account keeps its balance and cycle amounts while its interest records are written; the
@@ -406,7 +418,7 @@ impl IntcalcJob<'_> {
     ///
     /// The 9400-TRANFILE-CLOSE abend when the generation cannot be cataloged; the catalog
     /// error is logged and the account updates stay committed.
-    fn end_of_file(self) -> ExitStatus {
+    async fn end_of_file(self) -> ExitStatus {
         let summary = self.interest.finish();
         if let Some(unposted) = summary.unposted {
             tracing::info!(
@@ -415,7 +427,7 @@ impl IntcalcJob<'_> {
                 "last account of the category balance file not updated (E-14)"
             );
         }
-        match self.systran.catalog() {
+        match self.systran.catalog_async().await {
             Ok(generation) => {
                 tracing::info!(
                     generation = %generation,

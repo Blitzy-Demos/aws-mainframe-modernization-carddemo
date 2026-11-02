@@ -7,7 +7,7 @@
 //!
 //! | COBOL access | SQL | Savepoint |
 //! |---|---|---|
-//! | `READ` by key | `SELECT` | none: a plain read |
+//! | `READ` by key | `SELECT` | its own |
 //! | `READ ... UPDATE` | `SELECT ... FOR UPDATE` | its own |
 //! | `REWRITE` | `UPDATE` of the eleven non-key columns | its own |
 //! | `READ` by key of each account the `CBSTM03A` cross-references name ([`PgStore::read_accounts`]) | one `SELECT ... WHERE account_id = ANY($1)` | none: a plain read |
@@ -37,8 +37,8 @@ use carddemo_domain::ports::{AccountReader, AccountWriter, PortError, PortResult
 use rust_decimal::Decimal;
 
 use super::{account_group_id, account_id, alnum, expect_affected, keyed_records, money};
+use crate::PersistenceError;
 use crate::tx::{PgStore, savepoint, settle};
-use crate::{PersistenceError, port_error};
 
 /// The table every conversion error names.
 const TABLE: &str = "accounts";
@@ -46,7 +46,7 @@ const TABLE: &str = "accounts";
 /// One `accounts` row in the column types sqlx decodes: the `BIGINT` key,
 /// `VARCHAR` text and `NUMERIC(12,2)` money, every column `NOT NULL`.
 ///
-/// The plain read and the locking read select the same columns into it, and
+/// The read by key and the locking read select the same columns into it, and
 /// [`Account::try_from`] holds each value to its PIC clause. sqlx checks every
 /// query text on its own, so each read spells the column list out.
 struct AccountRow {
@@ -131,9 +131,14 @@ impl AccountReader for PgStore<'_, '_> {
     /// P-COPAUA0C-007, P-COACCT01-012, P-CBTRN02C-009, P-CBACT04C-002,
     /// P-CBSTM03B-005, P-CBSTM03A-1259.
     ///
-    /// A plain read on the transaction itself: no lock and no savepoint.
+    /// No lock is taken. The read runs under its own savepoint, so a failed
+    /// statement leaves the caller's transaction usable: `COACTVWC` and
+    /// `COACTUPC` still read `CUSTDAT` after an `ACCTDAT` failure
+    /// (V-COACTVWC-006, V-COACTUPC-007), and INTCALC still commits the
+    /// account rewrite made before it (P-CBACT04C-010).
     async fn read_account(&mut self, id: AccountId) -> PortResult<Account> {
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             AccountRow,
             r#"SELECT account_id, acct_active_status, acct_curr_bal, acct_credit_limit,
                       acct_cash_credit_limit, acct_open_date, acct_expiraion_date,
@@ -143,10 +148,9 @@ impl AccountReader for PgStore<'_, '_> {
                 WHERE account_id = $1"#,
             id.to_i64()
         )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
-        found(row)
+        .fetch_optional(&mut *sp)
+        .await;
+        found(settle(sp, result).await?)
     }
 
     /// `COACTUPC` `9600-WRITE-PROCESSING` `READ ... UPDATE`
@@ -240,8 +244,8 @@ impl PgStore<'_, '_> {
     /// CBSTM03B 4000-ACCTFILE-PROC — P-CBSTM03B-005 [app/cbl/CBSTM03B.CBL:L206-229]
     /// for CBSTM03A 3000-ACCTFILE-GET — P-CBSTM03A-1259
     /// [app/cbl/CBSTM03A.CBL:L392-414]: the keyed `READ` of `ACCTFILE` for
-    /// each of `ids`, all in one statement. A plain read: no lock and no
-    /// savepoint.
+    /// each of `ids`, all in one statement. No lock is taken; the statement
+    /// runs under its own savepoint, as every store statement does.
     ///
     /// Each entry is what [`AccountReader::read_account`] returns for its ID:
     /// the record; [`PortError::NotFound`] when no account has the ID; or
@@ -261,7 +265,8 @@ impl PgStore<'_, '_> {
         let rows = if keys.is_empty() {
             Vec::new()
         } else {
-            sqlx::query_as!(
+            let mut sp = savepoint(self.tx).await?;
+            let result = sqlx::query_as!(
                 AccountRow,
                 r#"SELECT account_id, acct_active_status, acct_curr_bal, acct_credit_limit,
                           acct_cash_credit_limit, acct_open_date, acct_expiraion_date,
@@ -271,9 +276,9 @@ impl PgStore<'_, '_> {
                     WHERE account_id = ANY($1)"#,
                 keys.as_slice()
             )
-            .fetch_all(&mut **self.tx)
-            .await
-            .map_err(|err| port_error(&err))?
+            .fetch_all(&mut *sp)
+            .await;
+            settle(sp, result).await?
         };
         let binds = ids.into_iter().map(|id| (id, Ok(id.to_i64()))).collect();
         Ok(keyed_records(

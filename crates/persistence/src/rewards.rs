@@ -35,11 +35,11 @@
 //! The caller owns commit and rollback. CT02 (`POST /transactions`) commits
 //! the transaction insert, its accrual and the balance update together, and
 //! rolls all three back on any error; POSTTRAN (`batch posttran`) does the same
-//! for each posted record (AAP 0.3.5). Each write here runs under its own
-//! savepoint through `crate::tx::savepoint` and `crate::tx::settle`, so a
-//! failed accrual insert or balance upsert is undone alone and never leaves the
-//! outer transaction aborted before the caller decides what to do with it. The
-//! candidate-rule read is a plain read and runs on the transaction directly.
+//! for each posted record (AAP 0.3.5). Each statement here, the candidate-rule
+//! read included, runs under its own savepoint through `crate::tx::savepoint`
+//! and `crate::tx::settle`, so a failed read, accrual insert or balance upsert
+//! is undone alone and never leaves the outer transaction aborted before the
+//! caller decides what to do with it.
 //!
 //! # Values
 //!
@@ -73,7 +73,7 @@ use crate::tx::{PgStore, UnitOfWork, savepoint, settle};
 // The row conversions go through the crate's shared column helpers in
 // `crate::repos` rather than copies of them, so a stored reward value is held
 // to its domain type exactly as every repository holds its columns.
-use crate::{PersistenceError, port_error, repos};
+use crate::{PersistenceError, repos};
 
 /// The rule table, as [`PersistenceError::Corrupt`] names it.
 const RULES_TABLE: &str = "reward_rules";
@@ -275,8 +275,8 @@ impl RewardStore for PgRewardStore<'_, '_> {
     /// text, the form the column stores, and the category as its integer
     /// value. A pair without rules is an empty `Vec`.
     ///
-    /// The read changes nothing, so it runs on the transaction itself, with no
-    /// savepoint.
+    /// The read runs under its own savepoint, as every statement of the store
+    /// does.
     ///
     /// # Errors
     ///
@@ -289,7 +289,8 @@ impl RewardStore for PgRewardStore<'_, '_> {
         category_cd: TranCategoryCode,
     ) -> PortResult<Vec<RewardRule>> {
         let type_text = type_cd.trimmed();
-        let rows = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             RewardRuleRow,
             "SELECT rule_id, transaction_type_cd, transaction_category_cd, reward_rate, \
                     min_transaction_amount, max_transaction_amount, active_from, active_to \
@@ -299,9 +300,9 @@ impl RewardStore for PgRewardStore<'_, '_> {
             type_text.as_ref(),
             i32::from(category_cd.get()),
         )
-        .fetch_all(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_all(&mut *sp)
+        .await;
+        let rows = settle(sp, result).await?;
         rows.into_iter()
             .map(|row| RewardRule::try_from(row).map_err(PortError::from))
             .collect()

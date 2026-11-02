@@ -18,7 +18,9 @@
 //! three files under `CARDDEMO_STATEMENT_DIR`
 //! (`Settings::statement_dir`, default `./var/statements/`): `STATEMNT.PS` with the 80-byte
 //! `STMTFILE` records, `STATEMNT.HTML` with the 100-byte `HTMLFILE` records, each record followed
-//! by `LF`, and `STATEMNT.PS.PDF` with one text line per `STMTFILE` record.
+//! by `LF`, and `STATEMNT.PS.PDF` with one text line per `STMTFILE` record. The deletion of the
+//! previous files, the record encoding, the PDF rendering and the writes run on Tokio's blocking
+//! pool ([`blocking`]), inside the job span; only the database reads run on the job's task.
 //!
 //! # Exit
 //!
@@ -70,7 +72,7 @@ use tracing::Span;
 
 use super::{JobContext, setup_failure};
 use crate::exit::ExitStatus;
-use crate::generations::{LockFile, encode_fixed_lines, write_replacing};
+use crate::generations::{LockFile, blocking, encode_fixed_lines, write_replacing};
 use crate::pdf::render_statement;
 
 /// `STMTFILE` `DSN=AWS.M2.CARDDEMO.STATEMNT.PS` [app/jcl/CREASTMT.JCL:L87-91].
@@ -156,30 +158,72 @@ pub(super) async fn run(ctx: &JobContext, db: &Db) -> ExitStatus {
 /// The steps of [`run`]; the first failing one ends the job with its status.
 ///
 /// The statement lock is taken first, before `STEP010` and so before CREASTMT STEP030 —
-/// P-CREASTMT-004 deletes anything. The guard `_lock` holds it through `STEP010`, `STEP030`,
-/// CREASTMT STEP040 — P-CREASTMT-005, the rollback, [`prepare`], [`write_files`] and its
-/// [`discard_written`] cleanup, and releases it when the function returns on any path. A lock
-/// that cannot be taken ends the job before any statement file is deleted or written.
+/// P-CREASTMT-004 deletes anything. It is held through `STEP010`, `STEP030`, CREASTMT STEP040 —
+/// P-CREASTMT-005, the rollback, [`prepare`], [`write_files`] and its [`discard_written`]
+/// cleanup, and released when [`write_statement_files`] has returned, on any path. A lock that
+/// cannot be taken ends the job before any statement file is deleted or written.
+///
+/// Taking and releasing the lock, `STEP030` and the preparation and writing of the statement
+/// files run on Tokio's blocking pool, inside the job span. A runtime that shuts down before one
+/// of them starts ends the job with a setup failure (exit 16), with nothing of that phase
+/// deleted or written; a lock whose release cannot run on the pool is released where the
+/// runtime drops it.
 async fn create_statement_files(ctx: &JobContext, db: &Db) -> Result<(), ExitStatus> {
-    let _lock = lock_statement_dir(&ctx.settings.statement_dir)?;
+    let dir = ctx.settings.statement_dir.clone();
+    let lock = blocking(move || lock_statement_dir(&dir))
+        .await
+        .unwrap_or_else(|cancelled| {
+            Err(setup_failure(
+                "statement lock acquisition did not complete",
+                cancelled,
+            ))
+        })?;
+    let written = write_statement_files(ctx, db).await;
+    release_statement_lock(lock).await;
+    written
+}
+
+/// The steps of [`create_statement_files`] that run while it holds the statement lock: `STEP010`,
+/// `STEP030`, `STEP040`, the rollback, [`prepare`] and [`write_files`].
+///
+/// `STEP030` and the preparation and writing of the statement files run on Tokio's blocking
+/// pool, inside the job span.
+async fn write_statement_files(ctx: &JobContext, db: &Db) -> Result<(), ExitStatus> {
     let files = StatementFiles::under(&ctx.settings.statement_dir);
     let mut uow = db
         .begin()
         .await
         .map_err(|err| setup_failure("statement read unit of work could not begin", err))?;
     let transactions = step010_sort(&mut uow).await?;
-    step030_delete(&files)?;
+    let previous = files.clone();
+    blocking(move || step030_delete(&previous))
+        .await
+        .unwrap_or_else(|cancelled| {
+            Err(setup_failure(
+                "STEP030 statement file delete did not complete",
+                cancelled,
+            ))
+        })?;
     let (output, cards) = step040_cbstm03a(&mut uow, transactions).await?;
     uow.rollback()
         .await
         .map_err(|err| setup_failure("statement read unit of work could not end", err))?;
-    let prepared = prepare(&output)?;
-    write_files(&files, &prepared)?;
-    Span::current().record("written", output.stmt_lines.len());
+    let stmt_records = output.stmt_lines.len();
+    let html_records = output.html_lines.len();
+    let targets = files.clone();
+    blocking(move || prepare(&output).and_then(|prepared| write_files(&targets, &prepared)))
+        .await
+        .unwrap_or_else(|cancelled| {
+            Err(setup_failure(
+                "statement file preparation and write did not complete",
+                cancelled,
+            ))
+        })?;
+    Span::current().record("written", stmt_records);
     tracing::info!(
         cards,
-        stmt_records = output.stmt_lines.len(),
-        html_records = output.html_lines.len(),
+        stmt_records,
+        html_records,
         stmt_file = %files.stmt.display(),
         html_file = %files.html.display(),
         pdf_file = %files.pdf.display(),
@@ -487,6 +531,19 @@ fn lock_statement_dir(dir: &Path) -> Result<LockFile, ExitStatus> {
     })?;
     LockFile::acquire(dir.join(LOCK_FILE), "statement lock")
         .map_err(|err| setup_failure("statement lock not acquired", err))
+}
+
+/// Releases the statement lock `lock` on Tokio's blocking pool, inside the job span (see
+/// [`blocking`]), by dropping it there, which deletes the lock file. When the runtime cancels
+/// the release because it is shutting down, a warning is logged; the runtime still drops the
+/// lock, with the same effect.
+async fn release_statement_lock(lock: LockFile) {
+    if let Err(cancelled) = blocking(move || drop(lock)).await {
+        tracing::warn!(
+            error = %cancelled,
+            "statement lock release cancelled by runtime shutdown"
+        );
+    }
 }
 
 /// Deletes the file `path` and returns whether it existed: the `DISP=(MOD,DELETE,DELETE)`

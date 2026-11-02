@@ -169,6 +169,12 @@ const DECLINED_UPDATE: Unproven = Unproven {
     escalation_id: "E-41",
 };
 
+/// The decision for a card the cross-reference lacks, which tests a flag no
+/// statement set on the first message of a task (E-41).
+const UNKNOWN_CARD_DECISION: Unproven = Unproven {
+    escalation_id: "E-41",
+};
+
 /// A numeric request field holding non-digits, moved into the detail (E-47).
 const NON_DIGITS: Unproven = Unproven {
     escalation_id: "E-47",
@@ -1023,7 +1029,8 @@ async fn read_summary<S: AuthorizationStore>(
 /// COBOL tests the flag's starting byte: every byte but `Y` takes this decline,
 /// which audit row P-COPAUA0C-026 records as the E-41 proposal; `Y` would read
 /// summary storage no read filled. E-41 stays at `halt` until the user
-/// confirms the decline.
+/// confirms the decline, so [`decidable`] reports the case and no reply is
+/// sent for it.
 ///
 /// The context must hold no critical record ([`AuthContext::critical_entry`]):
 /// the COBOL task ends before this paragraph.
@@ -1062,6 +1069,34 @@ pub fn decide(amount: Money<10>, context: &AuthContext) -> AuthDecision {
         resp_code: Alnum::from_array(RESP_DECLINED),
         reason: Alnum::from_array(reason),
         approved_amount: Money::ZERO,
+    }
+}
+
+/// COPAUA0C 6000-MAKE-DECISION — P-COPAUA0C-026, P-COPAUA0C-028: whether the
+/// audit pins the decision of a request whose reads found `context`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L664-683].
+///
+/// A card the cross-reference holds is decided by [`decide`]. A card it lacks
+/// is not: `5100` leaves `CARD-NFOUND-XREF` set and skips `5500`, the only
+/// paragraph that sets `WS-PAUT-SMRY-SEG-FLG`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L441-457]
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L616-640], and the flag
+/// has no `VALUE` [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L134-136].
+/// The first message of a task therefore branches on storage no statement set
+/// and no runtime setting in the repository initializes, so neither the reply
+/// nor the decline reason is pinned.
+///
+/// # Errors
+///
+/// [`Unproven`] `E-41` (halt) for a card the cross-reference lacks: the
+/// consumer sends no reply for it and writes nothing. The `3100` decline
+/// [`decide`] gives such a card is the escalation's proposal, for the user to
+/// confirm.
+pub fn decidable(context: &AuthContext) -> Result<(), Unproven> {
+    if matches!(context.xref, Lookup::NotFound) {
+        Err(UNKNOWN_CARD_DECISION)
+    } else {
+        Ok(())
     }
 }
 
@@ -1286,8 +1321,8 @@ mod tests {
 
     use super::{
         AuthContext, AuthDecision, AuthRequest, ERR_APPLICATION, ERR_PROGRAM, ErrorLevel,
-        ErrorLogEntry, ErrorSource, Lookup, REQUEST_BUFFER_LEN, SummaryWrite, WriteStep, decide,
-        gather, oversize_request_entry, parse_amount, parse_request, reply_body,
+        ErrorLogEntry, ErrorSource, Lookup, REQUEST_BUFFER_LEN, SummaryWrite, WriteStep, decidable,
+        decide, gather, oversize_request_entry, parse_amount, parse_request, reply_body,
         reply_failure_entry, request_read_failure_entry, write_failure_entry, write_plan,
         xref_read_failure_entry,
     };
@@ -1689,6 +1724,24 @@ mod tests {
             write_plan(&request, amount, &context, &decision, at(PINNED)),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn the_unknown_card_decision_is_held_at_e41_and_a_found_card_is_decided() {
+        // P-COPAUA0C-028 (E-41 halt), P-COPAUA0C-026: the decision of a card the
+        // cross-reference lacks reads a flag no statement set; a found card's
+        // decision is pinned (P-COPAUA0C-021).
+        let mut unknown = fixture_store();
+        let body = request_text(UNKNOWN_CARD, "100.00", "TXN000000000002");
+        let (_, _, context, _) = authorize(&mut unknown, &body);
+        assert_eq!(
+            decidable(&context).map_err(|unproven| unproven.escalation_id),
+            Err("E-41")
+        );
+        let mut found = fixture_store();
+        let body = request_text(FIXTURE_CARD, "100.00", "TXN000000000001");
+        let (_, _, context, _) = authorize(&mut found, &body);
+        assert_eq!(decidable(&context), Ok(()));
     }
 
     #[test]

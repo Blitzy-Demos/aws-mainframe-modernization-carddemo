@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tr_type, tr_description\n                     FROM transaction_types\n                    WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')\n                    ORDER BY tr_type COLLATE \"C\"\n                    LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tr_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tr_description",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "8d1207833efabc6789b35a79892bf1b25c37d783770ba997c1e55d34ba2b0832"
+}

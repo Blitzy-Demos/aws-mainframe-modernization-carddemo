@@ -25,11 +25,13 @@
 //! # Writes
 //!
 //! Every `CardDemo` VSAM file is `RECOVERY(NONE)` [app/csd/CARDDEMO.CSD:L1-96]:
-//! a completed write survives a later failure in the same task. Each legacy
-//! write and each locking read (`SELECT ... FOR UPDATE`) therefore runs under its
-//! own savepoint through `crate::tx::savepoint` and `crate::tx::settle`, the one
-//! shared unit-of-work component; no file here opens, releases or rolls back a
-//! savepoint itself. Plain reads run on the transaction directly.
+//! a completed write survives a later failure in the same task. Every
+//! statement a method issues, legacy write, locking read (`SELECT ... FOR
+//! UPDATE`) or read alike, therefore runs under its own savepoint through
+//! `crate::tx::savepoint` and `crate::tx::settle`, the one shared unit-of-work
+//! component, so no failed statement leaves the transaction aborted and undoes
+//! the writes before it at commit; no file here opens, releases or rolls back
+//! a savepoint itself.
 //!
 //! # Transaction reads
 //!

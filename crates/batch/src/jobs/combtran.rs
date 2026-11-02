@@ -11,6 +11,10 @@
 //! ends with the condition code of the `REPRO`: [`ExitStatus::ReproCondition`], which carries
 //! no other meaning (an 8 here is never a reward halt).
 //!
+//! `STEP05R` runs whole on Tokio's blocking pool, inside the job span, and `STEP10` reads the
+//! combined file there before its load. A blocking task the runtime cancels while shutting down
+//! is a setup failure.
+//!
 //! # The load (E-09)
 //!
 //! The live master is the set of rows the view `transaction_master` holds. `REPRO` without
@@ -51,7 +55,9 @@ use tracing::Span;
 
 use super::{JobContext, setup_failure};
 use crate::exit::ExitStatus;
-use crate::generations::{Dataset, Generation, read_records};
+use crate::generations::{
+    Dataset, Generation, Generations, blocking, read_records, read_records_async,
+};
 
 /// The default `ERRORLIMIT` of `REPRO`: the number of failed records at which it stops
 /// (P-COMBTRAN-003). The COMBTRAN `REPRO` names no `ERRORLIMIT` [app/jcl/COMBTRAN.jcl:L48].
@@ -68,9 +74,14 @@ const ERROR_LIMIT_CONDITION: u8 = 12;
 /// The `halt` escalation for SORT input whose equal keys have no defined order.
 const EQUAL_KEY_ESCALATION: &str = "E-38";
 
-/// COMBTRAN: `STEP05R`, then `STEP10` on the generation it cataloged.
+/// COMBTRAN: `STEP05R` on the blocking pool, then `STEP10` on the generation it cataloged.
 pub(super) async fn run(ctx: &JobContext, db: &Db) -> ExitStatus {
-    match sort_step(ctx) {
+    let generations = ctx.generations.clone();
+    let sorted = match blocking(move || sort_step(&generations)).await {
+        Ok(sorted) => sorted,
+        Err(cancelled) => return setup_failure("STEP05R SORT did not complete", cancelled),
+    };
+    match sorted {
         Ok(combined) => repro_step(db, &combined).await,
         Err(status) => status,
     }
@@ -90,6 +101,8 @@ struct SortIn {
 /// records as read, FILLER included (`DCB=(*.SORTIN)`), each followed by `LF`. Records the
 /// number of SORTIN records in `read` and of combined records in `written` on the job span.
 ///
+/// Synchronous throughout: `run` calls it on the blocking pool, where the job span is current.
+///
 /// # Errors
 ///
 /// - A setup failure (exit 16) when a `(0)` generation is not cataloged or cannot be read, or
@@ -97,9 +110,9 @@ struct SortIn {
 ///   condition code for these, and a missing input is a JCL error that runs no step at all.
 /// - An equivalence halt (exit 16, E-38) when two different records share a TRAN-ID. Nothing is
 ///   allocated or written.
-fn sort_step(ctx: &JobContext) -> Result<Generation, ExitStatus> {
-    let backup = read_sortin(ctx, Dataset::TransactBkup)?;
-    let systran = read_sortin(ctx, Dataset::SysTran)?;
+fn sort_step(generations: &Generations) -> Result<Generation, ExitStatus> {
+    let backup = read_sortin(generations, Dataset::TransactBkup)?;
+    let systran = read_sortin(generations, Dataset::SysTran)?;
     let backup_records = backup.records.len();
     let mut records = backup.records;
     records.extend(systran.records);
@@ -119,8 +132,7 @@ fn sort_step(ctx: &JobContext) -> Result<Generation, ExitStatus> {
         );
         ExitStatus::equivalence_halt(&halt, EQUAL_KEY_ESCALATION)
     })?;
-    let mut pending = ctx
-        .generations
+    let mut pending = generations
         .begin_next(Dataset::TransactCombined)
         .map_err(|err| setup_failure("TRANSACT.COMBINED(+1) allocation failed", err))?;
     pending
@@ -147,9 +159,8 @@ fn sort_step(ctx: &JobContext) -> Result<Generation, ExitStatus> {
 ///
 /// A setup failure (exit 16) when no generation is cataloged or its file cannot be read or
 /// decoded.
-fn read_sortin(ctx: &JobContext, dataset: Dataset) -> Result<SortIn, ExitStatus> {
-    let generation = ctx
-        .generations
+fn read_sortin(generations: &Generations, dataset: Dataset) -> Result<SortIn, ExitStatus> {
+    let generation = generations
         .require_current(dataset)
         .map_err(|err| setup_failure("SORTIN generation not cataloged", err))?;
     let records = read_records::<TransactionLayout>(&generation.path)
@@ -247,10 +258,10 @@ impl fmt::Display for EqualKeyHalt<'_> {
 /// P-COMBTRAN-002, P-COMBTRAN-003, P-COMBTRAN-005 to P-COMBTRAN-008.
 ///
 /// Reads `TRANSACT.COMBINED(+1)`, the `TRANSACT` DD of the step, from the file `STEP05R`
-/// cataloged, loads its records into the live master in file order by [`load_records`] inside
-/// one unit of work, and commits. Once the load is committed, [`finish`] records the loaded
-/// records in `posted` and the duplicate records in `rejected` on the job span, and the step
-/// ends with the `REPRO` condition code:
+/// cataloged, on the blocking pool, loads its records into the live master in file order by
+/// [`load_records`] inside one unit of work, and commits. Once the load is committed, [`finish`]
+/// records the loaded records in `posted` and the duplicate records in `rejected` on the job
+/// span, and the step ends with the `REPRO` condition code:
 ///
 /// - 0 when every record loaded, an empty file included (P-COMBTRAN-002, P-COMBTRAN-005);
 /// - 8 after one to three duplicate records (P-COMBTRAN-003, P-COMBTRAN-008);
@@ -264,7 +275,7 @@ impl fmt::Display for EqualKeyHalt<'_> {
 /// records `posted` 0 and in `rejected` the duplicate records met before the failure.
 async fn repro_step(db: &Db, combined: &Generation) -> ExitStatus {
     let mut tally = ReproTally::default();
-    let records = match read_records::<TransactionLayout>(&combined.path) {
+    let records = match read_records_async::<TransactionLayout>(combined.path.clone()).await {
         Ok(records) => records,
         Err(err) => {
             return not_committed(
@@ -567,7 +578,7 @@ mod tests {
     }
 
     fn sorted(dir: &BatchDir) -> Generation {
-        sort_step(&dir.context()).unwrap_or_else(|status| panic!("{status:?}"))
+        sort_step(&dir.context().generations).unwrap_or_else(|status| panic!("{status:?}"))
     }
 
     fn read(generation: &Generation) -> String {
@@ -668,7 +679,7 @@ mod tests {
         let interest = record("0000000000000009", "INTEREST 9");
         dir.write("TRANSACT.BKUP.G0002V00", &[&first, &backed_up]);
         dir.write("SYSTRAN.G0004V00", &[&interest]);
-        let status = sort_step(&dir.context()).err();
+        let status = sort_step(&dir.context().generations).err();
         let expected = ExitStatus::EquivalenceHalt {
             lines: vec![
                 "TRANSACT.COMBINED(+1) not written: TRAN-ID 0000000000000009 keys two different \
@@ -693,7 +704,7 @@ mod tests {
             &[&record("0000000000000001", "BACKUP")],
         );
         assert_eq!(
-            sort_step(&dir.context()).err(),
+            sort_step(&dir.context().generations).err(),
             Some(ExitStatus::SetupFailure(
                 "SYSTRAN(0): no generation is cataloged".to_owned()
             ))

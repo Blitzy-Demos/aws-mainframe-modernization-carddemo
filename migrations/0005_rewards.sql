@@ -177,7 +177,15 @@ CREATE TABLE reward_accruals (
     CONSTRAINT reward_accruals_transaction_id_key UNIQUE (transaction_id)
 );
 
--- Serves the reward history of one account (GET /rewards/history/{account_id}), which
--- filters on account_id; created_at orders an account's accruals in time.
+-- The index the rewards specification (AAP 0.3.5) names for the reward history of one
+-- account (GET /rewards/history/{account_id}): account_id filters, created_at orders an
+-- account's accruals in time. The history page reads the index below, which adds the
+-- tie-breaker.
 CREATE INDEX reward_accruals_account_created_idx
     ON reward_accruals (account_id, created_at);
+
+-- The reward history orders newest first by (created_at, accrual_id) and pages by that
+-- pair; the accrual_id tie-breaker lets one backward index scan supply both the order and
+-- the cursor seek within an equal-timestamp tie group.
+CREATE INDEX reward_accruals_account_created_accrual_idx
+    ON reward_accruals (account_id, created_at, accrual_id);

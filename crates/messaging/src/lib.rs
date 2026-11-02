@@ -70,6 +70,7 @@
 
 pub mod connection;
 pub mod consumer;
+mod db_deadline;
 pub mod error_queue;
 pub mod ids;
 
@@ -96,6 +97,8 @@ use crate::consumer::Flow;
 use crate::flows::cdra::CdraFlow;
 use crate::flows::cdrd::CdrdFlow;
 use crate::flows::cp00::Cp00Flow;
+
+pub use crate::db_deadline::STATEMENT_TIMEOUT;
 
 /// Every way starting or running the consumers can fail. It is the only error
 /// type of the crate.
@@ -317,7 +320,7 @@ pub async fn start(
             &mut tasks,
             date_channel,
             settings.queue_date_request.clone(),
-            CdrdFlow::new(clock),
+            CdrdFlow::new(clock, settings.queue_date_request.clone()),
         ),
         spawn_consumer(
             &mut tasks,

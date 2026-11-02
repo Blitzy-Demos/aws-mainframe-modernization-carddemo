@@ -23,8 +23,8 @@ use carddemo_domain::ports::{DisclosureGroupReader, PortError, PortResult};
 use rust_decimal::Decimal;
 
 use super::{account_group_id, interest_rate, tran_category_code, tran_type_code};
-use crate::tx::PgStore;
-use crate::{PersistenceError, port_error};
+use crate::PersistenceError;
+use crate::tx::{PgStore, savepoint, settle};
 
 /// The table every `Corrupt` error of this module names.
 const TABLE: &str = "disclosure_groups";
@@ -84,6 +84,10 @@ impl DisclosureGroupReader for PgStore<'_, '_> {
     /// calls this method again with `DisclosureGroupKey::default_group`, the
     /// second `READ` of 1200-A [app/cbl/CBACT04C.cbl:L436-438]
     /// [app/cbl/CBACT04C.cbl:L443-444].
+    ///
+    /// The read runs under its own savepoint: INTCALC reads the rate of an
+    /// account after rewriting the previous one, and a failed read must leave
+    /// that rewrite committable (P-CBACT04C-010).
     async fn read_disclosure_group(
         &mut self,
         key: DisclosureGroupKey,
@@ -91,7 +95,8 @@ impl DisclosureGroupReader for PgStore<'_, '_> {
         let group = key.dis_acct_group_id.trimmed();
         let tran_type = key.dis_tran_type_cd.trimmed();
         let category = i32::from(key.dis_tran_cat_cd.get());
-        let row = sqlx::query_as!(
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
             DisclosureGroupRow,
             "SELECT dis_acct_group_id AS acct_group_id, dis_tran_type_cd AS tran_type_cd, \
              dis_tran_cat_cd AS tran_cat_cd, dis_int_rate AS int_rate \
@@ -101,9 +106,9 @@ impl DisclosureGroupReader for PgStore<'_, '_> {
             &*tran_type,
             category,
         )
-        .fetch_one(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?;
+        .fetch_one(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?;
         DisclosureGroup::try_from(row).map_err(PortError::from)
     }
 }

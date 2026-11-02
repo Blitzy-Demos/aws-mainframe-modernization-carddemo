@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT card_number AS num, card_acct_id AS acct_id,\n                            card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,\n                            card_expiraion_date AS expiraion_date,\n                            card_active_status AS active_status\n                       FROM cards\n                      WHERE ($1::text IS NULL OR card_number <= $1)\n                        AND ($2::bigint IS NULL OR card_acct_id = $2)\n                        AND ($3::text IS NULL OR card_number = $3)\n                      ORDER BY card_number DESC\n                      LIMIT $4",
+  "query": "SELECT card_number AS num, card_acct_id AS acct_id,\n                        card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,\n                        card_expiraion_date AS expiraion_date,\n                        card_active_status AS active_status\n                   FROM cards\n                  WHERE card_number = $1\n                    AND ($2::text IS NULL OR card_number >= $2)\n                    AND ($3::bigint IS NULL OR card_acct_id = $3)\n                  ORDER BY card_number ASC\n                  LIMIT $4",
   "describe": {
     "columns": [
       {
@@ -37,8 +37,8 @@
     "parameters": {
       "Left": [
         "Text",
-        "Int8",
         "Text",
+        "Int8",
         "Int8"
       ]
     },
@@ -51,5 +51,5 @@
       false
     ]
   },
-  "hash": "c8cb40dbc6e70dd57778666d00dd71f8281a0ee0bb30667af1d4aa5d0ff4f9b3"
+  "hash": "09c44386249c5d829538dfec2d77a430fe4b5245ffc7942dcb54a21719a59793"
 }
