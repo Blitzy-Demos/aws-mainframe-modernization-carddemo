@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO trancatg_file (tran_type_cd, tran_cat_cd, tran_cat_type_desc)\n               VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int4",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "00d95571baeaeece565769ca2681add7b6c2f85a936702eee4c8798af8f08712"
+}

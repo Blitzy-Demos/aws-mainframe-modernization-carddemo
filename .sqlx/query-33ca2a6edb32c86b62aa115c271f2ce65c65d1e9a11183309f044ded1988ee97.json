@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO trancatg_file (tran_type_cd, tran_cat_cd, tran_cat_type_desc)\n           SELECT trc_type_code, trc_type_category::integer, rtrim(trc_cat_data)\n             FROM transaction_categories\n            ORDER BY trc_type_code COLLATE \"C\", trc_type_category COLLATE \"C\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "33ca2a6edb32c86b62aa115c271f2ce65c65d1e9a11183309f044ded1988ee97"
+}

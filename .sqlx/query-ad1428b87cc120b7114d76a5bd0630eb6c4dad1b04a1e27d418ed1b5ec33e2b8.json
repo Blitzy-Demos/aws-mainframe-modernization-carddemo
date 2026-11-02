@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM disclosure_groups",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "ad1428b87cc120b7114d76a5bd0630eb6c4dad1b04a1e27d418ed1b5ec33e2b8"
+}

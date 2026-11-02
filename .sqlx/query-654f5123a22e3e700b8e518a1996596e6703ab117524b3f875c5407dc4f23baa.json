@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT setval(pg_get_serial_sequence('reward_accruals', 'accrual_id'), 1, false)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "setval",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "654f5123a22e3e700b8e518a1996596e6703ab117524b3f875c5407dc4f23baa"
+}

@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT NOT EXISTS (SELECT 1 FROM transaction_types)\n              AND NOT EXISTS (SELECT 1 FROM transaction_categories) AS \"empty!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "empty!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f7727f56a06f5ca868000cef645a70c96be393e43f221a90bd0aeee62dc3f23d"
+}

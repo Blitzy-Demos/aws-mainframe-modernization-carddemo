@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO accounts (\n                   account_id, acct_active_status, acct_curr_bal, acct_credit_limit,\n                   acct_cash_credit_limit, acct_open_date, acct_expiraion_date,\n                   acct_reissue_date, acct_curr_cyc_credit, acct_curr_cyc_debit,\n                   acct_addr_zip, acct_group_id)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Numeric",
+        "Numeric",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e8e4ef9a64eb960336544e85ce2a4bcedb5ddd3d66cc9b6ed6ac450128045e0e"
+}

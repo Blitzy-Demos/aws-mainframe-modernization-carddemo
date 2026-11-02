@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO reward_rules (\n                   rule_id, transaction_type_cd, transaction_category_cd, reward_rate,\n                   min_transaction_amount, max_transaction_amount, active_from, active_to)\n               OVERRIDING SYSTEM VALUE\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Int4",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3c99d9ff760a906f916563a576b9b3d2b6ba20ae3acc6ab8ec0091ff30c3dac6"
+}

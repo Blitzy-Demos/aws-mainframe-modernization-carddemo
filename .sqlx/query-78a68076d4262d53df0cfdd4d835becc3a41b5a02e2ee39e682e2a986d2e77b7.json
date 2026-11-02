@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO transaction_category_balances (\n                   trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal)\n               VALUES ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Int4",
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "78a68076d4262d53df0cfdd4d835becc3a41b5a02e2ee39e682e2a986d2e77b7"
+}

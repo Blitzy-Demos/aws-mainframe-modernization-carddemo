@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM reward_accruals",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "8e238b836eca2f205d295b3776cbc180e981ef1c48e39591e0a270fea3406d67"
+}
