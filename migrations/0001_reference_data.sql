@@ -83,6 +83,18 @@ CREATE TABLE transaction_types (
     CONSTRAINT xtran_type PRIMARY KEY (tr_type)
 );
 
+-- COTRTLIC browses the types through the cursors C-TR-TYPE-FORWARD (TR_TYPE >= the start
+-- key, ORDER BY TR_TYPE) and C-TR-TYPE-BACKWARD (TR_TYPE < the start key, ORDER BY TR_TYPE
+-- DESC) [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L338-367]. TR_TYPE is CHAR(2), so
+-- that order is the byte order of the code padded with spaces to its 2 bytes. The primary
+-- key on the right-trimmed column cannot supply it: it puts 'A' before 'A' || chr(1), where
+-- the padded bytes put the control character, below the space, first. browse_tran_types
+-- (crates/persistence/src/repos/tran_types.rs) therefore compares and orders by
+-- rpad(tr_type, 2) COLLATE "C". This expression index supplies that order and the start-key
+-- bound; the primary key still serves the keyed reads, updates and deletes and the equality
+-- of the type filter.
+CREATE INDEX transaction_types_padded_tr_type ON transaction_types ((rpad(tr_type, 2)) COLLATE "C");
+
 -- The primary key index replaces the Db2 unique index X_TRAN_TYPE_CATG (TRC_TYPE_CODE ASC,
 -- TRC_TYPE_CATEGORY ASC). As in Db2, a category whose type is missing cannot be inserted
 -- (Db2 SQLCODE -530) and a type that still has categories cannot be deleted (Db2 SQLCODE

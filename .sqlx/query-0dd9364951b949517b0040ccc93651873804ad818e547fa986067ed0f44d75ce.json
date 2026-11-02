@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tr_type, tr_description\n                     FROM transaction_types\n                    WHERE tr_type = $1::text\n                      AND ($2::text IS NULL OR rpad(tr_type, 2) COLLATE \"C\" >= rpad($2::text, 2))\n                      AND ($3::text IS NULL OR tr_description LIKE $3::text ESCAPE '')\n                    ORDER BY rpad(tr_type, 2) COLLATE \"C\"\n                    LIMIT $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tr_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tr_description",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "0dd9364951b949517b0040ccc93651873804ad818e547fa986067ed0f44d75ce"
+}

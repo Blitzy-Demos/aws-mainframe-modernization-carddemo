@@ -742,7 +742,7 @@ fn foreign_keys_and_delete_rules() {
 
 /// The indexes that replace the keys and alternate indexes of the COBOL
 /// files and tables, checked on their key lists, uniqueness and predicates.
-const EXPECTED_INDEXES: [ExpectedIndex; 17] = [
+const EXPECTED_INDEXES: [ExpectedIndex; 18] = [
     ExpectedIndex {
         table: "transaction_types",
         name: "xtran_type",
@@ -751,6 +751,16 @@ const EXPECTED_INDEXES: [ExpectedIndex; 17] = [
         primary: true,
         predicate: None,
         replaces: "PRIMARY KEY(TR_TYPE), index XTRAN_TYPE (TRNTYPE.ddl:L4)",
+    },
+    ExpectedIndex {
+        table: "transaction_types",
+        name: "transaction_types_padded_tr_type",
+        keys: "(rpad((tr_type)::text, 2))",
+        unique: false,
+        primary: false,
+        predicate: None,
+        replaces: "the ORDER BY TR_TYPE of the COTRTLIC cursors C-TR-TYPE-FORWARD and \
+                   C-TR-TYPE-BACKWARD, TR_TYPE CHAR(2) padded to 2 (COTRTLIC.cbl:L338-367)",
     },
     ExpectedIndex {
         table: "transaction_categories",
@@ -779,9 +789,10 @@ const EXPECTED_INDEXES: [ExpectedIndex; 17] = [
         predicate: None,
         replaces: "CXACAIX, AIX KEYS(11,25) NONUNIQUEKEY (XREFFILE.jcl:L72-75)",
     },
-    // The definitions of the two padded-key indexes print no COLLATE: "C" is the collation
-    // each rpad expression takes from its column, and pg_indexes prints only a differing
-    // one, so these key lists also pin the byte order.
+    // The definitions of the three padded-key indexes (transaction_types_padded_tr_type
+    // above, users_padded_user_id and transaction_category_balances_padded_key) print no
+    // COLLATE: "C" is the collation each rpad expression takes from its column, and
+    // pg_indexes prints only a differing one, so these key lists also pin the byte order.
     ExpectedIndex {
         table: "users",
         name: "users_padded_user_id",

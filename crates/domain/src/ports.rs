@@ -694,9 +694,14 @@ pub trait TranTypeMasterStore {
     ///   P-COTRTLIC-033). The bound is strict, unlike the [`Browse`] default:
     ///   the cursor excludes the start key itself.
     ///
-    /// `None` as the start key reads from the first type forward or from the
-    /// last type backward. The blank key `COTRTLIC` holds after a filter change
-    /// is `Some` key of spaces, which a backward read answers with no rows.
+    /// `TR_TYPE` is `CHAR(2)`, so keys compare and sort as their two
+    /// space-padded bytes, the `Ord` of [`TranTypeCode`]: `A\x01` comes before
+    /// `A `. `None` as the start key reads from the first type forward or from
+    /// the last type backward. The blank key `COTRTLIC` holds after a filter
+    /// change is `Some` key of spaces, which a backward read answers with only
+    /// the codes that sort below two spaces, those that begin with a byte
+    /// below the space or with a space and then such a byte: no rows when no
+    /// code holds one.
     ///
     /// # Errors
     ///

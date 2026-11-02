@@ -171,7 +171,10 @@ impl UserStore for PgStore<'_, '_> {
     /// out [app/cbl/COUSR00C.cbl:L592]), then up to `limit` `READNEXT`s
     /// ascending or `READPREV`s descending, the start key included. A `None`
     /// start is `LOW-VALUES` forward and `HIGH-VALUES` backward: no bound. A
-    /// start past the last key is the `STARTBR` `NOTFND`, an empty page.
+    /// forward start past the last key is the `STARTBR` `NOTFND`, an empty
+    /// page. A backward start is an upper bound: the keys at or below it,
+    /// descending, so a start past the last key reads the last users, highest
+    /// first, up to `limit`.
     async fn browse_users(&mut self, browse: Browse<UserId>) -> PortResult<Vec<UserSecurity>> {
         let start = browse
             .start_key

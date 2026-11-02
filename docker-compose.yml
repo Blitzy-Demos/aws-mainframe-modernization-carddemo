@@ -10,6 +10,16 @@
 #   docker compose --profile app up -d
 #   docker compose --profile app run --rm api cargo run --bin batch -- <subcommand>
 #
+# Teardown, for both modes: with the app profile named, Compose acts on the
+# app-profile services and their volumes as well as on the infrastructure. A
+# plain `docker compose down -v` leaves the cargo-target, cargo-registry and
+# web-node-modules volumes behind.
+# Remove every container and keep the data and build volumes:
+#   docker compose --profile app down
+# Also remove every named volume (postgres-data, rabbitmq-data, cargo-target,
+# cargo-registry, web-node-modules):
+#   docker compose --profile app down -v
+#
 # crates/testkit/tests/compose_tags.rs reads this file line by line, without a
 # YAML library, and compares it with the testcontainers stack. Keep every value
 # it reads a literal on one line: block style, `image: name:tag`, environment in
@@ -38,12 +48,20 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13.7-management
+    # RabbitMQ names its node rabbit@<hostname> and keeps that node's data
+    # under /var/lib/rabbitmq. The fixed hostname and the rabbitmq-data volume,
+    # which replaces the anonymous volume the image declares, keep the messages
+    # on the durable queues through restarts, recreation and `down` without -v,
+    # as postgres-data keeps the database. definitions.json is still imported
+    # at every boot.
+    hostname: rabbitmq
     # No RABBITMQ_DEFAULT_USER/PASS: rabbitmq.conf imports definitions.json at
     # boot, which declares user carddemo, vhost / and the six durable queues,
     # and suppresses the default guest user.
     volumes:
       - ./infra/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
       - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - rabbitmq-data:/var/lib/rabbitmq
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
@@ -56,11 +74,21 @@ services:
   api:
     image: rust:1.88.0-bookworm
     profiles: ["app"]
-    # cargo run execs the binary, which then runs as PID 1. The kernel drops
-    # SIGTERM for a PID 1 without a handler, and the binary installs none, so
-    # an init process forwards the signal and `docker compose stop` ends the
-    # server at once rather than killing it after the grace period.
+    # The server installs SIGINT and SIGTERM handlers before it logs
+    # `api listening`. On `docker compose stop` it stops accepting
+    # connections, answers the requests in flight, closes the database pool
+    # and exits 0. init stays because cargo run compiles first and only then
+    # execs the binary. The kernel drops SIGTERM for a PID 1 without a
+    # handler, so the init process runs as PID 1 and forwards the stop signal
+    # to cargo while it is still building: a stop during a build ends cargo
+    # at once instead of killing it after the grace period.
     init: true
+    # Restarted after a non-zero exit, which the server makes only when start-up
+    # or serving fails. `docker compose run` clears the policy, so a batch
+    # command (`run --rm api cargo run --bin batch -- posttran`) still exits
+    # once with its own status, 4 when records are rejected, and is never run
+    # again.
+    restart: on-failure
     working_dir: /workspace
     command: cargo run -p carddemo-api --bin api
     environment:
@@ -93,8 +121,17 @@ services:
   mq:
     image: rust:1.88.0-bookworm
     profiles: ["app"]
-    # As for api: the consumers run as PID 1 and install no SIGTERM handler.
+    # mq installs no signal handler, so as PID 1 it would ignore SIGTERM. The
+    # init process forwards the signal instead, and mq ends at once: the
+    # delivery in flight stays unsettled, and the broker redelivers it.
     init: true
+    # mq exits with status 1 when a consumer stops on an error, for example
+    # when the broker restarts, and does not reconnect to the broker by itself.
+    # restart: on-failure restarts it, Docker backing off between attempts
+    # until the broker accepts it; restart: true under depends_on also restarts
+    # it after a Compose-driven restart of rabbitmq. Neither applies to
+    # `docker compose stop`.
+    restart: on-failure
     working_dir: /workspace
     command: cargo run -p carddemo-messaging --bin mq
     environment:
@@ -114,6 +151,7 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+        restart: true
 
   web:
     image: node:22.23.4-bookworm
@@ -146,6 +184,7 @@ services:
 
 volumes:
   postgres-data:
+  rabbitmq-data:
   cargo-target:
   cargo-registry:
   web-node-modules:

@@ -10,7 +10,7 @@
 //! | `READ` by key | `SELECT` | its own |
 //! | `READ ... UPDATE` | `SELECT ... FOR UPDATE` | its own |
 //! | `REWRITE` | `UPDATE` of the eleven non-key columns | its own |
-//! | `READ` by key of each account the `CBSTM03A` cross-references name ([`PgStore::read_accounts`]) | one `SELECT ... WHERE account_id = ANY($1)` | none: a plain read |
+//! | `READ` by key of each account the `CBSTM03A` cross-references name ([`PgStore::read_accounts`]) | one `SELECT ... WHERE account_id = ANY($1)` | its own; no statement for an empty key set |
 //!
 //! # Columns
 //!

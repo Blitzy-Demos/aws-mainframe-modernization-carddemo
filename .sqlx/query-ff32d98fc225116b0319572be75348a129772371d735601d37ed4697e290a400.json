@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT tr_type, tr_description\n                     FROM transaction_types\n                    WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')\n                    ORDER BY tr_type COLLATE \"C\"\n                    LIMIT $2",
+  "query": "SELECT tr_type, tr_description\n                     FROM transaction_types\n                    WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')\n                    ORDER BY rpad(tr_type, 2) COLLATE \"C\"\n                    LIMIT $2",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "8d1207833efabc6789b35a79892bf1b25c37d783770ba997c1e55d34ba2b0832"
+  "hash": "ff32d98fc225116b0319572be75348a129772371d735601d37ed4697e290a400"
 }

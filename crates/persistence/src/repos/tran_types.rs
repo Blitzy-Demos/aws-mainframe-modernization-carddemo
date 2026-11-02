@@ -28,18 +28,26 @@
 //!   `VARCHAR(2)` key columns admit (their `CHECK` in migration 0001). Db2
 //!   compares `CHAR` values blank-padded, so the trimmed equality is the Db2
 //!   equality of `TR_TYPE = :host-variable`.
-//! - Every text key is compared and ordered `COLLATE "C"`, by byte value: the
-//!   key order of the cursors' `ORDER BY TR_TYPE`, never the locale order of
-//!   the database's default collation.
+//! - Every text key is compared and ordered `COLLATE "C"`, by byte value,
+//!   never by the locale order of the database's default collation.
+//! - The cursors' start bound and `ORDER BY TR_TYPE` compare the key padded
+//!   back to its two bytes, `rpad(tr_type, 2) COLLATE "C"` against
+//!   `rpad(start, 2)`: the byte order of the Db2 `CHAR(2)` column and of the
+//!   `Ord` of [`TranTypeCode`]. The right-trimmed column alone would sort `A`
+//!   before `A` followed by a byte below the space, where the padded key
+//!   compares the padding space of `A ` with that byte and sorts it after.
+//!   The expression index `transaction_types_padded_tr_type` (migration 0001)
+//!   holds exactly that padded key, so a page reads it in order, from the
+//!   start bound or from either end, with no sort.
 //! - The type filter (the `:WS-EDIT-TYPE-FLAG <> '1'` branch of the
 //!   `COTRTLIC` cursors and count) and the start key select a static statement
 //!   of their own: a given type code is a direct `tr_type` equality on the
 //!   primary key `xtran_type`, and otherwise a given start key is a direct
-//!   range bound on it. A `$n IS NULL OR …` predicate is folded away only in a
-//!   custom plan, so under a generic prepared plan it would keep the key out
-//!   of the index condition and a page would read every type before its start
-//!   key. Within the one row a type code selects, the start bound stays such a
-//!   test.
+//!   range bound on `transaction_types_padded_tr_type`. A `$n IS NULL OR …`
+//!   predicate is folded away only in a custom plan, so under a generic
+//!   prepared plan it would keep the key out of the index condition and a
+//!   page would read every type before its start key. Within the one row a
+//!   type code selects, the start bound stays such a test.
 //! - The `:WS-EDIT-DESC-FLAG <> '1'` branch stays a typed
 //!   `$n::text IS NULL OR …` predicate in every statement: no index serves the
 //!   `LIKE` on `tr_description`, so it only tests the rows the key selects.
@@ -151,20 +159,26 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     ///   TR_TYPE DESC` [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L354-367],
     ///   opened by `8100-READ-BACKWARDS` (P-COTRTLIC-033). The bound is strict,
     ///   as the port documents for this method: the start key itself is never
-    ///   fetched, so a blank start key fetches nothing.
+    ///   fetched, so a blank start key, two spaces, fetches only the codes
+    ///   that sort below it, those that begin with a byte below the space or
+    ///   with a space and then such a byte.
     ///
-    /// `None` as the start key drops the bound, reading from the first or the
-    /// last type. The type and description filters are the cursors' `AND`
-    /// conditions (P-COTRTLIC-020). The rows come back in fetch order; the
-    /// backward page is the rule's to show ascending.
+    /// Keys compare and sort as the two padded bytes of `TR_TYPE CHAR(2)`, the
+    /// order of [`TranTypeCode`], so `A\x01` comes before `A ` (`A` stored);
+    /// the module documentation explains how. `None` as the start key drops
+    /// the bound, reading from the first or the last type. The type and
+    /// description filters are the cursors' `AND` conditions (P-COTRTLIC-020).
+    /// The rows come back in fetch order; the backward page is the rule's to
+    /// show ascending.
     ///
     /// Each direction has three static statements, chosen by which keys are
     /// present (`types_forward`, `types_backward`): a type filter reads the one
     /// row `tr_type = code` through `xtran_type`, with the start bound left as
     /// a `$n IS NULL OR …` test of that row; otherwise a start key bounds the
-    /// `xtran_type` range directly; otherwise the scan runs from the first or
-    /// last key. The description filter is a `$n IS NULL OR …` test in all
-    /// three, as the module documentation explains.
+    /// range of the padded-key index `transaction_types_padded_tr_type`
+    /// directly; otherwise the scan reads that index from the first or last
+    /// key. The description filter is a `$n IS NULL OR …` test in all three,
+    /// as the module documentation explains.
     async fn browse_tran_types(
         &mut self,
         browse: Browse<TranTypeCode>,
@@ -298,9 +312,10 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
 /// `C-TR-TYPE-FORWARD` (P-COTRTLIC-003)
 /// [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L338-352], opened by
 /// `8000-READ-FORWARD` (P-COTRTLIC-030), with the filters of P-COTRTLIC-020.
-/// Up to `limit` types in ascending byte order from `start` inclusive, or
-/// from the first type, read on `conn` by the static statement of the keys
-/// present.
+/// Up to `limit` types in ascending byte order of the code padded to its
+/// `X(2)` bytes, from `start` inclusive, or from the first type, read on
+/// `conn` by the static statement of the keys present. `type_code` and
+/// `start` are right-trimmed codes; each bound pads `start` back with `rpad`.
 async fn types_forward(
     conn: &mut sqlx::PgConnection,
     type_code: Option<&str>,
@@ -315,9 +330,9 @@ async fn types_forward(
                 r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE tr_type = $1::text
-                      AND ($2::text IS NULL OR tr_type COLLATE "C" >= $2::text)
+                      AND ($2::text IS NULL OR rpad(tr_type, 2) COLLATE "C" >= rpad($2::text, 2))
                       AND ($3::text IS NULL OR tr_description LIKE $3::text ESCAPE '')
-                    ORDER BY tr_type COLLATE "C"
+                    ORDER BY rpad(tr_type, 2) COLLATE "C"
                     LIMIT $4"#,
                 code,
                 start,
@@ -332,9 +347,9 @@ async fn types_forward(
                 MasterRow,
                 r#"SELECT tr_type, tr_description
                      FROM transaction_types
-                    WHERE tr_type COLLATE "C" >= $1::text
+                    WHERE rpad(tr_type, 2) COLLATE "C" >= rpad($1::text, 2)
                       AND ($2::text IS NULL OR tr_description LIKE $2::text ESCAPE '')
-                    ORDER BY tr_type COLLATE "C"
+                    ORDER BY rpad(tr_type, 2) COLLATE "C"
                     LIMIT $3"#,
                 start,
                 pattern,
@@ -349,7 +364,7 @@ async fn types_forward(
                 r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')
-                    ORDER BY tr_type COLLATE "C"
+                    ORDER BY rpad(tr_type, 2) COLLATE "C"
                     LIMIT $2"#,
                 pattern,
                 limit,
@@ -365,9 +380,11 @@ async fn types_forward(
 /// `C-TR-TYPE-BACKWARD` (P-COTRTLIC-003)
 /// [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L354-367], opened by
 /// `8100-READ-BACKWARDS` (P-COTRTLIC-033), with the filters of
-/// P-COTRTLIC-020. Up to `limit` types in descending byte order strictly
-/// below `start`, or from the last type, read on `conn` by the static
-/// statement of the keys present.
+/// P-COTRTLIC-020. Up to `limit` types in descending byte order of the code
+/// padded to its `X(2)` bytes, strictly below `start`, or from the last type,
+/// read on `conn` by the static statement of the keys present. `type_code`
+/// and `start` are right-trimmed codes; each bound pads `start` back with
+/// `rpad`.
 async fn types_backward(
     conn: &mut sqlx::PgConnection,
     type_code: Option<&str>,
@@ -382,9 +399,9 @@ async fn types_backward(
                 r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE tr_type = $1::text
-                      AND ($2::text IS NULL OR tr_type COLLATE "C" < $2::text)
+                      AND ($2::text IS NULL OR rpad(tr_type, 2) COLLATE "C" < rpad($2::text, 2))
                       AND ($3::text IS NULL OR tr_description LIKE $3::text ESCAPE '')
-                    ORDER BY tr_type COLLATE "C" DESC
+                    ORDER BY rpad(tr_type, 2) COLLATE "C" DESC
                     LIMIT $4"#,
                 code,
                 start,
@@ -399,9 +416,9 @@ async fn types_backward(
                 MasterRow,
                 r#"SELECT tr_type, tr_description
                      FROM transaction_types
-                    WHERE tr_type COLLATE "C" < $1::text
+                    WHERE rpad(tr_type, 2) COLLATE "C" < rpad($1::text, 2)
                       AND ($2::text IS NULL OR tr_description LIKE $2::text ESCAPE '')
-                    ORDER BY tr_type COLLATE "C" DESC
+                    ORDER BY rpad(tr_type, 2) COLLATE "C" DESC
                     LIMIT $3"#,
                 start,
                 pattern,
@@ -416,7 +433,7 @@ async fn types_backward(
                 r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')
-                    ORDER BY tr_type COLLATE "C" DESC
+                    ORDER BY rpad(tr_type, 2) COLLATE "C" DESC
                     LIMIT $2"#,
                 pattern,
                 limit,
