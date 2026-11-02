@@ -1,0 +1,151 @@
+# CardDemo local runtime. Compose is the only runtime: no images are built, and
+# nothing here is meant for deployment.
+#
+# Infrastructure, for processes started on the host:
+#   docker compose up -d postgres rabbitmq
+# The host defaults in .env.example reach both through the published localhost
+# ports. The RabbitMQ management console is http://localhost:15672 (carddemo).
+#
+# Everything in containers, browser entry point http://localhost:5173:
+#   docker compose --profile app up -d
+#   docker compose --profile app run --rm api cargo run --bin batch -- <subcommand>
+#
+# crates/testkit/tests/compose_tags.rs reads this file line by line, without a
+# YAML library, and compares it with the testcontainers stack. Keep every value
+# it reads a literal on one line: block style, `image: name:tag`, environment in
+# mapping form, ports as quoted short-form strings, and no anchors, aliases,
+# extension fields or variable interpolation.
+
+services:
+  postgres:
+    image: postgres:16.15
+    environment:
+      POSTGRES_DB: carddemo
+      POSTGRES_USER: carddemo
+      POSTGRES_PASSWORD: carddemo
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      # Over TCP, not the socket: on first boot the entrypoint's temporary
+      # initdb server listens on the socket only, so a socket check would
+      # report healthy just before that server restarts.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U carddemo -d carddemo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13.7-management
+    # No RABBITMQ_DEFAULT_USER/PASS: rabbitmq.conf imports definitions.json at
+    # boot, which declares user carddemo, vhost / and the six durable queues,
+    # and suppresses the default guest user.
+    volumes:
+      - ./infra/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  api:
+    image: rust:1.88.0-bookworm
+    profiles: ["app"]
+    # cargo run execs the binary, which then runs as PID 1. The kernel drops
+    # SIGTERM for a PID 1 without a handler, and the binary installs none, so
+    # an init process forwards the signal and `docker compose stop` ends the
+    # server at once rather than killing it after the grace period.
+    init: true
+    working_dir: /workspace
+    command: cargo run -p carddemo-api --bin api
+    environment:
+      CARDDEMO_DATABASE_URL: postgres://carddemo:carddemo@postgres:5432/carddemo
+      CARDDEMO_AMQP_URL: amqp://carddemo:carddemo@rabbitmq:5672/%2f
+      CARDDEMO_HTTP_ADDR: 0.0.0.0:8080
+      SQLX_OFFLINE: "true"
+      # The toolchain rust-toolchain.toml pins, which the image already holds.
+      # Naming it here keeps rustup from downloading the file's clippy, rustfmt
+      # and llvm-tools components into every new container, which
+      # `run --rm` creates per batch command; cargo run needs none of them.
+      RUSTUP_TOOLCHAIN: 1.88.0
+      # Cargo's download lock lives at the root of CARGO_HOME, not in its
+      # registry directory. The cargo-registry volume is therefore mounted as
+      # the whole CARGO_HOME, so api, mq and batch runs that build at the same
+      # time share that lock instead of unpacking the same crate at once.
+      CARGO_HOME: /cargo-home
+    volumes:
+      - .:/workspace
+      - cargo-target:/workspace/target
+      - cargo-registry:/cargo-home
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  mq:
+    image: rust:1.88.0-bookworm
+    profiles: ["app"]
+    # As for api: the consumers run as PID 1 and install no SIGTERM handler.
+    init: true
+    working_dir: /workspace
+    command: cargo run -p carddemo-messaging --bin mq
+    environment:
+      CARDDEMO_DATABASE_URL: postgres://carddemo:carddemo@postgres:5432/carddemo
+      CARDDEMO_AMQP_URL: amqp://carddemo:carddemo@rabbitmq:5672/%2f
+      SQLX_OFFLINE: "true"
+      # As for api: use the pinned toolchain without fetching its components,
+      # and share the cargo home, with its download lock, with api.
+      RUSTUP_TOOLCHAIN: 1.88.0
+      CARGO_HOME: /cargo-home
+    volumes:
+      - .:/workspace
+      - cargo-target:/workspace/target
+      - cargo-registry:/cargo-home
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  web:
+    image: node:22.23.4-bookworm
+    profiles: ["app"]
+    # sh runs as PID 1 and ignores SIGTERM; the init process forwards it.
+    init: true
+    working_dir: /workspace/web
+    command: sh -c "corepack enable && pnpm install --frozen-lockfile && pnpm dev --host 0.0.0.0 --port 5173"
+    environment:
+      CARDDEMO_API_PROXY_TARGET: http://api:8080
+      # Lets corepack fetch the pnpm release web/package.json names unattended.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      # pnpm puts its store on the filesystem that holds node_modules. Left to
+      # itself it picks the root of the source bind mount and writes the store
+      # into the checkout; inside the node_modules volume it persists with the
+      # installed packages and stays out of the source tree.
+      npm_config_store_dir: /workspace/web/node_modules/.pnpm-store
+    volumes:
+      - .:/workspace
+      - web-node-modules:/workspace/web/node_modules
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+volumes:
+  postgres-data:
+  cargo-target:
+  cargo-registry:
+  web-node-modules:
