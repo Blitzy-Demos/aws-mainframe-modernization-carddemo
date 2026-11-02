@@ -81,7 +81,7 @@ impl Flow for CdraFlow {
     ///
     /// Copies the function and key out of the request (P-COACCT01-011), lets
     /// [`mq_account_reply::process`] read the account through an
-    /// [`AccountFile`] and decide the outcome
+    /// `AccountFile` and decide the outcome
     /// [app/app-vsam-mq/cbl/COACCT01.cbl:L390-460], closes the file, and
     /// adapts the outcome to a [`Disposition`]. Only an `INQA` inquiry with a
     /// key above zero reads the file (P-COACCT01-012); every other request is
@@ -98,7 +98,7 @@ impl Flow for CdraFlow {
     /// P-COACCT01-018.
     ///
     /// The `MQ-ERR-DISPLAY` record of a reply put that failed
-    /// [app/app-vsam-mq/cbl/COACCT01.cbl:L492-498], as [`reply_failure_record`]
+    /// [app/app-vsam-mq/cbl/COACCT01.cbl:L492-498], as `reply_failure_record`
     /// lays it out. The consumer publishes it to `CARD.DEMO.ERROR` and then
     /// rejects the request without requeue.
     fn on_reply_failure(&self, _req: &Request, failure: &PublishFailure) -> FailureAction {
