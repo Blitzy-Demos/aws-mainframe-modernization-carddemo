@@ -103,7 +103,8 @@ impl fmt::Debug for AppState {
 /// before it serves anything; they never reach an API response.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
-    /// `CARDDEMO_CLOCK_OVERRIDE` is set but is not an RFC 3339 instant.
+    /// `CARDDEMO_CLOCK_OVERRIDE` is set but is not an RFC 3339 instant of at
+    /// most microsecond precision, without a leap second.
     #[error("invalid CARDDEMO_CLOCK_OVERRIDE: {0}")]
     Clock(#[from] ClockError),
     /// `CARDDEMO_CORS_ORIGIN` is not one serialized browser origin, the exact
@@ -180,7 +181,8 @@ impl PreparedState {
     /// # Errors
     ///
     /// The first setting that fails, in this order: [`StateError::Clock`]
-    /// when `CARDDEMO_CLOCK_OVERRIDE` is set and is not an RFC 3339 instant,
+    /// when `CARDDEMO_CLOCK_OVERRIDE` is set and is not an RFC 3339 instant of
+    /// at most microsecond precision,
     /// [`StateError::CorsOrigin`] when `CARDDEMO_CORS_ORIGIN` is not one
     /// serialized origin, [`StateError::JwtTtl`] when `CARDDEMO_JWT_TTL_SECS`
     /// is zero or gives an unrepresentable expiry, and
@@ -572,7 +574,8 @@ mod tests {
                 StateError::Clock(ClockError::InvalidOverride(value)) => {
                     assert_eq!(value, text.trim(), "{text:?}");
                 }
-                StateError::CorsOrigin { .. }
+                StateError::Clock(ClockError::InexactOverride { .. })
+                | StateError::CorsOrigin { .. }
                 | StateError::JwtTtl { .. }
                 | StateError::VersionKey(_) => panic!("{text:?} gave {err:?}"),
             }

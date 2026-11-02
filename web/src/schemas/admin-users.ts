@@ -1,8 +1,9 @@
 // Client edits of user administration, CU00 to CU03: the COUSR00C list start key, the
 // COUSR01C add form, the COUSR02C edit form and the COUSR03C delete key. They mirror the
-// width of each BMS field, the ASCII text the API requires of every member and key, and
-// the empty-field edits of the validation audit so a form never submits what the API
-// rejects first; the API stays authoritative. Its record-state
+// width of each BMS field, the ASCII text the API requires of every member and key (with
+// NUL characters in a name or new user ID only as LOW-VALUES), and the empty-field edits
+// of the validation audit so a form never submits what the API rejects first; the API
+// stays authoritative. Its record-state
 // and I/O texts ('User ID already exist...', 'User ID NOT found...', 'Unable to ...') and
 // 'Please modify to update ...', which needs the stored user and argon2 verification
 // (E-21), come from the server only.
@@ -51,13 +52,25 @@ const WIDTH = {
   userType: 1,
 } as const;
 
-// ASCII text, the OpenAPI `pattern` of every user member, the {id} path segment and the
-// start_key parameter. The COUSR0nC programs move each value byte for byte into its
-// PIC X(n) field of SEC-USER-DATA, and a 3270 field holds one byte per character, so the
-// API refuses a character above U+007F with no message, as it refuses an over-length
-// value: the issue keeps zod's default regex text. Spaces and NUL characters are ASCII,
-// so a blank field still gets its empty-field text.
+// ASCII text, the OpenAPI `pattern` of the password and user type members, the {id} path
+// segment and the start_key parameter. The COUSR0nC programs move each value byte for byte
+// into its PIC X(n) field of SEC-USER-DATA, and a 3270 field holds one byte per character,
+// so the API refuses a character above U+007F with no message, as it refuses an
+// over-length value: the issue keeps zod's default regex text. Spaces and NUL characters
+// are ASCII, so a blank field still gets its empty-field text.
 const ASCII_TEXT = /^[\x00-\x7F]*$/;
+
+// Storable ASCII text, the OpenAPI `pattern` of the names and the new user's ID, which the
+// rules store as text: PostgreSQL text cannot hold a NUL character (E-07), so the API
+// refuses NUL characters with no message, as it refuses a non-ASCII value, except as the
+// LOW-VALUES its empty-field edit answers. COUSR02C reads NUL characters alone as blank,
+// whatever their number; COUSR01C first moves the entry into its PIC X(n) field, padded
+// with spaces, so only exactly n of them stay LOW-VALUES (WIDTH.firstName and
+// WIDTH.lastName 20, WIDTH.userId 8). The password keeps ASCII_TEXT: it is stored as its
+// argon2id hash, never as text.
+const STORABLE_TEXT = /^(?:\x00+|[\x01-\x7F]*)$/;
+const STORABLE_ADD_NAME = /^(?:\x00{20}|[\x01-\x7F]*)$/;
+const STORABLE_ADD_USER_ID = /^(?:\x00{8}|[\x01-\x7F]*)$/;
 
 // `= SPACES OR LOW-VALUES` as a browser field meets it: a field left unentered arrives as
 // the empty string, and one holding only spaces is blank. Any other character, a tab
@@ -122,15 +135,15 @@ export const userAddSchema = z
     first_name: z
       .string({ required_error: USER_ADD_MESSAGES.firstNameEmpty })
       .max(WIDTH.firstName)
-      .regex(ASCII_TEXT),
+      .regex(STORABLE_ADD_NAME),
     last_name: z
       .string({ required_error: USER_ADD_MESSAGES.lastNameEmpty })
       .max(WIDTH.lastName)
-      .regex(ASCII_TEXT),
+      .regex(STORABLE_ADD_NAME),
     user_id: z
       .string({ required_error: USER_ADD_MESSAGES.userIdEmpty })
       .max(WIDTH.userId)
-      .regex(ASCII_TEXT),
+      .regex(STORABLE_ADD_USER_ID),
     password: z
       .string({ required_error: USER_ADD_MESSAGES.passwordEmpty })
       .max(WIDTH.password)
@@ -181,11 +194,11 @@ export const userUpdateSchema = z
     first_name: z
       .string({ required_error: USER_UPDATE_MESSAGES.firstNameEmpty })
       .max(WIDTH.firstName)
-      .regex(ASCII_TEXT),
+      .regex(STORABLE_TEXT),
     last_name: z
       .string({ required_error: USER_UPDATE_MESSAGES.lastNameEmpty })
       .max(WIDTH.lastName)
-      .regex(ASCII_TEXT),
+      .regex(STORABLE_TEXT),
     change_password: z.boolean().default(false),
     password: z.string().max(WIDTH.password).regex(ASCII_TEXT).optional(),
     // Any non-blank ASCII value, as for the add form: COUSR02C edits only for blank.

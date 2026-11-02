@@ -801,6 +801,157 @@ fn reward_rule_admin_methods() {
     });
 }
 
+/// [`at`] plus `micros` microseconds.
+fn at_plus_micros(micros: i64) -> DateTime<Utc> {
+    at() + TimeDelta::microseconds(micros)
+}
+
+/// `RewardEngine::accrue` of `tran` for `account_id` at processing instant
+/// `t`, over the reward store of `uow`.
+async fn accrue_at(
+    uow: &mut UnitOfWork,
+    tran: &Transaction,
+    account_id: AccountId,
+    t: DateTime<Utc>,
+) -> Option<RewardAccrual> {
+    let input = AccrualInput::for_transaction(tran, account_id);
+    RewardEngine::accrue(&mut uow.rewards(), input, t)
+        .await
+        .expect("the accrual succeeds")
+}
+
+/// The `PortError` a reward write reports for an instant `column` cannot store
+/// exactly.
+fn inexact<T>(column: &str) -> Result<T, PortError> {
+    Err(PortError::Unavailable(format!(
+        "{column} cannot store the instant exactly: it is not a whole microsecond of UTC time"
+    )))
+}
+
+/// A rule window one microsecond wide is stored exactly as submitted, and the
+/// engine over the real store decides its start and end at those instants:
+/// the start inclusive, the end exclusive (AAP 0.3.5). The accrual the engine
+/// returns carries the same `created_at` as the row the history reads back.
+#[test]
+fn microsecond_windows_and_accrual_instants_round_trip_exactly() {
+    let prepared = fixture_seed();
+    block_on(async {
+        let (_stack, db) = seeded(prepared).await;
+        let start = at_plus_micros(1);
+        let end = at_plus_micros(2);
+        let draft = new_rule("02", 1, 10_000, start, Some(end));
+        let mut uow = db.begin().await.expect("a unit of work");
+        let created = uow
+            .store()
+            .insert_reward_rule(draft.clone())
+            .await
+            .expect("the insert");
+        assert_eq!(created, RewardRule::from_new(RuleId::from(3), &draft));
+        uow.commit().await.expect("the rule commits");
+
+        let holder = account(5);
+        let before_start = live_transaction(&db, holder, "02", 1, 10_000).await;
+        let at_start = live_transaction(&db, holder, "02", 1, 10_000).await;
+        let at_end = live_transaction(&db, holder, "02", 1, 10_000).await;
+
+        let mut uow = db.begin().await.expect("a unit of work");
+        assert_eq!(
+            uow.store().reward_rule(created.rule_id).await,
+            Ok(Some(created.clone())),
+            "the reloaded window is the submitted one"
+        );
+        let before = accrue_at(&mut uow, &before_start, holder, at_plus_micros(0)).await;
+        let first = accrue_at(&mut uow, &at_start, holder, start).await;
+        let after = accrue_at(&mut uow, &at_end, holder, end).await;
+        uow.commit().await.expect("the accruals commit");
+
+        assert_eq!(before, None, "one microsecond before active_from");
+        assert_eq!(after, None, "at active_to, which is exclusive");
+        let accrued = first.expect("at active_from, which is inclusive");
+        assert_eq!(
+            (accrued.rule_id, accrued.points_earned, accrued.created_at),
+            (created.rule_id, points(100), start)
+        );
+
+        let mut uow = db.begin().await.expect("a unit of work");
+        let history = uow
+            .store()
+            .reward_history(holder, None, 10)
+            .await
+            .expect("the history read");
+        assert_eq!(history, vec![accrued], "returned and reloaded agree");
+        uow.rollback().await.expect("the read-only unit ends");
+        for tran in [&before_start, &at_end] {
+            assert_eq!(stored_accruals(&db, tran.transaction_id).await, 0);
+        }
+    });
+}
+
+/// An instant finer than a microsecond is refused by every reward write that
+/// binds one, naming the table and column, and nothing is stored: the rule
+/// insert and update, the soft delete and the accrual insert, directly and
+/// through the engine. The bind never narrows it to the microsecond
+/// `TIMESTAMPTZ` keeps.
+#[test]
+fn nanosecond_instants_are_refused_and_nothing_is_stored() {
+    let prepared = fixture_seed();
+    block_on(async {
+        let (_stack, db) = seeded(prepared).await;
+        let tran = live_transaction(&db, account(1), "01", 1, 10_000).await;
+        let nanos = at() + TimeDelta::nanoseconds(900);
+
+        let mut uow = db.begin().await.expect("a unit of work");
+        let mut store = uow.store();
+        assert_eq!(
+            store
+                .insert_reward_rule(new_rule("02", 1, 10_000, nanos, None))
+                .await,
+            inexact("reward_rules.active_from")
+        );
+        assert_eq!(
+            store
+                .insert_reward_rule(new_rule("02", 1, 10_000, seed_start(), Some(nanos)))
+                .await,
+            inexact("reward_rules.active_to")
+        );
+        assert_eq!(
+            store
+                .update_reward_rule(RuleId::from(1), new_rule("01", 1, 20_000, nanos, None))
+                .await,
+            inexact("reward_rules.active_from")
+        );
+        assert_eq!(
+            store.soft_delete_reward_rule(RuleId::from(1), nanos).await,
+            inexact("reward_rules.active_to")
+        );
+        assert_eq!(
+            store
+                .reward_store()
+                .insert_accrual(accrual(&tran, account(1), 1, 100, nanos))
+                .await,
+            inexact("reward_accruals.created_at")
+        );
+        let input = AccrualInput::for_transaction(&tran, account(1));
+        assert_eq!(
+            RewardEngine::accrue(&mut store.reward_store(), input, nanos).await,
+            inexact("reward_accruals.created_at").map_err(RewardError::Store)
+        );
+        uow.commit()
+            .await
+            .expect("no statement ran, so the unit commits");
+
+        let mut uow = db.begin().await.expect("a unit of work");
+        assert_eq!(
+            uow.store().list_reward_rules().await,
+            Ok(vec![retail_seed_rule(), travel_seed_rule()]),
+            "no rule was added or changed"
+        );
+        uow.rollback().await.expect("the read-only unit ends");
+        assert_eq!(stored_accruals(&db, tran.transaction_id).await, 0);
+        assert_eq!(stored_balance(&db, account(1)).await, None);
+    });
+}
+
 /// The balance read and the reward history page: no balance before any
 /// accrual; history newest first by `created_at`, equal instants by
 /// `accrual_id`, one look-ahead row beyond `limit`, an inclusive start key,

@@ -28,9 +28,9 @@
 //!
 //! [`TransactionAddRequest`] carries the 14 input fields of map `COTRN2A`
 //! [app/cpy-bms/COTRN02.CPY:L60-138] as entered. [`TransactionAddRequest::check`]
-//! applies the BMS field lengths and keeps the free-text fields ASCII; every
-//! other edit, with its audited message, is `transaction_add::validate`'s
-//! (V-COTRN02C-001 to V-COTRN02C-028).
+//! applies the BMS field lengths and keeps the free-text fields ASCII and
+//! storable; every other edit, with its audited message, is
+//! `transaction_add::validate`'s (V-COTRN02C-001 to V-COTRN02C-028).
 //!
 //! The 3270 field cannot hold more characters than its width, so an
 //! over-length entry has no COBOL path, and the validation audit records no
@@ -46,13 +46,21 @@
 //! as one Latin-1 character, and cut it at the field width. A 3270 map field
 //! holds one byte per character, so such an entry has no COBOL counterpart
 //! either, and the check answers it as it answers an over-length one: 400
-//! `INVALID`, no message, its BMS field named (E-49). No other member reaches
-//! the record unless its class or format edit passes it, and only ASCII
-//! digits, signs, points and dashes pass those edits (V-COTRN02C-001,
+//! `INVALID`, no message, its BMS field named (E-49). The same five fields
+//! also refuse NUL characters beside other text, through
+//! [`storable_text`](crate::dto::storable_text): the rule reads an entry of
+//! NUL characters only as `LOW-VALUES` and answers it `can NOT be empty`
+//! (V-COTRN02C-010, V-COTRN02C-011, V-COTRN02C-016 to V-COTRN02C-018), so
+//! such an entry passes; any other entry the rule stores as written, and
+//! `PostgreSQL` text cannot hold NUL (E-07). A 3270 field never sends NUL
+//! characters mixed with other text, so that entry has no COBOL counterpart
+//! and gets the same no-message answer (E-49). No other member reaches the
+//! record unless its class or format edit passes it, and only ASCII digits,
+//! signs, points and dashes pass those edits (V-COTRN02C-001,
 //! V-COTRN02C-002, V-COTRN02C-019 to V-COTRN02C-023, V-COTRN02C-026); the
 //! confirmation is never stored, and any value but `Y`, `y`, `N`, `n` or blank
-//! is V-COTRN02C-028. The rule therefore answers a non-ASCII entry there with
-//! its audited message, in its audited order.
+//! is V-COTRN02C-028. The rule therefore answers a non-ASCII or NUL entry
+//! there with its audited message, in its audited order.
 //!
 //! Every `COTRN02C` outcome other than the add sets `WS-ERR-FLG`, the `N` and
 //! blank confirmations included (V-COTRN02C-027, V-COTRN02C-028), so the
@@ -85,7 +93,8 @@ use crate::error::ApiError;
 
 /// The message of an answer the validation audit records as
 /// `no-message (E-49)`: the account filter (V-COTRN00C-001) and the
-/// over-length `COTRN02C` entries, neither of which a 3270 screen can send.
+/// over-length, non-ASCII and mixed-NUL `COTRN02C` entries, none of which a
+/// 3270 screen can send.
 const NO_MESSAGE: &str = "";
 
 /// The BMS field of a `COTRN00C` message (`MOVE -1 TO TRNIDINL`,
@@ -475,12 +484,13 @@ impl fmt::Debug for TransactionResponse {
 /// with its `can NOT be empty` message (V-COTRN02C-003, V-COTRN02C-008 to
 /// V-COTRN02C-018). The account ID is used when entered, otherwise the card
 /// number. Every member is limited to its map field's width, and the source,
-/// description and merchant name, city and zip to ASCII characters; the
-/// formats are the rule's edits, so that a malformed entry gets its audited
-/// message. The published `pattern` of a code, amount, date or merchant ID is
-/// the form its edit accepts (V-COTRN02C-019 to V-COTRN02C-023,
-/// V-COTRN02C-026); the dates' is their shape only, the calendar check being
-/// `CSUTLDTC`'s (V-COTRN02C-024, V-COTRN02C-025).
+/// description and merchant name, city and zip to ASCII characters, with NUL
+/// characters only as the whole entry; the formats are the rule's edits, so
+/// that a malformed entry gets its audited message. The published `pattern`
+/// of a code, amount, date or merchant ID is the form its edit accepts
+/// (V-COTRN02C-019 to V-COTRN02C-023, V-COTRN02C-026); the dates' is their
+/// shape only, the calendar check being `CSUTLDTC`'s (V-COTRN02C-024,
+/// V-COTRN02C-025).
 ///
 /// It also serializes, so a client builds the bodies it sends from it.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
@@ -508,15 +518,17 @@ pub struct TransactionAddRequest {
     #[schema(max_length = 4, pattern = "^[0-9]{4}$")]
     #[validate(length(max = 4))]
     pub tran_cat_cd: Option<String>,
-    /// `TRNSRC` (`TRNSRCI X(10)`): the source, ASCII characters only.
+    /// `TRNSRC` (`TRNSRCI X(10)`): the source, in ASCII without NUL
+    /// characters, or NUL characters only, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 10, pattern = r"^[\x00-\x7F]*$")]
-    #[validate(length(max = 10), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 10, pattern = r"^(?:\x00+|[\x01-\x7F]*)$")]
+    #[validate(length(max = 10), custom(function = "crate::dto::storable_text"))]
     pub tran_source: Option<String>,
-    /// `TDESC` (`TDESCI X(60)`): the description, ASCII characters only.
+    /// `TDESC` (`TDESCI X(60)`): the description, in ASCII without NUL
+    /// characters, or NUL characters only, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 60, pattern = r"^[\x00-\x7F]*$")]
-    #[validate(length(max = 60), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 60, pattern = r"^(?:\x00+|[\x01-\x7F]*)$")]
+    #[validate(length(max = 60), custom(function = "crate::dto::storable_text"))]
     pub tran_desc: Option<String>,
     /// `TRNAMT` (`TRNAMTI X(12)`): the amount as text in the form
     /// `-99999999.99`, a sign, eight digits, a point and two digits, such as
@@ -545,20 +557,23 @@ pub struct TransactionAddRequest {
     #[schema(max_length = 9, pattern = "^[0-9]{9}$")]
     #[validate(length(max = 9))]
     pub tran_merchant_id: Option<String>,
-    /// `MNAME` (`MNAMEI X(30)`): the merchant name, ASCII characters only.
+    /// `MNAME` (`MNAMEI X(30)`): the merchant name, in ASCII without NUL
+    /// characters, or NUL characters only, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 30, pattern = r"^[\x00-\x7F]*$")]
-    #[validate(length(max = 30), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 30, pattern = r"^(?:\x00+|[\x01-\x7F]*)$")]
+    #[validate(length(max = 30), custom(function = "crate::dto::storable_text"))]
     pub tran_merchant_name: Option<String>,
-    /// `MCITY` (`MCITYI X(25)`): the merchant city, ASCII characters only.
+    /// `MCITY` (`MCITYI X(25)`): the merchant city, in ASCII without NUL
+    /// characters, or NUL characters only, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 25, pattern = r"^[\x00-\x7F]*$")]
-    #[validate(length(max = 25), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 25, pattern = r"^(?:\x00+|[\x01-\x7F]*)$")]
+    #[validate(length(max = 25), custom(function = "crate::dto::storable_text"))]
     pub tran_merchant_city: Option<String>,
-    /// `MZIP` (`MZIPI X(10)`): the merchant zip, ASCII characters only.
+    /// `MZIP` (`MZIPI X(10)`): the merchant zip, in ASCII without NUL
+    /// characters, or NUL characters only, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 10, pattern = r"^[\x00-\x7F]*$")]
-    #[validate(length(max = 10), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 10, pattern = r"^(?:\x00+|[\x01-\x7F]*)$")]
+    #[validate(length(max = 10), custom(function = "crate::dto::storable_text"))]
     pub tran_merchant_zip: Option<String>,
     /// `CONFIRM` (`CONFIRMI X(1)`): `Y` adds the transaction; `N` or blank asks
     /// for confirmation (V-COTRN02C-027) and any other value is rejected
@@ -573,18 +588,21 @@ impl TransactionAddRequest {
     /// The checks of the entry as a 3270 map could hold it: every member
     /// within its map field's width, and the five free-text members the rule
     /// moves byte for byte into `X(n)` fields (`TRNSRC`, `TDESC`, `MNAME`,
-    /// `MCITY`, `MZIP`) ASCII, through [`ascii_text`](crate::dto::ascii_text).
+    /// `MCITY`, `MZIP`) ASCII and storable, through
+    /// [`storable_text`](crate::dto::storable_text): NUL characters only as
+    /// the whole entry.
     ///
-    /// Blank members, `SPACES` or `LOW-VALUES` included, pass: the rule answers
-    /// them with their `can NOT be empty` messages (V-COTRN02C-008 to
-    /// V-COTRN02C-018).
+    /// Blank members, `SPACES` or `LOW-VALUES` of any length within the width
+    /// included, pass: the rule answers them with their `can NOT be empty`
+    /// messages (V-COTRN02C-008 to V-COTRN02C-018).
     ///
     /// # Errors
     ///
-    /// 400 `INVALID` with an empty message, the audit having no over-length or
-    /// non-ASCII row for `COTRN02C` (E-49), and one [`TransactionAddField`]
-    /// entry per member that is longer than its width or, among the five, holds
-    /// a non-ASCII character, in screen order.
+    /// 400 `INVALID` with an empty message, the audit having no over-length,
+    /// non-ASCII or mixed-NUL row for `COTRN02C` (E-49), and one
+    /// [`TransactionAddField`] entry per member that is longer than its width
+    /// or, among the five, holds a non-ASCII character or a NUL character
+    /// beside other text, in screen order.
     pub fn check(&self) -> Result<(), ApiError> {
         self.validate()
             .map_err(|errors| reject_invalid(&errors, TransactionAddField::of_member, NO_MESSAGE))
@@ -717,31 +735,36 @@ mod tests {
         ("confirm", "CONFIRM", 1),
     ];
 
+    /// The `pattern` of a free-text member: ASCII text without NUL characters,
+    /// or NUL characters only, the `LOW-VALUES` the rule answers as blank.
+    const STORABLE_TEXT: &str = r"^(?:\x00+|[\x01-\x7F]*)$";
+
     /// The `pattern` the API document publishes for each of the
     /// [`ADD_MEMBERS`], in the same order: the form the class or format edit
-    /// accepts (V-COTRN02C-019 to V-COTRN02C-023, V-COTRN02C-026), ASCII for
-    /// the free-text members, and none for the key fields and the
-    /// confirmation, whose edits depend on another member or answer a blank
-    /// or `N` with a message.
+    /// accepts (V-COTRN02C-019 to V-COTRN02C-023, V-COTRN02C-026),
+    /// [`STORABLE_TEXT`] for the free-text members, and none for the key
+    /// fields and the confirmation, whose edits depend on another member or
+    /// answer a blank or `N` with a message.
     const ADD_PATTERNS: [(&str, Option<&str>); 14] = [
         ("account_id", None),
         ("card_number", None),
         ("tran_type_cd", Some("^[0-9]{2}$")),
         ("tran_cat_cd", Some("^[0-9]{4}$")),
-        ("tran_source", Some(r"^[\x00-\x7F]*$")),
-        ("tran_desc", Some(r"^[\x00-\x7F]*$")),
+        ("tran_source", Some(STORABLE_TEXT)),
+        ("tran_desc", Some(STORABLE_TEXT)),
         ("tran_amt", Some(r"^[+-][0-9]{8}\.[0-9]{2}$")),
         ("tran_orig_date", Some("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
         ("tran_proc_date", Some("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
         ("tran_merchant_id", Some("^[0-9]{9}$")),
-        ("tran_merchant_name", Some(r"^[\x00-\x7F]*$")),
-        ("tran_merchant_city", Some(r"^[\x00-\x7F]*$")),
-        ("tran_merchant_zip", Some(r"^[\x00-\x7F]*$")),
+        ("tran_merchant_name", Some(STORABLE_TEXT)),
+        ("tran_merchant_city", Some(STORABLE_TEXT)),
+        ("tran_merchant_zip", Some(STORABLE_TEXT)),
         ("confirm", None),
     ];
 
     /// The [`ADD_MEMBERS`] the rule moves byte for byte into `X(n)` record
-    /// fields without a class edit, which the check keeps ASCII.
+    /// fields without a class edit, which the check keeps ASCII and free of
+    /// NUL characters unless they are the whole entry.
     const ASCII_MEMBERS: [(&str, &str, usize); 5] = [
         ("tran_source", "TRNSRC", 10),
         ("tran_desc", "TDESC", 60),
@@ -918,11 +941,14 @@ mod tests {
     }
 
     #[test]
-    fn add_check_names_each_free_text_member_holding_a_non_ascii_character() -> TestResult {
+    fn add_check_names_each_free_text_member_holding_non_ascii_or_mixed_nul_text() -> TestResult {
         for (member, field, width) in ASCII_MEMBERS {
             // Accented Latin-1, the first non-ASCII code point, non-Latin-1,
             // outside the BMP, inside ASCII text, and a width of `é` that fits
-            // the length check but not the field's bytes.
+            // the length check but not the field's bytes; then NUL characters
+            // beside other text, which the rule would store and PostgreSQL
+            // text cannot hold: inside, leading, trailing, before and after a
+            // space, and a full width with one other character.
             let rejected = [
                 "\u{e9}".to_owned(),
                 "\u{80}".to_owned(),
@@ -930,6 +956,12 @@ mod tests {
                 "\u{1f600}".to_owned(),
                 "Caf\u{e9}".to_owned(),
                 "\u{e9}".repeat(width),
+                "A\0B".to_owned(),
+                "\0A".to_owned(),
+                "A\0".to_owned(),
+                "\0 ".to_owned(),
+                " \0".to_owned(),
+                format!("{}A", "\0".repeat(width - 1)),
             ];
             for entered in rejected {
                 let error = request_with(&[member], &entered)?
@@ -980,7 +1012,14 @@ mod tests {
     #[test]
     fn add_check_passes_blank_free_text_members_to_the_rule() -> TestResult {
         for (member, _, width) in ASCII_MEMBERS {
-            for blank in [String::new(), " ".repeat(width), "\0".repeat(width)] {
+            let blanks = [
+                String::new(),
+                " ".repeat(width),
+                "\0".to_owned(),
+                "\0\0".to_owned(),
+                "\0".repeat(width),
+            ];
+            for blank in blanks {
                 assert!(
                     request_with(&[member], &blank)?.check().is_ok(),
                     "{member} {blank:?}"
@@ -1129,6 +1168,85 @@ mod tests {
             assert_eq!(
                 error,
                 DomainError::invalid(message).with_field(field),
+                "{member}"
+            );
+        }
+        Ok(())
+    }
+
+    // V-COTRN02C-010, V-COTRN02C-011, V-COTRN02C-016 to V-COTRN02C-018: NUL
+    // characters alone pass the check and reach the rule as `LOW-VALUES`,
+    // which answers them with the field's empty-field message; NUL characters
+    // beside other text fail the check, which the handler runs first, so they
+    // never reach the rule.
+    #[tokio::test]
+    async fn add_rule_answers_all_nul_free_text_as_empty_and_the_check_stops_mixed_nul()
+    -> TestResult {
+        let mut store = OneXref(CardXref {
+            xref_card_num: CardNumber::move_from(CARD),
+            xref_cust_id: CustomerId::new(1)?,
+            xref_acct_id: AccountId::new(1)?,
+        });
+        // (member, message, BMS field), in the order of `ASCII_MEMBERS`
+        let empty_answers = [
+            (
+                "tran_source",
+                messages::SOURCE_CAN_NOT_BE_EMPTY,
+                transaction_add::FIELD_TRNSRC,
+            ),
+            (
+                "tran_desc",
+                messages::DESCRIPTION_CAN_NOT_BE_EMPTY,
+                transaction_add::FIELD_TDESC,
+            ),
+            (
+                "tran_merchant_name",
+                messages::MERCHANT_NAME_CAN_NOT_BE_EMPTY,
+                transaction_add::FIELD_MNAME,
+            ),
+            (
+                "tran_merchant_city",
+                messages::MERCHANT_CITY_CAN_NOT_BE_EMPTY,
+                transaction_add::FIELD_MCITY,
+            ),
+            (
+                "tran_merchant_zip",
+                messages::MERCHANT_ZIP_CAN_NOT_BE_EMPTY,
+                transaction_add::FIELD_MZIP,
+            ),
+        ];
+        for ((member, field, width), (answered, message, rule_field)) in
+            ASCII_MEMBERS.into_iter().zip(empty_answers)
+        {
+            assert_eq!(member, answered);
+            for low_values in ["\0".to_owned(), "\0".repeat(width)] {
+                let mut body = valid_add_body();
+                body[member] = Value::from(low_values.as_str());
+                let request: TransactionAddRequest = serde_json::from_value(body)?;
+                request.check()?;
+                let error = transaction_add::validate(&mut store, request.into_input())
+                    .await
+                    .expect_err(member);
+                assert_eq!(
+                    error,
+                    DomainError::empty(message).with_field(rule_field),
+                    "{member} {low_values:?}"
+                );
+            }
+            let mut body = valid_add_body();
+            body[member] = Value::from("A\0B");
+            let request: TransactionAddRequest = serde_json::from_value(body)?;
+            let error = request.check().expect_err(member);
+            assert_eq!(
+                answer(&error)?,
+                (
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "code": "INVALID",
+                        "message": "",
+                        "fields": [{ "field": field, "message": "" }],
+                    })
+                ),
                 "{member}"
             );
         }

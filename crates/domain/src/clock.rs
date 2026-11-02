@@ -6,6 +6,23 @@
 //! [`AnyClock`] from the `CARDDEMO_CLOCK_OVERRIDE` setting with
 //! [`AnyClock::from_override`]; this module reads no environment itself.
 //!
+//! # Instants
+//!
+//! A processing instant, and every instant a reward rule, soft delete or
+//! accrual stores, is a whole microsecond of UTC time: no part finer than a
+//! microsecond and no leap second. That is what a `PostgreSQL` `TIMESTAMPTZ`
+//! holds and the resolution the database reads its own clock at, so an
+//! instant written and read back equals the one a rule decided with. The
+//! policy is enforced where instants enter, never by narrowing one later:
+//!
+//! - [`SystemClock`] reads the host clock at whole microseconds;
+//! - [`parse_instant`] refuses RFC 3339 text finer than a microsecond or on a
+//!   leap second; `CARDDEMO_CLOCK_OVERRIDE` and the instants of the reward-rule
+//!   requests are read through it, and [`INSTANT_PATTERN`] publishes what it
+//!   accepts;
+//! - [`is_whole_microsecond`] lets a writer refuse an instant it did not
+//!   parse, such as one of a [`FixedClock`] built directly.
+//!
 //! The formatters stand in for `FUNCTION CURRENT-DATE`, `EXEC CICS FORMATTIME`
 //! and `ACCEPT … FROM DATE/DAY`. They render the instant in UTC, because the
 //! replacement has no CICS or Language Environment local-time zone and parity
@@ -20,7 +37,99 @@
 //!   one second or more, renders as the last sub-second of second 59, because
 //!   no COBOL time field can hold second 60.
 
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, SubsecRound, Timelike, Utc};
+
+/// The fraction digits of a whole microsecond. RFC 3339 text may write more,
+/// but only as zeros.
+const MICROSECOND_DIGITS: u16 = 6;
+
+/// Nanoseconds per microsecond.
+const NANOS_PER_MICROSECOND: u32 = 1_000;
+
+/// Nanoseconds per second. `chrono` holds a leap second as second 59 with a
+/// sub-second part of this many nanoseconds or more.
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
+
+/// The ECMA-262 pattern of the text [`parse_instant`] accepts, as the
+/// `OpenAPI` document publishes it for the reward-rule instants.
+///
+/// An RFC 3339 date-time: `YYYY-MM-DD`, then `T`, `t` or a space, then
+/// `hh:mm:ss` with seconds `00` to `59`; an optional fraction of one or more
+/// digits, every digit after the 6th `0`; and `Z`, `z` or an offset `+hh:mm`,
+/// `-hh:mm` or `U+2212` `hh:mm` up to 23:59. It is exactly the shape `chrono`'s
+/// RFC 3339 parser reads, less the leap second and the digits finer than a
+/// microsecond that [`parse_instant`] refuses. Whether the day exists in its
+/// month is left to the `date-time` format.
+pub const INSTANT_PATTERN: &str = r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt ]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]{1,6}0*)?([Zz]|[+\-\u2212]([01][0-9]|2[0-3]):[0-5][0-9])$";
+
+/// Whether `t` is a whole microsecond of UTC time: no part finer than a
+/// microsecond, and not a leap second.
+///
+/// These are the instants a `TIMESTAMPTZ` column stores exactly; the sqlx
+/// encoder would silently drop the finer part of any other.
+#[must_use]
+pub fn is_whole_microsecond(t: DateTime<Utc>) -> bool {
+    let nanos = t.nanosecond();
+    nanos < NANOS_PER_SECOND && nanos % NANOS_PER_MICROSECOND == 0
+}
+
+/// Parses `text` as an RFC 3339 instant that is a whole microsecond of UTC
+/// time, and converts it to UTC.
+///
+/// The text is read by `chrono`'s RFC 3339 parser, whose shape
+/// [`INSTANT_PATTERN`] states, and then held to the microsecond. `chrono`
+/// would keep 9 fraction digits and skip any beyond them unread, so the digits
+/// are checked in the text itself: every one after the 6th must be `0`.
+/// `"…00.000001000Z"` and `"…00.000000000Z"` are therefore accepted, and
+/// `"…00.000000900Z"` and `"…00.0000000001Z"` refused. Second `60`, which
+/// `chrono` accepts as a leap second, is refused too.
+///
+/// # Errors
+///
+/// [`InstantError::NotRfc3339`] when `chrono` does not parse the text,
+/// [`InstantError::FinerThanMicrosecond`] when a fraction digit after the 6th
+/// is not `0`, and [`InstantError::LeapSecond`] for second `60`, checked in
+/// that order.
+pub fn parse_instant(text: &str) -> Result<DateTime<Utc>, InstantError> {
+    let parsed = DateTime::parse_from_rfc3339(text).map_err(InstantError::NotRfc3339)?;
+    // Parsed text starts with the 19 ASCII bytes `YYYY-MM-DDThh:mm:ss`; a
+    // fraction is the `.` at byte 19 and the run of digits after it.
+    let fraction = text
+        .as_bytes()
+        .get(19..)
+        .and_then(|rest| rest.strip_prefix(b"."))
+        .unwrap_or_default();
+    if fraction
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .skip(usize::from(MICROSECOND_DIGITS))
+        .any(|&digit| digit != b'0')
+    {
+        return Err(InstantError::FinerThanMicrosecond);
+    }
+    if parsed.nanosecond() >= NANOS_PER_SECOND {
+        return Err(InstantError::LeapSecond);
+    }
+    Ok(parsed.with_timezone(&Utc))
+}
+
+/// Why text is not an instant [`parse_instant`] accepts.
+///
+/// Each text is a reason written to follow the name of the field or setting
+/// that held the value, and quotes nothing of the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InstantError {
+    /// Not an RFC 3339 date-time; `chrono`'s reason follows.
+    #[error("value is not an RFC 3339 date-time: {0}")]
+    NotRfc3339(chrono::ParseError),
+    /// A fraction digit after the 6th is not `0`: the instant has a part finer
+    /// than a microsecond, which a timestamp cannot hold.
+    #[error("value is finer than a microsecond: a fraction digit after the 6th is not 0")]
+    FinerThanMicrosecond,
+    /// Second `60`, a leap second, which a timestamp cannot hold.
+    #[error("value is a leap second (second 60), which a timestamp cannot hold")]
+    LeapSecond,
+}
 
 /// Source of the processing instant.
 ///
@@ -41,12 +150,19 @@ impl<C: Clock + ?Sized> Clock for &C {
 
 /// The host clock, read on every call: `EXEC CICS ASKTIME` and
 /// `FUNCTION CURRENT-DATE` in the COBOL.
+///
+/// The reading is truncated to the whole microsecond, the resolution
+/// `PostgreSQL` reads its own clock at and a `TIMESTAMPTZ` keeps, so every
+/// instant it gives is [`is_whole_microsecond`]. No COBOL field is finer than
+/// the hundredths of `DB2-FORMAT-TS` and the milliseconds of `FORMATTIME`,
+/// which the truncation leaves unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+        // `Utc::now` never reads a leap second, so whole microseconds remain.
+        Utc::now().trunc_subsecs(MICROSECOND_DIGITS)
     }
 }
 
@@ -75,24 +191,35 @@ impl AnyClock {
     ///
     /// An absent value (`None`) selects the [`SystemClock`]. A supplied value
     /// is trimmed of surrounding whitespace and must then be an RFC 3339
-    /// instant, which is converted to UTC and selects a [`FixedClock`]. A
-    /// supplied value that is empty or only whitespace is an error, never the
-    /// system clock, so a mistyped pin cannot fall back to wall time.
+    /// instant of at most microsecond precision and no leap second, read by
+    /// [`parse_instant`], which is converted to UTC and selects a
+    /// [`FixedClock`]. A supplied value that is empty or only whitespace is an
+    /// error, never the system clock, so a mistyped pin cannot fall back to
+    /// wall time.
     ///
     /// Treating an empty variable as unset is the settings layer's job
     /// (`Settings` in `crates/runtime`), not this parser's.
     ///
     /// # Errors
     ///
-    /// [`ClockError::InvalidOverride`] when the supplied value, trimmed, is not
-    /// an RFC 3339 instant, including when it is empty or only whitespace.
+    /// - [`ClockError::InvalidOverride`] when the supplied value, trimmed, is
+    ///   not an RFC 3339 instant, including when it is empty or only
+    ///   whitespace.
+    /// - [`ClockError::InexactOverride`] when it is one, but finer than a
+    ///   microsecond or a leap second, so the instants the clock stamps could
+    ///   not be stored as pinned.
     pub fn from_override(value: Option<&str>) -> Result<Self, ClockError> {
         let Some(text) = value.map(str::trim) else {
             return Ok(Self::System(SystemClock));
         };
-        DateTime::parse_from_rfc3339(text)
-            .map(|instant| Self::Fixed(FixedClock(instant.with_timezone(&Utc))))
-            .map_err(|_| ClockError::InvalidOverride(text.to_owned()))
+        match parse_instant(text) {
+            Ok(instant) => Ok(Self::Fixed(FixedClock(instant))),
+            Err(InstantError::NotRfc3339(_)) => Err(ClockError::InvalidOverride(text.to_owned())),
+            Err(reason) => Err(ClockError::InexactOverride {
+                value: text.to_owned(),
+                reason,
+            }),
+        }
     }
 }
 
@@ -111,6 +238,17 @@ pub enum ClockError {
     /// The override, as trimmed, is not an RFC 3339 instant.
     #[error("CARDDEMO_CLOCK_OVERRIDE is not an RFC 3339 instant: {0}")]
     InvalidOverride(String),
+    /// The override, as trimmed, is an RFC 3339 instant but not a whole
+    /// microsecond of UTC time: finer than a microsecond, or a leap second.
+    #[error(
+        "CARDDEMO_CLOCK_OVERRIDE is not an instant a timestamp holds exactly: {value}: {reason}"
+    )]
+    InexactOverride {
+        /// The override, as trimmed.
+        value: String,
+        /// Why the instant cannot be held exactly.
+        reason: InstantError,
+    },
 }
 
 /// The year as the four digits a `PIC 9(4)` receiver keeps.
@@ -274,11 +412,11 @@ pub fn hhmmss_compact(t: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnyClock, Clock, ClockError, FixedClock, SystemClock, auth_key_complement, cics_timestamp,
-        db2_timestamp, hhmmss, hhmmss_colon, hhmmss_compact, milliseconds, mmddyyyy_dashed, yyddd,
-        yymmdd,
+        AnyClock, Clock, ClockError, FixedClock, InstantError, SystemClock, auth_key_complement,
+        cics_timestamp, db2_timestamp, hhmmss, hhmmss_colon, hhmmss_compact, is_whole_microsecond,
+        milliseconds, mmddyyyy_dashed, parse_instant, yyddd, yymmdd,
     };
-    use chrono::{DateTime, NaiveDate, Utc};
+    use chrono::{DateTime, NaiveDate, SubsecRound, TimeDelta, Utc};
 
     /// The instant the TRANREPT parity run pins the processing clock to.
     const PINNED: &str = "2022-07-01T12:00:00Z";
@@ -304,6 +442,8 @@ mod tests {
             " 2022-07-01T12:00:00Z\n",
             "2022-07-01T14:00:00+02:00",
             "2022-07-01T07:00:00-05:00",
+            "2022-07-01T12:00:00.000000000Z",
+            "2022-07-01T12:00:00.0000000000000Z",
         ] {
             let clock = AnyClock::from_override(Some(value)).expect("valid override");
             assert_eq!(clock, AnyClock::Fixed(FixedClock(at(PINNED))), "{value:?}");
@@ -330,6 +470,161 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_override_rejects_an_instant_a_timestamp_cannot_hold() {
+        for (value, kept, reason) in [
+            (
+                "2022-07-01T12:00:00.000000900Z",
+                "2022-07-01T12:00:00.000000900Z",
+                InstantError::FinerThanMicrosecond,
+            ),
+            (
+                "2022-07-01T12:00:00.0000000001Z",
+                "2022-07-01T12:00:00.0000000001Z",
+                InstantError::FinerThanMicrosecond,
+            ),
+            (
+                " 2016-12-31T23:59:60Z\n",
+                "2016-12-31T23:59:60Z",
+                InstantError::LeapSecond,
+            ),
+        ] {
+            let error = AnyClock::from_override(Some(value)).expect_err("an inexact override");
+            assert_eq!(
+                error,
+                ClockError::InexactOverride {
+                    value: kept.to_owned(),
+                    reason,
+                },
+                "{value:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "CARDDEMO_CLOCK_OVERRIDE is not an instant a timestamp holds exactly: \
+                     {kept}: {reason}"
+                )
+            );
+        }
+    }
+
+    /// 2022-07-01T12:00:00Z plus `micros` microseconds.
+    fn pinned_plus(micros: i64) -> DateTime<Utc> {
+        at(PINNED) + TimeDelta::microseconds(micros)
+    }
+
+    #[test]
+    fn parse_instant_accepts_whole_microseconds_in_every_rfc_3339_form() {
+        for (text, expected) in [
+            (PINNED, pinned_plus(0)),
+            ("2022-07-01T12:00:00.000001Z", pinned_plus(1)),
+            ("2022-07-01T12:00:00.000001000Z", pinned_plus(1)),
+            ("2022-07-01T12:00:00.000000000Z", pinned_plus(0)),
+            ("2022-07-01T12:00:00.123456000000000Z", pinned_plus(123_456)),
+            ("2022-07-01T12:00:00.5Z", pinned_plus(500_000)),
+            ("2022-07-01T14:00:00.000001+02:00", pinned_plus(1)),
+            ("2022-07-01T12:00:00-00:00", pinned_plus(0)),
+            ("2022-07-01T07:00:00\u{2212}05:00", pinned_plus(0)),
+            ("2022-07-01t12:00:00z", pinned_plus(0)),
+            ("2022-07-01 12:00:00Z", pinned_plus(0)),
+            (
+                "2016-12-31T23:59:59.999999Z",
+                at("2016-12-31T23:59:59.999999Z"),
+            ),
+        ] {
+            let parsed = parse_instant(text).unwrap_or_else(|error| panic!("{text:?}: {error}"));
+            assert_eq!(parsed, expected, "{text:?}");
+            assert!(is_whole_microsecond(parsed), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn parse_instant_refuses_digits_finer_than_a_microsecond_and_leap_seconds() {
+        for (text, expected) in [
+            (
+                "2022-07-01T12:00:00.000000900Z",
+                InstantError::FinerThanMicrosecond,
+            ),
+            (
+                "2022-07-01T12:00:00.0000001Z",
+                InstantError::FinerThanMicrosecond,
+            ),
+            (
+                "2022-07-01T12:00:00.0000000001Z",
+                InstantError::FinerThanMicrosecond,
+            ),
+            (
+                "2022-07-01T12:00:00.000001000000000000001+02:00",
+                InstantError::FinerThanMicrosecond,
+            ),
+            (
+                "2016-12-31T23:59:60.0000001Z",
+                InstantError::FinerThanMicrosecond,
+            ),
+            ("2016-12-31T23:59:60Z", InstantError::LeapSecond),
+            ("2016-12-31T23:59:60.5Z", InstantError::LeapSecond),
+            ("2017-01-01T01:59:60+02:00", InstantError::LeapSecond),
+        ] {
+            assert_eq!(parse_instant(text), Err(expected), "{text:?}");
+        }
+        assert_eq!(
+            InstantError::FinerThanMicrosecond.to_string(),
+            "value is finer than a microsecond: a fraction digit after the 6th is not 0"
+        );
+        assert_eq!(
+            InstantError::LeapSecond.to_string(),
+            "value is a leap second (second 60), which a timestamp cannot hold"
+        );
+    }
+
+    #[test]
+    fn parse_instant_refuses_text_that_is_not_rfc_3339() {
+        for text in [
+            "",
+            "not-a-date",
+            "2022-07-01",
+            "2022-07-01T12:00:00",
+            " 2022-07-01T12:00:00Z",
+            "2022-07-01T12:00:00Z ",
+            "2022-07-01T12:00:00.Z",
+            "2022-07-01T24:00:00Z",
+            "2022-07-01T12:60:00Z",
+            "2022-07-01T12:00:61Z",
+            "2022-02-30T00:00:00Z",
+            "2022-07-01T12:00:00+24:00",
+            "2022-07-01T12:00:00+0200",
+            "2022-07-01T12:00:00.0000001",
+        ] {
+            let error = parse_instant(text).expect_err("not RFC 3339");
+            assert!(matches!(error, InstantError::NotRfc3339(_)), "{text:?}");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("value is not an RFC 3339 date-time: "),
+                "{text:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_microseconds_are_the_instants_a_timestamp_holds() {
+        let leap = NaiveDate::from_ymd_opt(2016, 12, 31)
+            .and_then(|date| date.and_hms_nano_opt(23, 59, 59, 1_000_000_000))
+            .expect("a leap second")
+            .and_utc();
+        for (t, expected) in [
+            (pinned_plus(0), true),
+            (pinned_plus(1), true),
+            (pinned_plus(999_999), true),
+            (pinned_plus(0) + TimeDelta::nanoseconds(1), false),
+            (pinned_plus(1) + TimeDelta::nanoseconds(999), false),
+            (leap, false),
+            (leap + TimeDelta::microseconds(1), false),
+        ] {
+            assert_eq!(is_whole_microsecond(t), expected, "{t:?}");
+        }
+    }
+
     fn read<C: Clock>(clock: C) -> DateTime<Utc> {
         clock.now()
     }
@@ -349,11 +644,14 @@ mod tests {
     }
 
     #[test]
-    fn the_system_clock_reads_the_host_clock() {
-        let before = Utc::now();
+    fn the_system_clock_reads_the_host_clock_at_whole_microseconds() {
+        // The reading is truncated, so it may lie below a `before` taken in
+        // the same microsecond; `before` is truncated likewise.
+        let before = Utc::now().trunc_subsecs(6);
         let read = AnyClock::System(SystemClock).now();
         let after = Utc::now();
-        assert!(before <= read && read <= after);
+        assert!(before <= read && read <= after, "{before} {read} {after}");
+        assert!(is_whole_microsecond(read), "{read:?}");
     }
 
     #[test]

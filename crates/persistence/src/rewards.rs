@@ -46,8 +46,10 @@
 //! Points cross the `BIGINT` columns only as `RewardPoints` (`to_i64` and
 //! `TryFrom<i64>`), amounts the `NUMERIC(11,2)` bounds only as `Money<9>`, and
 //! rates the `NUMERIC(9,4)` column only as `RewardRate`; nothing is a
-//! floating-point value. A stored value that does not fit its domain type is
-//! [`PersistenceError::Corrupt`], which a port method reports as
+//! floating-point value. An accrual's `created_at` is bound only as the whole
+//! microsecond its `TIMESTAMPTZ` column stores exactly, and is refused, never
+//! narrowed, when it is finer. A stored value that does not fit its domain
+//! type is [`PersistenceError::Corrupt`], which a port method reports as
 //! `PortError::Unavailable` with the table and column named, never the value.
 //!
 //! The SQL names the reward tables only. The `transactions` row an accrual
@@ -69,14 +71,16 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{Postgres, Transaction};
 
+use crate::repos::rewards::ACCRUALS_TABLE;
 use crate::tx::{PgStore, UnitOfWork, savepoint, settle};
 // The row conversions go through the crate's shared column helpers in
 // `crate::repos` rather than copies of them, so a stored reward value is held
 // to its domain type exactly as every repository holds its columns.
 use crate::{PersistenceError, repos};
 
-/// The rule table, as [`PersistenceError::Corrupt`] names it.
-const RULES_TABLE: &str = "reward_rules";
+/// The rule table, as [`PersistenceError::Corrupt`] and
+/// [`PersistenceError::InexactInstant`] name it.
+pub(crate) const RULES_TABLE: &str = "reward_rules";
 
 /// The balance table, as [`PersistenceError::Corrupt`] names it.
 const BALANCES_TABLE: &str = "reward_balances";
@@ -311,13 +315,20 @@ impl RewardStore for PgRewardStore<'_, '_> {
     /// Inserts the `reward_accruals` row and returns the `accrual_id` the
     /// identity column assigned it.
     ///
-    /// Every field of `accrual` is stored unchanged, `created_at` included,
-    /// which the caller took from the processing clock. The insert runs under
-    /// its own savepoint: a rejected row is undone alone and leaves the outer
-    /// transaction usable.
+    /// Every field of `accrual` is stored exactly as given. `created_at`, the
+    /// caller's processing clock, must be a whole microsecond of UTC time, the
+    /// resolution of the `TIMESTAMPTZ` column, which the processing clock
+    /// guarantees; an instant the column cannot hold exactly is refused before
+    /// the insert, never narrowed by the bind, so the accrual the engine
+    /// returns and the row read back carry the same instant. The insert runs
+    /// under its own savepoint: a rejected row is undone alone and leaves the
+    /// outer transaction usable.
     ///
     /// # Errors
     ///
+    /// - `PortError::Unavailable` naming `reward_accruals.created_at` when
+    ///   `created_at` is not a whole microsecond of UTC time, with nothing
+    ///   written.
     /// - `PortError::Duplicate` when the transaction already has an accrual:
     ///   the `UNIQUE (transaction_id)` constraint
     ///   `reward_accruals_transaction_id_key`, one row per qualifying
@@ -336,6 +347,7 @@ impl RewardStore for PgRewardStore<'_, '_> {
             points_earned,
             created_at,
         } = accrual;
+        let created_at = repos::exact_instant(created_at, ACCRUALS_TABLE, "created_at")?;
         let mut sp = savepoint(self.tx).await?;
         let result = sqlx::query_scalar!(
             "INSERT INTO reward_accruals \

@@ -12,9 +12,21 @@
 //! - JSON names are the Rust field names, in `snake_case`.
 //! - Requests carry each map field as entered, as an `Option<String>`: a blank
 //!   or missing field reaches the rule unchanged, so the rule answers it with
-//!   the audited COBOL message. The only edit a request applies itself is the
-//!   BMS field length (`#[schema(max_length)]` and `#[validate(length(max))]`),
-//!   rejected through `reject_invalid`.
+//!   the audited COBOL message. The only edits a request applies itself, each
+//!   published as `#[schema(max_length, pattern)]` and rejected through
+//!   `reject_invalid` before any rule runs, are the BMS field width
+//!   (`#[validate(length(max))]`) and the encoding checks that apply to the
+//!   member: ASCII ([`ascii_text`]) where a rule moves the value byte for
+//!   byte into an `X(n)` field with no edit that reads those bytes, and, for
+//!   free text a rule stores, no NUL character beside other text
+//!   ([`storable_text`], [`storable_text_of_width`]), which `PostgreSQL` text
+//!   cannot hold. Where a program's audited edit reads the value, that edit
+//!   answers it and no encoding check precedes it: the `COTRTUPC` type code
+//!   and description (`admin_transaction_types`), and the sign-on fields,
+//!   which get the width check and then the `COSGN00C` blank edits (`auth`).
+//!   The reward DTOs (`admin_reward_rules`, `rewards`) serve no COBOL program
+//!   or BMS map and are the exception: their requests carry their own
+//!   required members and request-written checks.
 //! - Responses carry the entity field names: the copybook names in lower
 //!   `snake_case`, prefix and spelling kept (`acct_expiraion_date`,
 //!   `pa_merchant_catagory_code`). The request-fixed keys are the exceptions:
@@ -67,7 +79,9 @@ use crate::error::{ApiError, ErrorFieldBody};
 /// Latin-1 character each, so `é` would come back as `Ã©`. Within ASCII,
 /// characters and bytes agree, so the width the length check counts is the
 /// width the `MOVE` fills. Spaces and low-values are ASCII: blank members
-/// still reach the rule, which answers them with its own message.
+/// still reach the rule, which answers them with its own message. Free text
+/// the rule stores is checked by [`storable_text`] or
+/// [`storable_text_of_width`] instead, which add the NUL check to this one.
 ///
 /// The published API document carries this check on each such member as the
 /// pattern `^[\x00-\x7F]*$`. A failure is reported under the `ascii` code,
@@ -82,6 +96,71 @@ pub fn ascii_text(value: &str) -> Result<(), ValidationError> {
         Ok(())
     } else {
         Err(ValidationError::new("ascii"))
+    }
+}
+
+/// The `validator` check of the free text a rule stores in an `X(n)` record
+/// field whenever it is not blank, for a rule that reads any text made only
+/// of NUL characters as `LOW-VALUES`: ASCII, as [`ascii_text`] checks it, and
+/// either no NUL character or nothing but NUL characters.
+///
+/// The `COTRN02C` source, description and merchant name, city and zip
+/// (`transaction_add`) and the `COUSR02C` first and last names
+/// (`user_update`) are read that way, so an all-NUL value reaches the rule,
+/// which answers it with its own `can NOT be empty` message. Any other value
+/// is written as entered, and `PostgreSQL` text cannot hold a NUL character
+/// (E-07), so the write could only fail. A 3270 field never sends NUL
+/// characters mixed with other text, so such a value has no COBOL counterpart
+/// and is answered as the non-ASCII and over-length ones are: 400 `Invalid`,
+/// no message, its BMS field named (E-49). The value is never stripped or
+/// altered.
+///
+/// The published API document carries this check on each such member as the
+/// pattern `^(?:\x00+|[\x01-\x7F]*)$`.
+///
+/// # Errors
+///
+/// A [`ValidationError`] with code `ascii` when `value` holds a character
+/// above `U+007F`, otherwise with code `nul` when it holds a NUL character
+/// beside any other character.
+pub fn storable_text(value: &str) -> Result<(), ValidationError> {
+    storable(value, low_values(value))
+}
+
+/// [`storable_text`] for a rule that reads NUL characters as `LOW-VALUES`
+/// only when they fill the `X(N)` field: ASCII, and either no NUL character or
+/// exactly `N` of them.
+///
+/// The `COUSR01C` edits (`user_add`) `MOVE` the entry into its `X(N)` field
+/// first, which pads it with spaces, so only `N` NUL characters stay
+/// `LOW-VALUES` and get the empty-field message; a shorter run of NUL
+/// characters is stored with the padding, which `PostgreSQL` text cannot hold
+/// (E-07). The published API document carries this check as the pattern
+/// `^(?:\x00{N}|[\x01-\x7F]*)$`.
+///
+/// # Errors
+///
+/// A [`ValidationError`] with code `ascii` when `value` holds a character
+/// above `U+007F`, otherwise with code `nul` when it holds a NUL character
+/// and is not exactly `N` of them.
+pub fn storable_text_of_width<const N: usize>(value: &str) -> Result<(), ValidationError> {
+    storable(value, value.len() == N && low_values(value))
+}
+
+/// Whether `value` is a text made only of NUL characters, which a rule reads
+/// as `LOW-VALUES`.
+fn low_values(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte == 0)
+}
+
+/// The ASCII check of `value`, then its NUL characters refused unless the
+/// rule reads the whole value as `LOW-VALUES` (`blank`).
+fn storable(value: &str, blank: bool) -> Result<(), ValidationError> {
+    ascii_text(value)?;
+    if blank || !value.contains('\0') {
+        Ok(())
+    } else {
+        Err(ValidationError::new("nul"))
     }
 }
 
@@ -212,12 +291,14 @@ pub(crate) fn bms_errors<F: BmsField>(
         .collect()
 }
 
-/// The error-body fields of a failed length check: each failing request field
-/// mapped to its BMS field by `map`, through [`bms_errors`].
+/// The error-body fields of a failed DTO check: each request field that fails
+/// its width or encoding check mapped to its BMS field by `map`, through
+/// [`bms_errors`].
 ///
-/// `map` takes the request field's JSON name, which `validator` reports, and
-/// must cover every field the DTO validates; a name it maps to `None` is left
-/// out. Two request fields that share a BMS field give one entry.
+/// `map` takes the request field's JSON name, which `validator` reports
+/// whatever the failing check, and must cover every field the DTO validates;
+/// a name it maps to `None` is left out. A field that fails more than one
+/// check, and two request fields that share a BMS field, give one entry.
 #[must_use]
 pub(crate) fn length_errors<F: BmsField>(
     errors: &ValidationErrors,
@@ -227,12 +308,15 @@ pub(crate) fn length_errors<F: BmsField>(
     bms_errors(errors.field_errors().into_keys().filter_map(map), message)
 }
 
-/// The 400 answer to a request whose fields fail their length checks: kind
-/// `Invalid`, `message`, and the failing BMS fields from [`length_errors`].
+/// The 400 answer to a request whose fields fail their width or encoding
+/// checks: kind `Invalid`, `message`, and the failing BMS fields from
+/// [`length_errors`].
 ///
 /// `message` is the `carddemo_domain::messages` constant the validation
 /// audit's over-length row names for the program, or `""` where the audit
-/// records the path as `no-message` and links its escalation.
+/// records the path as `no-message` and links its escalation. A DTO with an
+/// encoding check passes `""`: no 3270 field sends a non-ASCII character or
+/// NUL characters beside other text, so neither has an audited text (E-49).
 #[must_use]
 pub(crate) fn reject_invalid<F: BmsField>(
     errors: &ValidationErrors,
@@ -248,6 +332,8 @@ pub(crate) fn reject_invalid<F: BmsField>(
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use axum::http::StatusCode;
     use carddemo_domain::error::ErrorKind;
     use carddemo_domain::messages;
@@ -262,7 +348,8 @@ mod tests {
     use validator::Validate;
 
     use super::{
-        BmsField, ascii_text, bms_errors, id_string, length_errors, money, reject_invalid, text,
+        BmsField, ascii_text, bms_errors, id_string, length_errors, money, reject_invalid,
+        storable_text, storable_text_of_width, text,
     };
     use crate::error::ErrorFieldBody;
 
@@ -358,6 +445,44 @@ mod tests {
         for value in rejected {
             let error = ascii_text(value).expect_err(value);
             assert_eq!(error.code, "ascii", "{value:?}");
+        }
+    }
+
+    #[test]
+    fn storable_text_admits_nul_only_as_the_low_values_the_rule_reads_as_blank() {
+        // (value, code of `storable_text`, code of `storable_text_of_width::<4>`)
+        let cases = [
+            ("", None, None),
+            (" ", None, None),
+            ("    ", None, None),
+            ("ABC 123", None, None),
+            ("\u{1}\u{7f}", None, None),
+            ("\0", None, Some("nul")),
+            ("\0\0", None, Some("nul")),
+            ("\0\0\0", None, Some("nul")),
+            ("\0\0\0\0", None, None),
+            ("A\0", Some("nul"), Some("nul")),
+            ("\0A", Some("nul"), Some("nul")),
+            ("A\0B", Some("nul"), Some("nul")),
+            ("\0 ", Some("nul"), Some("nul")),
+            (" \0", Some("nul"), Some("nul")),
+            ("\0\0\0 ", Some("nul"), Some("nul")),
+            ("\u{e9}", Some("ascii"), Some("ascii")),
+            ("\0\u{e9}", Some("ascii"), Some("ascii")),
+            ("\u{1f600}", Some("ascii"), Some("ascii")),
+        ];
+        for (value, any_length, full_width) in cases {
+            let codes = [
+                storable_text(value).err().map(|error| error.code),
+                storable_text_of_width::<4>(value)
+                    .err()
+                    .map(|error| error.code),
+            ];
+            assert_eq!(
+                codes,
+                [any_length.map(Cow::from), full_width.map(Cow::from)],
+                "{value:?}"
+            );
         }
     }
 

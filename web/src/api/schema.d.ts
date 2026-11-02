@@ -2147,14 +2147,19 @@ export interface components {
             /**
              * Format: date-time
              * @description The first instant the rule is active, inclusive, as an RFC 3339
-             *     date-time.
+             *     date-time of at most microsecond precision, converted to UTC: a
+             *     fraction digit after the 6th must be `0`, and second `60` (a leap
+             *     second) is refused, because the stored timestamp keeps whole
+             *     microseconds and no leap second. The day must exist in its month.
              * @example 2022-01-01T00:00:00Z
              */
             active_from: string;
             /**
              * Format: date-time
-             * @description The end of the active window, exclusive, as an RFC 3339 date-time.
-             *     Absent or `null` leaves the rule open-ended.
+             * @description The end of the active window, exclusive, as an RFC 3339 date-time of
+             *     at most microsecond precision, converted to UTC, held to the same
+             *     constraints as `active_from`. Absent or `null` leaves the rule
+             *     open-ended.
              * @example 2030-01-01T00:00:00Z
              */
             active_to?: string | null;
@@ -2353,12 +2358,13 @@ export interface components {
          *     with its `can NOT be empty` message (V-COTRN02C-003, V-COTRN02C-008 to
          *     V-COTRN02C-018). The account ID is used when entered, otherwise the card
          *     number. Every member is limited to its map field's width, and the source,
-         *     description and merchant name, city and zip to ASCII characters; the
-         *     formats are the rule's edits, so that a malformed entry gets its audited
-         *     message. The published `pattern` of a code, amount, date or merchant ID is
-         *     the form its edit accepts (V-COTRN02C-019 to V-COTRN02C-023,
-         *     V-COTRN02C-026); the dates' is their shape only, the calendar check being
-         *     `CSUTLDTC`'s (V-COTRN02C-024, V-COTRN02C-025).
+         *     description and merchant name, city and zip to ASCII characters, with NUL
+         *     characters only as the whole entry; the formats are the rule's edits, so
+         *     that a malformed entry gets its audited message. The published `pattern`
+         *     of a code, amount, date or merchant ID is the form its edit accepts
+         *     (V-COTRN02C-019 to V-COTRN02C-023, V-COTRN02C-026); the dates' is their
+         *     shape only, the calendar check being `CSUTLDTC`'s (V-COTRN02C-024,
+         *     V-COTRN02C-025).
          *
          *     It also serializes, so a client builds the bodies it sends from it.
          */
@@ -2384,21 +2390,36 @@ export interface components {
             tran_amt?: string | null;
             /** @description `TCATCD` (`TCATCDI X(4)`): the transaction category code, 4 digits. */
             tran_cat_cd?: string | null;
-            /** @description `TDESC` (`TDESCI X(60)`): the description, ASCII characters only. */
+            /**
+             * @description `TDESC` (`TDESCI X(60)`): the description, in ASCII without NUL
+             *     characters, or NUL characters only, the `LOW-VALUES` answered as empty.
+             */
             tran_desc?: string | null;
-            /** @description `MCITY` (`MCITYI X(25)`): the merchant city, ASCII characters only. */
+            /**
+             * @description `MCITY` (`MCITYI X(25)`): the merchant city, in ASCII without NUL
+             *     characters, or NUL characters only, the `LOW-VALUES` answered as empty.
+             */
             tran_merchant_city?: string | null;
             /** @description `MID` (`MIDI X(9)`): the merchant ID, 9 digits. */
             tran_merchant_id?: string | null;
-            /** @description `MNAME` (`MNAMEI X(30)`): the merchant name, ASCII characters only. */
+            /**
+             * @description `MNAME` (`MNAMEI X(30)`): the merchant name, in ASCII without NUL
+             *     characters, or NUL characters only, the `LOW-VALUES` answered as empty.
+             */
             tran_merchant_name?: string | null;
-            /** @description `MZIP` (`MZIPI X(10)`): the merchant zip, ASCII characters only. */
+            /**
+             * @description `MZIP` (`MZIPI X(10)`): the merchant zip, in ASCII without NUL
+             *     characters, or NUL characters only, the `LOW-VALUES` answered as empty.
+             */
             tran_merchant_zip?: string | null;
             /** @description `TORIGDT` (`TORIGDTI X(10)`): the origination date, `YYYY-MM-DD`. */
             tran_orig_date?: string | null;
             /** @description `TPROCDT` (`TPROCDTI X(10)`): the processing date, `YYYY-MM-DD`. */
             tran_proc_date?: string | null;
-            /** @description `TRNSRC` (`TRNSRCI X(10)`): the source, ASCII characters only. */
+            /**
+             * @description `TRNSRC` (`TRNSRCI X(10)`): the source, in ASCII without NUL
+             *     characters, or NUL characters only, the `LOW-VALUES` answered as empty.
+             */
             tran_source?: string | null;
             /** @description `TTYPCD` (`TTYPCDI X(2)`): the transaction type code, 2 digits. */
             tran_type_cd?: string | null;
@@ -2506,9 +2527,15 @@ export interface components {
          *     (V-COUSR01C-001 to V-COUSR01C-005).
          */
         UserAddRequest: {
-            /** @description `FNAMEI PIC X(20)`, the first name, in ASCII. */
+            /**
+             * @description `FNAMEI PIC X(20)`, the first name, in ASCII without NUL characters, or
+             *     exactly 20 NUL characters, the `LOW-VALUES` answered as empty.
+             */
             first_name?: string | null;
-            /** @description `LNAMEI PIC X(20)`, the last name, in ASCII. */
+            /**
+             * @description `LNAMEI PIC X(20)`, the last name, in ASCII without NUL characters, or
+             *     exactly 20 NUL characters, the `LOW-VALUES` answered as empty.
+             */
             last_name?: string | null;
             /**
              * @description `PASSWDI PIC X(8)`, the password in ASCII, stored as the argon2id hash
@@ -2516,8 +2543,9 @@ export interface components {
              */
             password?: string | null;
             /**
-             * @description `USERIDI PIC X(8)`, the new user's ID in ASCII, stored with its case
-             *     kept.
+             * @description `USERIDI PIC X(8)`, the new user's ID in ASCII without NUL characters,
+             *     stored with its case kept, or exactly 8 NUL characters, the
+             *     `LOW-VALUES` answered as empty.
              */
             user_id?: string | null;
             /**
@@ -2614,9 +2642,15 @@ export interface components {
          *     missing password is not (E-21, see `password`).
          */
         UserUpdateRequest: {
-            /** @description `FNAMEI PIC X(20)`, the first name, in ASCII. */
+            /**
+             * @description `FNAMEI PIC X(20)`, the first name, in ASCII without NUL characters, or
+             *     NUL characters only, the `LOW-VALUES` answered as empty.
+             */
             first_name?: string | null;
-            /** @description `LNAMEI PIC X(20)`, the last name, in ASCII. */
+            /**
+             * @description `LNAMEI PIC X(20)`, the last name, in ASCII without NUL characters, or
+             *     NUL characters only, the `LOW-VALUES` answered as empty.
+             */
             last_name?: string | null;
             /**
              * @description `PASSWDI PIC X(8)`, the password in ASCII, as entered, case kept. Absent or

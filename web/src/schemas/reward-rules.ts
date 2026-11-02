@@ -43,11 +43,15 @@ const TYPE_CODE_PATTERN = /^[\x01-\xFF]*$/;
 // digits as the OpenAPI pattern allows.
 const CATEGORY_CODE_PATTERN = /^[0-9]{1,4}$/;
 
-// An unsigned rate with at most the 4 fraction digits of NUMERIC(9,4). The
-// sign is checked separately so a negative rate gets its own message. The
-// OpenAPI pattern carries no integer-digit limit, so a rate of 100000 or more
-// passes here and is answered by the server on field `reward_rate`.
-const REWARD_RATE_PATTERN = /^[0-9]+(\.[0-9]{1,4})?$/;
+// An unsigned rate whose fraction has no non-zero digit beyond the fourth
+// place, the 4 fraction digits of NUMERIC(9,4). Zeros after the fourth place
+// are accepted (`1.50000`, `0.00000`), because the server drops trailing
+// fraction zeros before it checks the scale; `1.50001` is rejected. The text is
+// matched as written and submitted unchanged. The sign is checked separately
+// so a negative rate gets its own message. The OpenAPI pattern carries no
+// integer-digit limit, so a rate of 100000 or more passes here and is answered
+// by the server on field `reward_rate`.
+const REWARD_RATE_PATTERN = /^[0-9]+(\.[0-9]{1,4}0*)?$/;
 
 // `RewardRuleRequest.min_transaction_amount` / `max_transaction_amount`: the
 // OpenAPI pattern of an S9(09)V99 amount, sign allowed.

@@ -2,12 +2,15 @@
 // follow the COTRN02C audit (Order, ID) order across fields, so the first
 // issue is the message the server answers, and each field gets at most its
 // own first issue; against the server's TransactionAddRequest constraints, the
-// free-text members accept ASCII only, with zod's regex issue (no-message,
+// free-text members accept ASCII only, with NUL characters only as the whole
+// (blank) entry, and answer anything else with zod's regex issue (no-message,
 // E-49), and every member with a class or format edit answers a non-ASCII or
 // malformed entry with its audited COTRN02C text. Expected texts are the
 // docs/parity/validation-audit.md COTRN02C rows.
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+
+import openapi from "../../openapi/openapi.json";
 
 import {
   type TransactionAddFormValues,
@@ -212,37 +215,65 @@ function printableAscii(width: number): string {
   return printable.repeat(Math.ceil(width / printable.length)).slice(0, width);
 }
 
+/** The server's published TransactionAddRequest members. */
+const PUBLISHED_ADD = openapi.components.schemas.TransactionAddRequest.properties;
+
+/** Non-blank entries a free-text member of `width` accepts. */
+function textEntries(width: number): string[] {
+  return [printableAscii(width), "\u007f", "Cafe"];
+}
+
+/**
+ * Entries a free-text member of `width` refuses before any COBOL edit:
+ * non-ASCII text, then NUL characters beside other text, which COTRN02C would
+ * store and PostgreSQL text cannot hold (E-07).
+ */
+function unstorableEntries(width: number): string[] {
+  return [
+    "\u00e9",
+    "\u0080",
+    "\u20ac",
+    "\u{1f600}",
+    "Caf\u00e9",
+    "\u00e9".repeat(width),
+    "A\u0000B",
+    "\u0000A",
+    "A\u0000",
+    "\u0000 ",
+    " \u0000",
+    `${"\u0000".repeat(width - 1)}A`,
+  ];
+}
+
+/** Blank entries of a member of `width`: empty, spaces, and NUL characters only (LOW-VALUES). */
+function blankEntries(width: number): string[] {
+  return ["", " ".repeat(width), "\u0000", "\u0000\u0000", "\u0000".repeat(width)];
+}
+
 describe("transactionAddFormSchema", () => {
   it("accepts the valid entry", () => {
     expect(issuesOf(VALID)).toEqual([]);
   });
 
   describe.each(FREE_TEXT)("%s", (member, width, emptyMessage) => {
-    it.each([printableAscii(width), "\u007f", "Cafe"])(
-      "accepts the ASCII entry %j",
+    it.each(textEntries(width))("accepts the ASCII entry %j", (entered) => {
+      expect(issuesAt({ ...VALID, [member]: entered }, member)).toEqual([]);
+    });
+
+    it.each(unstorableEntries(width))(
+      "rejects %j with zod's regex issue and no audited text",
       (entered) => {
-        expect(issuesAt({ ...VALID, [member]: entered }, member)).toEqual([]);
+        const issues = issuesAt({ ...VALID, [member]: entered }, member);
+        expect(issues).toHaveLength(1);
+        expect(issues[0]).toMatchObject({
+          code: z.ZodIssueCode.invalid_string,
+          validation: "regex",
+        });
+        expect(AUDITED).not.toContain(issues[0]?.message);
       },
     );
 
-    it.each([
-      "\u00e9",
-      "\u0080",
-      "\u20ac",
-      "\u{1f600}",
-      "Caf\u00e9",
-      "\u00e9".repeat(width),
-    ])("rejects %j with zod's regex issue and no audited text", (entered) => {
-      const issues = issuesAt({ ...VALID, [member]: entered }, member);
-      expect(issues).toHaveLength(1);
-      expect(issues[0]).toMatchObject({
-        code: z.ZodIssueCode.invalid_string,
-        validation: "regex",
-      });
-      expect(AUDITED).not.toContain(issues[0]?.message);
-    });
-
-    it.each(["", " ".repeat(width), "\u0000".repeat(width)])(
+    it.each(blankEntries(width))(
       "answers the blank entry %j with its can NOT be empty text",
       (entered) => {
         expect(
@@ -250,6 +281,17 @@ describe("transactionAddFormSchema", () => {
         ).toEqual([emptyMessage]);
       },
     );
+
+    it("gives its regex issue to exactly the entries the published pattern refuses", () => {
+      const published = new RegExp(PUBLISHED_ADD[member].pattern);
+      const entries = [...textEntries(width), ...unstorableEntries(width), ...blankEntries(width)];
+      for (const entered of entries) {
+        const refused = issuesAt({ ...VALID, [member]: entered }, member).some(
+          (issue) => issue.code === z.ZodIssueCode.invalid_string,
+        );
+        expect(refused, JSON.stringify(entered)).toBe(!published.test(entered));
+      }
+    });
   });
 
   // The members whose class or format edit rejects a non-ASCII entry, which

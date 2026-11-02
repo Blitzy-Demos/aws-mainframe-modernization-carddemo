@@ -58,6 +58,11 @@
 //! constructor's reason, never the value itself, which may be a card
 //! verification code or a social security number. Port methods turn it into a
 //! [`PortError`] with `?`.
+//!
+//! On the way out, `exact_instant` holds an instant to what its `TIMESTAMPTZ`
+//! column stores, a whole microsecond: a finer instant is
+//! [`PersistenceError::InexactInstant`] before the statement runs, never
+//! narrowed by the bind.
 
 pub mod accounts;
 pub mod authorizations;
@@ -76,12 +81,14 @@ pub use transactions::LoadOutcome;
 
 use std::collections::BTreeMap;
 
+use carddemo_domain::clock::is_whole_microsecond;
 use carddemo_domain::numeric::{
     AccountGroupId, AccountId, Alnum, AuthCount, CardNumber, CustSsn, CustomerId, Cvv, FicoScore,
     InterestRate, MerchantId, Money, NumericCode, NumericError, RewardPoints, RewardRate,
     TranCategoryCode, TranId, TranTypeCode, UserId,
 };
 use carddemo_domain::ports::{PortError, PortResult};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::PersistenceError;
@@ -327,6 +334,40 @@ pub(crate) fn account_group_id(
     alnum(value, table, column).map(AccountGroupId::from_alnum)
 }
 
+/// An instant as a `TIMESTAMPTZ` column of `table` binds it, refused unless
+/// the column stores it exactly.
+///
+/// `PostgreSQL` keeps a timestamp to the whole microsecond and has no leap
+/// second, and the sqlx encoder drops anything finer without a word. An
+/// instant that is not
+/// [`is_whole_microsecond`](carddemo_domain::clock::is_whole_microsecond) is
+/// therefore [`PersistenceError::InexactInstant`] naming the table and column,
+/// never the value, and is never truncated or rounded. Writers call this
+/// before their statement, so a refused instant writes nothing.
+pub(crate) fn exact_instant(
+    value: DateTime<Utc>,
+    table: &'static str,
+    column: &'static str,
+) -> Result<DateTime<Utc>, PersistenceError> {
+    if is_whole_microsecond(value) {
+        Ok(value)
+    } else {
+        Err(PersistenceError::InexactInstant { table, column })
+    }
+}
+
+/// [`exact_instant`] for a nullable column, such as `reward_rules.active_to`.
+/// `None` stays `None`.
+pub(crate) fn opt_exact_instant(
+    value: Option<DateTime<Utc>>,
+    table: &'static str,
+    column: &'static str,
+) -> Result<Option<DateTime<Utc>>, PersistenceError> {
+    value
+        .map(|instant| exact_instant(instant, table, column))
+        .transpose()
+}
+
 /// A row limit as the `BIGINT` a `LIMIT` clause binds.
 ///
 /// Generic over the caller's integer type, so the `u16` of `Browse::limit`
@@ -392,13 +433,14 @@ mod tests {
 
     use carddemo_domain::numeric::{AuthCount, FicoScore};
     use carddemo_domain::ports::PortError;
+    use chrono::{NaiveDate, TimeDelta, TimeZone, Utc};
     use rust_decimal::Decimal;
 
     use super::{
         PersistenceError, account_group_id, account_id, alnum, auth_count, card_number, cust_ssn,
-        customer_id, cvv, expect_affected, fico_score, interest_rate, keyed_records, limit_i64,
-        merchant_id, money, numeric_code, opt_alnum, opt_money, reward_points, reward_rate,
-        tran_category_code, tran_id, tran_type_code, user_id,
+        customer_id, cvv, exact_instant, expect_affected, fico_score, interest_rate, keyed_records,
+        limit_i64, merchant_id, money, numeric_code, opt_alnum, opt_exact_instant, opt_money,
+        reward_points, reward_rate, tran_category_code, tran_id, tran_type_code, user_id,
     };
 
     const TABLE: &str = "accounts";
@@ -711,6 +753,59 @@ mod tests {
             format!("stored customers.cust_ssn value does not fit its domain type: {OUT_OF_RANGE}");
         assert_eq!(error, PortError::Unavailable(expected));
         assert!(!error.to_string().contains("1234567890"), "{error}");
+    }
+
+    #[test]
+    fn instants_bind_only_when_their_column_stores_them_exactly() {
+        let noon = Utc
+            .with_ymd_and_hms(2022, 7, 1, 12, 0, 0)
+            .single()
+            .expect("a valid UTC instant");
+        let leap = NaiveDate::from_ymd_opt(2016, 12, 31)
+            .and_then(|date| date.and_hms_nano_opt(23, 59, 59, 1_000_000_000))
+            .expect("a leap second")
+            .and_utc();
+        for (instant, exact) in [
+            (noon, true),
+            (noon + TimeDelta::microseconds(1), true),
+            (noon + TimeDelta::nanoseconds(1), false),
+            (noon + TimeDelta::nanoseconds(1_000_900), false),
+            (leap, false),
+        ] {
+            for outcome in [
+                exact_instant(instant, "reward_rules", "active_from").map(Some),
+                opt_exact_instant(Some(instant), "reward_rules", "active_from"),
+            ] {
+                match outcome {
+                    Ok(bound) => {
+                        assert!(exact, "{instant:?} was bound");
+                        assert_eq!(bound, Some(instant), "bound unchanged");
+                    }
+                    Err(PersistenceError::InexactInstant { table, column }) => {
+                        assert!(!exact, "{instant:?} was refused");
+                        assert_eq!((table, column), ("reward_rules", "active_from"));
+                    }
+                    Err(other) => panic!("{instant:?}: expected InexactInstant, got {other}"),
+                }
+            }
+        }
+        assert!(matches!(
+            opt_exact_instant(None, "reward_rules", "active_to"),
+            Ok(None)
+        ));
+        assert_eq!(
+            exact_instant(
+                noon + TimeDelta::nanoseconds(900),
+                "reward_rules",
+                "active_from"
+            )
+            .map_err(PortError::from),
+            Err(PortError::Unavailable(
+                "reward_rules.active_from cannot store the instant exactly: it is not a whole \
+                 microsecond of UTC time"
+                    .to_owned()
+            ))
+        );
     }
 
     #[test]

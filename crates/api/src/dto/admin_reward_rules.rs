@@ -25,6 +25,7 @@
 //! `carddemo_domain::rewards::validate_rule`, which the handler calls with the
 //! draft, so each keeps its one message.
 
+use carddemo_domain::clock::parse_instant;
 use carddemo_domain::entities::RewardRule;
 use carddemo_domain::numeric::{Money, TranCategoryCode, TranTypeCode};
 use carddemo_domain::rewards::RuleDraft;
@@ -81,13 +82,28 @@ pub struct RewardRuleRequest {
     #[schema(pattern = r"^-?[0-9]+(\.[0-9]{1,2})?$", example = "500.00")]
     pub max_transaction_amount: Option<String>,
     /// The first instant the rule is active, inclusive, as an RFC 3339
-    /// date-time.
-    #[schema(format = DateTime, example = "2022-01-01T00:00:00Z")]
+    /// date-time of at most microsecond precision, converted to UTC: a
+    /// fraction digit after the 6th must be `0`, and second `60` (a leap
+    /// second) is refused, because the stored timestamp keeps whole
+    /// microseconds and no leap second. The day must exist in its month.
+    // The pattern is `carddemo_domain::clock::INSTANT_PATTERN`, the shape
+    // `instant` accepts; the attribute takes only a literal.
+    #[schema(
+        format = DateTime,
+        pattern = r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt ]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]{1,6}0*)?([Zz]|[+\-\u2212]([01][0-9]|2[0-3]):[0-5][0-9])$",
+        example = "2022-01-01T00:00:00Z"
+    )]
     pub active_from: String,
-    /// The end of the active window, exclusive, as an RFC 3339 date-time.
-    /// Absent or `null` leaves the rule open-ended.
+    /// The end of the active window, exclusive, as an RFC 3339 date-time of
+    /// at most microsecond precision, converted to UTC, held to the same
+    /// constraints as `active_from`. Absent or `null` leaves the rule
+    /// open-ended.
     #[serde(default)]
-    #[schema(format = DateTime, example = "2030-01-01T00:00:00Z")]
+    #[schema(
+        format = DateTime,
+        pattern = r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt ]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]{1,6}0*)?([Zz]|[+\-\u2212]([01][0-9]|2[0-3]):[0-5][0-9])$",
+        example = "2030-01-01T00:00:00Z"
+    )]
     pub active_to: Option<String>,
 }
 
@@ -113,7 +129,9 @@ impl RewardRuleRequest {
     ///   `Decimal` holds.
     /// - `min_transaction_amount`, `max_transaction_amount`: not
     ///   `-?[0-9]+(.[0-9]{1,2})?`, or a magnitude of 10^9 or more.
-    /// - `active_from`, `active_to`: not an RFC 3339 date-time.
+    /// - `active_from`, `active_to`: not an RFC 3339 date-time; a fraction
+    ///   digit after the 6th that is not `0`, finer than a microsecond; or
+    ///   second `60`, a leap second. None of them is narrowed to fit.
     pub fn into_draft(self) -> Result<RuleDraft, ApiError> {
         let Self {
             transaction_type_cd,
@@ -318,16 +336,18 @@ fn optional_amount(field: &str, text: Option<&str>) -> Result<Option<Money<9>>, 
     .transpose()
 }
 
-/// The UTC instant written as an RFC 3339 date-time in request field `field`.
+/// The UTC instant written as an RFC 3339 date-time in request field `field`,
+/// through [`parse_instant`]: an instant finer than a microsecond or on a leap
+/// second, which `reward_rules` would not store as written, is rejected rather
+/// than narrowed.
 fn instant(field: &str, text: &str) -> Result<DateTime<Utc>, ApiError> {
-    DateTime::parse_from_rfc3339(text)
-        .map(|instant| instant.with_timezone(&Utc))
-        .map_err(|err| rejected(field, err))
+    parse_instant(text).map_err(|err| rejected(field, err))
 }
 
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
+    use carddemo_domain::clock::INSTANT_PATTERN;
     use carddemo_domain::entities::RewardRule;
     use carddemo_domain::error::ErrorKind;
     use carddemo_domain::messages::{
@@ -335,7 +355,7 @@ mod tests {
     };
     use carddemo_domain::numeric::{Money, RewardRate, RuleId, TranCategoryCode, TranTypeCode};
     use carddemo_domain::rewards::validate_rule;
-    use chrono::{DateTime, TimeZone, Utc};
+    use chrono::{DateTime, TimeDelta, TimeZone, Utc};
     use rust_decimal::Decimal;
     use serde_json::{Value, json};
     use utoipa::PartialSchema;
@@ -564,6 +584,65 @@ mod tests {
         }
     }
 
+    /// 2022-07-01T12:00:00Z plus `micros` microseconds.
+    fn noon_plus(micros: i64) -> DateTime<Utc> {
+        instant(2022, 7, 1, 12) + TimeDelta::microseconds(micros)
+    }
+
+    #[test]
+    fn whole_microsecond_instants_convert_to_utc_as_written() {
+        let cases = [
+            ("2022-07-01T12:00:00Z", noon_plus(0)),
+            ("2022-07-01T12:00:00.000001Z", noon_plus(1)),
+            ("2022-07-01T12:00:00.000001000Z", noon_plus(1)),
+            ("2022-07-01T12:00:00.000000000Z", noon_plus(0)),
+            ("2022-07-01T14:00:00.000002+02:00", noon_plus(2)),
+            ("2022-07-01T07:00:00\u{2212}05:00", noon_plus(0)),
+            ("2022-07-01 12:00:00.5z", noon_plus(500_000)),
+        ];
+        for (text, expected) in cases {
+            let draft = request(body_with("active_from", json!(text)))
+                .into_draft()
+                .unwrap_or_else(|error| panic!("active_from {text}: {}", error.body().message));
+            assert_eq!(draft.active_from, expected, "active_from {text}");
+            let draft = request(body_with("active_to", json!(text)))
+                .into_draft()
+                .unwrap_or_else(|error| panic!("active_to {text}: {}", error.body().message));
+            assert_eq!(draft.active_to, Some(expected), "active_to {text}");
+        }
+    }
+
+    #[test]
+    fn instants_finer_than_a_microsecond_or_on_a_leap_second_are_rejected() {
+        let finer = "value is finer than a microsecond: a fraction digit after the 6th is not 0";
+        let leap = "value is a leap second (second 60), which a timestamp cannot hold";
+        let cases = [
+            ("2022-07-01T12:00:00.000000900Z", finer),
+            ("2022-07-01T12:00:00.0000000001Z", finer),
+            ("2016-12-31T23:59:60Z", leap),
+        ];
+        for field in ["active_from", "active_to"] {
+            for (text, reason) in cases {
+                let error = rejection(body_with(field, json!(text)));
+                assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{field} {text}");
+                assert_eq!(
+                    error.body().code,
+                    ErrorKind::Invalid.code(),
+                    "{field} {text}"
+                );
+                assert_eq!(error.body().message, format!("{field}: {reason}"));
+                assert!(error.body().fields.is_empty(), "{field} {text}");
+            }
+        }
+        assert!(
+            rejection(body_with("active_from", json!("2022-01-01")))
+                .body()
+                .message
+                .starts_with("active_from: value is not an RFC 3339 date-time: "),
+            "a date alone is not an instant"
+        );
+    }
+
     #[test]
     fn rejection_reasons_say_what_is_wrong() {
         let cases = [
@@ -731,6 +810,7 @@ mod tests {
         }
         for name in ["active_from", "active_to"] {
             assert_eq!(property(name)["format"], json!("date-time"), "{name}");
+            assert_eq!(property(name)["pattern"], json!(INSTANT_PATTERN), "{name}");
         }
     }
 

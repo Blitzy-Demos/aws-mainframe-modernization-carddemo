@@ -35,10 +35,18 @@
 //! `SEC-USER-DATA`, so a non-ASCII character would take two to four bytes of
 //! the width, be cut at it, and read back one Latin-1 character per byte (`é`
 //! stored as `Ã©`), and a user ID added that way could not be addressed again.
-//! Neither edit has a `COUSR0nC` path or text, so both are answered alike: 400
-//! `Invalid` on the field with an empty message. A blank or missing field is
-//! ASCII and reaches the rule unchanged, which answers it with the audited
-//! empty-field message.
+//! The names and the new user's ID are text the rules store, and
+//! `PostgreSQL` text cannot hold NUL (E-07), so they also refuse NUL
+//! characters except as the `LOW-VALUES` the rule answers as empty
+//! ([`crate::dto::storable_text`], [`crate::dto::storable_text_of_width`]):
+//! `COUSR02C` reads NUL characters alone as blank, whatever their number,
+//! while `COUSR01C` first moves the entry into its `X(n)` field, padded with
+//! spaces, so only `n` of them stay `LOW-VALUES`. The password keeps NUL,
+//! being stored as its argon2id hash, and so does the one-byte user type,
+//! which is NUL-free or the full-width `LOW-VALUES`. None of these edits has
+//! a `COUSR0nC` path or text, so all are answered alike: 400 `Invalid` on the
+//! field with an empty message. A blank or missing field passes and reaches
+//! the rule unchanged, which answers it with the audited empty-field message.
 
 use std::fmt;
 
@@ -61,13 +69,15 @@ use crate::pagination::{Page, PageDirection, PageQuery, PageSize};
 /// the key `SEC-USR-ID PIC X(08)` [app/cpy/CSUSR01Y.cpy:L18].
 const USER_ID_LEN: usize = 8;
 
-/// The `message` of a field or key longer than its BMS field, or holding a
-/// character outside ASCII.
+/// The `message` of a field or key longer than its BMS field, holding a
+/// character outside ASCII, or, for a name or new user ID, holding NUL
+/// characters the rule would store.
 ///
-/// A 3270 field never sends more than its `PIC X(n)` width, and holds one
-/// byte per character, so no `COUSR0nC` path or message exists for a longer
-/// value or for a character the `MOVE` of its UTF-8 bytes would split, and
-/// the validation audit has no row for either: the request is answered as a
+/// A 3270 field never sends more than its `PIC X(n)` width, holds one byte
+/// per character and never sends NUL characters beside other text, so no
+/// `COUSR0nC` path or message exists for a longer value, for a character the
+/// `MOVE` of its UTF-8 bytes would split, or for such NUL characters, and the
+/// validation audit has no row for any of them: the request is answered as a
 /// no-message path, 400 `Invalid` with the field named and an empty text, as
 /// E-49 answers the REST inputs that have no COBOL counterpart.
 const OVER_LENGTH: &str = "";
@@ -485,21 +495,33 @@ impl UserMessageResponse {
 /// (V-COUSR01C-001 to V-COUSR01C-005).
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, ToSchema, Validate)]
 pub struct UserAddRequest {
-    /// `FNAMEI PIC X(20)`, the first name, in ASCII.
+    /// `FNAMEI PIC X(20)`, the first name, in ASCII without NUL characters, or
+    /// exactly 20 NUL characters, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 20, pattern = "^[\\x00-\\x7F]*$")]
-    #[validate(length(max = 20), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 20, pattern = "^(?:\\x00{20}|[\\x01-\\x7F]*)$")]
+    #[validate(
+        length(max = 20),
+        custom(function = "crate::dto::storable_text_of_width::<20>")
+    )]
     pub first_name: Option<String>,
-    /// `LNAMEI PIC X(20)`, the last name, in ASCII.
+    /// `LNAMEI PIC X(20)`, the last name, in ASCII without NUL characters, or
+    /// exactly 20 NUL characters, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 20, pattern = "^[\\x00-\\x7F]*$")]
-    #[validate(length(max = 20), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 20, pattern = "^(?:\\x00{20}|[\\x01-\\x7F]*)$")]
+    #[validate(
+        length(max = 20),
+        custom(function = "crate::dto::storable_text_of_width::<20>")
+    )]
     pub last_name: Option<String>,
-    /// `USERIDI PIC X(8)`, the new user's ID in ASCII, stored with its case
-    /// kept.
+    /// `USERIDI PIC X(8)`, the new user's ID in ASCII without NUL characters,
+    /// stored with its case kept, or exactly 8 NUL characters, the
+    /// `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 8, pattern = "^[\\x00-\\x7F]*$")]
-    #[validate(length(max = 8), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 8, pattern = "^(?:\\x00{8}|[\\x01-\\x7F]*)$")]
+    #[validate(
+        length(max = 8),
+        custom(function = "crate::dto::storable_text_of_width::<8>")
+    )]
     pub user_id: Option<String>,
     /// `PASSWDI PIC X(8)`, the password in ASCII, stored as the argon2id hash
     /// of the value as entered, case kept and space-padded to 8 characters.
@@ -530,16 +552,18 @@ impl fmt::Debug for UserAddRequest {
 }
 
 impl UserAddRequest {
-    /// Checks every member against its BMS field width and for ASCII, before
-    /// `COUSR01C` `PROCESS-ENTER-KEY` moves it into `SEC-USER-DATA`
-    /// (P-COUSR01C-002, P-COUSR01C-003); blank members pass, for the
-    /// empty-field edits (V-COUSR01C-001 to V-COUSR01C-005).
+    /// Checks every member against its BMS field width and for ASCII, and the
+    /// names and user ID for NUL characters other than the full-width
+    /// `LOW-VALUES`, before `COUSR01C` `PROCESS-ENTER-KEY` moves them into
+    /// `SEC-USER-DATA` (P-COUSR01C-002, P-COUSR01C-003); blank members pass,
+    /// for the empty-field edits (V-COUSR01C-001 to V-COUSR01C-005).
     ///
     /// # Errors
     ///
     /// 400 with code `INVALID`, an empty message and one [`UserAddField`] per
     /// member longer than its field or holding a character above `U+007F`,
-    /// in screen order.
+    /// and per name or user ID holding a NUL character without being exactly
+    /// its width of them, in screen order.
     pub fn check(&self) -> Result<(), ApiError> {
         self.validate()
             .map_err(|errors| reject_invalid(&errors, UserAddField::of_request_member, OVER_LENGTH))
@@ -570,15 +594,17 @@ impl UserAddRequest {
 /// missing password is not (E-21, see `password`).
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, ToSchema, Validate)]
 pub struct UserUpdateRequest {
-    /// `FNAMEI PIC X(20)`, the first name, in ASCII.
+    /// `FNAMEI PIC X(20)`, the first name, in ASCII without NUL characters, or
+    /// NUL characters only, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 20, pattern = "^[\\x00-\\x7F]*$")]
-    #[validate(length(max = 20), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 20, pattern = "^(?:\\x00+|[\\x01-\\x7F]*)$")]
+    #[validate(length(max = 20), custom(function = "crate::dto::storable_text"))]
     pub first_name: Option<String>,
-    /// `LNAMEI PIC X(20)`, the last name, in ASCII.
+    /// `LNAMEI PIC X(20)`, the last name, in ASCII without NUL characters, or
+    /// NUL characters only, the `LOW-VALUES` answered as empty.
     #[serde(default)]
-    #[schema(max_length = 20, pattern = "^[\\x00-\\x7F]*$")]
-    #[validate(length(max = 20), custom(function = "crate::dto::ascii_text"))]
+    #[schema(max_length = 20, pattern = "^(?:\\x00+|[\\x01-\\x7F]*)$")]
+    #[validate(length(max = 20), custom(function = "crate::dto::storable_text"))]
     pub last_name: Option<String>,
     /// `PASSWDI PIC X(8)`, the password in ASCII, as entered, case kept. Absent or
     /// `null`: the current password, unchanged and not re-hashed (E-21). An
@@ -619,18 +645,20 @@ impl fmt::Debug for UserUpdateRequest {
 }
 
 impl UserUpdateRequest {
-    /// Checks every member against its BMS field width and for ASCII, before
-    /// `COUSR02C` `UPDATE-USER-INFO` compares it with the stored user and
-    /// moves it into `SEC-USER-DATA` (P-COUSR02C-004 to P-COUSR02C-006);
-    /// blank members pass, for the empty-field edits (V-COUSR02C-005 to
-    /// V-COUSR02C-008). The `{id}` segment is checked apart, by
-    /// `check_user_id_key` with [`UserUpdateField::UsrIdIn`].
+    /// Checks every member against its BMS field width and for ASCII, and the
+    /// names for NUL characters beside other text, before `COUSR02C`
+    /// `UPDATE-USER-INFO` compares them with the stored user and moves them
+    /// into `SEC-USER-DATA` (P-COUSR02C-004 to P-COUSR02C-006); blank members,
+    /// NUL characters alone included, pass, for the empty-field edits
+    /// (V-COUSR02C-005 to V-COUSR02C-008). The `{id}` segment is checked
+    /// apart, by `check_user_id_key` with [`UserUpdateField::UsrIdIn`].
     ///
     /// # Errors
     ///
     /// 400 with code `INVALID`, an empty message and one [`UserUpdateField`]
     /// per member longer than its field or holding a character above
-    /// `U+007F`, in screen order.
+    /// `U+007F`, and per name holding a NUL character beside other text, in
+    /// screen order.
     pub fn check(&self) -> Result<(), ApiError> {
         self.validate().map_err(|errors| {
             reject_invalid(&errors, UserUpdateField::of_request_member, OVER_LENGTH)
@@ -660,11 +688,11 @@ mod tests {
     use axum::extract::Query;
     use axum::http::{StatusCode, Uri};
     use carddemo_domain::entities::UserSecurity;
-    use carddemo_domain::error::ErrorKind;
+    use carddemo_domain::error::{DomainError, ErrorKind};
     use carddemo_domain::messages;
     use carddemo_domain::numeric::{Alnum, UserId};
     use carddemo_domain::ports::Direction;
-    use carddemo_domain::rules::user_add::UserAddInput;
+    use carddemo_domain::rules::user_add::{self, UserAddInput};
     use carddemo_domain::rules::user_list::{self, UserListPage};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
@@ -1007,6 +1035,149 @@ mod tests {
             rejection(update.check()),
             Some(over_length(&["FNAME", "PASSWD", "USRTYPE"]))
         );
+    }
+
+    /// NUL characters beside other text, within `width`: inside, leading,
+    /// trailing, before and after a space, and a full width with one other
+    /// character.
+    fn mixed_nul_values(width: usize) -> [String; 6] {
+        [
+            "A\0B".to_owned(),
+            "\0A".to_owned(),
+            "A\0".to_owned(),
+            "\0 ".to_owned(),
+            " \0".to_owned(),
+            format!("{}A", "\0".repeat(width - 1)),
+        ]
+    }
+
+    #[test]
+    fn nul_the_rules_would_store_is_rejected_on_the_name_and_user_id_fields() {
+        // (member, BMS width, field of the add, field of the update)
+        let members = [
+            ("first_name", 20, "FNAME", Some("FNAME")),
+            ("last_name", 20, "LNAME", Some("LNAME")),
+            ("user_id", 8, "USERID", None),
+        ];
+        for (member, width, add_field, update_field) in members {
+            let add_rejected = Some(over_length(&[add_field]));
+            let update_rejected = update_field.map(|field| over_length(&[field]));
+            for value in mixed_nul_values(width) {
+                let add: UserAddRequest =
+                    serde_json::from_value(one_member(member, value.clone())).expect("parses");
+                assert_eq!(rejection(add.check()), add_rejected, "{member} {value:?}");
+                let update: UserUpdateRequest =
+                    serde_json::from_value(one_member(member, value.clone())).expect("parses");
+                assert_eq!(
+                    rejection(update.check()),
+                    update_rejected,
+                    "{member} {value:?}"
+                );
+            }
+            // Fewer NUL characters than the width: `COUSR01C` pads them with
+            // spaces and stores them, while `COUSR02C` reads them as blank.
+            for value in ["\0".to_owned(), "\0".repeat(width - 1)] {
+                let add: UserAddRequest =
+                    serde_json::from_value(one_member(member, value.clone())).expect("parses");
+                assert_eq!(rejection(add.check()), add_rejected, "{member} {value:?}");
+                let update: UserUpdateRequest =
+                    serde_json::from_value(one_member(member, value.clone())).expect("parses");
+                assert_eq!(rejection(update.check()), None, "{member} {value:?}");
+            }
+            let full: UserAddRequest =
+                serde_json::from_value(one_member(member, "\0".repeat(width))).expect("parses");
+            assert_eq!(rejection(full.check()), None, "{member}");
+        }
+
+        // The password is hashed and never stored as text, and a one-byte user
+        // type is NUL-free or the full-width `LOW-VALUES`: both keep NUL.
+        for (member, value) in [("password", "A\0"), ("password", "\0"), ("usr_type", "\0")] {
+            let add: UserAddRequest =
+                serde_json::from_value(one_member(member, value.to_owned())).expect("parses");
+            assert_eq!(rejection(add.check()), None, "{member} {value:?}");
+            let update: UserUpdateRequest =
+                serde_json::from_value(one_member(member, value.to_owned())).expect("parses");
+            assert_eq!(rejection(update.check()), None, "{member} {value:?}");
+        }
+    }
+
+    // V-COUSR01C-001 to V-COUSR01C-003: the NUL characters that pass the add's
+    // check are the full-width `LOW-VALUES` the rule answers as empty.
+    #[test]
+    fn full_width_nul_passes_the_add_check_and_gets_the_empty_field_message() {
+        // (member, BMS width, message, BMS field)
+        let members = [
+            (
+                "first_name",
+                20,
+                messages::FIRST_NAME_CAN_NOT_BE_EMPTY,
+                UserAddField::FName.as_str(),
+            ),
+            (
+                "last_name",
+                20,
+                messages::LAST_NAME_CAN_NOT_BE_EMPTY,
+                UserAddField::LName.as_str(),
+            ),
+            (
+                "user_id",
+                8,
+                messages::USER_ID_CAN_NOT_BE_EMPTY,
+                UserAddField::UserId.as_str(),
+            ),
+        ];
+        for (member, width, message, field) in members {
+            let mut body = json!({
+                "first_name": "Ann",
+                "last_name": "Lee",
+                "user_id": "user0099",
+                "password": "pass1234",
+                "usr_type": "U",
+            });
+            body[member] = Value::from("\0".repeat(width));
+            let add: UserAddRequest = serde_json::from_value(body).expect("parses");
+            assert!(add.check().is_ok(), "{member}");
+            assert_eq!(
+                user_add::edit(&add.into_input()),
+                Err(DomainError::empty(message).with_field(field)),
+                "{member}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_schemas_publish_the_text_each_rule_can_store() {
+        let ascii = "^[\\x00-\\x7F]*$";
+        let add = serde_json::to_value(UserAddRequest::schema()).expect("the schema serializes");
+        // (member, maxLength, pattern)
+        let add_members = [
+            ("first_name", 20, "^(?:\\x00{20}|[\\x01-\\x7F]*)$"),
+            ("last_name", 20, "^(?:\\x00{20}|[\\x01-\\x7F]*)$"),
+            ("user_id", 8, "^(?:\\x00{8}|[\\x01-\\x7F]*)$"),
+            ("password", 8, ascii),
+            ("usr_type", 1, ascii),
+        ];
+        for (member, width, pattern) in add_members {
+            let property = &add["properties"][member];
+            assert_eq!(property["maxLength"], json!(width), "{member}");
+            assert_eq!(property["pattern"], json!(pattern), "{member}");
+        }
+        assert_eq!(keys(&add["properties"]).len(), add_members.len());
+
+        let update =
+            serde_json::to_value(UserUpdateRequest::schema()).expect("the schema serializes");
+        let update_members = [
+            ("first_name", 20, "^(?:\\x00+|[\\x01-\\x7F]*)$"),
+            ("last_name", 20, "^(?:\\x00+|[\\x01-\\x7F]*)$"),
+            ("password", 8, ascii),
+            ("usr_type", 1, ascii),
+        ];
+        for (member, width, pattern) in update_members {
+            let property = &update["properties"][member];
+            assert_eq!(property["maxLength"], json!(width), "{member}");
+            assert_eq!(property["pattern"], json!(pattern), "{member}");
+        }
+        assert_eq!(keys(&update["properties"]).len(), update_members.len());
     }
 
     #[test]

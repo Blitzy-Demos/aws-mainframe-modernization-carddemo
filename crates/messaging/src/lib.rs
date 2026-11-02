@@ -114,7 +114,8 @@ pub enum MessagingError {
     #[error("persistence error: {0}")]
     Persistence(#[from] PersistenceError),
 
-    /// `CARDDEMO_CLOCK_OVERRIDE` is set but is not an RFC 3339 instant.
+    /// `CARDDEMO_CLOCK_OVERRIDE` is set but is not an RFC 3339 instant of at
+    /// most microsecond precision, without a leap second.
     #[error("invalid clock override: {0}")]
     Clock(#[from] ClockError),
 

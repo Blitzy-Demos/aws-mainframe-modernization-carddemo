@@ -71,16 +71,23 @@ pub trait RewardStore {
     /// Inserts `accrual` as one `reward_accruals` row and returns the
     /// `accrual_id` the database assigned it.
     ///
-    /// The row keeps every field of `accrual` unchanged, `created_at`
-    /// included, which the caller takes from the processing clock.
+    /// The row stores every field of `accrual` exactly. `created_at`, which
+    /// the caller takes from the processing clock, must be a whole microsecond
+    /// of UTC time ([`is_whole_microsecond`]), the resolution of its
+    /// `TIMESTAMPTZ` column; the processing clock guarantees it. A store
+    /// refuses an instant the column cannot hold exactly instead of narrowing
+    /// it, so the accrual the engine returns and the row read back carry the
+    /// same instant.
     ///
     /// # Errors
     ///
     /// [`PortError::Duplicate`] when an accrual for the same `transaction_id`
     /// already exists: the `UNIQUE (transaction_id)` constraint
     /// `reward_accruals_transaction_id_key`, one row per qualifying
-    /// transaction. [`PortError::Unavailable`] on any other failure.
+    /// transaction. [`PortError::Unavailable`] when `created_at` is not a
+    /// whole microsecond, with nothing written, and on any other failure.
     ///
+    /// [`is_whole_microsecond`]: crate::clock::is_whole_microsecond
     /// [`PortError::Duplicate`]: crate::ports::PortError::Duplicate
     /// [`PortError::Unavailable`]: crate::ports::PortError::Unavailable
     fn insert_accrual(

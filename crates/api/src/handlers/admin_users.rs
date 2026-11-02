@@ -330,8 +330,9 @@ pub async fn create_user(
     traced(&span, add(&state, &span, body)).await
 }
 
-/// The CU01 add: the width check, `user_add::prepare` on the blocking pool,
-/// then the single `WRITE` of `user_add::add`, committed when it succeeds.
+/// The CU01 add: the width and encoding check, `user_add::prepare` on the
+/// blocking pool, then the single `WRITE` of `user_add::add`, committed when
+/// it succeeds.
 async fn add(
     state: &AppState,
     span: &Span,

@@ -373,12 +373,12 @@ async fn add_transaction(
 }
 
 /// COTRN02C PROCESS-ENTER-KEY — P-COTRN02C-003, P-COTRN02C-004;
-/// V-COTRN02C-001 to V-COTRN02C-028: the length check of the body, then the
-/// `COTRN02C` edits in the unit of work the add continues in.
+/// V-COTRN02C-001 to V-COTRN02C-028: the width and encoding check of the
+/// body, then the `COTRN02C` edits in the unit of work the add continues in.
 ///
 /// # Errors
 ///
-/// The length check's 400, a failed `Db::begin` (500), or the first edit the
+/// That check's 400, a failed `Db::begin` (500), or the first edit the
 /// rule rejects; the unit of work is rolled back before an edit error is
 /// returned.
 async fn validate_request(

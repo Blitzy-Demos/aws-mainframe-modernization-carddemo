@@ -47,7 +47,11 @@
 //! leaves the transaction aborted before the handler decides. No column
 //! defaults to the current time: the soft-delete instant is the caller's
 //! processing clock (`CARDDEMO_CLOCK_OVERRIDE` pins it, AAP 0.6.4), never SQL
-//! `now()`.
+//! `now()`. An instant is bound only when its `TIMESTAMPTZ` column stores it
+//! exactly, as a whole microsecond of UTC time; any other is
+//! [`PersistenceError::InexactInstant`], reported as
+//! [`PortError::Unavailable`] before the statement runs, and is never
+//! narrowed.
 //!
 //! The methods carry no message text and emit no span: the handlers choose the
 //! `carddemo_domain::messages` text of a missing rule or account and record the
@@ -61,13 +65,14 @@ use carddemo_domain::ports::{PortError, PortResult};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
-use super::{account_id, limit_i64, reward_points};
+use super::{account_id, exact_instant, limit_i64, opt_exact_instant, reward_points};
 use crate::PersistenceError;
-use crate::rewards::{RewardBalanceRow, RewardRuleRow};
+use crate::rewards::{RULES_TABLE, RewardBalanceRow, RewardRuleRow};
 use crate::tx::{PgStore, savepoint, settle};
 
-/// The accrual table, as [`PersistenceError::Corrupt`] names it.
-const ACCRUALS_TABLE: &str = "reward_accruals";
+/// The accrual table, as [`PersistenceError::Corrupt`] and
+/// [`PersistenceError::InexactInstant`] name it.
+pub(crate) const ACCRUALS_TABLE: &str = "reward_accruals";
 
 /// What `DELETE /admin/reward-rules/{id}` found and did
 /// ([`PgStore::soft_delete_reward_rule`]).
@@ -124,7 +129,8 @@ impl TryFrom<RewardAccrualRow> for RewardAccrual {
 
 /// The column values a validated rule binds, in the form each column stores:
 /// the type code right-trimmed, the category as its integer value, the rate
-/// and the amount bounds as their exact decimals.
+/// and the amount bounds as their exact decimals, and the window instants as
+/// the whole microseconds `TIMESTAMPTZ` keeps.
 struct RuleBinds<'a> {
     transaction_type_cd: Cow<'a, str>,
     transaction_category_cd: i32,
@@ -135,17 +141,24 @@ struct RuleBinds<'a> {
     active_to: Option<DateTime<Utc>>,
 }
 
-impl<'a> From<&'a NewRewardRule> for RuleBinds<'a> {
-    fn from(rule: &'a NewRewardRule) -> Self {
-        Self {
+/// The binds of `rule`. A window instant the column cannot store exactly,
+/// finer than a microsecond or a leap second, is
+/// [`PersistenceError::InexactInstant`] naming `reward_rules` and the column,
+/// so the rule is refused before any statement rather than stored with a
+/// narrowed start or end.
+impl<'a> TryFrom<&'a NewRewardRule> for RuleBinds<'a> {
+    type Error = PersistenceError;
+
+    fn try_from(rule: &'a NewRewardRule) -> Result<Self, Self::Error> {
+        Ok(Self {
             transaction_type_cd: rule.transaction_type_cd.trimmed(),
             transaction_category_cd: i32::from(rule.transaction_category_cd.get()),
             reward_rate: rule.reward_rate.to_decimal(),
             min_transaction_amount: rule.min_transaction_amount.map(Money::to_decimal),
             max_transaction_amount: rule.max_transaction_amount.map(Money::to_decimal),
-            active_from: rule.active_from,
-            active_to: rule.active_to,
-        }
+            active_from: exact_instant(rule.active_from, RULES_TABLE, "active_from")?,
+            active_to: opt_exact_instant(rule.active_to, RULES_TABLE, "active_to")?,
+        })
     }
 }
 
@@ -210,11 +223,12 @@ impl PgStore<'_, '_> {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] when the insert fails, for example on a
-    /// table check that a validated rule never trips, or when the returned row
-    /// does not fit its domain type.
+    /// [`PortError::Unavailable`] when `active_from` or `active_to` is not a
+    /// whole microsecond of UTC time, with nothing written; when the insert
+    /// fails, for example on a table check that a validated rule never trips;
+    /// or when the returned row does not fit its domain type.
     pub async fn insert_reward_rule(&mut self, rule: NewRewardRule) -> PortResult<RewardRule> {
-        let binds = RuleBinds::from(&rule);
+        let binds = RuleBinds::try_from(&rule)?;
         let mut sp = savepoint(self.tx).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,
@@ -247,14 +261,15 @@ impl PgStore<'_, '_> {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] when the update fails or the returned row
-    /// does not fit its domain type.
+    /// [`PortError::Unavailable`] when `active_from` or `active_to` is not a
+    /// whole microsecond of UTC time, with nothing written, or when the update
+    /// fails or the returned row does not fit its domain type.
     pub async fn update_reward_rule(
         &mut self,
         id: RuleId,
         rule: NewRewardRule,
     ) -> PortResult<Option<RewardRule>> {
-        let binds = RuleBinds::from(&rule);
+        let binds = RuleBinds::try_from(&rule)?;
         let mut sp = savepoint(self.tx).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,
@@ -294,15 +309,20 @@ impl PgStore<'_, '_> {
     ///    [`SoftDeleteOutcome::Unchanged`], with nothing written, and a missing
     ///    one [`SoftDeleteOutcome::NotFound`].
     ///
+    /// `at` is compared and stored as given: the processing clock reads whole
+    /// microseconds, the resolution of `active_to`.
+    ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] when the update or the read fails or the
-    /// rule does not fit its domain type.
+    /// [`PortError::Unavailable`] when `at` is not a whole microsecond of UTC
+    /// time, with nothing read or written, or when the update or the read
+    /// fails or the rule does not fit its domain type.
     pub async fn soft_delete_reward_rule(
         &mut self,
         id: RuleId,
         at: DateTime<Utc>,
     ) -> PortResult<SoftDeleteOutcome> {
+        let at = exact_instant(at, RULES_TABLE, "active_to")?;
         let mut sp = savepoint(self.tx).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,

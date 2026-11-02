@@ -10,11 +10,11 @@
  * widths. An over-length entry has no COBOL path (a 3270 field holds no more
  * than its width) and the server answers it with no message (E-49), so it keeps
  * zod's default text and gets no other issue. A non-ASCII character in a CT02
- * free-text field is answered the same way and keeps zod's regex text. Every
- * other message is the byte-identical text of its
- * `docs/parity/validation-audit.md` row. Values stay the strings entered,
- * untrimmed and in their case; COTRN02C converts them
- * (`FUNCTION NUMVAL`, `NUMVAL-C`) server-side.
+ * free-text field, or a NUL character beside other text there, is answered the
+ * same way and keeps zod's regex text. Every other message is the
+ * byte-identical text of its `docs/parity/validation-audit.md` row. Values
+ * stay the strings entered, untrimmed and in their case; COTRN02C converts
+ * them (`FUNCTION NUMVAL`, `NUMVAL-C`) server-side.
  *
  * Server-only outcomes: the cross-reference look-ups of the account or card
  * (V-COTRN02C-004 to V-COTRN02C-007), the CSUTLDTC calendar checks of both
@@ -140,14 +140,18 @@ const AMOUNT = /^[-+]\d{8}\.\d{2}$/;
  */
 const CONFIRM = /^[YyNn]$/;
 /**
- * ASCII text, the OpenAPI `pattern` of the CT02 free-text members (TRNSRC,
- * TDESC, MNAME, MCITY, MZIP), which have no class edit: COTRN02C moves them
- * byte for byte into their `PIC X(n)` record fields
+ * Storable ASCII text, the OpenAPI `pattern` of the CT02 free-text members
+ * (TRNSRC, TDESC, MNAME, MCITY, MZIP), which have no class edit: COTRN02C
+ * moves them byte for byte into their `PIC X(n)` record fields
  * [app/cbl/COTRN02C.cbl:L450-465], and a 3270 field holds one byte per
- * character. The server answers a non-ASCII entry with no message (E-49), as
- * it answers an over-length one, so the issue keeps zod's default regex text.
+ * character. NUL characters are accepted only as the whole entry, the
+ * LOW-VALUES COTRN02C answers with its `can NOT be empty` text; beside other
+ * text they would be stored, and PostgreSQL text cannot hold them (E-07).
+ * The server answers a non-ASCII or mixed-NUL entry with no message (E-49),
+ * as it answers an over-length one, so the issue keeps zod's default regex
+ * text.
  */
-const ASCII_TEXT = /^[\x00-\x7F]*$/;
+const STORABLE_TEXT = /^(?:\x00+|[\x01-\x7F]*)$/;
 
 /**
  * A format or class edit. Without `message` the edit has no audited text and
@@ -302,23 +306,23 @@ type TransactionAddKey = keyof TransactionAddRequest;
 // Every DTO member is optional, so `satisfies z.ZodType<…>` alone would accept
 // a missing or misspelt member; this `satisfies` ties the keys to the DTO's.
 // Each member checks only what the server checks before any COBOL edit: its
-// width, and for the free-text members (no class edit) ASCII. The COBOL edits
-// run at object level in `editTransactionAdd`, so their issues can follow the
-// audit Order across fields.
+// width, and for the free-text members (no class edit) storable ASCII. The
+// COBOL edits run at object level in `editTransactionAdd`, so their issues can
+// follow the audit Order across fields.
 const transactionAddShape = {
   account_id: z.string().max(ADD_WIDTH.account_id),
   card_number: z.string().max(ADD_WIDTH.card_number),
   tran_type_cd: z.string().max(ADD_WIDTH.tran_type_cd),
   tran_cat_cd: z.string().max(ADD_WIDTH.tran_cat_cd),
-  tran_source: z.string().max(ADD_WIDTH.tran_source).regex(ASCII_TEXT),
-  tran_desc: z.string().max(ADD_WIDTH.tran_desc).regex(ASCII_TEXT),
+  tran_source: z.string().max(ADD_WIDTH.tran_source).regex(STORABLE_TEXT),
+  tran_desc: z.string().max(ADD_WIDTH.tran_desc).regex(STORABLE_TEXT),
   tran_amt: z.string().max(ADD_WIDTH.tran_amt),
   tran_orig_date: z.string().max(ADD_WIDTH.tran_orig_date),
   tran_proc_date: z.string().max(ADD_WIDTH.tran_proc_date),
   tran_merchant_id: z.string().max(ADD_WIDTH.tran_merchant_id),
-  tran_merchant_name: z.string().max(ADD_WIDTH.tran_merchant_name).regex(ASCII_TEXT),
-  tran_merchant_city: z.string().max(ADD_WIDTH.tran_merchant_city).regex(ASCII_TEXT),
-  tran_merchant_zip: z.string().max(ADD_WIDTH.tran_merchant_zip).regex(ASCII_TEXT),
+  tran_merchant_name: z.string().max(ADD_WIDTH.tran_merchant_name).regex(STORABLE_TEXT),
+  tran_merchant_city: z.string().max(ADD_WIDTH.tran_merchant_city).regex(STORABLE_TEXT),
+  tran_merchant_zip: z.string().max(ADD_WIDTH.tran_merchant_zip).regex(STORABLE_TEXT),
   confirm: z.string().max(ADD_WIDTH.confirm),
 } satisfies Record<TransactionAddKey, z.ZodTypeAny>;
 
@@ -479,10 +483,12 @@ function editTransactionAdd(
  *    transaction...' answer (V-COTRN02C-027), not a client error: the
  *    confirmation dialog sends `Y`.
  *
- * Every member's width, and the ASCII text of the free-text members (source,
- * description, merchant name, city and zip), are checked before these edits,
- * as the server checks them before any COBOL edit; their issues keep zod's
- * text (E-49), and a field over its width gets none of these edits.
+ * Every member's width, and the storable ASCII text of the free-text members
+ * (source, description, merchant name, city and zip: no NUL character unless
+ * the whole entry is NUL characters), are checked before these edits, as the
+ * server checks them before any COBOL edit; their issues keep zod's text
+ * (E-49), and a field over its width gets none of these edits. An entry of
+ * NUL characters only passes that check and gets its `can NOT be empty` text.
  *
  * `card_number` gets only its width here. Its numeric edit and the rule that
  * one of the two keys is entered depend on the account field, so they are

@@ -98,7 +98,8 @@ const DEADLOCK_DETECTED: &str = "40P01";
 const LOCK_NOT_AVAILABLE: &str = "55P03";
 
 /// A failure of a persistence operation: connect, migrate, seed, `TRAN-ID`
-/// allocation, commit, or a stored value read back from the database.
+/// allocation, commit, a stored value read back from the database, or an
+/// instant a column cannot store exactly.
 ///
 /// Display texts name files, tables, columns and lines, never a password, a
 /// password hash or the contents of a row beyond its key. Port methods report
@@ -166,6 +167,20 @@ pub enum PersistenceError {
         /// Why the value does not fit, usually the domain constructor's error
         /// text.
         reason: String,
+    },
+
+    /// An instant to be written is not a whole microsecond of UTC time: it
+    /// has a part finer than the microsecond a `TIMESTAMPTZ` keeps, or is a
+    /// leap second. The bind would narrow it without a word, so the write is
+    /// refused before its statement runs.
+    #[error(
+        "{table}.{column} cannot store the instant exactly: it is not a whole microsecond of UTC time"
+    )]
+    InexactInstant {
+        /// The table the write targets.
+        table: &'static str,
+        /// The `TIMESTAMPTZ` column the instant was to be bound to.
+        column: &'static str,
     },
 }
 
@@ -470,6 +485,13 @@ mod tests {
         }
     }
 
+    fn inexact_instant() -> PersistenceError {
+        PersistenceError::InexactInstant {
+            table: "reward_accruals",
+            column: "created_at",
+        }
+    }
+
     fn codec_failure() -> PersistenceError {
         PersistenceError::Codec {
             path: PathBuf::from("app/data/ASCII/acctdata.txt"),
@@ -525,6 +547,7 @@ mod tests {
     #[test]
     fn conversion_keeps_port_outcomes_and_reports_the_rest_as_unavailable() {
         let corrupt_text = corrupt().to_string();
+        let inexact_text = inexact_instant().to_string();
         let cases = [
             (
                 PersistenceError::Port(PortError::Duplicate),
@@ -547,6 +570,7 @@ mod tests {
                 PortError::Contention,
             ),
             (corrupt(), unavailable(&corrupt_text)),
+            (inexact_instant(), unavailable(&inexact_text)),
             (
                 PersistenceError::Migrate(MigrateError::VersionMissing(3)),
                 unavailable(
@@ -597,6 +621,11 @@ mod tests {
                 corrupt(),
                 "stored accounts.acct_curr_bal value does not fit its domain type: more than \
                  10 integer digits",
+            ),
+            (
+                inexact_instant(),
+                "reward_accruals.created_at cannot store the instant exactly: it is not a \
+                 whole microsecond of UTC time",
             ),
         ];
         for (err, expected) in cases {

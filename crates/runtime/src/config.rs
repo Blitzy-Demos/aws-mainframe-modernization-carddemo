@@ -154,7 +154,9 @@ pub struct Settings {
     ///
     /// This crate never parses it. Consumers turn it into a clock with the
     /// domain clock, `carddemo_domain::clock::AnyClock::from_override`, which
-    /// rejects any value that is not an RFC 3339 instant.
+    /// rejects any value that is not an RFC 3339 instant of at most
+    /// microsecond precision: a fraction digit after the 6th must be `0`, and
+    /// a leap second (second 60) is refused.
     pub clock_override: Option<String>,
     /// `RUST_LOG`: log filter directives, from [`rust_log_directives`]: the
     /// default `info` when unset, empty or not valid Unicode, else the value
@@ -240,7 +242,8 @@ impl Settings {
     /// `CARDDEMO_CLOCK_OVERRIDE` counts as unset; any other value of it,
     /// whitespace-only included, is passed through verbatim, and
     /// `AnyClock::from_override` in the domain clock rejects what is not an
-    /// RFC 3339 instant. An empty `RUST_LOG` likewise counts as unset and gives
+    /// RFC 3339 instant of at most microsecond precision and no leap second.
+    /// An empty `RUST_LOG` likewise counts as unset and gives
     /// the default `info`; any other value of it is kept verbatim (see
     /// [`rust_log_directives`]).
     ///
