@@ -62,9 +62,16 @@
 //! Money, rates and points are decimal newtypes ([`Money`], [`MoneyExpr`],
 //! [`InterestRate`], [`RewardRate`], [`RewardPoints`]). No financial or reward
 //! value is ever a binary floating-point number, and no newtype converts from
-//! one. No money operation rounds: no carried program uses `ROUNDED`, so every
-//! store truncates as its COBOL receiving field does. The only rounding in the
-//! crate is the ceiling the reward rule prescribes for whole points.
+//! one. Fixed-point money arithmetic never rounds: no carried program uses
+//! `ROUNDED`, so every store of an arithmetic result truncates as its COBOL
+//! receiving field does. The crate rounds in two places only:
+//!
+//! - the audited `FUNCTION NUMVAL` and `NUMVAL-C` conversions of entered text
+//!   (COTRTUPC, CSUTLDPY, CORPT00C, COACTUPC, COPAUA0C), whose floating-point
+//!   result puts a fraction its receiver cannot hold at the nearest unit: the
+//!   integer of an unsigned `9(n)` receiver, the cent of a money receiver. An
+//!   exact midpoint gets no guessed result, because E-40 holds it at `halt`;
+//! - the ceiling the reward rule prescribes for whole points.
 
 pub mod auth;
 pub mod clock;

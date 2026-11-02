@@ -31,9 +31,11 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 /// R18: every operation outside the permitted algebra fails to compile.
 ///
-/// - `money_plus_interest_rate.rs`: `Money<10> + InterestRate` (E0277);
-/// - `money_plus_reward_rate.rs`: `Money<10> + RewardRate` (E0277);
-/// - `money_plus_reward_points.rs`: `Money<10> + RewardPoints` (E0277);
+/// - `money_plus_interest_rate.rs`: `Money<10> + InterestRate` (E0308: the
+///   only `Add` of money takes `Money` of any width);
+/// - `money_plus_reward_rate.rs`: `Money<10> + RewardRate` (E0308, likewise);
+/// - `money_plus_reward_points.rs`: `Money<10> + RewardPoints` (E0308,
+///   likewise);
 /// - `reward_points_plus_money.rs`: `RewardPoints + Money<10>` (E0308: the only
 ///   `Add` of `RewardPoints` takes `RewardPoints`);
 /// - `money_from_f64.rs`: `Money<10>` converted from a binary floating-point
@@ -46,8 +48,8 @@ fn forbidden_operations_fail_to_compile() {
     cases.compile_fail("tests/compile_fail/*.rs");
 }
 
-/// `Money<A> ± Money<B>`, `MoneyExpr ± Money<B>` and `MoneyExpr ± MoneyExpr` give
-/// an exact `MoneyExpr`, which `store` returns to a field of any width.
+/// `Money<A> ± Money<B>` and `MoneyExpr ± Money<B>` give an exact `MoneyExpr`,
+/// which `store` returns to a field of any width.
 #[test]
 fn money_sums_and_differences_are_exact_across_widths() -> TestResult {
     let balance = Money::<10>::from_decimal(dec!(1.25))?;
@@ -69,7 +71,8 @@ fn money_sums_and_differences_are_exact_across_widths() -> TestResult {
     let temp_bal: Money<9> = (credit - debit + amount).store::<9>();
     assert_eq!(temp_bal, Money::<9>::from_decimal(dec!(377.00))?);
 
-    let combined: MoneyExpr = sum + difference;
+    // One intermediate joins another only once stored into a field.
+    let combined: MoneyExpr = sum + difference.store::<10>();
     assert_eq!(combined.to_decimal(), dec!(-5.00));
     Ok(())
 }
@@ -104,17 +107,24 @@ fn money_times_interest_rate_gives_the_monthly_interest() -> TestResult {
 }
 
 /// `Money<D> * RewardRate` is the exact `PointsExpr`, whose `ceil` gives whole
-/// `RewardPoints`; points combine only with points, checked.
+/// `RewardPoints`; points combine only with points, checked, giving
+/// `RewardPoints`. `checked_ceil`, `checked_add` and `checked_sub` are the
+/// forms that report `Overflow`.
 #[test]
 fn money_times_reward_rate_gives_whole_points() -> TestResult {
     let amount = Money::<9>::from_decimal(dec!(10.01))?;
     let rate = RewardRate::from_decimal(dec!(1.0000))?;
     let product: PointsExpr = amount * rate;
-    let points: RewardPoints = product.ceil()?;
+    let points: RewardPoints = product.ceil();
     assert_eq!(points, RewardPoints::try_from(11_i64)?);
+    assert_eq!(product.checked_ceil(), Ok(points));
 
-    assert_eq!(points + points, Ok(RewardPoints::try_from(22_i64)?));
-    assert_eq!(RewardPoints::ZERO - points, Err(Overflow));
+    let sum: RewardPoints = points + points;
+    assert_eq!(sum, RewardPoints::try_from(22_i64)?);
+    let difference: RewardPoints = sum - points;
+    assert_eq!(difference, points);
+    assert_eq!(points.checked_add(points), Ok(sum));
+    assert_eq!(RewardPoints::ZERO.checked_sub(points), Err(Overflow));
     Ok(())
 }
 

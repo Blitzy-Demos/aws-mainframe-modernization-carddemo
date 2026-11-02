@@ -40,12 +40,12 @@
 //!
 //! | Operands | Result | COBOL meaning |
 //! |---|---|---|
-//! | `Money<A> ± Money<B>`, `Money<A> ± MoneyExpr`, `MoneyExpr ± Money<B>`, `MoneyExpr ± MoneyExpr` | [`MoneyExpr`], exact | `ADD`, `SUBTRACT` or `COMPUTE` intermediate |
+//! | `Money<A> ± Money<B>`, `MoneyExpr ± Money<B>` | [`MoneyExpr`], exact | `ADD`, `SUBTRACT` or `COMPUTE` intermediate |
 //! | `MoneyExpr::store::<D>()`, `Money<A>::store::<D>()` | `Money<D>`: excess fraction digits and high-order integer digits truncated, sign kept | receiving field without `ON SIZE ERROR`, numeric `MOVE` (P-COBIL00C-021) |
 //! | `MoneyExpr::store_checked::<D>()` | `Result<Money<D>, Overflow>` | receiving field with `ON SIZE ERROR` |
 //! | `Money<D> * InterestRate` | [`RatedBalance`], the exact product; its only method, `monthly()`, gives the cent quotient of the division by 1200, truncated toward zero, as a `MoneyExpr` | `CBACT04C` `1300-COMPUTE-INTEREST` (P-CBACT04C-012) |
-//! | `Money<D> * RewardRate` | [`PointsExpr`], exact; its only method, `ceil()`, gives `Result<RewardPoints, Overflow>` | reward accrual (new) |
-//! | `RewardPoints ± RewardPoints` | `Result<RewardPoints, Overflow>` | reward balance totals (new) |
+//! | `Money<D> * RewardRate` | [`PointsExpr`], exact; its `ceil()` gives [`RewardPoints`], checked (`checked_ceil()` is the fallible form, giving `Result<RewardPoints, Overflow>`) | reward accrual (new) |
+//! | `RewardPoints ± RewardPoints` | [`RewardPoints`], checked (`checked_add` and `checked_sub` are the fallible forms, giving `Result<RewardPoints, Overflow>`) | reward balance totals (new) |
 //! | comparisons | `Money` and `MoneyExpr` among themselves, across widths | `IF ... >= ...` |
 //!
 //! Anything not listed has no `impl` and fails to compile. The compile-fail suite
@@ -81,8 +81,10 @@ pub use rates::{InterestRate, RatedBalance, RewardRate};
 ///
 /// - `MoneyExpr::store_checked`, the `ON SIZE ERROR` form of a store, when the
 ///   integer part does not fit the receiver's digits;
-/// - `PointsExpr::ceil` and the checked `RewardPoints` additions and
-///   subtractions, when the points fall outside `0..=i64::MAX`;
+/// - `PointsExpr::checked_ceil`, `RewardPoints::checked_add` and
+///   `RewardPoints::checked_sub`, when the points fall outside `0..=i64::MAX`.
+///   `PointsExpr::ceil` and the `RewardPoints` `+` and `-` operators are
+///   checked the same way but panic instead, so a result never wraps;
 /// - the checked `AuthCount` increment and decrement, when a count passes the
 ///   four digits of `S9(04) COMP`. The COBOL `ADD 1` and `SUBTRACT 1` there have
 ///   no `ON SIZE ERROR`, and their wrap depends on a compiler option the

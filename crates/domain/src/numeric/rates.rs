@@ -628,21 +628,37 @@ mod tests {
         ];
         for (cents, rate, expected) in cases {
             let amount = Money::<9>::from_cents(cents).expect("test amount fits S9(09)V99");
-            let points = (amount * reward(rate)).ceil();
+            let points = (amount * reward(rate)).checked_ceil();
             let expected =
                 expected.map(|value| RewardPoints::try_from(value).expect("non-negative points"));
             assert_eq!(points, expected, "{cents} cents x {rate}");
+            if let Ok(whole) = points {
+                assert_eq!(
+                    (amount * reward(rate)).ceil(),
+                    whole,
+                    "{cents} cents x {rate}"
+                );
+            }
         }
     }
 
     #[test]
     fn points_product_stays_exact_at_the_widest_amount() {
         let widest = Money::<16>::from_cents(999_999_999_999_999_999).expect("fits");
-        assert_eq!((widest * reward(dec!(99999.9999))).ceil(), Err(Overflow));
+        assert_eq!(
+            (widest * reward(dec!(99999.9999))).checked_ceil(),
+            Err(Overflow)
+        );
         let largest = Money::<16>::from_cents(92_233_720_368_547_758).expect("fits");
         assert_eq!(
-            (largest * reward(dec!(1))).ceil().map(RewardPoints::to_i64),
+            (largest * reward(dec!(1)))
+                .checked_ceil()
+                .map(RewardPoints::to_i64),
             Ok(922_337_203_685_478)
+        );
+        assert_eq!(
+            (largest * reward(dec!(1))).ceil().to_i64(),
+            922_337_203_685_478
         );
     }
 }

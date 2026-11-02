@@ -5,7 +5,9 @@
 //! `points = ceil(amount × rate)`. `Money<D> * RewardRate` yields the exact
 //! [`PointsExpr`]: an amount of scale 2 times a rate of scale at most 4 has scale
 //! at most 6, so nothing is rounded before [`PointsExpr::ceil`] turns the product
-//! into [`RewardPoints`].
+//! into [`RewardPoints`]. [`PointsExpr::checked_ceil`] is its fallible form,
+//! which reports a result outside the points range as [`Overflow`] instead of
+//! panicking; the reward engine uses it.
 //!
 //! [`RewardPoints`] is a whole number in `0..=i64::MAX`. The `BIGINT` columns of
 //! the reward tables hold it through [`RewardPoints::to_i64`] and
@@ -14,7 +16,8 @@
 //! browser; [`Display`](fmt::Display) and [`FromStr`] are that string form, so a
 //! value such as `9007199254740993` round-trips exactly. No total is ever
 //! negative: points are never redeemed, so `available = earned − redeemed`
-//! never drops below zero, and a negative result is reported as [`Overflow`].
+//! never drops below zero, and a negative result is a size error, reported as
+//! [`Overflow`] by the checked forms and a panic from the operators.
 
 use std::fmt;
 use std::ops::{Add, Sub};
@@ -27,8 +30,10 @@ use super::{NumericError, Overflow};
 /// The exact product of a money amount and a [`RewardRate`](super::RewardRate),
 /// before it is rounded up to whole points.
 ///
-/// Its only operation is [`ceil`](Self::ceil): it adds to, compares with and
-/// converts to nothing, so an unrounded product cannot reach a balance.
+/// Its only operation is the round up to whole points: [`ceil`](Self::ceil),
+/// or [`checked_ceil`](Self::checked_ceil), its fallible form. It adds to,
+/// compares with and converts to nothing else, so an unrounded product cannot
+/// reach a balance.
 #[derive(Debug, Clone, Copy)]
 pub struct PointsExpr(Decimal);
 
@@ -39,7 +44,26 @@ impl PointsExpr {
         Self(product)
     }
 
-    /// Rounds the product up to whole points: the reward rule's `ceil`.
+    /// Rounds the product up to whole points: the reward rule's `ceil`,
+    /// checked.
+    ///
+    /// A product in `(-1, 0]` rounds to zero points, and the result has scale 0
+    /// and is never a negative zero, as [`checked_ceil`](Self::checked_ceil)
+    /// describes.
+    ///
+    /// # Panics
+    ///
+    /// When the rounded value is negative or above `i64::MAX`, outside the
+    /// range of [`RewardPoints`]. [`checked_ceil`](Self::checked_ceil) is the
+    /// fallible form, which reports that as [`Overflow`] instead.
+    #[must_use]
+    pub fn ceil(self) -> RewardPoints {
+        self.checked_ceil()
+            .expect("rounded reward points must lie within 0..=i64::MAX")
+    }
+
+    /// Rounds the product up to whole points, the reward rule's `ceil`, or
+    /// reports a result outside the range of [`RewardPoints`].
     ///
     /// A product in `(-1, 0]` rounds to zero points, and the result is built
     /// from its integer value, so it has scale 0 and is never a negative zero.
@@ -48,7 +72,7 @@ impl PointsExpr {
     ///
     /// [`Overflow`] when the rounded value is negative or above `i64::MAX`,
     /// outside the range of [`RewardPoints`].
-    pub fn ceil(self) -> Result<RewardPoints, Overflow> {
+    pub fn checked_ceil(self) -> Result<RewardPoints, Overflow> {
         let whole = i64::try_from(self.0.ceil()).map_err(|_| Overflow)?;
         RewardPoints::from_points(whole)
     }
@@ -59,12 +83,14 @@ impl PointsExpr {
 ///
 /// Invariant: an integer of scale 0 in `0..=i64::MAX`, the range of the `BIGINT`
 /// columns that store it and of the `^[0-9]+$` text the API exchanges. Every
-/// constructor checks it, and the checked arithmetic reports [`Overflow`] rather
-/// than leave it.
+/// constructor checks it, and no arithmetic leaves it or wraps.
 ///
 /// `RewardPoints + RewardPoints` and `RewardPoints - RewardPoints` give
-/// `Result<RewardPoints, Overflow>`. No operator mixes points with money, a
-/// rate, a `Decimal` or a plain integer.
+/// `RewardPoints`, checked: a result outside the range panics, as
+/// `Duration + Duration` does. [`RewardPoints::checked_add`] and
+/// [`RewardPoints::checked_sub`] are the fallible forms, which report
+/// [`Overflow`] instead. No operator mixes points with money, a rate, a
+/// `Decimal` or a plain integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RewardPoints(Decimal);
 
@@ -126,21 +152,35 @@ impl TryFrom<i64> for RewardPoints {
     }
 }
 
-/// `self + other`, checked: see [`RewardPoints::checked_add`].
+/// `self + other`, checked: the sum of two point totals, which never wraps.
+///
+/// # Panics
+///
+/// When the sum exceeds `i64::MAX`. [`RewardPoints::checked_add`] is the
+/// fallible form, which reports that as [`Overflow`] instead.
 impl Add for RewardPoints {
-    type Output = Result<Self, Overflow>;
+    type Output = Self;
 
-    fn add(self, other: Self) -> Self::Output {
+    fn add(self, other: Self) -> Self {
         self.checked_add(other)
+            .expect("a reward points sum must not exceed i64::MAX")
     }
 }
 
-/// `self - other`, checked: see [`RewardPoints::checked_sub`].
+/// `self - other`, checked: the difference of two point totals, which never
+/// wraps.
+///
+/// # Panics
+///
+/// When `other` exceeds `self`, because points are never negative.
+/// [`RewardPoints::checked_sub`] is the fallible form, which reports that as
+/// [`Overflow`] instead.
 impl Sub for RewardPoints {
-    type Output = Result<Self, Overflow>;
+    type Output = Self;
 
-    fn sub(self, other: Self) -> Self::Output {
+    fn sub(self, other: Self) -> Self {
         self.checked_sub(other)
+            .expect("a reward points difference must not be below zero")
     }
 }
 
@@ -263,10 +303,26 @@ mod tests {
         ];
         for (left, right, sum, difference) in cases {
             assert_eq!(left.checked_add(right), sum, "{left} + {right}");
-            assert_eq!(left + right, sum, "{left} + {right}");
+            if let Ok(sum) = sum {
+                assert_eq!(left + right, sum, "{left} + {right}");
+            }
             assert_eq!(left.checked_sub(right), difference, "{left} - {right}");
-            assert_eq!(left - right, difference, "{left} - {right}");
+            if let Ok(difference) = difference {
+                assert_eq!(left - right, difference, "{left} - {right}");
+            }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "a reward points sum must not exceed i64::MAX")]
+    fn addition_past_i64_max_panics() {
+        let _ = points(i64::MAX) + points(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "a reward points difference must not be below zero")]
+    fn subtraction_below_zero_panics() {
+        let _ = points(5) - points(7);
     }
 
     #[test]
@@ -286,12 +342,23 @@ mod tests {
             (dec!(9223372036854775808), Err(Overflow)),
         ];
         for (product, expected) in cases {
-            let result = PointsExpr::from_exact(product).ceil();
+            let result = PointsExpr::from_exact(product).checked_ceil();
             assert_eq!(result, expected.map(points), "ceil({product})");
             if let Ok(whole) = result {
                 assert_eq!(whole.0.scale(), 0, "ceil({product})");
                 assert!(!whole.0.is_sign_negative(), "ceil({product})");
+                assert_eq!(
+                    PointsExpr::from_exact(product).ceil(),
+                    whole,
+                    "ceil({product})"
+                );
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "rounded reward points must lie within 0..=i64::MAX")]
+    fn ceil_outside_the_points_range_panics() {
+        let _ = PointsExpr::from_exact(dec!(-1)).ceil();
     }
 }

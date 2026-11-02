@@ -286,9 +286,10 @@ proptest! {
     }
 
     /// Money addition and subtraction are exact (AAP 0.5.3.1: `Money<A> ±
-    /// Money<B>` gives an exact `MoneyExpr`). Two `S9(10)V99` operands always
-    /// fit `S9(11)V99`, so storing there returns the exact `Decimal` result,
-    /// and chained terms cancel without loss.
+    /// Money<B>` and `MoneyExpr ± Money<B>` give an exact `MoneyExpr`). Two
+    /// `S9(10)V99` operands always fit `S9(11)V99`, so storing there returns
+    /// the exact `Decimal` result, and chained terms, a stored intermediate
+    /// among them, cancel without loss.
     #[test]
     fn sums_and_differences_are_exact(
         (a, b) in (cents_up_to(MAX_CENTS_10), cents_up_to(MAX_CENTS_10)),
@@ -300,9 +301,12 @@ proptest! {
         prop_assert_eq!((x + y).store::<11>().to_decimal(), sum);
         prop_assert_eq!((x - y).store::<11>().to_decimal(), difference);
         prop_assert_eq!(((x + y) - y).store::<10>(), x);
-        prop_assert_eq!((x - (x - y)).store::<10>(), y);
-        prop_assert_eq!(((x + y) + (x - y)).to_decimal(), amount(a) * Decimal::TWO);
-        prop_assert_eq!(((x + y) - (x - y)).to_decimal(), amount(b) * Decimal::TWO);
+        prop_assert_eq!((x - x + y).store::<10>(), y);
+        prop_assert_eq!((x - (x - y).store::<11>()).store::<10>(), y);
+        prop_assert_eq!((x + y + x - y).to_decimal(), amount(a) * Decimal::TWO);
+        prop_assert_eq!(((x + y) + (x - y).store::<11>()).to_decimal(), amount(a) * Decimal::TWO);
+        prop_assert_eq!((x + y - x + y).to_decimal(), amount(b) * Decimal::TWO);
+        prop_assert_eq!(((x + y) - (x - y).store::<11>()).to_decimal(), amount(b) * Decimal::TWO);
     }
 
     /// Operands of different widths combine exactly too, in either order:
@@ -382,8 +386,9 @@ proptest! {
     ) {
         let exact = amount(cents) * Decimal::new(units, 4);
         let accrued = (money::<9>(cents) * reward_rate(units))
-            .ceil()
+            .checked_ceil()
             .map_err(|overflow| TestCaseError::fail(format!("ceil({exact}): {overflow}")))?;
+        prop_assert_eq!((money::<9>(cents) * reward_rate(units)).ceil(), accrued);
         let whole = Decimal::from(accrued.to_i64());
         prop_assert!(whole >= exact, "{} points for {}", whole, exact);
         prop_assert!(whole < exact + Decimal::ONE, "{} points for {}", whole, exact);
@@ -393,9 +398,10 @@ proptest! {
         prop_assert_eq!(accrued.to_string(), whole.to_string());
     }
 
-    /// A negative product never yields negative points: `PointsExpr::ceil`
-    /// gives zero for a product above -1 and `Overflow` at -1 or below
-    /// (`numeric/points.rs`). The reward engine never reaches this, because it
+    /// A negative product never yields negative points:
+    /// `PointsExpr::checked_ceil` gives zero for a product above -1 and
+    /// `Overflow` at -1 or below (`numeric/points.rs`), and `PointsExpr::ceil`
+    /// gives the same zero. The reward engine never reaches this, because it
     /// accrues nothing for an amount at or below zero (AAP 0.3.5 step 1).
     #[test]
     fn negative_products_never_give_negative_points(
@@ -403,38 +409,49 @@ proptest! {
         units in reward_rate_units(),
     ) {
         let exact = amount(-cents) * Decimal::new(units, 4);
-        let expected = if exact > -Decimal::ONE { Ok(RewardPoints::ZERO) } else { Err(Overflow) };
-        prop_assert_eq!((money::<9>(-cents) * reward_rate(units)).ceil(), expected);
+        let product = money::<9>(-cents) * reward_rate(units);
+        if exact > -Decimal::ONE {
+            prop_assert_eq!(product.checked_ceil(), Ok(RewardPoints::ZERO));
+            prop_assert_eq!(product.ceil(), RewardPoints::ZERO);
+        } else {
+            prop_assert_eq!(product.checked_ceil(), Err(Overflow));
+        }
     }
 
-    /// `RewardPoints + RewardPoints` is checked (AAP 0.5.3.1): it holds the sum
-    /// exactly when the sum fits `0..=i64::MAX`, the `BIGINT` range, and
-    /// reports `Overflow` otherwise; the operator and `checked_add` agree.
+    /// `RewardPoints + RewardPoints` is checked (AAP 0.5.3.1): `checked_add`
+    /// holds the sum exactly when the sum fits `0..=i64::MAX`, the `BIGINT`
+    /// range, and reports `Overflow` otherwise; the operator gives the same
+    /// `RewardPoints` wherever the sum fits.
     #[test]
     fn point_sums_are_checked_at_i64_max(x in point_totals(), y in point_totals()) {
         let sum = i128::from(x) + i128::from(y);
         let expected = i64::try_from(sum).map(points).map_err(|_| Overflow);
         prop_assert_eq!(points(x).checked_add(points(y)), expected);
-        prop_assert_eq!(points(x) + points(y), expected);
+        if let Ok(sum) = expected {
+            prop_assert_eq!(points(x) + points(y), sum);
+        }
         let headroom = i64::MAX - x;
-        prop_assert_eq!(points(x) + points(headroom), Ok(points(i64::MAX)));
+        prop_assert_eq!(points(x) + points(headroom), points(i64::MAX));
         if let Some(past) = headroom.checked_add(1) {
-            prop_assert_eq!(points(x) + points(past), Err(Overflow));
+            prop_assert_eq!(points(x).checked_add(points(past)), Err(Overflow));
         }
     }
 
     /// `RewardPoints - RewardPoints` never goes below zero: points are never
     /// redeemed, so `available = earned - redeemed` stays whole and
-    /// non-negative (AAP 0.3.5 invariant), and a larger subtrahend is
-    /// `Overflow`.
+    /// non-negative (AAP 0.3.5 invariant), and `checked_sub` reports a larger
+    /// subtrahend as `Overflow`; the operator gives the same `RewardPoints`
+    /// wherever the difference is not negative.
     #[test]
     fn point_differences_never_go_below_zero(x in point_totals(), y in point_totals()) {
         let expected = if x >= y { Ok(points(x - y)) } else { Err(Overflow) };
         prop_assert_eq!(points(x).checked_sub(points(y)), expected);
-        prop_assert_eq!(points(x) - points(y), expected);
-        prop_assert_eq!(points(x) - points(x), Ok(RewardPoints::ZERO));
+        if let Ok(difference) = expected {
+            prop_assert_eq!(points(x) - points(y), difference);
+        }
+        prop_assert_eq!(points(x) - points(x), RewardPoints::ZERO);
         if let Some(above) = x.checked_add(1) {
-            prop_assert_eq!(points(x) - points(above), Err(Overflow));
+            prop_assert_eq!(points(x).checked_sub(points(above)), Err(Overflow));
         }
     }
 
@@ -471,18 +488,19 @@ fn reward_points_range_ends() {
     assert_eq!(balance.to_string(), "9007199254740993");
 }
 
-/// `PointsExpr::ceil` reports `Overflow` past `i64::MAX`, the range of the
-/// `BIGINT` points columns (AAP 0.5.3.1). At the rate 10000.0000 an amount of
-/// 92233720368547758.00 accrues 9223372036854775800 points, and one cent more
-/// passes the limit.
+/// `PointsExpr::checked_ceil` reports `Overflow` past `i64::MAX`, the range of
+/// the `BIGINT` points columns (AAP 0.5.3.1). At the rate 10000.0000 an amount
+/// of 92233720368547758.00 accrues 9223372036854775800 points, which
+/// `PointsExpr::ceil` gives too, and one cent more passes the limit.
 #[test]
 fn points_beyond_i64_max_overflow() {
     let rate = reward_rate(100_000_000);
     let largest = money::<16>(92_233_720_368_547_758);
     assert_eq!(
-        (largest * rate).ceil().map(RewardPoints::to_i64),
+        (largest * rate).checked_ceil().map(RewardPoints::to_i64),
         Ok(9_223_372_036_854_775_800)
     );
+    assert_eq!((largest * rate).ceil().to_i64(), 9_223_372_036_854_775_800);
     let past = money::<16>(92_233_720_368_547_759);
-    assert_eq!((past * rate).ceil(), Err(Overflow));
+    assert_eq!((past * rate).checked_ceil(), Err(Overflow));
 }

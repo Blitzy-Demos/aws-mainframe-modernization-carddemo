@@ -1,6 +1,6 @@
 //! R18 compile-fail case: money plus reward points. `Money<10>` is the
-//! `S9(10)V99` of `ACCT-CURR-BAL`, and no `Add<RewardPoints>` exists for any
-//! money width, so this must fail with E0277 at the `+`.
+//! `S9(10)V99` of `ACCT-CURR-BAL`, and money adds only money, of any width,
+//! so this must fail with a type mismatch (E0308) at `points`.
 
 use carddemo_domain::numeric::{Money, RewardPoints};
 

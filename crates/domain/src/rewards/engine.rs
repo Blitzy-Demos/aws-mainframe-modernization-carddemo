@@ -218,12 +218,13 @@ fn rule_matches(rule: &RewardRule, input: &AccrualInput, at: DateTime<Utc>) -> b
 ///
 /// # Errors
 ///
-/// [`Overflow`] when the rounded product lies outside the range of
-/// [`RewardPoints`]: above `i64::MAX`, which no `S9(09)V99` amount reaches at
-/// any reward rate, or below zero, which only an amount of -1.00 or less
-/// reaches.
+/// [`Overflow`] when `ceil(amount × rate)` is negative or exceeds `i64::MAX`,
+/// outside the range of [`RewardPoints`]. The product decides, not the amount
+/// alone: a product above -1 rounds up to zero points (-0.99 at rate 1.0000
+/// earns 0), while -0.01 at rate 100.0000 is `ceil(-1) = -1`. No `S9(09)V99`
+/// amount exceeds `i64::MAX` at any reward rate.
 pub fn points_for(amount: Money<9>, rate: RewardRate) -> Result<RewardPoints, Overflow> {
-    (amount * rate).ceil()
+    (amount * rate).checked_ceil()
 }
 
 /// Rewards step (4) for the balance: `balance` after a credit of `points`
@@ -563,6 +564,27 @@ mod tests {
             assert_eq!(
                 points_for(amount(cents), rate),
                 Ok(points(expected)),
+                "{cents} cents at {reward_rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_amount_overflows_only_when_its_rounded_product_is_negative() {
+        // (amount cents, rate, points): `ceil(amount × rate)` decides, so the
+        // same amount overflows at one rate and earns nothing at another.
+        let cases = [
+            (-1, dec!(100.0000), Err(Overflow)),
+            (-1, dec!(99.9999), Ok(0)),
+            (-99, dec!(1.0000), Ok(0)),
+            (-100, dec!(1.0000), Err(Overflow)),
+            (-99_999_999_999, dec!(0), Ok(0)),
+        ];
+        for (cents, reward_rate, expected) in cases {
+            let rate = RewardRate::from_decimal(reward_rate).expect("a reward rate");
+            assert_eq!(
+                points_for(amount(cents), rate),
+                expected.map(points),
                 "{cents} cents at {reward_rate}"
             );
         }

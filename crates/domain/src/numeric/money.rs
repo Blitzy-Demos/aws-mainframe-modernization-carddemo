@@ -91,10 +91,12 @@ const fn pow10(n: u8) -> i64 {
 ///
 /// Deliberately not implemented, so that each fails to compile: `Div`, `Neg`,
 /// `Rem` and `Sum`; `Mul` by anything but an `InterestRate` or a `RewardRate`
-/// (the two products `rates.rs` defines); any `Add` or `Sub` with an
-/// `InterestRate`, a `RewardRate`, `RewardPoints`, a `Decimal` or an integer;
-/// `From` or `TryFrom` of any floating-point or integer type; comparisons with
-/// raw numbers or `Decimal`; and any rounding.
+/// (the two products `rates.rs` defines); `Add` or `Sub` with a [`MoneyExpr`]
+/// on the right, because a further term joins an expression only as
+/// `MoneyExpr ± Money`; any `Add` or `Sub` with an `InterestRate`, a
+/// `RewardRate`, `RewardPoints`, a `Decimal` or an integer; `From` or `TryFrom`
+/// of any floating-point or integer type; comparisons with raw numbers or
+/// `Decimal`; and any rounding.
 #[derive(Debug, Clone, Copy)]
 pub struct Money<const D: u8>(Decimal);
 
@@ -245,9 +247,10 @@ impl<const D: u8> fmt::Display for Money<D> {
 /// The exact value of a money `ADD`, `SUBTRACT` or `COMPUTE`, before it reaches
 /// a receiving field.
 ///
-/// It comes from adding and subtracting [`Money`] of any widths and other
-/// `MoneyExpr` values, and from `RatedBalance::monthly()` for the CBACT04C
-/// interest (P-CBACT04C-012). It leaves the algebra only through
+/// It comes from adding and subtracting [`Money`] of any widths, from adding
+/// [`Money`] to or subtracting it from a `MoneyExpr` (the further terms of a
+/// `COMPUTE`), and from `RatedBalance::monthly()` for the CBACT04C interest
+/// (P-CBACT04C-012). It leaves the algebra only through
 /// [`MoneyExpr::store`], [`MoneyExpr::store_checked`] or
 /// [`MoneyExpr::to_decimal`], and compares with `Money` of any width.
 ///
@@ -258,10 +261,12 @@ impl<const D: u8> fmt::Display for Money<D> {
 /// that would lose one panics instead of rounding.
 ///
 /// Deliberately not implemented, so that each fails to compile: `Mul`, `Div`,
-/// `Neg`, `Rem` and `Sum`; any `Add`, `Sub` or `Mul` with an `InterestRate`, a
-/// `RewardRate`, `RewardPoints`, a `Decimal` or an integer; `From` or `TryFrom`
-/// of any floating-point or integer type; and any rounding method, because no
-/// COBOL statement in the repository rounds (P-CBACT04C-011).
+/// `Neg`, `Rem` and `Sum`; `Add` or `Sub` with another `MoneyExpr`, which
+/// joins the expression only once stored into a field; any `Add`, `Sub` or
+/// `Mul` with an `InterestRate`, a `RewardRate`, `RewardPoints`, a `Decimal`
+/// or an integer; `From` or `TryFrom` of any floating-point or integer type;
+/// and any rounding method, because no COBOL statement in the repository
+/// rounds (P-CBACT04C-011).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MoneyExpr(Decimal);
 
@@ -411,62 +416,6 @@ impl<const B: u8> Sub<Money<B>> for MoneyExpr {
     type Output = MoneyExpr;
 
     fn sub(self, rhs: Money<B>) -> MoneyExpr {
-        MoneyExpr::exact(self.0.checked_sub(rhs.0))
-    }
-}
-
-/// `Money<A> + MoneyExpr`: an exact sum with an intermediate result.
-///
-/// # Panics
-///
-/// Only if the result would lose a digit, which takes on the order of `10^10`
-/// chained maximal operations (see [`MoneyExpr`]).
-impl<const A: u8> Add<MoneyExpr> for Money<A> {
-    type Output = MoneyExpr;
-
-    fn add(self, rhs: MoneyExpr) -> MoneyExpr {
-        MoneyExpr::exact(self.0.checked_add(rhs.0))
-    }
-}
-
-/// `Money<A> - MoneyExpr`: an exact difference with an intermediate result.
-///
-/// # Panics
-///
-/// Only if the result would lose a digit, which takes on the order of `10^10`
-/// chained maximal operations (see [`MoneyExpr`]).
-impl<const A: u8> Sub<MoneyExpr> for Money<A> {
-    type Output = MoneyExpr;
-
-    fn sub(self, rhs: MoneyExpr) -> MoneyExpr {
-        MoneyExpr::exact(self.0.checked_sub(rhs.0))
-    }
-}
-
-/// `MoneyExpr + MoneyExpr`: the exact sum of two intermediate results.
-///
-/// # Panics
-///
-/// Only if the result would lose a digit, which takes on the order of `10^10`
-/// chained maximal operations (see [`MoneyExpr`]).
-impl Add for MoneyExpr {
-    type Output = MoneyExpr;
-
-    fn add(self, rhs: MoneyExpr) -> MoneyExpr {
-        MoneyExpr::exact(self.0.checked_add(rhs.0))
-    }
-}
-
-/// `MoneyExpr - MoneyExpr`: the exact difference of two intermediate results.
-///
-/// # Panics
-///
-/// Only if the result would lose a digit, which takes on the order of `10^10`
-/// chained maximal operations (see [`MoneyExpr`]).
-impl Sub for MoneyExpr {
-    type Output = MoneyExpr;
-
-    fn sub(self, rhs: MoneyExpr) -> MoneyExpr {
         MoneyExpr::exact(self.0.checked_sub(rhs.0))
     }
 }
@@ -686,7 +635,8 @@ mod tests {
         assert_eq!(tcatbal.cents(), 1);
         let balance = (m10(-1000) + m9(250)).store::<10>();
         assert_eq!(balance.to_string(), "-7.50");
-        let total = (Money::<9>::ZERO + MoneyExpr::from_cent_count(1)).store::<9>();
+        let monthly = MoneyExpr::from_cent_count(1).store::<9>();
+        let total = (Money::<9>::ZERO + monthly).store::<9>();
         let account = (m10(100) + total).store::<10>();
         assert_eq!(account.cents(), 101);
     }
@@ -709,11 +659,15 @@ mod tests {
         let b = m10(150);
         assert_eq!((a - b).to_string(), "-0.50");
         assert_eq!((a - b).to_decimal(), dec!(-0.50));
-        assert_eq!((a + b) + (a - b), m9(200));
-        assert_eq!((a + b) - (a - b), m9(300));
+        // A further term joins an expression as `MoneyExpr ± Money`; another
+        // intermediate joins it once stored into a field.
+        assert_eq!((a + b) + (a - b).store::<11>(), m9(200));
+        assert_eq!((a + b) - (a - b).store::<11>(), m9(300));
         assert_eq!((a + b) - a, b);
-        assert_eq!(a - (a + b), m9(-150));
-        assert_eq!(a + (a - b), m9(50));
+        assert_eq!(a - a - b, m9(-150));
+        assert_eq!(a - (a + b).store::<11>(), m9(-150));
+        assert_eq!(a + a - b, m9(50));
+        assert_eq!(a + (a - b).store::<11>(), m9(50));
         let widest = Money::<16>::from_cents(999_999_999_999_999_999).expect("fits");
         assert_eq!(
             (widest + widest).store::<16>().cents(),
