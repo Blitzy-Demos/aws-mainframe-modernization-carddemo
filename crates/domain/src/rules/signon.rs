@@ -16,6 +16,23 @@
 //! Normalisation and verification belong to [`crate::auth`]; this module only
 //! sequences them.
 //!
+//! The rule runs in two steps, because argon2id verification is memory-hard
+//! and CPU-bound and never yields:
+//!
+//! 1. [`sign_on`], asynchronous: the blank edits, the upper-casing and the
+//!    `USRSEC` read. It does no argon2 work and answers with a
+//!    [`SignonCheck`] holding the record read and the password typed.
+//! 2. [`SignonCheck::verify`], synchronous and pure: the password compare and
+//!    the outcome it selects.
+//!
+//! An adapter awaits [`sign_on`], ends its unit of work, then runs
+//! [`SignonCheck::verify`] where blocking work belongs. An asynchronous
+//! adapter runs it on a blocking thread pool, such as tokio's
+//! `spawn_blocking`, never inline on the executor, where one verification
+//! would hold a worker thread and delay every other task on it. The token
+//! needs a [`SignonOutcome`], which only [`SignonCheck::verify`] yields, so no
+//! sign-on succeeds without the second step.
+//!
 //! `POST /auth/login` adapts the rule and issues the token; the token, the
 //! logout text (P-COSGN00C-003) and the 3270 screen mechanics (first entry,
 //! AID keys, header) are not this module's concern. The COBOL keeps no session
@@ -95,13 +112,89 @@ pub struct SignonOutcome {
     pub landing: Landing,
 }
 
+/// A sign-on whose user record has been read and whose password is still to
+/// be verified: what [`sign_on`] answers and [`SignonCheck::verify`] completes.
+///
+/// Every field is owned, so the check is `Send + 'static` and an asynchronous
+/// adapter can move it into a blocking thread pool to verify it. `Debug` shows
+/// the user ID only: neither the password typed nor the stored hash reaches a
+/// log line or a tracing span.
+#[must_use = "the password is verified only by `SignonCheck::verify`"]
+pub struct SignonCheck {
+    /// `WS-USER-ID`: the upper-cased, space-padded user ID typed, the key of
+    /// the `USRSEC` record read.
+    user_id: UserId,
+    /// The `USRSEC` record read by that key.
+    user: UserSecurity,
+    /// `PASSWDI` as typed; it is upper-cased and padded when it is verified.
+    password: String,
+}
+
+impl fmt::Debug for SignonCheck {
+    /// The user ID only, ended with `..` to show that the password typed and
+    /// the record read are left out.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignonCheck")
+            .field("user_id", &self.user_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignonCheck {
+    /// COSGN00C READ-USER-SEC-FILE — P-COSGN00C-009, P-COSGN00C-010,
+    /// P-COSGN00C-012, P-COSGN00C-013, V-COSGN00C-004, V-COSGN00C-005.
+    ///
+    /// `IF SEC-USR-PWD = WS-USER-PWD` on the record read and the transfer it
+    /// selects [app/cbl/COSGN00C.cbl:L221-246]: the password typed is
+    /// upper-cased, padded to 8 (E-20) and verified against the stored hash. A
+    /// matching password signs the user on with the user type of the record
+    /// and the landing it selects. A password stored in lower or mixed case
+    /// never matches the upper-cased entry (P-COSGN00C-013).
+    ///
+    /// Synchronous: argon2id verification is memory-hard and CPU-bound and
+    /// never yields. An asynchronous adapter calls this on a blocking thread
+    /// pool, such as tokio's `spawn_blocking`, never inline on the executor.
+    ///
+    /// # Errors
+    ///
+    /// A [`DomainError`] with one field:
+    ///
+    /// - `SignonFailed`, [`WRONG_PASSWORD_TRY_AGAIN`], field `PASSWD`: the
+    ///   password does not match (V-COSGN00C-005).
+    /// - `Unexpected`, [`UNABLE_TO_VERIFY_THE_USER`], field `USERID`: the
+    ///   stored hash is unusable (V-COSGN00C-004).
+    pub fn verify(self) -> Result<SignonOutcome, DomainError> {
+        let Self {
+            user_id,
+            user,
+            password,
+        } = self;
+        match verify_signon(&password, &user.password_hash) {
+            Ok(true) => Ok(SignonOutcome {
+                user_id,
+                usr_type: user.sec_usr_type,
+                landing: landing_of(&user),
+            }),
+            Ok(false) => {
+                Err(DomainError::signon_failed(WRONG_PASSWORD_TRY_AGAIN).with_field(PASSWD))
+            }
+            // A stored hash argon2 cannot use has no COBOL counterpart, since
+            // the COBOL compares plaintext. It is a failure to verify the user
+            // record, so it answers as the WHEN OTHER branch of the read does
+            // (V-COSGN00C-004), never as a wrong password.
+            Err(_) => Err(unable_to_verify()),
+        }
+    }
+}
+
 /// COSGN00C PROCESS-ENTER-KEY — P-COSGN00C-002, P-COSGN00C-005,
 /// P-COSGN00C-006, P-COSGN00C-007, V-COSGN00C-001, V-COSGN00C-002; then
-/// READ-USER-SEC-FILE — P-COSGN00C-008 to P-COSGN00C-012, P-COSGN00C-013,
-/// V-COSGN00C-003, V-COSGN00C-004, V-COSGN00C-005.
+/// READ-USER-SEC-FILE — P-COSGN00C-008, P-COSGN00C-011, P-COSGN00C-012,
+/// V-COSGN00C-003, V-COSGN00C-004.
 ///
-/// Signs a user on as the ENTER key of the sign-on screen does
-/// [app/cbl/COSGN00C.cbl:L108-140]:
+/// The first step of a sign-on by the ENTER key of the sign-on screen
+/// [app/cbl/COSGN00C.cbl:L108-140], up to and including the user read:
 ///
 /// 1. A user ID of `SPACES OR LOW-VALUES` is rejected first, then a password of
 ///    `SPACES OR LOW-VALUES` [app/cbl/COSGN00C.cbl:L117-130]. Either rejection
@@ -109,10 +202,16 @@ pub struct SignonOutcome {
 /// 2. The user ID is upper-cased and padded to 8, giving the `USRSEC` key
 ///    [app/cbl/COSGN00C.cbl:L132-134]; the password is upper-cased and padded
 ///    when it is verified [app/cbl/COSGN00C.cbl:L135-136] (E-20).
-/// 3. The user record is read by that key and the password verified against
-///    its stored hash (`READ-USER-SEC-FILE` [app/cbl/COSGN00C.cbl:L209-257]).
-///    A matching password signs the user on with the user type of the record
-///    and the landing it selects.
+/// 3. The user record is read by that key (`READ-USER-SEC-FILE`
+///    [app/cbl/COSGN00C.cbl:L209-219, L247-256]).
+///
+/// The found record and the password typed come back as a [`SignonCheck`],
+/// unverified: this function does no argon2 work. The adapter awaits it, ends
+/// its unit of work, then runs [`SignonCheck::verify`] where blocking work
+/// belongs — for an asynchronous adapter a blocking thread pool, such as
+/// tokio's `spawn_blocking`, never inline on the executor, because argon2id
+/// verification is memory-hard and never yields. Only that second step yields
+/// the [`SignonOutcome`] that signs the user on.
 ///
 /// # Errors
 ///
@@ -125,13 +224,14 @@ pub struct SignonOutcome {
 /// - `SignonFailed`, [`USER_NOT_FOUND_TRY_AGAIN`], field `USERID`: no user has
 ///   the upper-cased ID (V-COSGN00C-003).
 /// - `Unexpected`, [`UNABLE_TO_VERIFY_THE_USER`], field `USERID`: the read
-///   failed otherwise, or the stored hash is unusable (V-COSGN00C-004).
-/// - `SignonFailed`, [`WRONG_PASSWORD_TRY_AGAIN`], field `PASSWD`: the
-///   password does not match (V-COSGN00C-005).
+///   failed otherwise (V-COSGN00C-004).
+///
+/// A wrong password and an unusable stored hash are answered by
+/// [`SignonCheck::verify`].
 pub async fn sign_on<S: UserStore>(
     store: &mut S,
     input: SignonInput,
-) -> Result<SignonOutcome, DomainError> {
+) -> Result<SignonCheck, DomainError> {
     let SignonInput { user_id, password } = input;
     if is_spaces_or_low_values(&user_id, USERIDI_LEN) {
         return Err(DomainError::empty(PLEASE_ENTER_USER_ID).with_field(USERID));
@@ -140,7 +240,12 @@ pub async fn sign_on<S: UserStore>(
         return Err(DomainError::empty(PLEASE_ENTER_PASSWORD).with_field(PASSWD));
     }
     let key = UserId::move_from(&normalize_signon_user_id(&user_id));
-    read_user_sec_file(store, key, &password).await
+    let user = read_user_sec_file(store, key).await?;
+    Ok(SignonCheck {
+        user_id: key,
+        user,
+        password,
+    })
 }
 
 /// COSGN00C PROCESS-ENTER-KEY — P-COSGN00C-005, P-COSGN00C-006,
@@ -157,40 +262,26 @@ fn is_spaces_or_low_values(entered: &str, width: usize) -> bool {
     field.iter().all(|&byte| byte == b' ') || field.iter().all(|&byte| byte == 0)
 }
 
-/// COSGN00C READ-USER-SEC-FILE — P-COSGN00C-008, P-COSGN00C-009,
-/// P-COSGN00C-010, P-COSGN00C-011, P-COSGN00C-012, P-COSGN00C-013,
-/// V-COSGN00C-003, V-COSGN00C-004, V-COSGN00C-005.
+/// COSGN00C READ-USER-SEC-FILE — P-COSGN00C-008, P-COSGN00C-011,
+/// P-COSGN00C-012, P-COSGN00C-013, V-COSGN00C-003, V-COSGN00C-004.
 ///
-/// `EXEC CICS READ DATASET(USRSEC) RIDFLD(WS-USER-ID)` and the `EVALUATE` of
-/// its `RESP` [app/cbl/COSGN00C.cbl:L211-257]. The key is compared byte for
+/// `EXEC CICS READ DATASET(USRSEC) RIDFLD(WS-USER-ID)` and the `RESP`
+/// branches of its `EVALUATE` that end before the password compare
+/// [app/cbl/COSGN00C.cbl:L211-219, L247-256]. The key is compared byte for
 /// byte, so a user ID stored in lower or mixed case is never found (E-20).
 ///
 /// # Errors
 ///
-/// As [`sign_on`] lists for V-COSGN00C-003 to V-COSGN00C-005.
+/// As [`sign_on`] lists for V-COSGN00C-003 and V-COSGN00C-004.
 async fn read_user_sec_file<S: UserStore>(
     store: &mut S,
     key: UserId,
-    password: &str,
-) -> Result<SignonOutcome, DomainError> {
-    let user = match store.read_user(key).await {
-        Ok(user) => user,
+) -> Result<UserSecurity, DomainError> {
+    match store.read_user(key).await {
+        Ok(user) => Ok(user),
         Err(PortError::NotFound) => {
-            return Err(DomainError::signon_failed(USER_NOT_FOUND_TRY_AGAIN).with_field(USERID));
+            Err(DomainError::signon_failed(USER_NOT_FOUND_TRY_AGAIN).with_field(USERID))
         }
-        Err(_) => return Err(unable_to_verify()),
-    };
-    match verify_signon(password, &user.password_hash) {
-        Ok(true) => Ok(SignonOutcome {
-            user_id: key,
-            usr_type: user.sec_usr_type,
-            landing: landing_of(&user),
-        }),
-        Ok(false) => Err(DomainError::signon_failed(WRONG_PASSWORD_TRY_AGAIN).with_field(PASSWD)),
-        // A stored hash argon2 cannot use has no COBOL counterpart, since the
-        // COBOL compares plaintext. It is a failure to verify the user record,
-        // so it answers as the WHEN OTHER branch of the read does
-        // (V-COSGN00C-004), never as a wrong password.
         Err(_) => Err(unable_to_verify()),
     }
 }
@@ -219,8 +310,9 @@ fn landing_of(user: &UserSecurity) -> Landing {
 mod tests {
     use std::future::Future;
     use std::sync::OnceLock;
+    use std::thread;
 
-    use super::{Landing, SignonInput, SignonOutcome, sign_on};
+    use super::{Landing, SignonCheck, SignonInput, SignonOutcome, sign_on};
     use crate::auth::hash_stored_password;
     use crate::entities::UserSecurity;
     use crate::error::{DomainError, ErrorKind, FieldError};
@@ -273,17 +365,28 @@ mod tests {
         future
     }
 
-    /// Signs on with the map fields typed as `user_id` and `password`.
-    fn run(
+    /// The first step only: the edits and the user read for the map fields
+    /// typed as `user_id` and `password`.
+    fn look_up(
         store: &mut FakeStore,
         user_id: &str,
         password: &str,
-    ) -> Result<SignonOutcome, DomainError> {
+    ) -> Result<SignonCheck, DomainError> {
         let input = SignonInput {
             user_id: user_id.to_owned(),
             password: password.to_owned(),
         };
         block_on(send(sign_on(store, input)))
+    }
+
+    /// Signs on with the map fields typed as `user_id` and `password`: both
+    /// steps, the read and then the verification.
+    fn run(
+        store: &mut FakeStore,
+        user_id: &str,
+        password: &str,
+    ) -> Result<SignonOutcome, DomainError> {
+        look_up(store, user_id, password).and_then(SignonCheck::verify)
     }
 
     /// Asserts that `result` is the rejection of `kind` with `message`, whose
@@ -417,6 +520,76 @@ mod tests {
                 &case,
             );
             assert_eq!(store.calls, ["read_user"], "{case}");
+        }
+    }
+
+    #[test]
+    fn the_read_step_leaves_the_password_unverified() {
+        // V-COSGN00C-005 and the unusable-hash case of V-COSGN00C-004: the
+        // read step answers with a check once the record is found, and only
+        // the verification step rejects.
+        let cases = [
+            (
+                "ADMIN001",
+                "WRONGPWD",
+                ErrorKind::SignonFailed,
+                WRONG_PASSWORD_TRY_AGAIN,
+                "PASSWD",
+            ),
+            (
+                "BADHASH1",
+                "PASSWORD",
+                ErrorKind::Unexpected,
+                UNABLE_TO_VERIFY_THE_USER,
+                "USERID",
+            ),
+        ];
+        for (typed_id, typed_password, kind, message, field) in cases {
+            let mut store = seeded();
+            let case = format!("{typed_id:?} {typed_password:?}");
+            let check = look_up(&mut store, typed_id, typed_password)
+                .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+            assert_eq!(store.calls, ["read_user"], "{case}");
+            assert_rejected(check.verify(), kind, message, field, &case);
+        }
+    }
+
+    #[test]
+    fn a_check_verified_on_another_thread_answers_as_inline() {
+        // An asynchronous adapter verifies on a blocking thread pool. The
+        // bounds of `thread::spawn` check that the check is Send + 'static,
+        // and the outcome there is the one the same entry gives inline.
+        let cases = [
+            ("ADMIN001", "PASSWORD"),
+            ("uSeR0001", "PassWord"),
+            ("ADMIN001", "WRONGPWD"),
+            ("BADHASH1", "PASSWORD"),
+        ];
+        for (typed_id, typed_password) in cases {
+            let case = format!("{typed_id:?} {typed_password:?}");
+            let inline = run(&mut seeded(), typed_id, typed_password);
+            let check = look_up(&mut seeded(), typed_id, typed_password)
+                .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+            let elsewhere = thread::spawn(move || check.verify())
+                .join()
+                .unwrap_or_else(|_| panic!("{case}: the verifying thread panicked"));
+            assert_eq!(elsewhere, inline, "{case}");
+        }
+    }
+
+    #[test]
+    fn debug_of_the_check_omits_the_password_and_the_hash() {
+        let mut store = seeded();
+        let check = look_up(&mut store, "admin001", "notshown")
+            .unwrap_or_else(|error| panic!("ADMIN001 is read: {error:?}"));
+        let rendered = format!("{check:?}");
+        let user_id = UserId::move_from("ADMIN001");
+        assert_eq!(
+            rendered,
+            format!("SignonCheck {{ user_id: {user_id:?}, .. }}")
+        );
+        for hidden in ["notshown", "NOTSHOWN", "argon2"] {
+            assert!(!rendered.contains(hidden), "{hidden} in {rendered}");
         }
     }
 
