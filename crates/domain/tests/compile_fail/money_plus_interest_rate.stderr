@@ -1,0 +1,10 @@
+error[E0277]: cannot add `InterestRate` to `Money<10>`
+  --> tests/compile_fail/money_plus_interest_rate.rs:14:21
+   |
+14 |     let _ = balance + rate;
+   |                     ^ no implementation for `Money<10> + InterestRate`
+   |
+   = help: the trait `Add<InterestRate>` is not implemented for `Money<10>`
+   = help: the following other types implement trait `Add<Rhs>`:
+             `Money<A>` implements `Add<Money<B>>`
+             `Money<A>` implements `Add<MoneyExpr>`

@@ -1,0 +1,10 @@
+error[E0277]: cannot add `RewardPoints` to `Money<10>`
+  --> tests/compile_fail/money_plus_reward_points.rs:10:20
+   |
+10 |     let _ = amount + points;
+   |                    ^ no implementation for `Money<10> + RewardPoints`
+   |
+   = help: the trait `Add<RewardPoints>` is not implemented for `Money<10>`
+   = help: the following other types implement trait `Add<Rhs>`:
+             `Money<A>` implements `Add<Money<B>>`
+             `Money<A>` implements `Add<MoneyExpr>`
