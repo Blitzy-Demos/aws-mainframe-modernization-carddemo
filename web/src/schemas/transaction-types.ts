@@ -40,6 +40,8 @@ import { z } from "zod";
 
 import type { components, paths } from "@/api/schema";
 
+import { isSpacesOrLowValues } from "./primitives";
+
 type TranTypeListQuery = NonNullable<
   paths["/admin/transaction-types"]["get"]["parameters"]["query"]
 >;
@@ -113,9 +115,6 @@ const ALPHANUMERIC_OR_SPACE = /^[A-Za-z0-9 ]*$/;
 /** Every byte a space; the empty text included. */
 const ALL_SPACES = /^ *$/;
 
-/** Every byte `LOW-VALUES`. */
-const ALL_LOW_VALUES = /^\u0000*$/;
-
 /** The entry moved into its `X(width)` map field: padded with spaces. */
 function mapField(value: string, width: number): string {
   return value.padEnd(width, " ");
@@ -131,11 +130,7 @@ function mapField(value: string, width: number): string {
  */
 function isNotSupplied(value: string, width: number): boolean {
   const field = mapField(value, width);
-  return (
-    field === mapField("*", width) ||
-    ALL_SPACES.test(field) ||
-    ALL_LOW_VALUES.test(field)
-  );
+  return field === mapField("*", width) || isSpacesOrLowValues(field);
 }
 
 /**
@@ -148,11 +143,7 @@ function typeCodeFilterEdit(value: string, ctx: z.RefinementCtx): void {
     return;
   }
   const field = mapField(value, TYPE_CODE_LENGTH);
-  if (
-    ALL_SPACES.test(field) ||
-    ALL_LOW_VALUES.test(field) ||
-    TWO_DIGITS.test(field)
-  ) {
+  if (isSpacesOrLowValues(field) || TWO_DIGITS.test(field)) {
     return;
   }
   ctx.addIssue({

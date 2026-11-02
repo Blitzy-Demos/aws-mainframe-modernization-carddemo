@@ -21,6 +21,8 @@ import { z } from "zod";
 
 import type { components } from "@/api/schema";
 
+import { isSpacesOrLowValues } from "./primitives";
+
 type LoginRequest = components["schemas"]["LoginRequest"];
 type LoginField = components["schemas"]["LoginField"];
 
@@ -36,17 +38,11 @@ export const LOGIN_MESSAGES = {
 } as const;
 
 /**
- * `<field> = SPACES OR LOW-VALUES` as the server's sign-on rule tests it:
- * every character a space, or every character NUL; the empty text is both.
- * A mix of the two, a tab or any other whitespace is not blank to the COBOL,
- * so `String.prototype.trim` is not used: it would block input the server
- * reads and answers with 'User not found. Try again ...'.
+ * One map field: the length check, then the field's COSGN00C blank edit,
+ * `SPACES OR LOW-VALUES` as the server's sign-on rule tests it. The value is
+ * not trimmed: a tab or other whitespace is not blank to the COBOL, and the
+ * server reads it and answers 'User not found. Try again ...'.
  */
-function isSpacesOrLowValues(value: string): boolean {
-  return /^ *$/.test(value) || /^\u0000*$/.test(value);
-}
-
-/** One map field: the length check, then the field's COSGN00C blank edit. */
 function mapField(emptyMessage: string) {
   return z
     .string()

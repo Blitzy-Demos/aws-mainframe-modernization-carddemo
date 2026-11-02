@@ -23,6 +23,8 @@ import { z } from "zod";
 
 import type { components, paths } from "@/api/schema";
 
+import { DATE_PATTERN, isSpacesOrLowValues } from "./primitives";
+
 type ReportQuery = NonNullable<
   paths["/reports/transactions"]["get"]["parameters"]["query"]
 >;
@@ -95,15 +97,6 @@ const DATE_TEXT_MAX_LENGTH = 10;
 
 /** The OpenAPI `maxLength` of `confirm`: `CONFIRMI X(1)`. */
 const CONFIRM_MAX_LENGTH = 1;
-
-/**
- * The client's date form, the `CSUTLDTC` picture `YYYY-MM-DD`. The server
- * also accepts parts `NUMVAL-C` reads into its numeric fields, such as the
- * `1` of `2022-1-1`; the client does not reproduce that reading and asks for
- * this form instead. Whether a date in this form is a calendar date stays the
- * server's `CSUTLDTC` check.
- */
-const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 /** One date part: its map field width, its value limit and its two texts. */
 interface DatePartRule {
@@ -181,13 +174,6 @@ interface ReceivedPart {
 }
 
 /**
- * The COBOL `= SPACES OR LOW-VALUES` test of entered text: empty, all spaces
- * or all NUL characters.
- */
-const isBlank = (text: string): boolean =>
-  /^ *$/.test(text) || /^\0*$/.test(text);
-
-/**
  * One `YYYY-MM-DD` text split at its first two hyphens into year, month and
  * day exactly as entered, as the server splits it: a missing part is empty,
  * and text after a third hyphen stays in the day.
@@ -232,7 +218,7 @@ function receiveParts({ rule, value }: EnteredDate): ReceivedPart[] {
  * `LOW-VALUES`. Text longer than the field is never blank.
  */
 const isBlankPart = ({ rule, text }: ReceivedPart): boolean =>
-  text.length <= rule.width && isBlank(text);
+  text.length <= rule.width && isSpacesOrLowValues(text);
 
 /**
  * The value edit of one part (`IS NOT NUMERIC OR > '12'`, `> '31'`, year
@@ -274,6 +260,9 @@ function customRangeRejection(
   if (invalid !== undefined) {
     return { field: invalid.field, message: invalid.rule.invalid };
   }
+  // The server also accepts parts `NUMVAL-C` reads into its numeric fields,
+  // such as the `1` of `2022-1-1`; the client does not reproduce that reading
+  // and asks for the `YYYY-MM-DD` form instead.
   const malformed = dates.find(({ value }) => !DATE_PATTERN.test(value ?? ""));
   if (malformed !== undefined) {
     return { field: malformed.rule.field, message: malformed.rule.invalidDate };
@@ -295,7 +284,11 @@ const confirmFieldText = (value: string): string =>
  * confirmation); any other value is quoted back.
  */
 function confirmRejection(confirm: string | undefined): Rejection | undefined {
-  if (confirm === undefined || isBlank(confirm) || /^[YyNn]$/.test(confirm)) {
+  if (
+    confirm === undefined ||
+    isSpacesOrLowValues(confirm) ||
+    /^[YyNn]$/.test(confirm)
+  ) {
     return undefined;
   }
   const { invalidConfirmQuote, invalidConfirmTail } = REPORT_MESSAGES;

@@ -24,6 +24,8 @@ import { z } from "zod";
 
 import type { components, paths } from "@/api/schema";
 
+import { DATE_PATTERN, isSpacesOrLowValues } from "./primitives";
+
 /** COTRN00C texts of the CT00 browse filter. */
 export const transactionListMessages = {
   /** V-COTRN00C-004: start key entered and not 16 digits. */
@@ -131,26 +133,10 @@ const MERCHANT_ID = /^\d{9}$/;
  */
 const AMOUNT = /^[-+]\d{8}\.\d{2}$/;
 /**
- * (1:4) digits, (5:1) `-`, (6:2) digits, (8:1) `-`, (9:2) digits
- * [app/cbl/COTRN02C.cbl:L353-378]. The dates are text inputs, not a date
- * picker; calendar validity is CSUTLDTC's, server-side.
- */
-const DATE = /^\d{4}-\d{2}-\d{2}$/;
-/**
  * The confirmations COTRN02C does not reject: `Y`/`y` add, `N`/`n` prompt
  * [app/cbl/COTRN02C.cbl:L169-187].
  */
 const CONFIRM = /^[YyNn]$/;
-
-/**
- * `= SPACES OR LOW-VALUES`: empty, spaces only, or NUL characters only, as the
- * server reads a received map field.
- */
-const BLANK = /^(?: *|\u0000+)$/;
-
-function isBlank(value: string): boolean {
-  return BLANK.test(value);
-}
 
 /**
  * A format or class edit. Without `message` the edit has no audited text and
@@ -173,34 +159,19 @@ function checkEdit(value: string, edit: Edit, ctx: z.RefinementCtx): void {
 }
 
 /**
- * A field the COBOL requires: at most `width` characters, then `emptyMessage`
- * when blank, then `edit` when given. At most one issue per value, the first
- * the COBOL would raise for the field.
+ * A single required field edited on its own, the CT01 view key: at most
+ * `width` characters, then `emptyMessage` when blank. At most one issue: an
+ * over-length value gets only the width issue. The CT02 add form edits its
+ * required fields at object level instead, because its issues must follow the
+ * audit Order across fields ({@link transactionAddSchema}).
  */
-function requiredField(width: number, emptyMessage: string, edit?: Edit) {
+function requiredField(width: number, emptyMessage: string) {
   return z
     .string()
     .max(width)
     .superRefine((value, ctx) => {
-      if (value.length > width) {
-        return;
-      }
-      if (isBlank(value)) {
+      if (value.length <= width && isSpacesOrLowValues(value)) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, message: emptyMessage });
-      } else if (edit !== undefined) {
-        checkEdit(value, edit, ctx);
-      }
-    });
-}
-
-/** A field the COBOL edits only when entered: at most `width` characters, then `edit`. */
-function enteredField(width: number, edit: Edit) {
-  return z
-    .string()
-    .max(width)
-    .superRefine((value, ctx) => {
-      if (value.length <= width && !isBlank(value)) {
-        checkEdit(value, edit, ctx);
       }
     });
 }
@@ -220,7 +191,7 @@ function optionalParam(edit: Edit, width?: number) {
   return text
     .optional()
     .superRefine((value, ctx) => {
-      if (value === undefined || isBlank(value)) {
+      if (value === undefined || isSpacesOrLowValues(value)) {
         return;
       }
       if (width === undefined || value.length <= width) {
@@ -315,90 +286,201 @@ export const transactionViewBmsFieldMap: Record<
 // CT02 add form: COTRN02
 // ---------------------------------------------------------------------------
 
+type TransactionAddKey = keyof TransactionAddRequest;
+
 // Every DTO member is optional, so `satisfies z.ZodType<…>` alone would accept
 // a missing or misspelt member; this `satisfies` ties the keys to the DTO's.
+// Each member checks only its width; the COBOL edits run at object level in
+// `editTransactionAdd`, so their issues can follow the audit Order across
+// fields.
 const transactionAddShape = {
-  account_id: enteredField(ADD_WIDTH.account_id, {
+  account_id: z.string().max(ADD_WIDTH.account_id),
+  card_number: z.string().max(ADD_WIDTH.card_number),
+  tran_type_cd: z.string().max(ADD_WIDTH.tran_type_cd),
+  tran_cat_cd: z.string().max(ADD_WIDTH.tran_cat_cd),
+  tran_source: z.string().max(ADD_WIDTH.tran_source),
+  tran_desc: z.string().max(ADD_WIDTH.tran_desc),
+  tran_amt: z.string().max(ADD_WIDTH.tran_amt),
+  tran_orig_date: z.string().max(ADD_WIDTH.tran_orig_date),
+  tran_proc_date: z.string().max(ADD_WIDTH.tran_proc_date),
+  tran_merchant_id: z.string().max(ADD_WIDTH.tran_merchant_id),
+  tran_merchant_name: z.string().max(ADD_WIDTH.tran_merchant_name),
+  tran_merchant_city: z.string().max(ADD_WIDTH.tran_merchant_city),
+  tran_merchant_zip: z.string().max(ADD_WIDTH.tran_merchant_zip),
+  confirm: z.string().max(ADD_WIDTH.confirm),
+} satisfies Record<TransactionAddKey, z.ZodTypeAny>;
+
+const transactionAddFields = z.object(transactionAddShape);
+
+/** A CT02 field required by VALIDATE-INPUT-DATA-FIELDS, with its empty text. */
+interface AddRequiredField {
+  readonly field: TransactionAddKey;
+  readonly message: string;
+}
+
+/** A class or format edit of an entered CT02 field, with its audited text. */
+interface AddFieldEdit {
+  readonly field: TransactionAddKey;
+  readonly pattern: RegExp;
+  readonly message: string;
+}
+
+/** Order 1, VALIDATE-INPUT-KEY-FIELDS: the class test of an entered account ID. */
+const ADD_KEY_EDITS = [
+  // V-COTRN02C-001, Order 1
+  {
+    field: "account_id",
     pattern: ACCOUNT_ID,
     message: transactionAddMessages.accountIdMustBeNumeric,
-  }),
-  card_number: z.string().max(ADD_WIDTH.card_number),
-  tran_type_cd: requiredField(
-    ADD_WIDTH.tran_type_cd,
-    transactionAddMessages.typeCdCanNotBeEmpty,
-    { pattern: TYPE_CD, message: transactionAddMessages.typeCdMustBeNumeric },
-  ),
-  tran_cat_cd: requiredField(
-    ADD_WIDTH.tran_cat_cd,
-    transactionAddMessages.categoryCdCanNotBeEmpty,
-    { pattern: CATEGORY_CD, message: transactionAddMessages.categoryCdMustBeNumeric },
-  ),
-  tran_source: requiredField(ADD_WIDTH.tran_source, transactionAddMessages.sourceCanNotBeEmpty),
-  tran_desc: requiredField(ADD_WIDTH.tran_desc, transactionAddMessages.descriptionCanNotBeEmpty),
-  tran_amt: requiredField(
-    ADD_WIDTH.tran_amt,
-    transactionAddMessages.amountCanNotBeEmpty,
-    { pattern: AMOUNT, message: transactionAddMessages.amountShouldBeInFormat },
-  ),
-  tran_orig_date: requiredField(
-    ADD_WIDTH.tran_orig_date,
-    transactionAddMessages.origDateCanNotBeEmpty,
-    { pattern: DATE, message: transactionAddMessages.origDateShouldBeInFormat },
-  ),
-  tran_proc_date: requiredField(
-    ADD_WIDTH.tran_proc_date,
-    transactionAddMessages.procDateCanNotBeEmpty,
-    { pattern: DATE, message: transactionAddMessages.procDateShouldBeInFormat },
-  ),
-  tran_merchant_id: requiredField(
-    ADD_WIDTH.tran_merchant_id,
-    transactionAddMessages.merchantIdCanNotBeEmpty,
-    { pattern: MERCHANT_ID, message: transactionAddMessages.merchantIdMustBeNumeric },
-  ),
-  tran_merchant_name: requiredField(
-    ADD_WIDTH.tran_merchant_name,
-    transactionAddMessages.merchantNameCanNotBeEmpty,
-  ),
-  tran_merchant_city: requiredField(
-    ADD_WIDTH.tran_merchant_city,
-    transactionAddMessages.merchantCityCanNotBeEmpty,
-  ),
-  tran_merchant_zip: requiredField(
-    ADD_WIDTH.tran_merchant_zip,
-    transactionAddMessages.merchantZipCanNotBeEmpty,
-  ),
-  confirm: enteredField(ADD_WIDTH.confirm, {
-    pattern: CONFIRM,
-    message: transactionAddMessages.invalidConfirmValue,
-  }),
-} satisfies Record<keyof TransactionAddRequest, z.ZodTypeAny>;
+  },
+] as const satisfies readonly AddFieldEdit[];
 
 /**
- * The single-field edits of `POST /transactions`, keyed in COTRN02 screen
- * order, which is the audit Order of VALIDATE-INPUT-KEY-FIELDS and
- * VALIDATE-INPUT-DATA-FIELDS [app/cbl/COTRN02C.cbl:L164-437].
- *
- * - `account_id`: optional; when entered it must be 11 digits
- *   (V-COTRN02C-001).
- * - `card_number`: only its width. Its numeric edit and the rule that one of
- *   the two keys is entered depend on the account field, so they are
- *   {@link transactionAddFormSchema}'s.
- * - Data fields: each required with its `can NOT be empty` text
- *   (V-COTRN02C-008 to V-COTRN02C-018), then its class or format edit: type
- *   and category codes 2 and 4 digits, amount `-99999999.99`, dates
- *   `YYYY-MM-DD`, merchant ID 9 digits (V-COTRN02C-019 to V-COTRN02C-023,
- *   V-COTRN02C-026).
- * - `confirm`: blank, `Y`, `y`, `N` or `n`; anything else is V-COTRN02C-028.
- *   Blank and `N` are the server's 'Confirm to add this transaction...'
- *   answer (V-COTRN02C-027), not a client error: the confirmation dialog sends
- *   `Y`.
- *
- * COTRN02C stops at the first failing edit; a form shows each field's own
- * first issue. Forms resolve with {@link transactionAddFormSchema}, which adds
- * the key-field rules to these edits.
+ * Order 3, the blank EVALUATE of VALIDATE-INPUT-DATA-FIELDS
+ * [app/cbl/COTRN02C.cbl:L252-317]: the data fields in COTRN02 screen order.
  */
-export const transactionAddSchema = z.object(
-  transactionAddShape,
+const ADD_REQUIRED_FIELDS = [
+  // V-COTRN02C-008, Order 3
+  { field: "tran_type_cd", message: transactionAddMessages.typeCdCanNotBeEmpty },
+  // V-COTRN02C-009, Order 3
+  { field: "tran_cat_cd", message: transactionAddMessages.categoryCdCanNotBeEmpty },
+  // V-COTRN02C-010, Order 3
+  { field: "tran_source", message: transactionAddMessages.sourceCanNotBeEmpty },
+  // V-COTRN02C-011, Order 3
+  { field: "tran_desc", message: transactionAddMessages.descriptionCanNotBeEmpty },
+  // V-COTRN02C-012, Order 3
+  { field: "tran_amt", message: transactionAddMessages.amountCanNotBeEmpty },
+  // V-COTRN02C-013, Order 3
+  { field: "tran_orig_date", message: transactionAddMessages.origDateCanNotBeEmpty },
+  // V-COTRN02C-014, Order 3
+  { field: "tran_proc_date", message: transactionAddMessages.procDateCanNotBeEmpty },
+  // V-COTRN02C-015, Order 3
+  { field: "tran_merchant_id", message: transactionAddMessages.merchantIdCanNotBeEmpty },
+  // V-COTRN02C-016, Order 3
+  { field: "tran_merchant_name", message: transactionAddMessages.merchantNameCanNotBeEmpty },
+  // V-COTRN02C-017, Order 3
+  { field: "tran_merchant_city", message: transactionAddMessages.merchantCityCanNotBeEmpty },
+  // V-COTRN02C-018, Order 3
+  { field: "tran_merchant_zip", message: transactionAddMessages.merchantZipCanNotBeEmpty },
+] as const satisfies readonly AddRequiredField[];
+
+/**
+ * Orders 4 to 10, the class and format edits of VALIDATE-INPUT-DATA-FIELDS
+ * [app/cbl/COTRN02C.cbl:L322-436], then Order 11, the confirmation edit of
+ * PROCESS-ENTER-KEY [app/cbl/COTRN02C.cbl:L182-187]. The CSUTLDTC calendar
+ * checks of the dates (Orders 8 and 9) are server-only.
+ */
+const ADD_VALUE_EDITS = [
+  // V-COTRN02C-019, Order 4
+  {
+    field: "tran_type_cd",
+    pattern: TYPE_CD,
+    message: transactionAddMessages.typeCdMustBeNumeric,
+  },
+  // V-COTRN02C-020, Order 4
+  {
+    field: "tran_cat_cd",
+    pattern: CATEGORY_CD,
+    message: transactionAddMessages.categoryCdMustBeNumeric,
+  },
+  // V-COTRN02C-021, Order 5
+  {
+    field: "tran_amt",
+    pattern: AMOUNT,
+    message: transactionAddMessages.amountShouldBeInFormat,
+  },
+  // V-COTRN02C-022, Order 6: (1:4) digits, (5:1) `-`, (6:2) digits, (8:1)
+  // `-`, (9:2) digits [app/cbl/COTRN02C.cbl:L353-363].
+  {
+    field: "tran_orig_date",
+    pattern: DATE_PATTERN,
+    message: transactionAddMessages.origDateShouldBeInFormat,
+  },
+  // V-COTRN02C-023, Order 7: the same form [app/cbl/COTRN02C.cbl:L368-378].
+  {
+    field: "tran_proc_date",
+    pattern: DATE_PATTERN,
+    message: transactionAddMessages.procDateShouldBeInFormat,
+  },
+  // V-COTRN02C-026, Order 10
+  {
+    field: "tran_merchant_id",
+    pattern: MERCHANT_ID,
+    message: transactionAddMessages.merchantIdMustBeNumeric,
+  },
+  // V-COTRN02C-028, Order 11
+  {
+    field: "confirm",
+    pattern: CONFIRM,
+    message: transactionAddMessages.invalidConfirmValue,
+  },
+] as const satisfies readonly AddFieldEdit[];
+
+/**
+ * The COBOL edits of `POST /transactions` in audit (Order, ID) order: the
+ * entered account ID's class test, every blank data field, then every class,
+ * format and confirmation edit. Each field gets at most one issue, its own
+ * first: a blank field only its empty text, and a field over its width none
+ * here, because its width issue stands alone (the server answers the length
+ * before any COBOL edit).
+ */
+function editTransactionAdd(
+  values: z.infer<typeof transactionAddFields>,
+  ctx: z.RefinementCtx,
+): void {
+  const withinWidth = (field: TransactionAddKey): boolean =>
+    values[field].length <= ADD_WIDTH[field];
+  const report = (field: TransactionAddKey, message: string): void => {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message, path: [field] });
+  };
+  const editEntered = (edits: readonly AddFieldEdit[]): void => {
+    for (const { field, pattern, message } of edits) {
+      const value = values[field];
+      if (withinWidth(field) && !isSpacesOrLowValues(value) && !pattern.test(value)) {
+        report(field, message);
+      }
+    }
+  };
+
+  editEntered(ADD_KEY_EDITS);
+  for (const { field, message } of ADD_REQUIRED_FIELDS) {
+    if (withinWidth(field) && isSpacesOrLowValues(values[field])) {
+      report(field, message);
+    }
+  }
+  editEntered(ADD_VALUE_EDITS);
+}
+
+/**
+ * The COTRN02C edits of `POST /transactions` the client can decide
+ * [app/cbl/COTRN02C.cbl:L164-437], as issues in audit (Order, ID) order:
+ *
+ * 1. `account_id`: when entered, 11 digits (V-COTRN02C-001, Order 1).
+ * 2. Each data field blank, in COTRN02 screen order: its `can NOT be empty`
+ *    text (V-COTRN02C-008 to V-COTRN02C-018, Order 3).
+ * 3. Each entered data field's class or format: type and category codes 2
+ *    and 4 digits (Order 4), amount `-99999999.99` (Order 5), original and
+ *    processing dates `YYYY-MM-DD` (Orders 6 and 7), merchant ID 9 digits
+ *    (Order 10) (V-COTRN02C-019 to V-COTRN02C-023, V-COTRN02C-026).
+ * 4. `confirm`: blank, `Y`, `y`, `N` or `n`; anything else is V-COTRN02C-028
+ *    (Order 11). Blank and `N` are the server's 'Confirm to add this
+ *    transaction...' answer (V-COTRN02C-027), not a client error: the
+ *    confirmation dialog sends `Y`.
+ *
+ * Every member's width is checked before these edits, as the server checks
+ * it before any COBOL edit; its issue keeps zod's text (E-49), and a field
+ * over its width gets none of these edits.
+ *
+ * `card_number` gets only its width here. Its numeric edit and the rule that
+ * one of the two keys is entered depend on the account field, so they are
+ * {@link transactionAddFormSchema}'s.
+ *
+ * COTRN02C stops at the first failing edit, so the first issue is the
+ * server's message; a form shows each field's own first issue. Forms resolve
+ * with {@link transactionAddFormSchema}, which puts the key-field rules first.
+ */
+export const transactionAddSchema = transactionAddFields.superRefine(
+  editTransactionAdd,
 ) satisfies z.ZodType<TransactionAddRequest>;
 
 /**
@@ -413,10 +495,10 @@ const transactionAddKeyRules = z
   .superRefine(({ account_id, card_number }, ctx) => {
     const withinWidths =
       account_id.length <= ADD_WIDTH.account_id && card_number.length <= ADD_WIDTH.card_number;
-    if (!withinWidths || !isBlank(account_id)) {
+    if (!withinWidths || !isSpacesOrLowValues(account_id)) {
       return;
     }
-    if (isBlank(card_number)) {
+    if (isSpacesOrLowValues(card_number)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: transactionAddMessages.accountOrCardNumberMustBeEntered,
@@ -432,14 +514,16 @@ const transactionAddKeyRules = z
   });
 
 /**
- * The schema the CT02 form submits with: the key-field rules, then every
- * single-field edit of {@link transactionAddSchema}.
+ * The schema the CT02 form submits with: the key-field rules of a blank
+ * account ID (V-COTRN02C-002, V-COTRN02C-003, Order 1), then
+ * {@link transactionAddSchema}'s widths and staged edits.
  *
- * It is an intersection rather than a `.superRefine` on the object because a
- * refinement runs after the object and would append the key-field issue
- * behind every data-field issue. Parsing the key rules first keeps the issues
- * in COBOL order: with every field blank the first issue is 'Account or Card
- * Number must be entered...', the next 'Type CD can NOT be empty...'.
+ * It is an intersection rather than a `.superRefine` chained on
+ * `transactionAddSchema` because that refinement would run after the staged
+ * edits and append the key-field issue behind every data-field issue. Parsing
+ * the key rules first keeps the issues in audit order: with every field blank
+ * the first issue is 'Account or Card Number must be entered...', the next
+ * 'Type CD can NOT be empty...'.
  */
 export const transactionAddFormSchema = transactionAddKeyRules.and(
   transactionAddSchema,

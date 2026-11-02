@@ -17,6 +17,8 @@ import { z } from "zod";
 
 import type { components, paths } from "@/api/schema";
 
+import { isSpacesOrLowValues } from "./primitives";
+
 /** The COPAUS0C PROCESS-ENTER-KEY texts, byte for byte as the validation audit records them. */
 export const authSummaryMessages = {
   /** V-COPAUS0C-001 · COPAUS0C.cbl:L269: the account ID is blank or LOW-VALUES. */
@@ -39,14 +41,6 @@ export const authDetailMessages = {
 /** `ACCTIDI PIC X(11)` (COPAU00.cpy:L60), the `maxLength` of the `account_id` query parameter. */
 const ACCOUNT_ID_LENGTH = 11;
 
-/**
- * `ACCTIDI = SPACES OR LOW-VALUES` (COPAUS0C.cbl:L264): empty, spaces only, or
- * NUL characters only, never trimmed. NUL-only text is blank too because the
- * server's edit (`auth_summary::edit_account_id`) treats LOW-VALUES as the
- * COBOL does; a mix of the two is not blank.
- */
-const BLANK_ACCOUNT_ID = /^(?: *|\0*)$/;
-
 /** `ACCTIDI IS NUMERIC` on X(11): exactly eleven ASCII digits, no sign and no spaces. */
 const ACCOUNT_ID_DIGITS = /^[0-9]{11}$/;
 
@@ -56,6 +50,10 @@ const ACCOUNT_ID_DIGITS = /^[0-9]{11}$/;
  * field is "not 11 digits" (the DTO length check runs before the rule), then
  * a blank value, then any other value that is not eleven digits. One issue at
  * most, so the field shows the single message the server would send.
+ *
+ * Blank is `ACCTIDI = SPACES OR LOW-VALUES` (COPAUS0C.cbl:L264). NUL-only text
+ * is blank too because the server's edit (`auth_summary::edit_account_id`)
+ * treats LOW-VALUES as the COBOL does.
  */
 const accountIdField = z
   .string({ required_error: authSummaryMessages.pleaseEnterAcctId })
@@ -64,7 +62,7 @@ const accountIdField = z
     if (value.length > ACCOUNT_ID_LENGTH) {
       return;
     }
-    if (BLANK_ACCOUNT_ID.test(value)) {
+    if (isSpacesOrLowValues(value)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: authSummaryMessages.pleaseEnterAcctId,

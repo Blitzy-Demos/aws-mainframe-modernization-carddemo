@@ -13,6 +13,8 @@ import { z } from "zod";
 
 import type { components } from "@/api/schema";
 
+import { isSpacesOrLowValues } from "./primitives";
+
 type PaymentRequest = components["schemas"]["PaymentRequest"];
 type BillPaymentField = components["schemas"]["BillPaymentField"];
 
@@ -34,14 +36,6 @@ const CONFIRM_LENGTH = 1;
 // cancel.
 const CONFIRM_ENTRIES: readonly string[] = ["Y", "y", "N", "n"];
 
-// SPACES or LOW-VALUES: the empty text, only spaces, or only NUL characters,
-// the blank the server's bill-payment rule reads in ACTIDINI and CONFIRMI.
-function isBlank(value: string): boolean {
-  return (
-    value === " ".repeat(value.length) || value === "\0".repeat(value.length)
-  );
-}
-
 // Keyed by the DTO's own properties: every PaymentRequest property is
 // optional, so `satisfies z.ZodType<PaymentRequest>` alone would still pass
 // after one is renamed, removed or added; this map fails tsc instead.
@@ -61,7 +55,8 @@ const paymentFields = z.object(paymentShape);
 // confirmation is looked at (V-COBIL00C-001, order 1; V-COBIL00C-003, order
 // 2). They are object-level rather than per field because of that order. An
 // over-long field skips them, since the server's length check answers alone
-// before the rule runs.
+// before the rule runs. Blank is SPACES or LOW-VALUES, the test the server's
+// bill-payment rule makes of ACTIDINI and CONFIRMI.
 function editEnterKey(
   { account_id, confirm = "" }: z.infer<typeof paymentFields>,
   ctx: z.RefinementCtx,
@@ -72,7 +67,7 @@ function editEnterKey(
   ) {
     return;
   }
-  if (isBlank(account_id)) {
+  if (isSpacesOrLowValues(account_id)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["account_id"],
@@ -80,7 +75,7 @@ function editEnterKey(
     });
     return;
   }
-  if (!isBlank(confirm) && !CONFIRM_ENTRIES.includes(confirm)) {
+  if (!isSpacesOrLowValues(confirm) && !CONFIRM_ENTRIES.includes(confirm)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["confirm"],
