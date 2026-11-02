@@ -730,6 +730,9 @@ fn edit_amount(amount: &Received<AMOUNT_LEN>) -> Result<Money<9>, DomainError> {
         .ok_or_else(|| DomainError::invalid(AMOUNT_SHOULD_BE_IN_FORMAT).with_field(FIELD_TRNAMT))
 }
 
+/// COTRN02C VALIDATE-INPUT-DATA-FIELDS — P-COTRN02C-012, P-COTRN02C-014,
+/// P-COTRN02C-028.
+///
 /// The `NUMVAL-C` value of an amount in the form `±99999999.99`, by the
 /// reference modifications `TRNAMTI(1:1)`, `(2:8)`, `(10:1)` and `(11:2)`;
 /// `None` for an amount in any other form.
@@ -780,6 +783,8 @@ fn edit_date_format(
         .ok_or_else(|| DomainError::invalid(message).with_field(field))
 }
 
+/// COTRN02C VALIDATE-INPUT-DATA-FIELDS — P-COTRN02C-013.
+///
 /// Whether `date` holds digits and dashes in the `YYYY-MM-DD` positions.
 fn is_dashed_date(date: &Alnum<DATE_LEN>) -> bool {
     let digits = DATE_DIGIT_PARTS.iter().all(|&(start, len)| {

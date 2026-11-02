@@ -2857,6 +2857,10 @@ mod tests {
             "Custom report submitted for printing ..."
         );
         assert_eq!(
+            report_submitted_message(REPORT_NAME_YEARLY),
+            "Yearly report submitted for printing ..."
+        );
+        assert_eq!(
             invalid_confirm_value_message("XY"),
             "\"X\" is not a valid value to confirm..."
         );

@@ -291,6 +291,9 @@ async fn page_backward<S: TransactionReader>(
     Ok(backward_page(before, rows, Some(anchor)))
 }
 
+/// COTRN02C COPY-LAST-TRAN-DATA — P-COTRN02C-026;
+/// COTRN00C STARTBR-TRANSACT-FILE — P-COTRN00C-011
+///
 /// `STARTBR` at `HIGH-VALUES` then `READPREV`, as `COTRN02C` reads the
 /// highest key for its "copy last transaction" (P-COTRN02C-026), with the
 /// `COTRN00C` page rules of [`backward_page`]: the latest `rows` transactions.

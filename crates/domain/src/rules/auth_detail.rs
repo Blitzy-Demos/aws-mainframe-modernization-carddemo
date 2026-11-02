@@ -408,10 +408,17 @@ fn fraud_report_date_text(date: NaiveDate) -> Alnum<8> {
 /// customer `COPAUS1C` passes.
 ///
 /// `None` when `PA-AUTH-ORIG-DATE` and the complemented `PA-AUTH-TIME-9C` give
-/// no timestamp `TIMESTAMP_FORMAT` accepts. `COPAUA0C` writes both from the
-/// clock, so only a damaged detail meets it.
-// Returns `Option`, not a bare row: `AUTH_TS` is NOT NULL and a damaged detail
-// yields no timestamp, so no row can be built for it.
+/// no timestamp `TIMESTAMP_FORMAT` accepts. The two come from different
+/// sources (P-COPAUA0C-014). `COPAUA0C` moves `PA-RQ-AUTH-DATE` to
+/// `PA-AUTH-ORIG-DATE` unedited, so a detail exactly as `COPAUA0C` stored it
+/// meets this whenever the request's date is not six digits `YYMMDD` that
+/// form a calendar date in the century of `report_date`. It complements
+/// `PA-AUTH-TIME-9C` from the `ASKTIME` clock, which gives a time of day back
+/// for every detail it writes, so the time fails only for a key time no clock
+/// gives.
+// Returns `Option`, not a bare row: `AUTH_TS` is NOT NULL, and a detail whose
+// request-sourced original date or key time forms no timestamp yields none, so
+// no row can be built for it.
 #[must_use]
 pub fn fraud_row(
     detail: &PendingAuthDetail,

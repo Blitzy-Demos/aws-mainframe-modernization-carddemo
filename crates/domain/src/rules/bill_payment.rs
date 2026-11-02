@@ -105,6 +105,8 @@ pub struct BillPaymentInput {
 }
 
 impl BillPaymentInput {
+    /// COBIL00C PROCESS-ENTER-KEY — V-COBIL00C-006.
+    ///
     /// `MOVE ACTIDINI OF COBIL0AI TO ACCT-ID XREF-ACCT-ID`
     /// [app/cbl/COBIL00C.cbl:L169-171]: the account key the reads use, `None`
     /// when the entry is not 11 digits.
@@ -174,6 +176,8 @@ pub struct PaymentSuccess {
     pub account_id: AccountId,
 }
 
+/// COBIL00C PROCESS-ENTER-KEY — P-COBIL00C-004; V-COBIL00C-001.
+///
 /// `ACTIDINI = SPACES OR LOW-VALUES` on the entered text: nothing entered, or
 /// only spaces, or only NUL characters, as [`Confirm::parse`] reads its field.
 fn is_blank_entry(text: Option<&str>) -> bool {
@@ -482,6 +486,7 @@ mod tests {
         INVALID_VALUE_VALID_VALUES_ARE_Y_N, TRAN_ID_ALREADY_EXIST,
         UNABLE_TO_ADD_BILL_PAY_TRANSACTION, UNABLE_TO_LOOKUP_ACCOUNT,
         UNABLE_TO_LOOKUP_XREF_AIX_FILE, UNABLE_TO_UPDATE_ACCOUNT, YOU_HAVE_NOTHING_TO_PAY,
+        payment_successful_message,
     };
     use crate::numeric::{
         AccountGroupId, AccountId, Alnum, CardNumber, CustomerId, MerchantId, Money,
@@ -822,7 +827,7 @@ mod tests {
             outcome,
             Ok(PaymentSuccess {
                 tran_id: tran_id(),
-                message: "Payment successful.  Your Transaction ID is 0000000000000043.".to_owned(),
+                message: payment_successful_message(TRAN_ID),
                 new_balance: Money::ZERO,
                 account_id: account_id(ACCOUNT),
             })

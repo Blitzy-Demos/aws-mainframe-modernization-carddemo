@@ -382,6 +382,8 @@ fn in_integer_date_domain(date: NaiveDate) -> bool {
     (first..=last).contains(&date.year())
 }
 
+/// CORPT00C PROCESS-ENTER-KEY — P-CORPT00C-003, P-CORPT00C-004, P-CORPT00C-017
+///
 /// `MOVE WS-CURDATE-YEAR TO WS-START-DATE-YYYY`: the year of `date` as the
 /// four low-order digits of the `9(04)` field.
 fn current_year(date: NaiveDate) -> u32 {
@@ -390,6 +392,9 @@ fn current_year(date: NaiveDate) -> u32 {
     u32::try_from(date.year().rem_euclid(YEAR_MODULUS)).unwrap_or_default()
 }
 
+/// CORPT00C PROCESS-ENTER-KEY — P-CORPT00C-003, P-CORPT00C-004,
+/// P-CORPT00C-008, P-CORPT00C-017
+///
 /// The `X(10)` date of `WS-START-DATE` or `WS-END-DATE`
 /// [app/cbl/CORPT00C.cbl:L60-71]: four year digits, `-`, two month digits,
 /// `-`, two day digits, each part keeping the low-order digits of its field.
@@ -422,6 +427,9 @@ enum ValueEdit {
 }
 
 impl ValueEdit {
+    /// CORPT00C PROCESS-ENTER-KEY — P-CORPT00C-007;
+    /// V-CORPT00C-008 to V-CORPT00C-013.
+    ///
     /// Whether the edit rejects the field holding the digits of `stored`.
     fn rejects(self, stored: u32) -> bool {
         match self {
@@ -820,10 +828,12 @@ mod tests {
     use crate::messages::{
         END_DATE_DAY_CAN_NOT_BE_EMPTY, END_DATE_MONTH_CAN_NOT_BE_EMPTY, END_DATE_NOT_A_VALID_DATE,
         END_DATE_NOT_A_VALID_DAY, END_DATE_NOT_A_VALID_MONTH, END_DATE_NOT_A_VALID_YEAR,
-        END_DATE_YEAR_CAN_NOT_BE_EMPTY, SELECT_A_REPORT_TYPE_TO_PRINT_REPORT,
-        START_DATE_DAY_CAN_NOT_BE_EMPTY, START_DATE_MONTH_CAN_NOT_BE_EMPTY,
-        START_DATE_NOT_A_VALID_DATE, START_DATE_NOT_A_VALID_DAY, START_DATE_NOT_A_VALID_MONTH,
-        START_DATE_NOT_A_VALID_YEAR, START_DATE_YEAR_CAN_NOT_BE_EMPTY, UNEXPECTED_ERROR,
+        END_DATE_YEAR_CAN_NOT_BE_EMPTY, REPORT_NAME_CUSTOM, REPORT_NAME_MONTHLY,
+        REPORT_NAME_YEARLY, SELECT_A_REPORT_TYPE_TO_PRINT_REPORT, START_DATE_DAY_CAN_NOT_BE_EMPTY,
+        START_DATE_MONTH_CAN_NOT_BE_EMPTY, START_DATE_NOT_A_VALID_DATE, START_DATE_NOT_A_VALID_DAY,
+        START_DATE_NOT_A_VALID_MONTH, START_DATE_NOT_A_VALID_YEAR,
+        START_DATE_YEAR_CAN_NOT_BE_EMPTY, UNEXPECTED_ERROR, confirm_print_report_message,
+        invalid_confirm_value_message, report_submitted_message,
     };
     use crate::numeric::Alnum;
     use crate::rules::Confirm;
@@ -928,10 +938,10 @@ mod tests {
                     today
                 ),
                 Ok(submitted(
-                    "Monthly",
+                    REPORT_NAME_MONTHLY,
                     start,
                     end,
-                    "Monthly report submitted for printing ..."
+                    &report_submitted_message(REPORT_NAME_MONTHLY)
                 )),
                 "{today}"
             );
@@ -971,10 +981,10 @@ mod tests {
                     today
                 ),
                 Ok(submitted(
-                    "Yearly",
+                    REPORT_NAME_YEARLY,
                     start,
                     end,
-                    "Yearly report submitted for printing ..."
+                    &report_submitted_message(REPORT_NAME_YEARLY)
                 )),
                 "{today}"
             );
@@ -996,16 +1006,12 @@ mod tests {
                     .with_field(FIELD_MONTHLY))
             );
         }
-        assert_eq!(
-            SELECT_A_REPORT_TYPE_TO_PRINT_REPORT,
-            "Select a report type to print report..."
-        );
     }
 
     #[test]
     fn custom_runs_over_the_entered_dates() {
         // P-CORPT00C-005 to P-CORPT00C-008, P-CORPT00C-014.
-        let message = "Custom report submitted for printing ...";
+        let message = report_submitted_message(REPORT_NAME_CUSTOM);
         let cases = [
             (TRANREPT_RANGE, "2022-01-01", "2022-07-06"),
             // One-digit parts are padded in their fields and converted to two.
@@ -1035,7 +1041,7 @@ mod tests {
         for (parts, start, end) in cases {
             assert_eq!(
                 custom(parts),
-                Ok(submitted("Custom", start, end, message)),
+                Ok(submitted(REPORT_NAME_CUSTOM, start, end, &message)),
                 "{parts:?}"
             );
         }
@@ -1067,10 +1073,10 @@ mod tests {
             assert_eq!(
                 custom(parts),
                 Ok(submitted(
-                    "Custom",
+                    REPORT_NAME_CUSTOM,
                     start,
                     end,
-                    "Custom report submitted for printing ..."
+                    &report_submitted_message(REPORT_NAME_CUSTOM)
                 )),
                 "{parts:?}"
             );
@@ -1117,14 +1123,6 @@ mod tests {
             custom(["2022", "13", "01", "2022", "07", ""]),
             Err(DomainError::empty(END_DATE_DAY_CAN_NOT_BE_EMPTY).with_field(FIELD_EDTDD))
         );
-        assert_eq!(
-            START_DATE_MONTH_CAN_NOT_BE_EMPTY,
-            "Start Date - Month can NOT be empty..."
-        );
-        assert_eq!(
-            END_DATE_YEAR_CAN_NOT_BE_EMPTY,
-            "End Date - Year can NOT be empty..."
-        );
     }
 
     #[test]
@@ -1164,11 +1162,6 @@ mod tests {
             custom(["2022", "02", "30", "20A2", "07", "06"]),
             Err(DomainError::invalid(END_DATE_NOT_A_VALID_YEAR).with_field(FIELD_EDTYYYY))
         );
-        assert_eq!(
-            START_DATE_NOT_A_VALID_MONTH,
-            "Start Date - Not a valid Month..."
-        );
-        assert_eq!(END_DATE_NOT_A_VALID_DAY, "End Date - Not a valid Day...");
     }
 
     #[test]
@@ -1191,11 +1184,6 @@ mod tests {
         for (parts, expected) in cases {
             assert_eq!(&custom(parts), expected, "{parts:?}");
         }
-        assert_eq!(
-            START_DATE_NOT_A_VALID_DATE,
-            "Start Date - Not a valid date..."
-        );
-        assert_eq!(END_DATE_NOT_A_VALID_DATE, "End Date - Not a valid date...");
     }
 
     #[test]
@@ -1262,7 +1250,7 @@ mod tests {
                 today()
             ),
             Err(
-                DomainError::invalid("Please confirm to print the Custom report...")
+                DomainError::invalid(confirm_print_report_message(REPORT_NAME_CUSTOM))
                     .with_field(FIELD_CONFIRM)
             )
         );
@@ -1280,9 +1268,9 @@ mod tests {
         // V-CORPT00C-016 to V-CORPT00C-018, P-CORPT00C-010, P-CORPT00C-011,
         // P-CORPT00C-014; exact texts, each report name DELIMITED BY SPACE.
         let reports = [
-            (ReportType::Monthly, "Monthly"),
-            (ReportType::Yearly, "Yearly"),
-            (ReportType::Custom, "Custom"),
+            (ReportType::Monthly, REPORT_NAME_MONTHLY),
+            (ReportType::Yearly, REPORT_NAME_YEARLY),
+            (ReportType::Custom, REPORT_NAME_CUSTOM),
         ];
         for (report_type, name) in reports {
             let ask = |confirm: Confirm| {
@@ -1290,34 +1278,28 @@ mod tests {
             };
             assert_eq!(
                 ask(Confirm::Blank),
-                Err(
-                    DomainError::invalid(format!("Please confirm to print the {name} report..."))
-                        .with_field(FIELD_CONFIRM)
-                )
+                Err(DomainError::invalid(confirm_print_report_message(name))
+                    .with_field(FIELD_CONFIRM))
             );
             let cleared = ask(Confirm::No).expect_err("N clears the screen");
             assert_eq!(cleared, DomainError::invalid("").with_field(FIELD_MONTHLY));
             assert_eq!(cleared.kind, ErrorKind::Invalid);
             assert_eq!(
                 ask(Confirm::Other("X".to_owned())),
-                Err(
-                    DomainError::invalid("\"X\" is not a valid value to confirm...")
-                        .with_field(FIELD_CONFIRM)
-                )
+                Err(DomainError::invalid(invalid_confirm_value_message("X"))
+                    .with_field(FIELD_CONFIRM))
             );
             // CONFIRMI is X(1): the quoted value is its first character.
             assert_eq!(
                 ask(Confirm::Other("XY".to_owned())),
-                Err(
-                    DomainError::invalid("\"X\" is not a valid value to confirm...")
-                        .with_field(FIELD_CONFIRM)
-                )
+                Err(DomainError::invalid(invalid_confirm_value_message("X"))
+                    .with_field(FIELD_CONFIRM))
             );
             let Ok(ReportRequestOutcome::Submitted { range, message }) = ask(Confirm::Yes) else {
                 panic!("{name}: Y runs the report");
             };
             assert_eq!(range.report_name, name);
-            assert_eq!(message, format!("{name} report submitted for printing ..."));
+            assert_eq!(message, report_submitted_message(name));
         }
         // Y and N are accepted in either case.
         assert_eq!(Confirm::parse(Some("y")), Confirm::Yes);
