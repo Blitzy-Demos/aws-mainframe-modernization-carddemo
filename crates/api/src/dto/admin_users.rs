@@ -173,7 +173,7 @@ impl BmsField for UserAddField {
 /// The BMS fields a `GET` or `PUT /admin/users/{id}` error names: the
 /// `COUSR2A` inputs [app/cpy-bms/COUSR02.CPY:L60-84].
 ///
-/// The fetch (`COUSR02C` `PROCESS-ENTER-KEY`) marks `USRIDIN` for a blank or
+/// The fetch, `COUSR02C` `PROCESS-ENTER-KEY`, marks `USRIDIN` for a blank or
 /// unknown ID and `FNAME` for a failed read (V-COUSR02C-001 to
 /// V-COUSR02C-003). The update (`UPDATE-USER-INFO`) edits the five fields in
 /// one `EVALUATE` (V-COUSR02C-004 to V-COUSR02C-008, all of Order 1) and puts
@@ -182,6 +182,8 @@ impl BmsField for UserAddField {
 // The ranks follow the audit's (Order, ID) order, as for `UserAddField`: the
 // screen order USRIDIN, FNAME, LNAME, PASSWD, USRTYPE of the update's
 // EVALUATE, which the fetch rows (USRIDIN before FNAME) agree with.
+// The doc text reaches web/src/api/schema.d.ts, whose hygiene scan reads a word
+// `fetch` followed by `(` as a call; its wording keeps them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum UserUpdateField {
     /// `USRIDINI PIC X(8)`, the ID of the user fetched or updated: the

@@ -168,7 +168,7 @@ pub async fn get_account(
 ///
 /// 1. the BMS field lengths of the body, then its `version` token
 ///    (V-COACTUPC-001), before any COBOL edit;
-/// 2. the account number `{id}` and the fetch (`load_snapshot`);
+/// 2. the account number `{id}` and the fetch, `load_snapshot`;
 /// 3. `account_update::validate` against the fetched records, with the
 ///    processing clock's date as `FUNCTION CURRENT-DATE`: the comparison
 ///    with the fetched values, then every `1200-EDIT-MAP-INPUTS` edit in
@@ -202,6 +202,8 @@ pub async fn get_account(
 ///   `halt` (E-26, E-40, E-47, E-74), and when the database or the commit
 ///   fails.
 /// - 401 from [`AuthUser`] for a request without a valid bearer token.
+// This text reaches web/src/api/schema.d.ts, whose hygiene scan reads a word
+// `fetch` followed by `(` as a call; the step-2 wording keeps them apart.
 #[utoipa::path(
     put,
     path = "/accounts/{id}",
