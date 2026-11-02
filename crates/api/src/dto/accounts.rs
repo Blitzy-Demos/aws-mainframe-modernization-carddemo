@@ -554,174 +554,221 @@ impl fmt::Debug for AccountResponse {
 /// which the rule receives as `LOW-VALUES` and answers with its audited
 /// message, so no field is required here. Each field is bounded by its BMS
 /// length [app/bms/COACTUP.bms], checked by [`AccountUpdateRequest::check`].
+// Each field carries its own `#[serde(default)]` instead of one on the
+// container: utoipa publishes a container default as `default: null` on every
+// property, which the type generator (`pnpm --dir web gen:api`, default
+// options) turns into required TypeScript members. Field defaults deserialize
+// the same (a missing field, or a short positional array, is `None`) and
+// publish no `default`.
 #[derive(Clone, Default, Deserialize, ToSchema, Validate)]
-#[serde(default)]
 pub struct AccountUpdateRequest {
     /// `ACSTTUS X(1)`: Account Status, `Y` or `N`.
+    #[serde(default)]
     #[schema(max_length = 1)]
     #[validate(length(max = 1))]
     pub acct_active_status: Option<String>,
     /// `OPNYEAR X(4)`: Open Date year.
+    #[serde(default)]
     #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub acct_open_year: Option<String>,
     /// `OPNMON X(2)`: Open Date month.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub acct_open_mon: Option<String>,
     /// `OPNDAY X(2)`: Open Date day.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub acct_open_day: Option<String>,
     /// `ACRDLIM X(15)`: Credit Limit, the amount text `NUMVAL-C` reads.
+    #[serde(default)]
     #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub acct_credit_limit: Option<String>,
     /// `EXPYEAR X(4)`: Expiry Date year.
+    #[serde(default)]
     #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub acct_exp_year: Option<String>,
     /// `EXPMON X(2)`: Expiry Date month.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub acct_exp_mon: Option<String>,
     /// `EXPDAY X(2)`: Expiry Date day.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub acct_exp_day: Option<String>,
     /// `ACSHLIM X(15)`: Cash Credit Limit.
+    #[serde(default)]
     #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub acct_cash_credit_limit: Option<String>,
     /// `RISYEAR X(4)`: Reissue Date year.
+    #[serde(default)]
     #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub acct_reissue_year: Option<String>,
     /// `RISMON X(2)`: Reissue Date month.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub acct_reissue_mon: Option<String>,
     /// `RISDAY X(2)`: Reissue Date day.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub acct_reissue_day: Option<String>,
     /// `ACURBAL X(15)`: Current Balance.
+    #[serde(default)]
     #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub acct_curr_bal: Option<String>,
     /// `ACRCYCR X(15)`: Current Cycle Credit.
+    #[serde(default)]
     #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub acct_curr_cyc_credit: Option<String>,
     /// `AADDGRP X(10)`: Account Group, which no edit checks.
+    #[serde(default)]
     #[schema(max_length = 10)]
     #[validate(length(max = 10))]
     pub acct_group_id: Option<String>,
     /// `ACRCYDB X(15)`: Current Cycle Debit.
+    #[serde(default)]
     #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub acct_curr_cyc_debit: Option<String>,
     /// `ACSTNUM X(9)`: Customer id, sent back as fetched.
+    #[serde(default)]
     #[schema(max_length = 9)]
     #[validate(length(max = 9))]
     pub customer_id: Option<String>,
     /// `ACTSSN1 X(3)`: the first three SSN digits.
+    #[serde(default)]
     #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub cust_ssn_1: Option<String>,
     /// `ACTSSN2 X(2)`: the fourth and fifth SSN digits.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub cust_ssn_2: Option<String>,
     /// `ACTSSN3 X(4)`: the last four SSN digits.
+    #[serde(default)]
     #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub cust_ssn_3: Option<String>,
     /// `DOBYEAR X(4)`: Date of Birth year.
+    #[serde(default)]
     #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub cust_dob_year: Option<String>,
     /// `DOBMON X(2)`: Date of Birth month.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub cust_dob_mon: Option<String>,
     /// `DOBDAY X(2)`: Date of Birth day.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub cust_dob_day: Option<String>,
     /// `ACSTFCO X(3)`: FICO Score.
+    #[serde(default)]
     #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub cust_fico_credit_score: Option<String>,
     /// `ACSFNAM X(25)`: First Name.
+    #[serde(default)]
     #[schema(max_length = 25)]
     #[validate(length(max = 25))]
     pub cust_first_name: Option<String>,
     /// `ACSMNAM X(25)`: Middle Name.
+    #[serde(default)]
     #[schema(max_length = 25)]
     #[validate(length(max = 25))]
     pub cust_middle_name: Option<String>,
     /// `ACSLNAM X(25)`: Last Name.
+    #[serde(default)]
     #[schema(max_length = 25)]
     #[validate(length(max = 25))]
     pub cust_last_name: Option<String>,
     /// `ACSADL1 X(50)`: Address line 1.
+    #[serde(default)]
     #[schema(max_length = 50)]
     #[validate(length(max = 50))]
     pub cust_addr_line_1: Option<String>,
     /// `ACSSTTE X(2)`: State.
+    #[serde(default)]
     #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub cust_addr_state_cd: Option<String>,
     /// `ACSADL2 X(50)`: Address line 2, which no edit checks.
+    #[serde(default)]
     #[schema(max_length = 50)]
     #[validate(length(max = 50))]
     pub cust_addr_line_2: Option<String>,
     /// `ACSZIPC X(5)`: Zip.
+    #[serde(default)]
     #[schema(max_length = 5)]
     #[validate(length(max = 5))]
     pub cust_addr_zip: Option<String>,
     /// `ACSCITY X(50)`: City, stored as address line 3.
+    #[serde(default)]
     #[schema(max_length = 50)]
     #[validate(length(max = 50))]
     pub cust_addr_line_3: Option<String>,
     /// `ACSCTRY X(3)`: Country, sent back as fetched.
+    #[serde(default)]
     #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub cust_addr_country_cd: Option<String>,
     /// `ACSPH1A X(3)`: Phone 1 area code.
+    #[serde(default)]
     #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub cust_phone_num_1a: Option<String>,
     /// `ACSPH1B X(3)`: Phone 1 prefix.
+    #[serde(default)]
     #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub cust_phone_num_1b: Option<String>,
     /// `ACSPH1C X(4)`: Phone 1 line number.
+    #[serde(default)]
     #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub cust_phone_num_1c: Option<String>,
     /// `ACSGOVT X(20)`: Government Issued Id, which no edit checks.
+    #[serde(default)]
     #[schema(max_length = 20)]
     #[validate(length(max = 20))]
     pub cust_govt_issued_id: Option<String>,
     /// `ACSPH2A X(3)`: Phone 2 area code.
+    #[serde(default)]
     #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub cust_phone_num_2a: Option<String>,
     /// `ACSPH2B X(3)`: Phone 2 prefix.
+    #[serde(default)]
     #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub cust_phone_num_2b: Option<String>,
     /// `ACSPH2C X(4)`: Phone 2 line number.
+    #[serde(default)]
     #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub cust_phone_num_2c: Option<String>,
     /// `ACSEFTC X(10)`: EFT Account Id.
+    #[serde(default)]
     #[schema(max_length = 10)]
     #[validate(length(max = 10))]
     pub cust_eft_account_id: Option<String>,
     /// `ACSPFLG X(1)`: Primary Card Holder, `Y` or `N`.
+    #[serde(default)]
     #[schema(max_length = 1)]
     #[validate(length(max = 1))]
     pub cust_pri_card_holder_ind: Option<String>,
@@ -730,6 +777,7 @@ pub struct AccountUpdateRequest {
     /// answered in `crate::handlers::accounts` with 400 and no message
     /// (V-COACTUPC-001, E-24) before any COBOL edit, so it has no length rule
     /// here.
+    #[serde(default)]
     pub version: Option<String>,
 }
 
@@ -1293,6 +1341,10 @@ mod tests {
         }
         assert!(properties["version"].get("maxLength").is_none());
         assert!(schema.get("required").is_none(), "{schema}");
+        // A published default makes the generated TypeScript member required.
+        for (name, property) in properties {
+            assert!(property.get("default").is_none(), "{name}: {property}");
+        }
 
         let response = serde_json::to_value(AccountResponse::schema()).expect("serializes");
         assert_eq!(
@@ -1402,6 +1454,10 @@ mod tests {
                 .expect("nulls deserialize");
         assert_eq!(nulls.cust_first_name, None);
         assert_eq!(nulls.version, None);
+        // An empty positional body is all-blank, as a missing field is.
+        let positional: AccountUpdateRequest =
+            serde_json::from_value(json!([])).expect("an empty array deserializes");
+        assert_eq!(positional.into_input(String::new(), token()), missing);
         assert_eq!(
             spaces.into_input(String::new(), token()).address_line_2,
             " ".repeat(50)

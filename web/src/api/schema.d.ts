@@ -1138,225 +1138,98 @@ export interface components {
          *     length [app/bms/COACTUP.bms], checked by [`AccountUpdateRequest::check`].
          */
         AccountUpdateRequest: {
-            /**
-             * @description `ACSTTUS X(1)`: Account Status, `Y` or `N`.
-             * @default null
-             */
-            acct_active_status: string | null;
-            /**
-             * @description `ACSHLIM X(15)`: Cash Credit Limit.
-             * @default null
-             */
-            acct_cash_credit_limit: string | null;
-            /**
-             * @description `ACRDLIM X(15)`: Credit Limit, the amount text `NUMVAL-C` reads.
-             * @default null
-             */
-            acct_credit_limit: string | null;
-            /**
-             * @description `ACURBAL X(15)`: Current Balance.
-             * @default null
-             */
-            acct_curr_bal: string | null;
-            /**
-             * @description `ACRCYCR X(15)`: Current Cycle Credit.
-             * @default null
-             */
-            acct_curr_cyc_credit: string | null;
-            /**
-             * @description `ACRCYDB X(15)`: Current Cycle Debit.
-             * @default null
-             */
-            acct_curr_cyc_debit: string | null;
-            /**
-             * @description `EXPDAY X(2)`: Expiry Date day.
-             * @default null
-             */
-            acct_exp_day: string | null;
-            /**
-             * @description `EXPMON X(2)`: Expiry Date month.
-             * @default null
-             */
-            acct_exp_mon: string | null;
-            /**
-             * @description `EXPYEAR X(4)`: Expiry Date year.
-             * @default null
-             */
-            acct_exp_year: string | null;
-            /**
-             * @description `AADDGRP X(10)`: Account Group, which no edit checks.
-             * @default null
-             */
-            acct_group_id: string | null;
-            /**
-             * @description `OPNDAY X(2)`: Open Date day.
-             * @default null
-             */
-            acct_open_day: string | null;
-            /**
-             * @description `OPNMON X(2)`: Open Date month.
-             * @default null
-             */
-            acct_open_mon: string | null;
-            /**
-             * @description `OPNYEAR X(4)`: Open Date year.
-             * @default null
-             */
-            acct_open_year: string | null;
-            /**
-             * @description `RISDAY X(2)`: Reissue Date day.
-             * @default null
-             */
-            acct_reissue_day: string | null;
-            /**
-             * @description `RISMON X(2)`: Reissue Date month.
-             * @default null
-             */
-            acct_reissue_mon: string | null;
-            /**
-             * @description `RISYEAR X(4)`: Reissue Date year.
-             * @default null
-             */
-            acct_reissue_year: string | null;
-            /**
-             * @description `ACSCTRY X(3)`: Country, sent back as fetched.
-             * @default null
-             */
-            cust_addr_country_cd: string | null;
-            /**
-             * @description `ACSADL1 X(50)`: Address line 1.
-             * @default null
-             */
-            cust_addr_line_1: string | null;
-            /**
-             * @description `ACSADL2 X(50)`: Address line 2, which no edit checks.
-             * @default null
-             */
-            cust_addr_line_2: string | null;
-            /**
-             * @description `ACSCITY X(50)`: City, stored as address line 3.
-             * @default null
-             */
-            cust_addr_line_3: string | null;
-            /**
-             * @description `ACSSTTE X(2)`: State.
-             * @default null
-             */
-            cust_addr_state_cd: string | null;
-            /**
-             * @description `ACSZIPC X(5)`: Zip.
-             * @default null
-             */
-            cust_addr_zip: string | null;
-            /**
-             * @description `DOBDAY X(2)`: Date of Birth day.
-             * @default null
-             */
-            cust_dob_day: string | null;
-            /**
-             * @description `DOBMON X(2)`: Date of Birth month.
-             * @default null
-             */
-            cust_dob_mon: string | null;
-            /**
-             * @description `DOBYEAR X(4)`: Date of Birth year.
-             * @default null
-             */
-            cust_dob_year: string | null;
-            /**
-             * @description `ACSEFTC X(10)`: EFT Account Id.
-             * @default null
-             */
-            cust_eft_account_id: string | null;
-            /**
-             * @description `ACSTFCO X(3)`: FICO Score.
-             * @default null
-             */
-            cust_fico_credit_score: string | null;
-            /**
-             * @description `ACSFNAM X(25)`: First Name.
-             * @default null
-             */
-            cust_first_name: string | null;
-            /**
-             * @description `ACSGOVT X(20)`: Government Issued Id, which no edit checks.
-             * @default null
-             */
-            cust_govt_issued_id: string | null;
-            /**
-             * @description `ACSLNAM X(25)`: Last Name.
-             * @default null
-             */
-            cust_last_name: string | null;
-            /**
-             * @description `ACSMNAM X(25)`: Middle Name.
-             * @default null
-             */
-            cust_middle_name: string | null;
-            /**
-             * @description `ACSPH1A X(3)`: Phone 1 area code.
-             * @default null
-             */
-            cust_phone_num_1a: string | null;
-            /**
-             * @description `ACSPH1B X(3)`: Phone 1 prefix.
-             * @default null
-             */
-            cust_phone_num_1b: string | null;
-            /**
-             * @description `ACSPH1C X(4)`: Phone 1 line number.
-             * @default null
-             */
-            cust_phone_num_1c: string | null;
-            /**
-             * @description `ACSPH2A X(3)`: Phone 2 area code.
-             * @default null
-             */
-            cust_phone_num_2a: string | null;
-            /**
-             * @description `ACSPH2B X(3)`: Phone 2 prefix.
-             * @default null
-             */
-            cust_phone_num_2b: string | null;
-            /**
-             * @description `ACSPH2C X(4)`: Phone 2 line number.
-             * @default null
-             */
-            cust_phone_num_2c: string | null;
-            /**
-             * @description `ACSPFLG X(1)`: Primary Card Holder, `Y` or `N`.
-             * @default null
-             */
-            cust_pri_card_holder_ind: string | null;
-            /**
-             * @description `ACTSSN1 X(3)`: the first three SSN digits.
-             * @default null
-             */
-            cust_ssn_1: string | null;
-            /**
-             * @description `ACTSSN2 X(2)`: the fourth and fifth SSN digits.
-             * @default null
-             */
-            cust_ssn_2: string | null;
-            /**
-             * @description `ACTSSN3 X(4)`: the last four SSN digits.
-             * @default null
-             */
-            cust_ssn_3: string | null;
-            /**
-             * @description `ACSTNUM X(9)`: Customer id, sent back as fetched.
-             * @default null
-             */
-            customer_id: string | null;
+            /** @description `ACSTTUS X(1)`: Account Status, `Y` or `N`. */
+            acct_active_status?: string | null;
+            /** @description `ACSHLIM X(15)`: Cash Credit Limit. */
+            acct_cash_credit_limit?: string | null;
+            /** @description `ACRDLIM X(15)`: Credit Limit, the amount text `NUMVAL-C` reads. */
+            acct_credit_limit?: string | null;
+            /** @description `ACURBAL X(15)`: Current Balance. */
+            acct_curr_bal?: string | null;
+            /** @description `ACRCYCR X(15)`: Current Cycle Credit. */
+            acct_curr_cyc_credit?: string | null;
+            /** @description `ACRCYDB X(15)`: Current Cycle Debit. */
+            acct_curr_cyc_debit?: string | null;
+            /** @description `EXPDAY X(2)`: Expiry Date day. */
+            acct_exp_day?: string | null;
+            /** @description `EXPMON X(2)`: Expiry Date month. */
+            acct_exp_mon?: string | null;
+            /** @description `EXPYEAR X(4)`: Expiry Date year. */
+            acct_exp_year?: string | null;
+            /** @description `AADDGRP X(10)`: Account Group, which no edit checks. */
+            acct_group_id?: string | null;
+            /** @description `OPNDAY X(2)`: Open Date day. */
+            acct_open_day?: string | null;
+            /** @description `OPNMON X(2)`: Open Date month. */
+            acct_open_mon?: string | null;
+            /** @description `OPNYEAR X(4)`: Open Date year. */
+            acct_open_year?: string | null;
+            /** @description `RISDAY X(2)`: Reissue Date day. */
+            acct_reissue_day?: string | null;
+            /** @description `RISMON X(2)`: Reissue Date month. */
+            acct_reissue_mon?: string | null;
+            /** @description `RISYEAR X(4)`: Reissue Date year. */
+            acct_reissue_year?: string | null;
+            /** @description `ACSCTRY X(3)`: Country, sent back as fetched. */
+            cust_addr_country_cd?: string | null;
+            /** @description `ACSADL1 X(50)`: Address line 1. */
+            cust_addr_line_1?: string | null;
+            /** @description `ACSADL2 X(50)`: Address line 2, which no edit checks. */
+            cust_addr_line_2?: string | null;
+            /** @description `ACSCITY X(50)`: City, stored as address line 3. */
+            cust_addr_line_3?: string | null;
+            /** @description `ACSSTTE X(2)`: State. */
+            cust_addr_state_cd?: string | null;
+            /** @description `ACSZIPC X(5)`: Zip. */
+            cust_addr_zip?: string | null;
+            /** @description `DOBDAY X(2)`: Date of Birth day. */
+            cust_dob_day?: string | null;
+            /** @description `DOBMON X(2)`: Date of Birth month. */
+            cust_dob_mon?: string | null;
+            /** @description `DOBYEAR X(4)`: Date of Birth year. */
+            cust_dob_year?: string | null;
+            /** @description `ACSEFTC X(10)`: EFT Account Id. */
+            cust_eft_account_id?: string | null;
+            /** @description `ACSTFCO X(3)`: FICO Score. */
+            cust_fico_credit_score?: string | null;
+            /** @description `ACSFNAM X(25)`: First Name. */
+            cust_first_name?: string | null;
+            /** @description `ACSGOVT X(20)`: Government Issued Id, which no edit checks. */
+            cust_govt_issued_id?: string | null;
+            /** @description `ACSLNAM X(25)`: Last Name. */
+            cust_last_name?: string | null;
+            /** @description `ACSMNAM X(25)`: Middle Name. */
+            cust_middle_name?: string | null;
+            /** @description `ACSPH1A X(3)`: Phone 1 area code. */
+            cust_phone_num_1a?: string | null;
+            /** @description `ACSPH1B X(3)`: Phone 1 prefix. */
+            cust_phone_num_1b?: string | null;
+            /** @description `ACSPH1C X(4)`: Phone 1 line number. */
+            cust_phone_num_1c?: string | null;
+            /** @description `ACSPH2A X(3)`: Phone 2 area code. */
+            cust_phone_num_2a?: string | null;
+            /** @description `ACSPH2B X(3)`: Phone 2 prefix. */
+            cust_phone_num_2b?: string | null;
+            /** @description `ACSPH2C X(4)`: Phone 2 line number. */
+            cust_phone_num_2c?: string | null;
+            /** @description `ACSPFLG X(1)`: Primary Card Holder, `Y` or `N`. */
+            cust_pri_card_holder_ind?: string | null;
+            /** @description `ACTSSN1 X(3)`: the first three SSN digits. */
+            cust_ssn_1?: string | null;
+            /** @description `ACTSSN2 X(2)`: the fourth and fifth SSN digits. */
+            cust_ssn_2?: string | null;
+            /** @description `ACTSSN3 X(4)`: the last four SSN digits. */
+            cust_ssn_3?: string | null;
+            /** @description `ACSTNUM X(9)`: Customer id, sent back as fetched. */
+            customer_id?: string | null;
             /**
              * @description The `version` of the `GET /accounts/{id}` response the client edited,
              *     standing for `ACUP-OLD-DETAILS`. A missing or malformed token is
              *     answered in `crate::handlers::accounts` with 400 and no message
              *     (V-COACTUPC-001, E-24) before any COBOL edit, so it has no length rule
              *     here.
-             * @default null
              */
-            version: string | null;
+            version?: string | null;
         };
         /**
          * @description The 200 answer of `PUT /accounts/{id}`: the records as they now stand and
