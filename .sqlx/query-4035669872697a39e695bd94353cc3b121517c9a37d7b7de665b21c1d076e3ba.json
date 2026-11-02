@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pending_auth_details\n                  SET pa_auth_orig_date = $5,\n                      pa_auth_orig_time = $6,\n                      pa_card_num = $7,\n                      pa_auth_type = $8,\n                      pa_card_expiry_date = $9,\n                      pa_message_type = $10,\n                      pa_message_source = $11,\n                      pa_auth_id_code = $12,\n                      pa_auth_resp_code = $13,\n                      pa_auth_resp_reason = $14,\n                      pa_processing_code = $15,\n                      pa_transaction_amt = $16,\n                      pa_approved_amt = $17,\n                      pa_merchant_catagory_code = $18,\n                      pa_acqr_country_code = $19,\n                      pa_pos_entry_mode = $20,\n                      pa_merchant_id = $21,\n                      pa_merchant_name = $22,\n                      pa_merchant_city = $23,\n                      pa_merchant_state = $24,\n                      pa_merchant_zip = $25,\n                      pa_transaction_id = $26,\n                      pa_match_status = $27,\n                      pa_auth_fraud = $28,\n                      pa_fraud_rpt_date = $29\n                WHERE auth_id = $1\n                  AND pa_acct_id = $2\n                  AND pa_auth_date_9c = $3\n                  AND pa_auth_time_9c = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Numeric",
+        "Numeric",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4035669872697a39e695bd94353cc3b121517c9a37d7b7de665b21c1d076e3ba"
+}

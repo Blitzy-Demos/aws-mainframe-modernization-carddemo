@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dis_acct_group_id AS acct_group_id, dis_tran_type_cd AS tran_type_cd, dis_tran_cat_cd AS tran_cat_cd, dis_int_rate AS int_rate FROM disclosure_groups WHERE dis_acct_group_id = $1 AND dis_tran_type_cd = $2 AND dis_tran_cat_cd = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "acct_group_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tran_type_cd",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "tran_cat_cd",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "int_rate",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "03efcac196f92c6e0c3ff9ec5219288f99070704b5a9b67016c86823d1940759"
+}

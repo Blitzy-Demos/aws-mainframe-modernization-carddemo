@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pending_auth_summaries\n                   (pa_acct_id, pa_cust_id, pa_auth_status, pa_account_status,\n                    pa_credit_limit, pa_cash_limit, pa_credit_balance, pa_cash_balance,\n                    pa_approved_auth_cnt, pa_declined_auth_cnt,\n                    pa_approved_auth_amt, pa_declined_auth_amt)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "VarcharArray",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Int2",
+        "Int2",
+        "Numeric",
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16d8852ff6c68879d790da2a7e81ca5d2d2ae5086669b2d5d00169589b53e4f2"
+}

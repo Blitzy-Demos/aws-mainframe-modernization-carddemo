@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pending_auth_summaries\n                  SET pa_cust_id = $2,\n                      pa_auth_status = $3,\n                      pa_account_status = $4,\n                      pa_credit_limit = $5,\n                      pa_cash_limit = $6,\n                      pa_credit_balance = $7,\n                      pa_cash_balance = $8,\n                      pa_approved_auth_cnt = $9,\n                      pa_declined_auth_cnt = $10,\n                      pa_approved_auth_amt = $11,\n                      pa_declined_auth_amt = $12\n                WHERE pa_acct_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "VarcharArray",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Int2",
+        "Int2",
+        "Numeric",
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5e1437cac7df97187a2fd8152a06c16aaaa5889b4700a3fccb4f4d044d19d369"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM transactions t\nWHERE NOT t.in_master\n  AND NOT EXISTS (SELECT 1 FROM reward_accruals a WHERE a.transaction_id = t.transaction_id)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "bd71d4b65140b13891014e795e111a9022529d1c5e14fd39b6f1987caee86b17"
+}

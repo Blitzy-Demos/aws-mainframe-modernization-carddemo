@@ -1,0 +1,49 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pending_auth_details\n                   (pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,\n                    pa_auth_orig_date, pa_auth_orig_time, pa_card_num, pa_auth_type,\n                    pa_card_expiry_date, pa_message_type, pa_message_source,\n                    pa_auth_id_code, pa_auth_resp_code, pa_auth_resp_reason,\n                    pa_processing_code, pa_transaction_amt, pa_approved_amt,\n                    pa_merchant_catagory_code, pa_acqr_country_code, pa_pos_entry_mode,\n                    pa_merchant_id, pa_merchant_name, pa_merchant_city, pa_merchant_state,\n                    pa_merchant_zip, pa_transaction_id, pa_match_status, pa_auth_fraud,\n                    pa_fraud_rpt_date)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n                       $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)\n               RETURNING auth_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "auth_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Numeric",
+        "Numeric",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d5a7e918e681567a024a7c0d815e1467f5ad60d0adaba6140e316a378d9a5fd3"
+}

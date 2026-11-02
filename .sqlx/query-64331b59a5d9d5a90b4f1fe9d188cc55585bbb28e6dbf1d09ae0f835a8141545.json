@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET sec_usr_fname = $2, sec_usr_lname = $3, password_hash = $4, sec_usr_type = $5 WHERE user_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "64331b59a5d9d5a90b4f1fe9d188cc55585bbb28e6dbf1d09ae0f835a8141545"
+}

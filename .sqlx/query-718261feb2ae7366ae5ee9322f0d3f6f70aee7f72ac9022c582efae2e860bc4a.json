@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO reward_balances (account_id, total_points_earned, total_points_redeemed, available_points) VALUES ($1, $2, 0, $2) ON CONFLICT (account_id) DO UPDATE SET total_points_earned = reward_balances.total_points_earned + EXCLUDED.total_points_earned, available_points = reward_balances.total_points_earned + EXCLUDED.total_points_earned - reward_balances.total_points_redeemed RETURNING account_id, total_points_earned, total_points_redeemed, available_points",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_points_earned",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_points_redeemed",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "available_points",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "718261feb2ae7366ae5ee9322f0d3f6f70aee7f72ac9022c582efae2e860bc4a"
+}

@@ -1,0 +1,55 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT card_number AS num, card_acct_id AS acct_id,\n                            card_cvv_cd AS cvv_cd, card_embossed_name AS embossed_name,\n                            card_expiraion_date AS expiraion_date,\n                            card_active_status AS active_status\n                       FROM cards\n                      WHERE ($1::text IS NULL OR card_number <= $1)\n                        AND ($2::bigint IS NULL OR card_acct_id = $2)\n                        AND ($3::text IS NULL OR card_number = $3)\n                      ORDER BY card_number DESC\n                      LIMIT $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "num",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "cvv_cd",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "embossed_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "expiraion_date",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "active_status",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c8cb40dbc6e70dd57778666d00dd71f8281a0ee0bb30667af1d4aa5d0ff4f9b3"
+}

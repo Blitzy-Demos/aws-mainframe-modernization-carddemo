@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal FROM transaction_category_balances WHERE trancat_acct_id = $1 AND trancat_type_cd = $2 AND trancat_cd = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "trancat_acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "trancat_type_cd",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "trancat_cd",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "tran_cat_bal",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "97389b8e8d65e446c8aa4abb33e58c0e56fffb62a915316197fd8ff902c4a77b"
+}

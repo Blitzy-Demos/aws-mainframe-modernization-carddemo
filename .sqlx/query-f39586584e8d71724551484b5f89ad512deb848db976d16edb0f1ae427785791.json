@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT max(tran_id) AS max_tran_id FROM transaction_master",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "max_tran_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f39586584e8d71724551484b5f89ad512deb848db976d16edb0f1ae427785791"
+}
