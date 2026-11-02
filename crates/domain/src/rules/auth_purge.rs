@@ -169,7 +169,10 @@ fn digits_value(field: &[u8]) -> Option<u32> {
     })
 }
 
-/// A checkpoint frequency field after its `1000-INITIALIZE` default.
+/// CBPAUP0C 1000-INITIALIZE — P-CBPAUP0C-001.
+///
+/// A checkpoint frequency field after its `1000-INITIALIZE` default
+/// [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L201-206].
 fn frequency(field: &[u8], default: u32) -> u32 {
     let defaulted = field.iter().all(|&byte| byte == b' ')
         || field == ZERO_LITERAL_FIELD

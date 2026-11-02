@@ -22,9 +22,9 @@
 //!   outside the range, writing no totals: `NEXT SENTENCE` leaves the inline
 //!   `PERFORM` (P-CBTRN03C-003). The `STEP05R` selection keeps such records out
 //!   of the input, so a correct caller never meets this.
-//! - At the end of the input the amount of the last record is added to the page
-//!   total a second time, and the account total of the last card is never
-//!   written (P-CBTRN03C-009, P-CBTRN03C-013).
+//! - At the end of the input the amount of the last record is added a second
+//!   time to the page and account totals, and the account total of the last
+//!   card is never written (P-CBTRN03C-009, P-CBTRN03C-013).
 //! - The line counter counts the total and header lines too, so a page break
 //!   falls where `MOD(WS-LINE-COUNTER, 20) = 0` happens to hold before a detail
 //!   line, not every 20 details (P-CBTRN03C-006).
@@ -303,6 +303,7 @@ impl ReportRun {
         }
         if let Some(amount) = self.last_amount {
             self.page_total = (self.page_total + amount).store::<9>();
+            self.account_total = (self.account_total + amount).store::<9>();
         }
         self.write_page_totals(&mut lines);
         self.write_grand_totals(&mut lines);
@@ -463,7 +464,14 @@ impl ReportRun {
         self.count_line();
     }
 
-    /// `ADD 1 TO WS-LINE-COUNTER`, keeping the nine digits of the field.
+    /// CBTRN03C `1110-WRITE-PAGE-TOTALS` [app/cbl/CBTRN03C.cbl:L299, L302],
+    /// `1120-WRITE-ACCOUNT-TOTALS` [app/cbl/CBTRN03C.cbl:L311, L314],
+    /// `1120-WRITE-HEADERS` [app/cbl/CBTRN03C.cbl:L327, L331, L335, L339] and
+    /// `1120-WRITE-DETAIL` [app/cbl/CBTRN03C.cbl:L373] — P-CBTRN03C-006,
+    /// P-CBTRN03C-008, P-CBTRN03C-475, P-CBTRN03C-007: the
+    /// `ADD 1 TO WS-LINE-COUNTER` after every counted line, keeping the nine
+    /// low-order digits of `WS-LINE-COUNTER PIC 9(09) COMP-3`
+    /// [app/cbl/CBTRN03C.cbl:L129-130], as the statement has no `ON SIZE ERROR`.
     fn count_line(&mut self) {
         self.line_counter = (self.line_counter + 1) % LINE_COUNTER_LIMIT;
     }

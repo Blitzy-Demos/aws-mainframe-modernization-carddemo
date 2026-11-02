@@ -150,12 +150,30 @@ pub enum RecordOutcome {
 }
 
 impl RecordOutcome {
+    /// COBTUPDT 1003-TREAT-RECORD, 10031-INSERT-DB, 10032-UPDATE-DB,
+    /// 10033-DELETE-DB — P-COBTUPDT-006, P-COBTUPDT-007, P-COBTUPDT-008,
+    /// P-COBTUPDT-009.
+    ///
     /// The text the paragraph displays for an outcome that performs no
     /// `9999-ABEND`: `RECORD INSERTED SUCCESSFULLY`, `RECORD UPDATED
     /// SUCCESSFULLY`, `RECORD DELETED SUCCESSFULLY` or `IGNORING COMMENTED
     /// LINE`. `None` for [`RecordOutcome::Unreported`], which displays
     /// nothing, and for [`RecordOutcome::Failed`], whose display
     /// [`MaintRun::record`] returns.
+    ///
+    /// Each text is the `DISPLAY` of one branch:
+    ///
+    /// - [`RecordOutcome::Inserted`]: `WHEN SQLCODE = ZERO` of
+    ///   `10031-INSERT-DB`
+    ///   [app/app-transaction-type-db2/cbl/COBTUPDT.cbl:L152-153];
+    /// - [`RecordOutcome::Updated`]: `WHEN SQLCODE = ZERO` of
+    ///   `10032-UPDATE-DB`
+    ///   [app/app-transaction-type-db2/cbl/COBTUPDT.cbl:L178-179];
+    /// - [`RecordOutcome::Deleted`]: `WHEN SQLCODE = ZERO` of
+    ///   `10033-DELETE-DB`
+    ///   [app/app-transaction-type-db2/cbl/COBTUPDT.cbl:L208-209];
+    /// - [`RecordOutcome::Ignored`]: `WHEN '*'` of `1003-TREAT-RECORD`
+    ///   [app/app-transaction-type-db2/cbl/COBTUPDT.cbl:L120-121].
     #[must_use]
     pub const fn display_text(&self) -> Option<&'static str> {
         match self {
