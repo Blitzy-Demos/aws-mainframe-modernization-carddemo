@@ -879,6 +879,19 @@ mod tests {
         let mut expected = stored(&store, 1);
         expected.pa_auth_fraud = FraudFlag::Confirmed;
         expected.pa_fraud_rpt_date = Alnum::move_from("07/01/22");
+        let mut untouched = store.details.clone();
+        untouched.remove(&AuthId::from(1));
+        assert_eq!(
+            untouched
+                .iter()
+                .map(|(&id, detail)| (id, detail.pa_acct_id))
+                .collect::<Vec<_>>(),
+            [
+                (AuthId::from(2), account_id(ACCOUNT)),
+                (AuthId::from(3), account_id(OTHER_ACCOUNT)),
+            ],
+            "the non-targets: detail 2 of the same account, detail 3 of another"
+        );
 
         let outcome = toggle(&mut store, &clock());
 
@@ -901,10 +914,11 @@ mod tests {
         let key = (CardNumber::move_from(CARD), newer_auth_ts());
         assert_eq!(store.frauds.len(), 1);
         assert_eq!(store.frauds.get(&key), row.as_ref());
+        let mut others = store.details.clone();
+        others.remove(&AuthId::from(1));
         assert_eq!(
-            store.details[&AuthId::from(2)],
-            stored(&store, 2),
-            "twins untouched"
+            others, untouched,
+            "detail 2 (same account) and detail 3 (other account) untouched"
         );
     }
 
