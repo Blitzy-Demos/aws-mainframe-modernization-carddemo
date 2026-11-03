@@ -24,14 +24,18 @@ type RewardRuleField = components["schemas"]["RewardRuleField"];
 
 /**
  * The request-written reward-rule texts, byte-identical to
- * `REWARD_RATE_NEGATIVE`, `REWARD_MIN_EXCEEDS_MAX` and
- * `REWARD_ACTIVE_TO_BEFORE_FROM` in crates/domain/src/messages.rs.
+ * `REWARD_RATE_NEGATIVE`, `REWARD_MIN_EXCEEDS_MAX`,
+ * `REWARD_ACTIVE_TO_BEFORE_FROM` and `REWARD_RULE_NOT_FOUND` in
+ * crates/domain/src/messages.rs. `notFound` is the 404 of
+ * `PUT /admin/reward-rules/{id}`, which the edit form also shows when the rule
+ * list holds no rule with the routed ID.
  */
 export const REWARD_RULE_MESSAGES = {
   rateNegative: "reward_rate must not be negative",
   minExceedsMax:
     "min_transaction_amount must not exceed max_transaction_amount",
   activeToBeforeFrom: "active_to must not precede active_from",
+  notFound: "Reward rule not found",
 } as const;
 
 // `RewardRuleRequest.transaction_type_cd`: the OpenAPI pattern, characters from

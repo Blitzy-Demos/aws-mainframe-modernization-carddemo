@@ -33,6 +33,12 @@ export const USER_UPDATE_MESSAGES = {
   userTypeEmpty: "User Type can NOT be empty...", // V-COUSR02C-008
 } as const;
 
+// The text of the message-only 200 that writes nothing because no field differs from the
+// stored user (V-COUSR02C-010) [app/cbl/COUSR02C.cbl:L236-243]. The schema never reports
+// it; the write's success answers 200 too, with `User <id> has been updated ...`, so the
+// edit page compares the answer's message with it to show it as a prompt, not a success.
+export const USER_UPDATE_UNCHANGED_MESSAGE = "Please modify to update ...";
+
 // COUSR03C DELETE-USER-INFO [app/cbl/COUSR03C.cbl:L176-186].
 export const USER_DELETE_MESSAGES = {
   userIdEmpty: "User ID can NOT be empty...", // V-COUSR03C-004
