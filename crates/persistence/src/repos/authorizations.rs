@@ -6,8 +6,9 @@
 //!
 //! [`AuthorizationStore`] on [`PgStore`], used by CP00 (`COPAUA0C`), CPVS
 //! (`COPAUS0C`), CPVD (`COPAUS1C` with `COPAUS2C`) and `batch cbpaup0j`
-//! (`CBPAUP0C`), and the inherent [`PgStore::read_fraud`], which reads back
-//! the fraud report the port only writes.
+//! (`CBPAUP0C`), the inherent [`PgStore::read_fraud`], which reads back the
+//! fraud report the port only writes, and the inherent
+//! [`PgStore::exclude_other_purges`], which keeps two `CBPAUP0C` purges apart.
 //!
 //! # Key order
 //!
@@ -65,6 +66,11 @@
 //! committed, and no toggle is lost. `COPAUS1C` takes no lock of its own;
 //! this one is the concurrency safeguard of the replacement. Every other read,
 //! the CPVD view and its PF8 step included, takes no lock.
+//!
+//! The purge has a safeguard of its own: `batch cbpaup0j` takes the advisory
+//! lock of [`PgStore::exclude_other_purges`] before its sweep, so two purges
+//! run one after the other and neither deletes a detail the other has already
+//! deleted. The sweep's reads still take no lock.
 
 use carddemo_domain::entities::{
     AuthFraud, FraudFlag, MatchStatus, NewPendingAuthDetail, PA_ACCOUNT_STATUS_OCCURS,
@@ -95,6 +101,15 @@ const FRAUD: &str = "auth_fraud";
 /// The column of the `PA-ACCOUNT-STATUS X(02) OCCURS 5 TIMES` table
 /// (P-CIPAUSMY-004), as a misfit names it.
 const ACCOUNT_STATUS: &str = "pa_account_status";
+
+/// The advisory lock key that keeps two purges apart
+/// ([`PgStore::exclude_other_purges`]).
+///
+/// The eight ASCII bytes `CBPAUP0J`, the job's name, read as a big-endian
+/// `i64` (`0x4342_5041_5550_304A`). The value is fixed and differs from
+/// [`crate::ids::TRAN_ID_LOCK_KEY`]: every purge takes the same key, and
+/// nothing else takes it.
+const PURGE_LOCK_KEY: i64 = i64::from_be_bytes(*b"CBPAUP0J");
 
 /// A row of `pending_auth_summaries`, in `CIPAUSMY` order.
 ///
@@ -976,6 +991,48 @@ impl PgStore<'_, '_> {
         let row = settle(sp, result).await?.ok_or(PortError::NotFound)?;
         Ok(fraud_from_row(&row)?)
     }
+
+    /// CBPAUP0J STEP01 [app/app-authorization-ims-db2-mq/jcl/CBPAUP0J.jcl:L24-25]:
+    /// keeps every other purge out of this unit of work for the rest of it,
+    /// so two `batch cbpaup0j` runs purge one after the other.
+    ///
+    /// The step is the replacement's alone, with no COBOL paragraph and no
+    /// audit row. The BMP runs `CBPAUP0C` under the PSB `PSBPAUTB`
+    /// (`PROCOPT=AP`) [app/app-authorization-ims-db2-mq/ims/PSBPAUTB.psb:L17],
+    /// and IMS program isolation never hands a program a segment another
+    /// program has deleted. Without this lock a second purge reads a detail
+    /// the first has deleted but not committed, waits on its row lock, then
+    /// finds no row to delete: a failed `DLET` that abends the run
+    /// (P-CBPAUP0C-005, P-CBPAUP0C-009).
+    ///
+    /// The statement takes the transaction-scoped advisory lock
+    /// [`PURGE_LOCK_KEY`] under its own savepoint, as every store statement
+    /// does; releasing the savepoint hands the lock to the unit of work, so it
+    /// stays held until the unit commits or rolls back. A purge that asks for
+    /// it while another holds it waits until that unit ends. The unit of work
+    /// runs at `READ COMMITTED`, the `PostgreSQL` default, where each
+    /// statement takes its own snapshot, so the waiting purge then sweeps the
+    /// rows the first one left.
+    ///
+    /// The purge takes the lock before any row lock, and only the purge takes
+    /// it. A purge waiting for it holds nothing that CP00's writes or the CPVD
+    /// fraud marking wait for, so it cannot deadlock with them.
+    ///
+    /// # Errors
+    ///
+    /// The mapped error of the failed lock statement:
+    /// [`PortError::Contention`] when the wait ends in a deadlock or a lock
+    /// timeout, [`PortError::Unavailable`] on any other failure.
+    pub async fn exclude_other_purges(&mut self) -> PortResult<()> {
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
+        let result = sqlx::query_scalar!(
+            r#"SELECT 1 AS "locked!" FROM pg_advisory_xact_lock($1)"#,
+            PURGE_LOCK_KEY
+        )
+        .fetch_one(&mut *sp)
+        .await;
+        settle(sp, result).await.map(|_| ())
+    }
 }
 
 /// One page of the details of the account `acct_id` in twin order, read under
@@ -1331,5 +1388,18 @@ fn parent_not_found(err: PortError) -> PortError {
     match err {
         PortError::Restricted => PortError::NotFound,
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PURGE_LOCK_KEY;
+    use crate::ids::TRAN_ID_LOCK_KEY;
+
+    #[test]
+    fn the_purge_lock_key_is_the_job_name_and_not_the_tran_id_key() {
+        assert_eq!(PURGE_LOCK_KEY.to_be_bytes(), *b"CBPAUP0J");
+        assert_eq!(PURGE_LOCK_KEY, 0x4342_5041_5550_304A);
+        assert_ne!(PURGE_LOCK_KEY, TRAN_ID_LOCK_KEY);
     }
 }

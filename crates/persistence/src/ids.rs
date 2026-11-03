@@ -58,17 +58,19 @@
 //! The seed refresh (`seed::run` in `SeedMode::Full`, `batch seed`) allocates
 //! nothing, but it deletes the account rows these units lock and empties the
 //! reward tables CT02 and `POSTTRAN` accrue into. It also takes the account
-//! lock before the reward tables: `LOCK TABLE accounts IN EXCLUSIVE MODE`,
-//! then the `TRUNCATE` of `reward_accruals`, `reward_balances` and
-//! `reward_rules`. `EXCLUSIVE` conflicts with the table lock every account row
-//! lock takes, and not with plain reads. The refresh therefore waits for every
-//! unit that already holds an account row; that unit can finish, because the
-//! refresh holds no reward table yet. A unit that asks for an account row lock
-//! later waits until the refresh has ended. The units that write the reward
-//! tables while holding an account lock, CT02 and `POSTTRAN`, take that lock
-//! before they touch a reward table, and the reward-rule administration takes
-//! no account lock, so no unit holds a reward table while it waits for the
-//! refresh.
+//! lock before the reward tables: `LOCK TABLE accounts IN EXCLUSIVE MODE` as
+//! its first statement, then the `TRUNCATE` of `reward_accruals`,
+//! `reward_balances` and `reward_rules`. A `SeedMode::IfEmpty` run takes the
+//! same lock first and, finding accounts, releases it as it rolls back,
+//! having touched nothing else. `EXCLUSIVE` conflicts with the table lock
+//! every account row lock takes, and not with plain reads. The refresh
+//! therefore waits for every unit that already holds an account row; that
+//! unit can finish, because the refresh holds no reward table yet. A unit
+//! that asks for an account row lock later waits until the refresh has ended.
+//! The units that write the reward tables while holding an account lock, CT02
+//! and `POSTTRAN`, take that lock before they touch a reward table, and the
+//! reward-rule administration takes no account lock, so no unit holds a
+//! reward table while it waits for the refresh.
 //!
 //! # The live master
 //!

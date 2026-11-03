@@ -43,8 +43,8 @@ use carddemo_persistence::{Db, PersistenceError, PgStore, UnitOfWork};
 use carddemo_testkit::{TestStack, block_on, fixtures};
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
-use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{PgConnection, PgPool};
 
 /// The balance account 1 is edited to after a seed: 12345.67.
 const EDITED_BALANCE_CENTS: i64 = 1_234_567;
@@ -72,9 +72,10 @@ DROP TRIGGER test_fail_reward_rule_commit ON reward_rules;
 DROP FUNCTION test_fail_reward_rule_commit();";
 
 /// The `application_name` of the sessions that contend for `accounts` in
-/// `refresh_waits_for_an_account_row_lock_holder`, which tells them apart in
-/// `pg_stat_activity`. [`CONTENDER_LOCK_WAITERS`] and [`CONTENDER_SESSIONS`]
-/// spell it out.
+/// `refresh_waits_for_an_account_row_lock_holder` and
+/// `if_empty_judges_accounts_once_it_holds_the_lock`, which tells them apart
+/// in `pg_stat_activity`. [`CONTENDER_LOCK_WAITERS`] and
+/// [`CONTENDER_SESSIONS`] spell it out.
 const CONTENDERS: &str = "seed-lock-order";
 
 /// The contending sessions that wait for a heavyweight lock: a table lock, or
@@ -95,6 +96,14 @@ const SESSION_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The pause between two reads of `pg_stat_activity`.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The account a unit of work inserts while `--if-empty` runs wait for it,
+/// outside the fixture accounts 1 to 50.
+const HOLDER_ACCOUNT: i64 = 77_777_777_777;
+
+/// The rows of [`HOLDER_ACCOUNT`] in `accounts`.
+const HOLDER_ACCOUNT_ROWS: &str =
+    "SELECT count(*)::text FROM accounts WHERE account_id = 77777777777";
 
 /// Rows per table, read in one statement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -864,8 +873,9 @@ fn source_errors_surface_only_where_the_load_reaches_them() {
     assert_eq!(block_on(counts(pool)), fixture_counts());
 }
 
-/// A pool of two sessions named [`CONTENDERS`] on the stack's database: one
-/// for the unit of work that holds an account row, one for the refresh.
+/// A pool of up to three sessions named [`CONTENDERS`] on the stack's
+/// database: one for the unit of work that holds or inserts an account row,
+/// and one for each of up to two seed runs.
 fn contender_pool(stack: &TestStack) -> PgPool {
     let options = stack
         .database_url()
@@ -874,7 +884,7 @@ fn contender_pool(stack: &TestStack) -> PgPool {
         .application_name(CONTENDERS);
     block_on(
         PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(3)
             .connect_with(options),
     )
     .unwrap_or_else(|err| panic!("the contender pool cannot connect: {err}"))
@@ -1022,6 +1032,72 @@ async fn race_refresh_with_holder(
     refresh
         .join()
         .unwrap_or_else(|_| panic!("the refresh thread panicked"))
+}
+
+/// Inserts the account [`HOLDER_ACCOUNT`] on `holder`. Until the holder's
+/// unit of work ends, the insert holds the `ROW EXCLUSIVE` lock on `accounts`
+/// every `INSERT` takes.
+async fn insert_holder_account(holder: &mut PgConnection) {
+    sqlx::query!(
+        r#"INSERT INTO accounts (
+               account_id, acct_active_status, acct_curr_bal, acct_credit_limit,
+               acct_cash_credit_limit, acct_open_date, acct_expiraion_date,
+               acct_reissue_date, acct_curr_cyc_credit, acct_curr_cyc_debit,
+               acct_addr_zip, acct_group_id)
+           VALUES ($1, 'Y', 0.00, 1000.00, 500.00, '2022-07-01', '2027-07-01',
+                   '2022-07-01', 0.00, 0.00, '98101', '')"#,
+        HOLDER_ACCOUNT
+    )
+    .execute(holder)
+    .await
+    .expect("the holder's account insert");
+}
+
+/// The race of `if_empty_judges_accounts_once_it_holds_the_lock`, on the
+/// sessions of `contenders`: a holder inserts [`HOLDER_ACCOUNT`] and keeps
+/// its unit of work open, `runs` `--if-empty` seeds start on threads of their
+/// own and must all wait for a lock, then the holder commits or, unless
+/// `commit`, rolls back. Returns the outcome of each run, in start order.
+///
+/// The holder lives inside this one future, as in
+/// [`race_refresh_with_holder`], so a failed assertion rolls it back inside
+/// the test runtime.
+async fn race_if_empty_with_holder(
+    stack: &TestStack,
+    contenders: &PgPool,
+    runs: usize,
+    commit: bool,
+) -> Vec<Result<SeedReport, PersistenceError>> {
+    let mut holder = contenders.begin().await.expect("the holder's unit of work");
+    insert_holder_account(&mut holder).await;
+    let seeds: Vec<_> = (0..runs)
+        .map(|_| {
+            let seed_db = Db::from_pool(contenders.clone());
+            thread::spawn(move || run_seed(&seed_db, SeedMode::IfEmpty, &sources()))
+        })
+        .collect();
+    wait_for_count(
+        stack,
+        CONTENDER_LOCK_WAITERS,
+        runs,
+        "--if-empty runs waiting for a lock",
+    )
+    .await;
+    if let Some(ended) = seeds.iter().position(thread::JoinHandle::is_finished) {
+        panic!("every --if-empty run must wait until the holder ends, but run {ended} ended first");
+    }
+    if commit {
+        holder.commit().await.expect("the holder commits");
+    } else {
+        holder.rollback().await.expect("the holder rolls back");
+    }
+    seeds
+        .into_iter()
+        .map(|seed| {
+            seed.join()
+                .unwrap_or_else(|_| panic!("an --if-empty run's thread panicked"))
+        })
+        .collect()
 }
 
 /// `ACCTFILE`, `CARDFILE`, `XREFFILE`, `CUSTFILE`, `DISCGRP`, `TCATBALF`,
@@ -1198,6 +1274,72 @@ fn if_empty_on_seeded_db_is_a_noop() {
         block_on(account_one_balance(db.pool())),
         Decimal::new(EDITED_BALANCE_CENTS, 2)
     );
+}
+
+/// `batch seed --if-empty` does nothing when `accounts` has rows (AAP 0.3.2),
+/// judged once the run holds its `accounts` lock. On an empty database a unit
+/// of work inserts [`HOLDER_ACCOUNT`] and stays open, so every `--if-empty`
+/// run started then waits for its lock:
+///
+/// - the holder commits: the one run finds that account and skips, so the
+///   account stays and nothing is loaded or cleared;
+/// - the holder rolls back, with two runs waiting: they queue on the lock, the
+///   first loads the seeded state and the second finds its rows and skips.
+///
+/// A run that read `accounts` before locking it would find the table empty
+/// and then delete the committed account and load the fixtures, or reload as
+/// a refresh what the other run had just loaded.
+#[test]
+fn if_empty_judges_accounts_once_it_holds_the_lock() {
+    let skipped = SeedReport {
+        skipped: true,
+        ..SeedReport::default()
+    };
+    let cases = [
+        (
+            true,
+            vec![skipped.clone()],
+            Counts {
+                accounts: 1,
+                ..Counts::default()
+            },
+            "1",
+        ),
+        (
+            false,
+            vec![first_seed_report(), skipped],
+            fixture_counts(),
+            "0",
+        ),
+    ];
+    for (commit, expected, expected_counts, holder_rows) in cases {
+        let (stack, db) = stack();
+        let contenders = contender_pool(&stack);
+        let mut reports: Vec<SeedReport> = block_on(Box::pin(race_if_empty_with_holder(
+            &stack,
+            &contenders,
+            expected.len(),
+            commit,
+        )))
+        .into_iter()
+        .map(|outcome| outcome.expect("every --if-empty run succeeds"))
+        .collect();
+        reports.sort_by_key(|report| report.skipped);
+        assert_eq!(reports, expected, "holder commits: {commit}");
+        block_on(Box::pin(async {
+            assert_eq!(
+                counts(db.pool()).await,
+                expected_counts,
+                "holder commits: {commit}"
+            );
+            assert_eq!(
+                stack.fetch_text_rows(HOLDER_ACCOUNT_ROWS).await,
+                vec![vec![Some(holder_rows.to_owned())]],
+                "holder commits: {commit}"
+            );
+            contenders.close().await;
+        }));
+    }
 }
 
 /// The README refresh sequence `ACCTFILE` … `DUSRSECJ` [README.md:L213-232] as

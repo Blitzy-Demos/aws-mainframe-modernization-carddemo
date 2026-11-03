@@ -30,7 +30,9 @@
 //!   only while both are empty: the refresh sequence runs no `CREADB21`, so a
 //!   master edited through the admin screens or `MNTTRDB2` survives a refresh.
 //! - [`SeedMode::IfEmpty`] does nothing when `accounts` holds a row, and is
-//!   [`SeedMode::Full`] otherwise.
+//!   [`SeedMode::Full`] otherwise. It judges the table once the run holds its
+//!   `accounts` lock, so an account a concurrent unit of work committed before
+//!   the lock was granted, a racing seed's included, makes it skip.
 //! - [`SeedMode::OnlyTranextr`] is the `TRANEXTR` → `TRANTYPE`/`TRANCATG`
 //!   chain: the Db2 masters are unloaded over the processing copies. Nothing
 //!   else changes. The `.PS` backups `TRANEXTR` writes in STEP10 and STEP20
@@ -38,7 +40,10 @@
 //!
 //! Each run is one database transaction, committed only at its end. Any
 //! failure drops the transaction, which rolls it back, so the database is left
-//! exactly as it was.
+//! exactly as it was. A [`SeedMode::Full`] or [`SeedMode::IfEmpty`] run takes
+//! `LOCK TABLE accounts IN EXCLUSIVE MODE` as its first statement and holds it
+//! to its end: plain reads go on, and the run is serialized with every unit
+//! of work that locks or writes an account row and with every other such run.
 //!
 //! # Two steps
 //!
@@ -222,7 +227,8 @@ pub struct SeedReport {
     /// The Db2 masters were empty and were loaded from the `CREADB21`
     /// statements.
     pub masters_loaded: bool,
-    /// `accounts` held rows before the run, so the run was a refresh.
+    /// `accounts` held rows when the run had locked it, so the run was a
+    /// refresh.
     pub refreshed: bool,
     /// [`SeedMode::IfEmpty`] found rows in `accounts` and wrote nothing.
     pub skipped: bool,
@@ -474,6 +480,13 @@ fn read_sources(sources: &SeedSources) -> PreparedSources {
 /// crate-internal `commit_transaction` of `crate::tx`, sends no `ROLLBACK`
 /// after it. Either way the database is unchanged.
 ///
+/// A [`SeedMode::Full`] or [`SeedMode::IfEmpty`] load first locks `accounts`
+/// in `EXCLUSIVE` mode for the rest of the transaction, and only then reads
+/// whether the table holds a row. That one read decides both whether an
+/// `--if-empty` run skips and whether the run is a refresh, and it sees every
+/// account committed before the lock was granted, a racing seed's included.
+/// [`SeedMode::OnlyTranextr`] touches no account and takes no lock.
+///
 /// A source error [`prepare`] kept is returned where the load reaches that
 /// source, after the statements before it and before any insert of its own,
 /// so the outcome is the one an inline read gives:
@@ -502,11 +515,18 @@ pub async fn run(db: &Db, prepared: PreparedSeed) -> Result<SeedReport, Persiste
     let mut tx = db.pool().begin().await?;
     let report = match prepared.plan {
         Plan::OnlyTranextr => tranextr(&mut tx).await?,
-        Plan::Load { if_empty: true, .. } if has_accounts(&mut tx).await? => SeedReport {
-            skipped: true,
-            ..SeedReport::default()
-        },
-        Plan::Load { sources, .. } => full(&mut tx, *sources).await?,
+        Plan::Load { if_empty, sources } => {
+            lock_accounts(&mut tx).await?;
+            let has_rows = has_accounts(&mut tx).await?;
+            if if_empty && has_rows {
+                SeedReport {
+                    skipped: true,
+                    ..SeedReport::default()
+                }
+            } else {
+                full(&mut tx, *sources, has_rows).await?
+            }
+        }
     };
     if report.skipped {
         tx.rollback().await?;
@@ -543,9 +563,13 @@ fn log_report(mode: SeedMode, report: &SeedReport) {
 /// [`SeedMode::Full`]: clear, reload every file, load the Db2 masters while
 /// they are empty, re-insert the seed reward rules. Each source's error, if
 /// [`prepare`] kept one, is returned just before that source's inserts.
+///
+/// It runs under the lock of [`lock_accounts`]; `refreshed` is whether
+/// `accounts` held a row once that lock was granted.
 async fn full(
     conn: &mut PgConnection,
     sources: PreparedSources,
+    refreshed: bool,
 ) -> Result<SeedReport, PersistenceError> {
     let PreparedSources {
         accounts,
@@ -560,7 +584,6 @@ async fn full(
         transaction_types,
         transaction_categories,
     } = sources;
-    let refreshed = has_accounts(conn).await?;
     clear(conn).await?;
     let mut report = SeedReport {
         accounts: load_accounts(conn, &accounts?).await?,
@@ -585,8 +608,46 @@ async fn full(
     Ok(report)
 }
 
+/// Locks `accounts` with `LOCK TABLE accounts IN EXCLUSIVE MODE` until the
+/// run ends: the first statement of every load, before [`has_accounts`]
+/// judges the table.
+///
+/// The mode conflicts with the table lock every account row lock takes
+/// (`SELECT ... FOR KEY SHARE` and `FOR UPDATE`, `UPDATE`, `DELETE`, and the
+/// foreign key check of a `reward_balances` insert), with the one an `INSERT`
+/// takes, and with itself, and not with plain reads. The statement therefore
+/// waits for every unit of work that holds an account row lock or has
+/// inserted an account and not yet ended, and for a load already running. A
+/// unit that asks for any of these locks later waits for the run to end.
+///
+/// - `--if-empty` is judged once the lock is granted. Under `READ COMMITTED`
+///   the read that follows takes its own snapshot, so it sees every account
+///   committed while the run waited, and a [`SeedMode::IfEmpty`] run skips
+///   instead of deleting them. Read before the lock, the table could look
+///   empty to a run that then deletes the rows committed in between. Two
+///   concurrent loads run one after the other, and a second `--if-empty` one
+///   finds the first one's rows. The lock is requested once, in its final
+///   mode: a weaker lock upgraded later would deadlock two runs that both
+///   held it. A run that skips holds it only until it rolls back.
+/// - It keeps the lock order [`crate::ids`] documents: account locks before
+///   the reward tables. Holding no reward table yet, the run lets a unit that
+///   already holds an account row finish, such as a CT02 add whose accrual is
+///   still to read `reward_rules` and write the accrual and the balance. The
+///   lock is held until the run ends, so the `DELETE` of `accounts` in
+///   [`clear`] never waits for a row lock. Truncating the reward tables before
+///   this lock would deadlock with that CT02: the run would hold them while
+///   waiting at the `DELETE` for the account row CT02 holds, and CT02 would
+///   wait for `reward_rules`.
+async fn lock_accounts(conn: &mut PgConnection) -> Result<(), PersistenceError> {
+    sqlx::query!("LOCK TABLE accounts IN EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Whether `accounts` holds a row: the `--if-empty` test, and what makes a
-/// [`SeedMode::Full`] run a refresh.
+/// [`SeedMode::Full`] run a refresh. A load reads it under the lock of
+/// [`lock_accounts`].
 async fn has_accounts(conn: &mut PgConnection) -> Result<bool, PersistenceError> {
     let has_rows = sqlx::query_scalar!(r#"SELECT EXISTS (SELECT 1 FROM accounts) AS "has_rows!""#)
         .fetch_one(&mut *conn)
@@ -606,24 +667,11 @@ async fn masters_empty(conn: &mut PgConnection) -> Result<bool, PersistenceError
 }
 
 /// Empties the reward tables and every table the seed reloads, children
-/// before their parents, after locking `accounts` against every row lock.
+/// before their parents. It runs under the lock of [`lock_accounts`], which
+/// the run took first and holds until it ends, so no other unit of work holds
+/// an account row lock meanwhile.
 ///
-/// `LOCK TABLE accounts IN EXCLUSIVE MODE` comes first, the lock order
-/// [`crate::ids`] documents: account locks before the reward tables. The mode
-/// conflicts with the table lock every account row lock takes (`SELECT ...
-/// FOR KEY SHARE` and `FOR UPDATE`, `UPDATE`, `DELETE`, and the foreign key
-/// check of a `reward_balances` insert), and not with plain reads. The
-/// statement therefore waits for every unit of work that already holds an
-/// account row lock, such as a CT02 add whose accrual is still to read
-/// `reward_rules` and write the accrual and the balance; holding no reward
-/// table yet, the run lets that unit finish. A unit that asks for an account
-/// row lock later waits for the run to end. The lock is held until the run
-/// ends, so the `DELETE` of `accounts` never waits for a row lock. Truncating
-/// the reward tables first would deadlock with that CT02: the run would hold
-/// them while waiting at the `DELETE` for the account row CT02 holds, and CT02
-/// would wait for `reward_rules`.
-///
-/// The reward tables are emptied next: `reward_balances` references the
+/// The reward tables are emptied first: `reward_balances` references the
 /// accounts about to be reloaded, and seeded accruals come only from posting
 /// the fixtures (AAP 0.3.2, 0.3.6). One `TRUNCATE … RESTART IDENTITY` empties
 /// them and restarts the `rule_id` and `accrual_id` identities at 1, so the
@@ -639,9 +687,6 @@ async fn masters_empty(conn: &mut PgConnection) -> Result<bool, PersistenceError
 /// before it reaches them. The other tables are the delete and define steps
 /// (STEP05, STEP10) of each load job; none references another.
 async fn clear(conn: &mut PgConnection) -> Result<(), PersistenceError> {
-    sqlx::query!("LOCK TABLE accounts IN EXCLUSIVE MODE")
-        .execute(&mut *conn)
-        .await?;
     sqlx::query!("TRUNCATE reward_accruals, reward_balances, reward_rules RESTART IDENTITY")
         .execute(&mut *conn)
         .await?;

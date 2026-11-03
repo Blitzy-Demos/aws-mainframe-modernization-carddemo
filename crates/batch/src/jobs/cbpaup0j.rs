@@ -8,6 +8,12 @@
 //! logic, the summary-delete condition that tests the approved count twice (E-16) and the
 //! in-memory count decrements (E-35) all live in the rule.
 //!
+//! The unit of work first excludes every other purge (`PgStore::exclude_other_purges`), so two
+//! runs purge one after the other. A run started while another is purging waits until that
+//! run's unit of work ends, then sweeps the rows it left and ends normally, where it would
+//! otherwise abend with `CBPAUP0C ABENDING ...` on the `DLET` of a detail the other run had
+//! already deleted.
+//!
 //! `DISPLAY` output becomes `tracing` events inside the job span: the parameters, the day, then
 //! either the four end-of-job counts or the abend. The span's `read` field carries the
 //! summaries and details read, its `deleted` field those deleted once the deletes are
@@ -36,8 +42,13 @@ use crate::exit::ExitStatus;
 /// 1. `1000-INITIALIZE` reads `PRM-INFO` from the `SYSIN` card and applies its defaults
 ///    (P-CBPAUP0C-001), and `ACCEPT CURRENT-YYDDD FROM DAY` reads the day from the processing
 ///    clock, so `CARDDEMO_CLOCK_OVERRIDE` pins it (P-CBPAUP0C-012).
-/// 2. The rule sweeps every summary and its details in one unit of work.
-/// 3. The unit of work is committed whether the sweep ends normally or abends. `EXEC DLI CHKP`
+/// 2. The unit of work begins and excludes every other purge before its first read
+///    (`PgStore::exclude_other_purges`), as IMS program isolation keeps the BMP from reaching
+///    a segment another program has deleted. A run started while another is purging waits
+///    until that run commits or rolls back, then sweeps the rows it left and ends normally
+///    instead of abending on a detail that is already gone.
+/// 3. The rule sweeps every summary and its details in that unit of work.
+/// 4. The unit of work is committed whether the sweep ends normally or abends. `EXEC DLI CHKP`
 ///    (P-CBPAUP0C-008), the normal end and the `GOBACK` of `9999-ABEND` all commit the deletes
 ///    made so far (P-CBPAUP0C-005, P-CBPAUP0C-009), so one commit after the rule returns leaves
 ///    the same rows as the COBOL's checkpoints. Every store statement, the failed one included,
@@ -50,10 +61,12 @@ use crate::exit::ExitStatus;
 /// `RETURN-CODE` and returns rather than calling `CEE3ABD`
 /// [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L377-383].
 ///
-/// A failure to begin or commit the unit of work also exits 16. Such a failure has no COBOL
-/// text, so it is reported as a setup failure. The commit stands in for the final
-/// `9000-TAKE-CHECKPOINT`, where a failed `CHKP` performs `9999-ABEND` and so also ends with
-/// 16 (P-CBPAUP0C-008). After a failed commit, none of the run's deletes persist.
+/// A failure to begin the unit of work, to exclude the other purges or to commit also exits 16.
+/// Such a failure has no COBOL text, so it is reported as a setup failure. A failed exclusion
+/// comes before any read or delete, and the unit of work is dropped uncommitted, which rolls it
+/// back. The commit stands in for the final `9000-TAKE-CHECKPOINT`, where a failed `CHKP`
+/// performs `9999-ABEND` and so also ends with 16 (P-CBPAUP0C-008). After a failed commit, none
+/// of the run's deletes persist.
 pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Cbpaup0jArgs) -> ExitStatus {
     let params = auth_purge::parse_sysin(&args.sysin);
     log_parameters(&BoundedSysin::of(&args.sysin), &params);
@@ -64,6 +77,12 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Cbpaup0jArgs) -> ExitS
         Ok(uow) => uow,
         Err(err) => return setup_failure("pending authorization purge could not begin", err),
     };
+    if let Err(err) = uow.store().exclude_other_purges().await {
+        return setup_failure(
+            "pending authorization purge could not exclude other runs",
+            err,
+        );
+    }
     let outcome = auth_purge::purge(&mut uow.store(), &params, today).await;
     // 9999-ABEND displays its text before the GOBACK that commits.
     if let Err(abend) = &outcome {
