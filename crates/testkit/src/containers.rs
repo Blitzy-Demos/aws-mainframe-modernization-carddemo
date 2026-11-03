@@ -25,6 +25,31 @@
 //! `TESTCONTAINERS_COMMAND=keep`, the containers are kept, as testcontainers
 //! keeps its own, and the network stays while one of them is attached.
 //!
+//! A run that SIGINT (Ctrl-C) or SIGTERM (`kill`, a CI timeout) interrupts
+//! unwinds nothing, so no `Drop` runs. The first stack a process creates
+//! therefore installs a thread that watches for both signals. On the first
+//! one it tears down, concurrently, every stack network the process created
+//! and has not removed, with the containers on it. It then waits for every
+//! network creation and container start still in flight, for at most 900
+//! seconds, three Docker calls' timeouts; when that runs out, it reports how
+//! many are left in flight. A network whose creation the teardown overtook is
+//! removed by that creation once Docker has created it. A container start may
+//! have had Docker create its container after the teardown looked for the
+//! network's containers, and Docker removes a network that only created, never
+//! started, containers name while it keeps those containers; testcontainers,
+//! too, re-creates a network it finds gone and starts its container there. A
+//! final sweep therefore tears every one of those networks down again, with any
+//! container Docker still lists under the network's name. The process then
+//! ends with status 128 plus the signal's number (130 for SIGINT, 143 for
+//! SIGTERM), as a shell reports a death by that signal. A second signal cuts
+//! the teardown short. Only the networks this process created, and the
+//! containers on them, are touched. Once the teardown has begun, no new stack
+//! network is created and no new container starts, and a thread that drops a
+//! stack waits for the exit instead of returning into its test. SIGKILL cannot
+//! be caught, so a killed run still leaves its stacks behind. With
+//! `TESTCONTAINERS_COMMAND=keep` no watcher is installed: both signals end the
+//! process at once and the containers are kept.
+//!
 //! Each container gets 300 seconds to start and become ready, instead of
 //! testcontainers' default 60, and each of the stack's own Docker calls, such
 //! as the network's creation and removal, gets 300 seconds instead of bollard's
@@ -38,8 +63,15 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::error::Error;
+use std::fmt::{self, Display};
+use std::future::poll_fn;
+use std::io::{self, Write};
+use std::panic::{self, AssertUnwindSafe};
+use std::pin::pin;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, Once, PoisonError, mpsc};
+use std::task::Poll;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +89,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use tokio::runtime::{Builder, Handle};
+#[cfg(unix)]
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::task::{self, JoinSet};
 
 use crate::{fixtures, runtime};
 
@@ -138,6 +173,33 @@ const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(300);
 /// creates after that has no guard to remove it.
 const DOCKER_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a signal teardown waits, in [`wait_for_creations`], for the network
+/// creations ([`StackNetwork::create`]) and container starts
+/// ([`ContainerStart`]) still in flight: three times [`DOCKER_CALL_TIMEOUT`],
+/// 900 seconds.
+///
+/// A network creation has at most three Docker calls left, one after another
+/// and each under that client timeout: the network's creation, which is under
+/// way, and then, because the teardown took its name, the lookup of the
+/// containers on the network, whose two requests run side by side, and the
+/// network's removal. No container removal follows, because no container can
+/// join a network its creation has not handed out.
+///
+/// A container start has at most testcontainers' network lookup and creation
+/// and two container creations left, each under testcontainers' 120-second
+/// client timeout, and then the container's start and readiness wait under
+/// [`CONTAINER_START_TIMEOUT`]: 780 seconds in all. Between the two
+/// creations, which a creation that finds no image or no network makes it
+/// retry, testcontainers pulls the image, a download no client timeout bounds.
+///
+/// A call that is still polled therefore settles in time, unless it pulls an
+/// image for longer than the rest of the bound. Only such a pull, and a call
+/// that is never polled again, outlast the bound. An example of the latter is
+/// one on a current-thread runtime whose only thread waits in
+/// [`await_signal_exit`] after dropping a stack. Without the bound, such a
+/// call would keep the process from ever exiting.
+const CREATIONS_WAIT: Duration = DOCKER_CALL_TIMEOUT.saturating_mul(3);
+
 /// The environment variable through which testcontainers decides whether the
 /// containers it started are removed when dropped.
 const TESTCONTAINERS_COMMAND: &str = "TESTCONTAINERS_COMMAND";
@@ -178,6 +240,46 @@ const NETWORK_LABEL: (&str, &str) = ("org.testcontainers.managed-by", "testconta
 /// Stack networks this process has created so far.
 static NETWORK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The signals the watcher thread tears the stacks down on, as its warnings
+/// name them.
+#[cfg(unix)]
+const STOP_SIGNALS: &str = "SIGINT and SIGTERM";
+
+/// The signal the watcher thread tears the stacks down on, as its warnings
+/// name it.
+#[cfg(not(unix))]
+const STOP_SIGNALS: &str = "Ctrl-C";
+
+/// Exit status after a Ctrl-C teardown off Unix: 128 plus SIGINT's number, 2,
+/// the status a Unix process reports for it.
+#[cfg(not(unix))]
+const CTRL_C_STATUS: i32 = 130;
+
+/// The stack networks of this process, for the teardown on a signal.
+static LIVE_NETWORKS: Mutex<LiveNetworks> = Mutex::new(LiveNetworks {
+    names: Some(BTreeSet::new()),
+    in_flight: 0,
+});
+
+/// Notified whenever [`LiveNetworks::in_flight`] drops, for
+/// [`wait_for_creations`].
+static IN_FLIGHT_SETTLED: Condvar = Condvar::new();
+
+/// The stack networks this process has created, or is creating, and has not
+/// removed. Only these are torn down on a signal: a network named after this
+/// process's id may belong to another process with the same id in another pid
+/// namespace on the same Docker daemon.
+struct LiveNetworks {
+    /// Their names, from just before each network's creation until its
+    /// removal; `None` once a signal teardown has taken them.
+    names: Option<BTreeSet<String>>,
+    /// The [`InFlight`] counts alive: the network creations ([`Creation`]) and
+    /// the container starts ([`ContainerStart`]) that have begun and not yet
+    /// ended, each of which may still create a Docker resource on a stack
+    /// network.
+    in_flight: usize,
+}
+
 /// A migrated `PostgreSQL` test database and, from [`TestStack::with_rabbitmq`],
 /// a `RabbitMQ` broker, each in its own container. The containers join the
 /// stack's own bridge network, so their published ports listen on `127.0.0.1`
@@ -187,6 +289,12 @@ static NETWORK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// container still on its network, and then removes the network. That works in
 /// a plain `#[test]` after [`crate::block_on`], inside `block_on`, and in a
 /// `#[tokio::test]` of either runtime flavour.
+///
+/// When SIGINT or SIGTERM interrupts the process, its signal thread does the
+/// same for every stack still alive and then ends the process with status 130
+/// or 143 (see the module documentation). A stack dropped once that teardown
+/// has begun leaves its network to it, and the dropping thread waits for the
+/// exit.
 pub struct TestStack {
     pool: PgPool,
     database_url: String,
@@ -419,30 +527,63 @@ impl TestStack {
 /// force-removes every container still on the network: one that testcontainers
 /// lost track of, because its start timed out or its drop was cut short, would
 /// otherwise outlive the stack and keep the network from being removed.
+///
+/// The name is in [`LIVE_NETWORKS`] from just before the network's creation
+/// until the guard's `Drop` has removed it, so a SIGINT or SIGTERM in between
+/// tears the network down through the signal thread instead.
 struct StackNetwork {
     name: String,
 }
 
 impl StackNetwork {
     /// Creates a uniquely named bridge network whose default host binding is
-    /// [`NETWORK_HOST_BINDING`].
+    /// [`NETWORK_HOST_BINDING`], after installing the signal thread on the
+    /// process's first call ([`watch_signals_once`]).
     ///
     /// # Panics
     ///
     /// Panics, naming the network and the error, if the Docker daemon cannot be
-    /// reached or refuses to create the network.
+    /// reached or refuses to create the network. Panics, naming the network,
+    /// once a signal teardown has begun, because the process is exiting: before
+    /// creating the network, or after removing it again when the teardown took
+    /// the name while Docker was creating it.
     async fn create() -> Self {
+        watch_signals_once();
         let sequence = NETWORK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         let name = format!("{NETWORK_NAME_PREFIX}-{}-{nanos}-{sequence}", process::id());
-        if let Err(error) = create_network(&name).await {
+        // Registered before the network exists, so that a signal teardown from
+        // here on either removes it or waits, at most `CREATIONS_WAIT`, until
+        // this call has.
+        let Some(creation) = Creation::register(&name) else {
+            panic!(
+                "cannot create the test network {name}: the process is removing its \
+                 test stacks on a signal and exiting"
+            );
+        };
+        let created = create_network(&name).await;
+        let taken = creation.settle(created.is_ok());
+        if taken && created.is_ok() {
+            // The teardown that took the name may have looked for the network
+            // before Docker created it, and it ends the process only once
+            // `creation` is dropped, after this removal, or once
+            // `CREATIONS_WAIT` has run out.
+            teardown_or_warn(&name).await;
+        }
+        drop(creation);
+        if let Err(error) = created {
             panic!(
                 "cannot create the test network {name} with host binding \
                  {NETWORK_HOST_BINDING} (is the Docker daemon running?): {error}"
             );
         }
+        assert!(
+            !taken,
+            "removed the test network {name} again: the process is removing its test \
+             stacks on a signal and exiting"
+        );
         Self { name }
     }
 
@@ -455,6 +596,13 @@ impl StackNetwork {
 
 impl Drop for StackNetwork {
     fn drop(&mut self) {
+        // A signal teardown that has taken the names removes this network and
+        // then ends the process. Removing it here as well would race that
+        // teardown, and returning would let the test harness exit first, with
+        // a status of its own.
+        if signal_teardown_started() {
+            await_signal_exit();
+        }
         // Removal takes Docker API calls, which need a tokio runtime. Inside a
         // runtime, as in `block_on` or a `#[tokio::test]` of either flavour, a
         // nested `block_on` panics, so a thread of its own, with its own
@@ -473,13 +621,515 @@ impl Drop for StackNetwork {
             },
             Err(error) => Err(format!("its removal thread did not start: {error}")),
         };
+        // Deregistered only after the removal, so that a signal during it still
+        // tears the network down. A teardown that took the name meanwhile
+        // reports its own outcome for it.
+        if !deregister(name) {
+            await_signal_exit();
+        }
         if let Err(error) = outcome {
-            eprintln!(
-                "warning: carddemo-testkit left the Docker network {name} behind \
-                 (remove it with `docker network rm {name}`): {error}"
-            );
+            warn_network_left(name, &error);
         }
     }
+}
+
+/// One count in [`LiveNetworks::in_flight`], held by a [`Creation`] or a
+/// [`ContainerStart`]. Dropping it, also when the future that holds it is
+/// dropped part-way, ends that call for a signal teardown that waits on it in
+/// [`wait_for_creations`].
+struct InFlight;
+
+impl InFlight {
+    /// Counts one more call in flight in `live`, the locked [`LIVE_NETWORKS`],
+    /// and returns that count together with the names, for the caller to
+    /// update under the same lock; or returns `None`, counting nothing, once a
+    /// signal teardown has taken the names.
+    fn begin(live: &mut LiveNetworks) -> Option<(Self, &mut BTreeSet<String>)> {
+        let names = live.names.as_mut()?;
+        live.in_flight += 1;
+        Some((Self, names))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        live_networks().in_flight -= 1;
+        IN_FLIGHT_SETTLED.notify_all();
+    }
+}
+
+/// A stack network name that [`StackNetwork::create`] has registered in
+/// [`LIVE_NETWORKS`] and not yet settled, counted in flight until dropped.
+struct Creation<'a> {
+    name: &'a str,
+    _in_flight: InFlight,
+}
+
+impl<'a> Creation<'a> {
+    /// Registers `name` as a network being created, or returns `None`,
+    /// registering nothing, once a signal teardown has taken the names.
+    fn register(name: &'a str) -> Option<Self> {
+        let mut live = live_networks();
+        let (in_flight, names) = InFlight::begin(&mut live)?;
+        names.insert(name.to_owned());
+        Some(Self {
+            name,
+            _in_flight: in_flight,
+        })
+    }
+
+    /// Settles the creation's outcome: deregisters the name unless the network
+    /// was `created`, and returns whether a signal teardown has taken the names,
+    /// this one included, meanwhile.
+    fn settle(&self, created: bool) -> bool {
+        match live_networks().names.as_mut() {
+            Some(names) => {
+                if !created {
+                    names.remove(self.name);
+                }
+                false
+            }
+            None => true,
+        }
+    }
+}
+
+/// A testcontainers start of one of a stack's containers, counted in flight
+/// from just before its `start()` until that call returns, or until its future
+/// is dropped. Until then the start may still create a container on the stack
+/// network, even after a signal teardown has looked for the network's
+/// containers, so that teardown waits for it before its final sweep.
+struct ContainerStart {
+    _in_flight: InFlight,
+}
+
+impl ContainerStart {
+    /// Counts the start of the container `image` on the stack network
+    /// `network` in flight.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the image and the network, once a signal teardown has
+    /// taken the names, so that no container is created after that teardown
+    /// has begun.
+    fn begin(image: &str, network: &str) -> Self {
+        let begun = InFlight::begin(&mut live_networks()).map(|(in_flight, _)| in_flight);
+        let Some(in_flight) = begun else {
+            panic!(
+                "cannot start the {image} test container on the network {network}: the process \
+                 is removing its test stacks on a signal and exiting"
+            );
+        };
+        Self {
+            _in_flight: in_flight,
+        }
+    }
+}
+
+/// Locks [`LIVE_NETWORKS`]. Each update under the lock is one insertion,
+/// removal, take or count, which leaves the state whole, so a lock that a
+/// panicking thread poisoned is used as it is.
+fn live_networks() -> MutexGuard<'static, LiveNetworks> {
+    LIVE_NETWORKS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Removes `name` from [`LIVE_NETWORKS`], for [`StackNetwork`]'s `Drop`, and
+/// returns `false`, removing nothing, once a signal teardown has taken the
+/// names.
+fn deregister(name: &str) -> bool {
+    match live_networks().names.as_mut() {
+        Some(names) => {
+            names.remove(name);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether a signal teardown has taken the names in [`LIVE_NETWORKS`].
+fn signal_teardown_started() -> bool {
+    live_networks().names.is_none()
+}
+
+/// Blocks the calling thread for good, once a signal teardown has begun: that
+/// teardown ends the process with [`process::exit`] when it is over, and this
+/// thread neither returns into a test, which would then fail on its removed
+/// containers, nor lets the test harness exit first with its own status.
+fn await_signal_exit() -> ! {
+    loop {
+        thread::park();
+    }
+}
+
+/// Waits until no network creation ([`Creation`]) and no container start
+/// ([`ContainerStart`]) is in flight, for at most `bound`, and returns how many
+/// still are: 0 once all have ended, otherwise the count still in flight when
+/// `bound` ran out.
+///
+/// The signal teardown waits here, at most [`CREATIONS_WAIT`], between its
+/// first pass and its final sweep. A creation that the teardown's take
+/// overtook removes its network itself before it ends. A container start may
+/// have created its container after the first pass looked for the network's
+/// containers. It ends once its start succeeds or fails: early when the first
+/// pass removed its container or its network, and otherwise once the
+/// container is ready, on a network of that name that testcontainers
+/// re-created because it found the network gone. The final sweep then removes
+/// that container and network.
+fn wait_for_creations(bound: Duration) -> usize {
+    let (live, _) = IN_FLIGHT_SETTLED
+        .wait_timeout_while(live_networks(), bound, |live| live.in_flight > 0)
+        .unwrap_or_else(PoisonError::into_inner);
+    live.in_flight
+}
+
+/// Installs, on the first call in the process, the thread that tears the
+/// process's stack networks down on SIGINT or SIGTERM (Ctrl-C off Unix), and
+/// returns once that thread watches for them, so a signal right after the
+/// first network exists is handled.
+///
+/// With `TESTCONTAINERS_COMMAND=keep` it installs nothing: the signals keep
+/// their default action, which ends the process at once, and the containers
+/// are kept, as testcontainers keeps its own. A thread or runtime that cannot
+/// be started, or a signal that cannot be watched, is reported on stderr, and
+/// that signal keeps its default action too.
+fn watch_signals_once() {
+    static WATCHER: Once = Once::new();
+    WATCHER.call_once(|| {
+        if keeps_containers() {
+            return;
+        }
+        let (ready, watching) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name(String::from("testkit-signals"))
+            .spawn(move || watch_signals(&ready));
+        match spawned {
+            Ok(_) => {
+                // The thread answers once its handlers are in place. It ends
+                // without answering only by panicking, which the panic hook
+                // reports, and the stacks then still start.
+                let _ = watching.recv();
+            }
+            Err(error) => warn_unwatched(STOP_SIGNALS, &error),
+        }
+    });
+}
+
+/// The signal thread. On a current-thread runtime of its own, so that it works
+/// whatever runtime the tests use, it installs the handlers, answers `ready`,
+/// and waits. On the first signal it tears down every stack network in
+/// [`LIVE_NETWORKS`] and ends the process with the signal's status, even when
+/// the teardown panics, because the threads in [`await_signal_exit`] wait for
+/// that exit.
+fn watch_signals(ready: &mpsc::Sender<()>) {
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            warn_unwatched(STOP_SIGNALS, &error);
+            // `create` waits for this answer, so the send cannot fail.
+            let _ = ready.send(());
+            return;
+        }
+    };
+    let Some((stop, mut signals)) = runtime.block_on(first_signal(ready)) else {
+        return;
+    };
+    let teardown = panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(teardown_on_signal(stop, &mut signals));
+    }));
+    if teardown.is_err() {
+        report(format_args!(
+            "warning: carddemo-testkit's teardown on {} failed part-way, so test stacks \
+             may be left behind (list them with \
+             `docker network ls --filter name={NETWORK_NAME_PREFIX}-{}-`)",
+            stop.name,
+            process::id()
+        ));
+    }
+    process::exit(stop.status);
+}
+
+/// Installs the signal handlers, answers `ready` once they are in place, and
+/// waits for the first signal. `None` when no handler could be installed.
+async fn first_signal(ready: &mpsc::Sender<()>) -> Option<(Stop, StopSignals)> {
+    let mut signals = StopSignals::install();
+    let stop = {
+        let mut first = pin!(signals.next());
+        // One poll installs the handlers that install only when first polled,
+        // such as Ctrl-C's off Unix, before `create` proceeds.
+        let polled = poll_fn(|context| Poll::Ready(first.as_mut().poll(context))).await;
+        // `create` waits for this answer, so the send cannot fail.
+        let _ = ready.send(());
+        match polled {
+            Poll::Ready(stop) => stop,
+            Poll::Pending => first.await,
+        }
+    }?;
+    Some((stop, signals))
+}
+
+/// Takes the names in [`LIVE_NETWORKS`], so that no new stack network is
+/// created and no new container starts, and tears those stack networks down
+/// through [`remove_live_networks`], unless a second signal cuts that short:
+/// then every network whose final sweep has not finished is reported.
+async fn teardown_on_signal(stop: Stop, signals: &mut StopSignals) {
+    let mut left = live_networks().names.take().unwrap_or_default();
+    report(format_args!(
+        "carddemo-testkit: {} received; removing the {} test stack network(s) of this \
+         process, with their containers, before it exits with status {}",
+        stop.name,
+        left.len(),
+        stop.status
+    ));
+    let second = tokio::select! {
+        () = remove_live_networks(&mut left) => None,
+        Some(second) = signals.next() => Some(second),
+    };
+    if let Some(second) = second {
+        report(format_args!(
+            "carddemo-testkit: {} received during the teardown; exiting at once",
+            second.name
+        ));
+        let reason = format!("a second signal, {}, cut its teardown short", second.name);
+        for name in &left {
+            warn_network_left(name, &reason);
+        }
+    }
+}
+
+/// Tears down the stack networks in `left`, the names the signal teardown
+/// took, in three steps:
+///
+/// 1. A first pass tears every one of them down concurrently, through
+///    [`teardown_network`]. Its outcomes are not reported, because the final
+///    sweep retries every name.
+/// 2. A wait, in [`wait_for_creations`], until every network creation and
+///    container start in flight has ended. A creation that created its network
+///    after the names were taken removes that network itself. A container start
+///    may have had Docker create its container after the first pass looked for
+///    the network's containers. Once the first pass has removed its network or
+///    container, the start fails early, unless testcontainers, finding the
+///    network gone, re-creates it and takes the container to readiness there.
+///    The wait lasts at most [`CREATIONS_WAIT`]: when it runs out, the calls
+///    still in flight are reported on stderr, with the commands that list what
+///    they may leave behind, and the teardown goes on.
+/// 3. The final sweep, [`sweep_networks`], tears every name down again,
+///    including a network of that name that testcontainers re-created. It
+///    exists because Docker removes a network that only created, never
+///    started, containers name and keeps those containers, so a container
+///    created after the first pass's lookup survives that pass. Docker still
+///    lists such a container under its network's name, so the sweep finds it.
+///    Each name leaves `left` once its sweep is over, and a failure is reported
+///    as it comes.
+async fn remove_live_networks(left: &mut BTreeSet<String>) {
+    teardown_networks(left.iter().cloned(), |_, _| {}).await;
+    match task::spawn_blocking(|| wait_for_creations(CREATIONS_WAIT)).await {
+        Ok(0) => {}
+        Ok(unsettled) => report(format_args!(
+            "warning: carddemo-testkit stopped waiting, after {CREATIONS_WAIT:?}, for the \
+             {unsettled} test network creation(s) and container start(s) still in flight, so \
+             their networks and containers may be left behind (list the networks with \
+             `docker network ls --filter name={NETWORK_NAME_PREFIX}-{}-` and the containers \
+             on each with `docker ps -a --filter network=<name>`)",
+            process::id()
+        )),
+        Err(error) => report(format_args!(
+            "warning: carddemo-testkit cannot wait for the test network creations and \
+             container starts still in flight, so their networks and containers may be left \
+             behind: {error}"
+        )),
+    }
+    sweep_networks(left).await;
+}
+
+/// The final sweep of a signal teardown: tears every stack network in `left`
+/// down concurrently, through [`teardown_network`], taking each name out of
+/// `left` once its teardown is over and reporting a failure on stderr as it
+/// comes. A network or container that is already gone counts as removed.
+///
+/// It works on `left` alone and never on [`LIVE_NETWORKS`], so it serves any
+/// set of stack network names.
+async fn sweep_networks(left: &mut BTreeSet<String>) {
+    let names = left.clone();
+    teardown_networks(names, |name, outcome| {
+        left.remove(&name);
+        if let Err(error) = outcome {
+            warn_network_left(&name, &error);
+        }
+    })
+    .await;
+}
+
+/// Tears every stack network in `names` down concurrently, through
+/// [`teardown_network`] on one client, and hands each name with its outcome to
+/// `settled` as its teardown ends. Without a Docker client, every name is
+/// handed over at once with that error.
+async fn teardown_networks(
+    names: impl IntoIterator<Item = String>,
+    mut settled: impl FnMut(String, Result<(), String>),
+) {
+    let docker = match docker_client() {
+        Ok(docker) => docker,
+        Err(error) => {
+            let error = error.to_string();
+            for name in names {
+                settled(name, Err(error.clone()));
+            }
+            return;
+        }
+    };
+    let mut teardowns = JoinSet::new();
+    let mut tasks = HashMap::new();
+    for name in names {
+        let (docker, removed) = (docker.clone(), name.clone());
+        let task = teardowns.spawn(async move { teardown_network(&docker, &removed).await });
+        tasks.insert(task.id(), name);
+    }
+    while let Some(joined) = teardowns.join_next_with_id().await {
+        let (id, outcome) = match joined {
+            Ok((id, removed)) => (id, removed.map_err(|error| error.to_string())),
+            Err(error) => (
+                error.id(),
+                Err(format!("its teardown task failed: {error}")),
+            ),
+        };
+        if let Some(name) = tasks.remove(&id) {
+            settled(name, outcome);
+        }
+    }
+}
+
+/// A signal that ends the process once the stacks are torn down.
+#[derive(Clone, Copy)]
+struct Stop {
+    /// The signal's name, for the notices.
+    name: &'static str,
+    /// The process's exit status for it: 128 plus the signal's number.
+    status: i32,
+}
+
+/// The handlers of SIGINT and SIGTERM, each `None` when it could not be
+/// installed, which leaves that signal its default action.
+#[cfg(unix)]
+struct StopSignals {
+    interrupt: Option<Signal>,
+    terminate: Option<Signal>,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    /// Installs both handlers, reporting on stderr one that cannot be
+    /// installed. Needs a current tokio runtime with its I/O driver enabled.
+    fn install() -> Self {
+        Self {
+            interrupt: install_handler(SignalKind::interrupt(), "SIGINT"),
+            terminate: install_handler(SignalKind::terminate(), "SIGTERM"),
+        }
+    }
+
+    /// The next signal the process receives, or `None` when no handler is
+    /// installed.
+    async fn next(&mut self) -> Option<Stop> {
+        tokio::select! {
+            Some(()) = received(self.interrupt.as_mut()) => Some(Stop {
+                name: "SIGINT",
+                status: 128 + SignalKind::interrupt().as_raw_value(),
+            }),
+            Some(()) = received(self.terminate.as_mut()) => Some(Stop {
+                name: "SIGTERM",
+                status: 128 + SignalKind::terminate().as_raw_value(),
+            }),
+            else => None,
+        }
+    }
+}
+
+/// Installs the handler of `kind`, named `name`, or reports on stderr that it
+/// cannot be installed.
+#[cfg(unix)]
+fn install_handler(kind: SignalKind, name: &str) -> Option<Signal> {
+    signal(kind)
+        .inspect_err(|error| warn_unwatched(name, error))
+        .ok()
+}
+
+/// The next delivery of `handler`, or `None` at once without one.
+#[cfg(unix)]
+async fn received(handler: Option<&mut Signal>) -> Option<()> {
+    match handler {
+        Some(handler) => handler.recv().await,
+        None => None,
+    }
+}
+
+/// The Ctrl-C handler, which `tokio::signal::ctrl_c` installs when first
+/// polled.
+#[cfg(not(unix))]
+struct StopSignals {
+    /// Whether the handler could not be installed, which
+    /// [`StopSignals::next`] reports once.
+    failed: bool,
+}
+
+#[cfg(not(unix))]
+impl StopSignals {
+    /// The handler, installed on the first poll of [`StopSignals::next`].
+    fn install() -> Self {
+        Self { failed: false }
+    }
+
+    /// The next Ctrl-C, or `None` when its handler cannot be installed, which
+    /// is reported on stderr the first time.
+    async fn next(&mut self) -> Option<Stop> {
+        if self.failed {
+            return None;
+        }
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => Some(Stop {
+                name: "Ctrl-C",
+                status: CTRL_C_STATUS,
+            }),
+            Err(error) => {
+                self.failed = true;
+                warn_unwatched(STOP_SIGNALS, &error);
+                None
+            }
+        }
+    }
+}
+
+/// Reports that `signal` cannot be watched, so it still ends the process at
+/// once and leaves the process's test stacks behind.
+fn warn_unwatched(signal: &str, error: &dyn Display) {
+    report(format_args!(
+        "warning: carddemo-testkit cannot watch for {signal}, so a run it interrupts \
+         leaves its Docker networks and containers behind: {error}"
+    ));
+}
+
+/// Reports that the stack network `name` could not be removed, with the
+/// command that finishes the job.
+fn warn_network_left(name: &str, error: &dyn Display) {
+    report(format_args!(
+        "warning: carddemo-testkit left the Docker network {name} behind \
+         (remove it with `docker network rm {name}`): {error}"
+    ));
+}
+
+/// Writes `message`, and a newline, to the process's stderr: every notice and
+/// warning of this module goes through it.
+///
+/// It writes to [`io::stderr`] itself, because `eprintln!` and the other
+/// print macros honour the test harness's output capture, which every thread a
+/// test spawns inherits. The signal thread, spawned inside the first test that
+/// creates a stack, would write into that test's capture buffer, which the
+/// teardown's [`process::exit`] discards unprinted. A [`StackNetwork`]'s
+/// `Drop`, on the test's thread and on its removal thread, would write into a
+/// buffer that a passing test never prints. A Docker resource left behind
+/// outlives the run, so no test outcome may hide it.
+fn report(message: fmt::Arguments<'_>) {
+    // A failed write is ignored: a report must never panic, because it runs
+    // in `Drop` too, where a panic during unwinding aborts the process.
+    let _ = writeln!(io::stderr().lock(), "{message}");
 }
 
 /// Creates the bridge network `name`, labelled [`NETWORK_LABEL`], with
@@ -504,31 +1154,54 @@ async fn create_network(name: &str) -> Result<(), DockerError> {
     Ok(())
 }
 
-/// Removes the Docker network `name` through a client and a current-thread
-/// runtime of its own, for [`StackNetwork`]'s `Drop`.
-///
-/// Before the network, it force-removes every container still on it, through
-/// [`remove_stack_containers`], unless `TESTCONTAINERS_COMMAND` is `keep`.
-/// Then the containers are kept, as testcontainers keeps its own, and the
-/// network stays while one of them is attached.
+/// Removes the Docker network `name` through [`teardown_network`], on a client
+/// and a current-thread runtime of its own, for [`StackNetwork`]'s `Drop`.
 ///
 /// # Errors
 ///
 /// Returns the error if the runtime cannot be built, the Docker daemon cannot
-/// be reached, or it refuses to remove the network, for example because a
-/// container kept by `TESTCONTAINERS_COMMAND=keep`, or one that could not be
-/// removed, is still attached. A container that could not be looked up or
-/// removed is reported on stderr instead.
+/// be reached, or [`teardown_network`] fails.
 fn remove_network(name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(async {
-        let docker = docker_client()?;
-        if !keeps_containers() {
-            remove_stack_containers(&docker, name).await;
-        }
-        docker.remove_network(name).await
-    })?;
+    runtime.block_on(async { teardown_network(&docker_client()?, name).await })?;
     Ok(())
+}
+
+/// Tears the stack network `name` down, for [`StackNetwork`]'s `Drop` and the
+/// signal teardown alike: it force-removes every container still on the
+/// network, through [`remove_stack_containers`], unless
+/// `TESTCONTAINERS_COMMAND` is `keep`, and then removes the network. Kept
+/// containers are kept as testcontainers keeps its own, and the network stays
+/// while one of them is attached. A network that is already gone, because the
+/// other of those two removed it first, counts as removed.
+///
+/// # Errors
+///
+/// Returns the error if the Docker daemon cannot be reached or refuses to
+/// remove the network, for example because a container kept by
+/// `TESTCONTAINERS_COMMAND=keep`, or one that could not be removed, is still
+/// attached. A container that could not be looked up or removed is reported on
+/// stderr instead.
+async fn teardown_network(docker: &Docker, name: &str) -> Result<(), DockerError> {
+    if !keeps_containers() {
+        remove_stack_containers(docker, name).await;
+    }
+    match docker.remove_network(name).await {
+        Err(error) if has_status(&error, &[NOT_FOUND]) => Ok(()),
+        removed => removed,
+    }
+}
+
+/// Tears the stack network `name` down through [`teardown_network`], on a
+/// client of its own, and reports a failure on stderr.
+async fn teardown_or_warn(name: &str) {
+    let removed = match docker_client() {
+        Ok(docker) => teardown_network(&docker, name).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = removed {
+        warn_network_left(name, &error);
+    }
 }
 
 /// A Docker client for the stack's own API calls, on the daemon `DOCKER_HOST`
@@ -550,12 +1223,15 @@ fn keeps_containers() -> bool {
 }
 
 /// Force-removes, with their anonymous volumes, the containers on the stack
-/// network `name`, for [`remove_network`]. They are the containers attached to
+/// network `name`, for [`teardown_network`]. They are the containers attached to
 /// it, which Docker requires gone before it removes the network, and those
 /// created on it but never started, which a start that timed out leaves
-/// behind. After a failed or cut-short start testcontainers keeps no handle on
-/// such a container, so nothing else removes it. The network's name is unique
-/// to its stack, so no other container is touched.
+/// behind, as does one whose container Docker created after a signal
+/// teardown's first pass. Docker lists those under the network's name even
+/// once the network is gone, so the final sweep of that teardown finds them.
+/// After a failed or cut-short start testcontainers keeps no handle on such a
+/// container, so nothing else removes it. The network's name is unique to its
+/// stack, so no other container is touched.
 ///
 /// A container that is already gone, or whose removal is already in progress,
 /// as testcontainers' own drop may have it, counts as removed. A lookup or a
@@ -608,10 +1284,10 @@ async fn remove_stack_containers(docker: &Docker, name: &str) {
         match removal {
             Ok(()) => {}
             Err(error) if has_status(&error, &[NOT_FOUND, CONFLICT]) => {}
-            Err(error) => eprintln!(
+            Err(error) => report(format_args!(
                 "warning: carddemo-testkit left the Docker container {id} of the network \
                  {name} behind (remove it with `docker rm -f -v {id}`): {error}"
-            ),
+            )),
         }
     }
 }
@@ -619,11 +1295,11 @@ async fn remove_stack_containers(docker: &Docker, name: &str) {
 /// Reports that the containers on the stack network `name` could not be looked
 /// up, so any of them may outlive the stack.
 fn warn_unlisted(name: &str, error: &DockerError) {
-    eprintln!(
+    report(format_args!(
         "warning: carddemo-testkit cannot look up the containers on the Docker network \
          {name}, so any of them may be left behind (list them with \
          `docker ps -a --filter network={name}`): {error}"
-    );
+    ));
 }
 
 /// Whether `error` is a Docker API response with one of `statuses`.
@@ -637,22 +1313,28 @@ fn has_status(error: &DockerError, statuses: &[u16]) -> bool {
 
 /// Starts the `PostgreSQL` container on `network`, connects a pool and migrates
 /// it, returning the container, the database URL and the pool.
+///
+/// The testcontainers start is a [`ContainerStart`] in flight until it
+/// returns, so a signal teardown waits for it before its final sweep removes
+/// a container that Docker created after the teardown's first pass. Once that
+/// teardown has begun, the start panics before it creates anything.
 async fn start_postgres(network: &str) -> (ContainerAsync<Postgres>, String, PgPool) {
-    let container = Postgres::default()
+    let image = Postgres::default()
         .with_db_name(POSTGRES_DB)
         .with_user(POSTGRES_USER)
         .with_password(POSTGRES_PASSWORD)
         .with_tag(POSTGRES_TAG)
         .with_network(network)
-        .with_startup_timeout(CONTAINER_START_TIMEOUT)
-        .start()
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "cannot start the {POSTGRES_IMAGE}:{POSTGRES_TAG} test container \
-                 (is the Docker daemon running?): {error}"
-            )
-        });
+        .with_startup_timeout(CONTAINER_START_TIMEOUT);
+    let start = ContainerStart::begin(&format!("{POSTGRES_IMAGE}:{POSTGRES_TAG}"), network);
+    let started = image.start().await;
+    drop(start);
+    let container = started.unwrap_or_else(|error| {
+        panic!(
+            "cannot start the {POSTGRES_IMAGE}:{POSTGRES_TAG} test container \
+             (is the Docker daemon running?): {error}"
+        )
+    });
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
         .await
@@ -674,12 +1356,15 @@ async fn start_postgres(network: &str) -> (ContainerAsync<Postgres>, String, PgP
 
 /// Starts the `RabbitMQ` container on `network` with the two repository files
 /// mounted read-only, returning the container and its AMQP URL.
+///
+/// The testcontainers start is a [`ContainerStart`] in flight until it
+/// returns, as in [`start_postgres`].
 async fn start_rabbitmq(
     network: &str,
     definitions: String,
     conf: String,
 ) -> (ContainerAsync<GenericImage>, String) {
-    let container = GenericImage::new(RABBITMQ_IMAGE, RABBITMQ_TAG)
+    let image = GenericImage::new(RABBITMQ_IMAGE, RABBITMQ_TAG)
         .with_exposed_port(AMQP_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout(RABBITMQ_READY))
         .with_mount(
@@ -691,15 +1376,16 @@ async fn start_rabbitmq(
         )
         .with_env_var("RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS", RABBITMQ_ERL_ARGS)
         .with_network(network)
-        .with_startup_timeout(CONTAINER_START_TIMEOUT)
-        .start()
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "cannot start the {RABBITMQ_IMAGE}:{RABBITMQ_TAG} test container \
-                 (is the Docker daemon running?): {error}"
-            )
-        });
+        .with_startup_timeout(CONTAINER_START_TIMEOUT);
+    let start = ContainerStart::begin(&format!("{RABBITMQ_IMAGE}:{RABBITMQ_TAG}"), network);
+    let started = image.start().await;
+    drop(start);
+    let container = started.unwrap_or_else(|error| {
+        panic!(
+            "cannot start the {RABBITMQ_IMAGE}:{RABBITMQ_TAG} test container \
+             (is the Docker daemon running?): {error}"
+        )
+    });
     let port = container
         .get_host_port_ipv4(AMQP_PORT)
         .await
@@ -751,26 +1437,93 @@ fn text_value(row: &PgRow, index: usize, sql: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use std::collections::{BTreeSet, HashMap};
+    use std::env;
+    use std::io::{self, BufRead, BufReader, Read, Write};
+    use std::process::{self, Child, Command, ExitStatus, Stdio};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use testcontainers::bollard::Docker;
     use testcontainers::bollard::container::{
         Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
-        StartContainerOptions,
+        RemoveContainerOptions, StartContainerOptions,
     };
     use testcontainers::bollard::errors::Error as DockerError;
-    use testcontainers::bollard::models::HostConfig;
+    use testcontainers::bollard::models::{ContainerStateStatusEnum, HostConfig};
     use testcontainers::bollard::network::InspectNetworkOptions;
     use testcontainers::core::error::WaitContainerError;
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{GenericImage, ImageExt, TestcontainersError};
 
     use super::{
-        AMQP_PORT, POSTGRES_IMAGE, POSTGRES_PORT, POSTGRES_TAG, StackNetwork, TestStack,
-        docker_client,
+        AMQP_PORT, CREATIONS_WAIT, ContainerStart, Creation, NETWORK_NAME_PREFIX, NOT_FOUND,
+        POSTGRES_IMAGE, POSTGRES_PORT, POSTGRES_TAG, StackNetwork, TESTCONTAINERS_COMMAND,
+        TestStack, create_network, docker_client, has_status, sweep_networks, teardown_network,
+        wait_for_creations,
     };
     use crate::block_on;
+
+    /// The bound of the creation waits that must run out: long enough to tell
+    /// a wait that ran out from one that returned at once, short enough not to
+    /// slow the suite.
+    const SHORT_WAIT: Duration = Duration::from_millis(200);
+
+    /// Asserts that `in_flight`, an open call of the kind `kind`, keeps
+    /// [`wait_for_creations`] waiting until its bound, and that dropping it
+    /// while a wait on the full [`CREATIONS_WAIT`] runs ends that wait long
+    /// before its bound: with the last call in flight, other tests' included.
+    fn assert_wait_follows(kind: &str, in_flight: impl Send) {
+        let started = Instant::now();
+        let unsettled = wait_for_creations(SHORT_WAIT);
+        let waited = started.elapsed();
+        assert!(
+            unsettled >= 1,
+            "the wait reported {unsettled} calls in flight while a {kind} was open"
+        );
+        assert!(
+            waited >= SHORT_WAIT,
+            "with a {kind} open, the wait returned after {waited:?}, before its bound of \
+             {SHORT_WAIT:?}"
+        );
+
+        let started = Instant::now();
+        let unsettled = thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(SHORT_WAIT);
+                drop(in_flight);
+            });
+            wait_for_creations(CREATIONS_WAIT)
+        });
+        let waited = started.elapsed();
+        assert_eq!(
+            unsettled, 0,
+            "calls were still in flight after the wait on a {kind}"
+        );
+        assert!(
+            waited < CREATIONS_WAIT,
+            "the wait returned only at its bound of {CREATIONS_WAIT:?}, not once the {kind} \
+             ended"
+        );
+    }
+
+    #[test]
+    fn the_creation_wait_ends_at_its_bound_or_once_the_creations_settle() {
+        // Neither call reaches Docker: each stays in flight while its waits run.
+        let name = format!("{NETWORK_NAME_PREFIX}-{}-creation-wait", process::id());
+        let creation =
+            Creation::register(&name).expect("no signal teardown runs in the test process");
+        // Settled as a failed creation, which deregisters the name; the creation
+        // stays in flight until it is dropped.
+        assert!(
+            !creation.settle(false),
+            "no signal teardown runs in the test process"
+        );
+        assert_wait_follows("network creation", creation);
+        let start = ContainerStart::begin(&format!("{POSTGRES_IMAGE}:{POSTGRES_TAG}"), &name);
+        assert_wait_follows("container start", start);
+    }
 
     /// The only host address a stack's containers may publish on. Written out
     /// rather than taken from the module, so that a changed binding fails here.
@@ -896,11 +1649,11 @@ mod tests {
             .collect()
     }
 
-    /// Starts a container on `network` through the Docker API alone, so that no
-    /// testcontainers handle removes it, as after a drop cut short, and returns
-    /// its ID. It keeps running, so it holds an endpoint on the network.
-    async fn start_untracked(docker: &Docker, network: &str) -> String {
-        let created = docker
+    /// Creates a container on `network` through the Docker API alone, without
+    /// starting it, so that no testcontainers handle removes it, and returns its
+    /// ID.
+    async fn create_untracked(docker: &Docker, network: &str) -> String {
+        docker
             .create_container(
                 None::<CreateContainerOptions<String>>,
                 Config {
@@ -914,12 +1667,107 @@ mod tests {
                 },
             )
             .await
-            .unwrap_or_else(|error| panic!("cannot create a container on {network}: {error}"));
+            .unwrap_or_else(|error| panic!("cannot create a container on {network}: {error}"))
+            .id
+    }
+
+    /// Starts a container on `network` through the Docker API alone, so that no
+    /// testcontainers handle removes it, as after a drop cut short, and returns
+    /// its ID. It keeps running, so it holds an endpoint on the network.
+    async fn start_untracked(docker: &Docker, network: &str) -> String {
+        let id = create_untracked(docker, network).await;
         docker
-            .start_container(&created.id, None::<StartContainerOptions<String>>)
+            .start_container(&id, None::<StartContainerOptions<String>>)
             .await
-            .unwrap_or_else(|error| panic!("cannot start the container {}: {error}", created.id));
-        created.id
+            .unwrap_or_else(|error| panic!("cannot start the container {id}: {error}"));
+        id
+    }
+
+    /// A Docker network and the containers a test created on it by hand. Its
+    /// `Drop` force-removes those containers, with their anonymous volumes, and
+    /// then the network, so that a failed check leaks nothing; one already gone
+    /// counts as removed.
+    struct Leftovers {
+        docker: Docker,
+        network: String,
+        containers: Vec<String>,
+    }
+
+    impl Drop for Leftovers {
+        fn drop(&mut self) {
+            block_on(async {
+                for id in &self.containers {
+                    let removed = self
+                        .docker
+                        .remove_container(
+                            id,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                v: true,
+                                ..RemoveContainerOptions::default()
+                            }),
+                        )
+                        .await;
+                    match removed {
+                        Ok(()) => {}
+                        Err(error) if has_status(&error, &[NOT_FOUND]) => {}
+                        Err(error) => eprintln!("cannot remove the test container {id}: {error}"),
+                    }
+                }
+                match self.docker.remove_network(&self.network).await {
+                    Ok(()) => {}
+                    Err(error) if has_status(&error, &[NOT_FOUND]) => {}
+                    Err(error) => {
+                        eprintln!("cannot remove the test network {}: {error}", self.network);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn the_final_sweep_removes_a_container_its_removed_network_left_behind() {
+        let docker = docker_client()
+            .unwrap_or_else(|error| panic!("cannot reach the Docker daemon: {error}"));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        // Named as a stack network, and never registered in `LIVE_NETWORKS`.
+        let name = format!("{NETWORK_NAME_PREFIX}-{}-{nanos}-sweep", process::id());
+        let mut leftovers = Leftovers {
+            docker: docker.clone(),
+            network: name.clone(),
+            containers: Vec::new(),
+        };
+        block_on(create_network(&name))
+            .unwrap_or_else(|error| panic!("cannot create the test network {name}: {error}"));
+        let created = block_on(create_untracked(&docker, &name));
+        leftovers.containers.push(created.clone());
+
+        // Docker removes a network that only a created, never started,
+        // container names and keeps that container: the state a container start
+        // that outran a signal teardown's first pass leaves behind.
+        block_on(docker.remove_network(&name)).unwrap_or_else(|error| {
+            panic!("cannot remove the test network {name} under its created container: {error}")
+        });
+        let kept = block_on(docker.inspect_container(&created, None::<InspectContainerOptions>))
+            .unwrap_or_else(|error| {
+                panic!("the created container {created} went with its network {name}: {error}")
+            });
+        assert_eq!(
+            kept.state.and_then(|state| state.status),
+            Some(ContainerStateStatusEnum::CREATED),
+            "the container {created} on {name} is not merely created"
+        );
+
+        let mut left = BTreeSet::from([name.clone()]);
+        block_on(sweep_networks(&mut left));
+        assert!(left.is_empty(), "the sweep kept {left:?} as not torn down");
+        let swept = block_on(docker.inspect_container(&created, None::<InspectContainerOptions>));
+        assert!(
+            is_not_found(&swept),
+            "the container {created} outlived the final sweep of {name}: {swept:?}"
+        );
     }
 
     #[test]
@@ -979,5 +1827,278 @@ mod tests {
             is_not_found(&removed),
             "the stack network {name} outlived its teardown: {removed:?}"
         );
+    }
+
+    /// The test that re-executes this test binary as its own child.
+    const SIGNAL_TEST: &str = "a_signal_removes_the_live_stack_and_exits_with_its_status";
+
+    /// Set, through `Command::env`, only in that child, which then holds a
+    /// stack until a signal ends it.
+    const SIGNAL_CHILD: &str = "CARDDEMO_TESTKIT_SIGNAL_CHILD";
+
+    /// The text before the network and the container in the child's stdout
+    /// line that reports its stack.
+    const STACK_MARKER: &str = "carddemo-testkit signal child stack:";
+
+    /// How long the child holds its stack before it stops waiting for the
+    /// signal and returns, so that it never runs forever.
+    const CHILD_LIFETIME: Duration = Duration::from_secs(300);
+
+    /// How long the parent waits for the child's stack: the network's creation
+    /// and the container's start, 300 seconds each at most, plus the migrations.
+    const STACK_WAIT: Duration = Duration::from_secs(660);
+
+    /// How long the parent waits for the child to exit, which covers the
+    /// teardown's Docker calls after the signal.
+    const EXIT_WAIT: Duration = Duration::from_secs(300);
+
+    /// Interval of the parent's checks for the child's exit.
+    const EXIT_POLL: Duration = Duration::from_millis(100);
+
+    /// A run of this test binary as the child of [`SIGNAL_TEST`], holding one
+    /// stack until a signal ends it. Its `Drop` kills a child that still runs
+    /// and removes whatever is left of the stack, so a failed check leaks
+    /// nothing.
+    struct SignalChild {
+        process: Child,
+        /// The child's stdout lines, read on a thread of their own so that the
+        /// child never blocks on a full pipe.
+        lines: mpsc::Receiver<String>,
+        /// The thread that collects the child's stderr until the child exits;
+        /// `None` once [`SignalChild::finish`] has joined it.
+        stderr: Option<JoinHandle<String>>,
+        /// The child's stack network and `PostgreSQL` container, once reported.
+        stack: Option<(String, String)>,
+    }
+
+    impl SignalChild {
+        /// Starts this test binary on [`SIGNAL_TEST`] alone, as the child, with
+        /// `TESTCONTAINERS_COMMAND` unset so that its stack is not kept. The
+        /// child keeps the harness's output capture, as a normal run does, so
+        /// its teardown notice on stderr shows that the notices bypass it.
+        fn spawn() -> Self {
+            let exe = env::current_exe()
+                .unwrap_or_else(|error| panic!("cannot locate the test binary: {error}"));
+            let tests = module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, path)| path);
+            let filter = format!("{tests}::{SIGNAL_TEST}");
+            let mut process = Command::new(&exe)
+                .args([filter.as_str(), "--exact", "--test-threads=1"])
+                .env(SIGNAL_CHILD, "1")
+                .env_remove(TESTCONTAINERS_COMMAND)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|error| panic!("cannot start {}: {error}", exe.display()));
+            let stdout = process.stdout.take().expect("the child's stdout is piped");
+            let stderr = process.stderr.take().expect("the child's stderr is piped");
+            let (sender, lines) = mpsc::channel();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    // The receiver lives until the child is gone.
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            let stderr = thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let read = BufReader::new(stderr).read_to_end(&mut bytes);
+                let text = String::from_utf8_lossy(&bytes);
+                match read {
+                    Ok(_) => text.into_owned(),
+                    Err(error) => format!("{text}\n(the rest of stderr is unreadable: {error})"),
+                }
+            });
+            Self {
+                process,
+                lines,
+                stderr: Some(stderr),
+                stack: None,
+            }
+        }
+
+        /// Waits, within [`STACK_WAIT`], for the child's stack, and returns its
+        /// network and container.
+        fn stack(&mut self) -> (String, String) {
+            let deadline = Instant::now() + STACK_WAIT;
+            loop {
+                let line = match self
+                    .lines
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
+                    Ok(line) => line,
+                    Err(RecvTimeoutError::Timeout) => {
+                        panic!("the child reported no stack within {STACK_WAIT:?}")
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let (status, stderr) = self.finish();
+                        panic!("the child ended without reporting a stack ({status:?}):\n{stderr}")
+                    }
+                };
+                // The harness may print the test's name on the same line.
+                let Some((_, reported)) = line.split_once(STACK_MARKER) else {
+                    continue;
+                };
+                let mut words = reported.split_whitespace().map(str::to_owned);
+                let (Some(network), Some(container)) = (words.next(), words.next()) else {
+                    panic!("the child's stack line is malformed: {line}");
+                };
+                self.stack = Some((network.clone(), container.clone()));
+                return (network, container);
+            }
+        }
+
+        /// Sends `signal` (`TERM` or `INT`) to the child with `kill`, then
+        /// returns what [`SignalChild::finish`] does.
+        fn signal(&mut self, signal: &str) -> (Option<ExitStatus>, String) {
+            let pid = self.process.id().to_string();
+            let sent = Command::new("kill")
+                .args([format!("-{signal}").as_str(), pid.as_str()])
+                .status()
+                .unwrap_or_else(|error| panic!("cannot run kill: {error}"));
+            assert!(sent.success(), "kill -{signal} {pid} failed: {sent}");
+            self.finish()
+        }
+
+        /// Waits, within [`EXIT_WAIT`], for the child to exit, killing it if it
+        /// does not, and returns its exit status, `None` when it was killed,
+        /// with everything it wrote to stderr.
+        fn finish(&mut self) -> (Option<ExitStatus>, String) {
+            let deadline = Instant::now() + EXIT_WAIT;
+            let status = loop {
+                match self.process.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) if Instant::now() < deadline => thread::sleep(EXIT_POLL),
+                    Ok(None) => {
+                        self.kill();
+                        break None;
+                    }
+                    Err(error) => panic!("cannot wait for the child: {error}"),
+                }
+            };
+            let stderr = self.stderr.take().map_or_else(String::new, |reader| {
+                reader
+                    .join()
+                    .unwrap_or_else(|_| String::from("(the child's stderr reader panicked)"))
+            });
+            (status, stderr)
+        }
+
+        /// Kills and reaps the child, reporting a failure on stderr.
+        fn kill(&mut self) {
+            if let Err(error) = self.process.kill() {
+                eprintln!("cannot kill the child test {}: {error}", self.process.id());
+            }
+            if let Err(error) = self.process.wait() {
+                eprintln!("cannot reap the child test {}: {error}", self.process.id());
+            }
+        }
+    }
+
+    impl Drop for SignalChild {
+        fn drop(&mut self) {
+            if matches!(self.process.try_wait(), Ok(None)) {
+                self.kill();
+            }
+            let Some((network, container)) = self.stack.take() else {
+                return;
+            };
+            let docker = match docker_client() {
+                Ok(docker) => docker,
+                Err(error) => {
+                    eprintln!(
+                        "cannot reach Docker to remove the child's container {container} and \
+                         network {network}: {error}"
+                    );
+                    return;
+                }
+            };
+            block_on(async {
+                let removed = docker
+                    .remove_container(
+                        &container,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            v: true,
+                            ..RemoveContainerOptions::default()
+                        }),
+                    )
+                    .await;
+                match removed {
+                    Ok(()) => {}
+                    Err(error) if has_status(&error, &[NOT_FOUND]) => {}
+                    Err(error) => {
+                        eprintln!("cannot remove the child's container {container}: {error}");
+                    }
+                }
+                if let Err(error) = teardown_network(&docker, &network).await {
+                    eprintln!("cannot remove the child's network {network}: {error}");
+                }
+            });
+        }
+    }
+
+    /// The child's part of [`SIGNAL_TEST`]: starts a `PostgreSQL` stack,
+    /// reports its network and container on stdout, and holds it until the
+    /// signal ends the process, or at most [`CHILD_LIFETIME`].
+    fn hold_a_stack() {
+        let stack = block_on(TestStack::postgres());
+        let network = stack
+            .network
+            .as_ref()
+            .expect("a new stack owns its network")
+            .name();
+        let container = stack
+            .postgres
+            .as_ref()
+            .expect("a new stack holds its PostgreSQL container")
+            .id();
+        // Written to stdout itself, past the harness's output capture, which
+        // the child runs under as a normal run does.
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{STACK_MARKER} {network} {container}")
+            .and_then(|()| stdout.flush())
+            .unwrap_or_else(|error| panic!("cannot report the stack on stdout: {error}"));
+        drop(stdout);
+        thread::sleep(CHILD_LIFETIME);
+    }
+
+    #[test]
+    fn a_signal_removes_the_live_stack_and_exits_with_its_status() {
+        if env::var_os(SIGNAL_CHILD).is_some() {
+            hold_a_stack();
+            return;
+        }
+        let docker = docker_client()
+            .unwrap_or_else(|error| panic!("cannot reach the Docker daemon: {error}"));
+        for (signal, status) in [("TERM", 143), ("INT", 130)] {
+            let mut child = SignalChild::spawn();
+            let (network, container) = child.stack();
+            let (exited, stderr) = child.signal(signal);
+            assert_eq!(
+                exited.as_ref().and_then(ExitStatus::code),
+                Some(status),
+                "SIG{signal} did not end the child with status {status} ({exited:?}):\n{stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("SIG{signal} received")),
+                "the child did not report its SIG{signal} teardown:\n{stderr}"
+            );
+            let left =
+                block_on(docker.inspect_network(&network, None::<InspectNetworkOptions<&str>>));
+            assert!(
+                is_not_found(&left),
+                "the stack network {network} outlived SIG{signal}: {left:?}"
+            );
+            let left =
+                block_on(docker.inspect_container(&container, None::<InspectContainerOptions>));
+            assert!(
+                is_not_found(&left),
+                "the container {container} outlived SIG{signal}: {left:?}"
+            );
+        }
     }
 }

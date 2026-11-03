@@ -323,19 +323,26 @@ describe("the sign-on redirect after a 401", () => {
 
     await screen.findByRole("heading", { name: "Sign on" });
     expect(getSession()).toBeNull();
-    expect(onLocation).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        pathname: "/login",
-        state: {
-          from: expect.objectContaining({
-            pathname: "/accounts/view",
-            search: "?acct=00000000001",
-            hash: "#details",
-          }),
-        },
-      }),
-    );
-    expect(onFailure).toHaveBeenCalledOnce();
+    // The heading is in the document once its render commits, but the screens
+    // report through effects, which React may run after that, and the call's
+    // rejection settles on its own schedule; so both reports are awaited.
+    await vi.waitFor(() => {
+      expect(onLocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          pathname: "/login",
+          state: {
+            from: expect.objectContaining({
+              pathname: "/accounts/view",
+              search: "?acct=00000000001",
+              hash: "#details",
+            }),
+          },
+        }),
+      );
+    });
+    await vi.waitFor(() => {
+      expect(onFailure).toHaveBeenCalledOnce();
+    });
     expectApiError(
       onFailure.mock.calls[0]?.[0],
       401,
