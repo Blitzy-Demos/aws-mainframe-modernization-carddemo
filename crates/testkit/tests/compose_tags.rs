@@ -12,8 +12,9 @@
 // properties (image, profiles, environment, ports and volumes) and skips every other property
 // by indentation. Whatever it cannot pin to one static value fails the parse with its line
 // number rather than passing silently: a variable reference without a default, an anchor,
-// alias, merge key or tag, a block scalar or nested value where a scalar is expected, and an
-// environment entry whose value would come from the shell.
+// alias, merge key or tag, a block scalar or nested value where a scalar is expected, an
+// environment entry whose value would come from the shell, and an environment variable defined
+// twice in one service, so that no later entry can override the value an assertion reads.
 
 use std::fs;
 
@@ -105,7 +106,8 @@ impl Service {
         format!("service {} ({COMPOSE_FILE}:{})", self.name, self.line)
     }
 
-    // The value the service's environment gives `key`, if any.
+    // The value the service's environment gives `key`, if any. The parser admits each variable
+    // name once per service, so the first match is the only one.
     fn env(&self, key: &str) -> Option<&str> {
         self.environment
             .iter()
@@ -514,7 +516,9 @@ fn is_mapping_item(item: &str) -> bool {
 }
 
 // The variables of an environment value, in file order: the list form `- KEY=VALUE`, whose
-// entry may be quoted as a whole, or the mapping form `KEY: VALUE`.
+// entry may be quoted as a whole, or the mapping form `KEY: VALUE`. Each variable name must be
+// unique: where the list form repeats a name, Compose takes the later value, so a repeated name
+// fails, naming the line of its later entry, as a repeated mapping key does.
 fn environment(value: &str, nested: &[Line], line: usize) -> Result<Vec<(String, String)>, String> {
     if !value.is_empty() {
         return Err(format!(
@@ -527,19 +531,24 @@ fn environment(value: &str, nested: &[Line], line: usize) -> Result<Vec<(String,
     {
         return scalar_map("", line, nested);
     }
-    sequence(nested)?
-        .into_iter()
-        .map(|item| {
-            let entry = inline_scalar(item.text, item.nested, item.number)?;
-            let (key, value) = entry.split_once('=').ok_or_else(|| {
-                format!(
-                    "line {}: {entry} has no =VALUE, so its value would come from the shell",
-                    item.number
-                )
-            })?;
-            Ok((key.to_owned(), value.to_owned()))
-        })
-        .collect()
+    let mut variables: Vec<(String, String)> = Vec::new();
+    for item in sequence(nested)? {
+        let entry = inline_scalar(item.text, item.nested, item.number)?;
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            format!(
+                "line {}: {entry} has no =VALUE, so its value would come from the shell",
+                item.number
+            )
+        })?;
+        if variables.iter().any(|(seen, _)| seen == key) {
+            return Err(format!(
+                "line {}: variable {key} is defined twice",
+                item.number
+            ));
+        }
+        variables.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(variables)
 }
 
 // The published ports of a ports value, each as `[host_ip:][published:]target[/protocol]`:
@@ -996,6 +1005,23 @@ fn parser_rejects_values_it_cannot_pin() {
             "null value",
             "services:\n  a:\n    environment:\n      TOKEN:\n",
             4,
+        ),
+        (
+            "list variable overridden by a later entry",
+            "services:\n  web:\n    environment:\n      \
+             - CARDDEMO_API_PROXY_TARGET=http://api:8080\n      \
+             - CARDDEMO_API_PROXY_TARGET=http://127.0.0.1:8080\n",
+            5,
+        ),
+        (
+            "list variable repeated after a quoted entry",
+            "services:\n  a:\n    environment:\n      - \"KEY=a\"\n      - KEY=b\n",
+            5,
+        ),
+        (
+            "mapping variable repeated",
+            "services:\n  a:\n    environment:\n      KEY: a\n      KEY: b\n",
+            5,
         ),
         (
             "block scalar",

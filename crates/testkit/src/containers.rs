@@ -18,17 +18,30 @@
 //! they would on Docker's default bridge. Dropping the stack removes the
 //! network after the containers.
 //!
+//! The network's teardown, which also runs when a constructor panics, first
+//! force-removes every container still on the network, then the network. That
+//! covers a container whose start timed out or was cut short, which
+//! testcontainers no longer tracks and so never removes. With
+//! `TESTCONTAINERS_COMMAND=keep`, the containers are kept, as testcontainers
+//! keeps its own, and the network stays while one of them is attached.
+//!
+//! Each container gets 300 seconds to start and become ready, instead of
+//! testcontainers' default 60, and each of the stack's own Docker calls, such
+//! as the network's creation and removal, gets 300 seconds instead of bollard's
+//! default 120: a shared, busy Docker daemon can exceed both defaults.
+//!
 //! The public API names only `sqlx::PgPool`, `lapin::Connection` and standard
 //! library types. No testcontainers or `carddemo-persistence` type crosses it,
 //! because the persistence suites reach this crate through a dev-dependency
 //! cycle and would otherwise meet a second copy of every persistence type.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::env;
 use std::error::Error;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use carddemo_persistence::seed::{SeedMode, SeedSources};
 use carddemo_persistence::{Db, migrate, seed};
@@ -36,8 +49,9 @@ use lapin::{Connection, ConnectionProperties};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row, ValueRef};
 use testcontainers::bollard::Docker;
+use testcontainers::bollard::container::{ListContainersOptions, RemoveContainerOptions};
 use testcontainers::bollard::errors::Error as DockerError;
-use testcontainers::bollard::network::CreateNetworkOptions;
+use testcontainers::bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use testcontainers::core::{AccessMode, IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -109,6 +123,35 @@ const RABBITMQ_READY: &str = "Server startup complete";
 /// boot; two serve one test's traffic.
 const RABBITMQ_ERL_ARGS: &str = "+S 2:2";
 
+/// Start budget of each test container: testcontainers' startup timeout, which
+/// bounds `docker start` plus the image's readiness wait, but not the create
+/// or image pull before them. testcontainers' default, 60 seconds, is shorter
+/// than a shared, busy Docker daemon can take for that. When the budget runs
+/// out, testcontainers keeps no handle on the container it created, and the
+/// stack network's teardown removes it.
+const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Client timeout of the stack's own Docker API calls: creating and removing
+/// its network, and removing the containers left on it. bollard's default, 120
+/// seconds, is shorter than a shared, busy Docker daemon can take for them,
+/// and the daemon still completes a call its client gave up on: a network it
+/// creates after that has no guard to remove it.
+const DOCKER_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The environment variable through which testcontainers decides whether the
+/// containers it started are removed when dropped.
+const TESTCONTAINERS_COMMAND: &str = "TESTCONTAINERS_COMMAND";
+
+/// The [`TESTCONTAINERS_COMMAND`] value with which testcontainers keeps them.
+const KEEP_COMMAND: &str = "keep";
+
+/// Docker API status of a container or network that does not exist.
+const NOT_FOUND: u16 = 404;
+
+/// Docker API status of a container removal that another one, such as
+/// testcontainers' own drop, already has in progress.
+const CONFLICT: u16 = 409;
+
 /// Connections of a stack's pool: enough for a test and the consumers or
 /// handlers it drives, while many stacks run side by side.
 const POOL_MAX_CONNECTIONS: u32 = 5;
@@ -140,8 +183,9 @@ static NETWORK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// stack's own bridge network, so their published ports listen on `127.0.0.1`
 /// only.
 ///
-/// Dropping the stack removes its containers and then its network. That works
-/// in a plain `#[test]` after [`crate::block_on`], inside `block_on`, and in a
+/// Dropping the stack removes its containers, force-removes any other
+/// container still on its network, and then removes the network. That works in
+/// a plain `#[test]` after [`crate::block_on`], inside `block_on`, and in a
 /// `#[tokio::test]` of either runtime flavour.
 pub struct TestStack {
     pool: PgPool,
@@ -185,9 +229,10 @@ impl TestStack {
     ///
     /// Panics, naming the network, the image, the URL or the error, if Docker is
     /// unavailable, the stack network cannot be created, the container does not
-    /// start or become ready, its port cannot be looked up, the pool cannot
-    /// connect, or a migration fails. As the panic unwinds, a container already
-    /// started is removed, then the stack network.
+    /// start and become ready within 300 seconds, its port cannot be looked up,
+    /// the pool cannot connect, or a migration fails. As the panic unwinds,
+    /// every container on the stack network, one whose start failed included,
+    /// is force-removed, then the network.
     pub async fn postgres() -> Self {
         // Created before any container, so that on a panic the containers,
         // dropped first, are gone when the network is removed.
@@ -231,8 +276,8 @@ impl TestStack {
     ///
     /// Panics in every case [`TestStack::postgres`] does, if either mounted
     /// file is missing (checked before any Docker network or container is
-    /// created) or its path is not UTF-8, or if the broker does not start or
-    /// become ready or its AMQP port cannot be looked up.
+    /// created) or its path is not UTF-8, or if the broker does not start and
+    /// become ready within 300 seconds or its AMQP port cannot be looked up.
     pub async fn with_rabbitmq() -> Self {
         let definitions = mount_source(RABBITMQ_DEFINITIONS_SOURCE);
         let conf = mount_source(RABBITMQ_CONF_SOURCE);
@@ -370,7 +415,10 @@ impl TestStack {
 ///
 /// The network exists before testcontainers sees its name, so testcontainers
 /// treats it as created elsewhere and never removes it; this guard's `Drop`
-/// does.
+/// does. Before that, unless `TESTCONTAINERS_COMMAND` is `keep`, it
+/// force-removes every container still on the network: one that testcontainers
+/// lost track of, because its start timed out or its drop was cut short, would
+/// otherwise outlive the stack and keep the network from being removed.
 struct StackNetwork {
     name: String,
 }
@@ -407,7 +455,7 @@ impl StackNetwork {
 
 impl Drop for StackNetwork {
     fn drop(&mut self) {
-        // Removal is a Docker API call, which needs a tokio runtime. Inside a
+        // Removal takes Docker API calls, which need a tokio runtime. Inside a
         // runtime, as in `block_on` or a `#[tokio::test]` of either flavour, a
         // nested `block_on` panics, so a thread of its own, with its own
         // current-thread runtime and client, runs it alike in every context,
@@ -443,7 +491,7 @@ impl Drop for StackNetwork {
 /// Returns the error if the Docker daemon cannot be reached or refuses the
 /// network, for example because one of that name exists.
 async fn create_network(name: &str) -> Result<(), DockerError> {
-    Docker::connect_with_defaults()?
+    docker_client()?
         .create_network(CreateNetworkOptions {
             name,
             check_duplicate: true,
@@ -459,15 +507,132 @@ async fn create_network(name: &str) -> Result<(), DockerError> {
 /// Removes the Docker network `name` through a client and a current-thread
 /// runtime of its own, for [`StackNetwork`]'s `Drop`.
 ///
+/// Before the network, it force-removes every container still on it, through
+/// [`remove_stack_containers`], unless `TESTCONTAINERS_COMMAND` is `keep`.
+/// Then the containers are kept, as testcontainers keeps its own, and the
+/// network stays while one of them is attached.
+///
 /// # Errors
 ///
 /// Returns the error if the runtime cannot be built, the Docker daemon cannot
-/// be reached, or it refuses the removal, for example because a container kept
-/// by `TESTCONTAINERS_COMMAND=keep` is still attached.
+/// be reached, or it refuses to remove the network, for example because a
+/// container kept by `TESTCONTAINERS_COMMAND=keep`, or one that could not be
+/// removed, is still attached. A container that could not be looked up or
+/// removed is reported on stderr instead.
 fn remove_network(name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(async { Docker::connect_with_defaults()?.remove_network(name).await })?;
+    runtime.block_on(async {
+        let docker = docker_client()?;
+        if !keeps_containers() {
+            remove_stack_containers(&docker, name).await;
+        }
+        docker.remove_network(name).await
+    })?;
     Ok(())
+}
+
+/// A Docker client for the stack's own API calls, on the daemon `DOCKER_HOST`
+/// names (the local socket by default), with [`DOCKER_CALL_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns the error if no client can be configured, for example because
+/// `DOCKER_HOST` names an unsupported scheme.
+fn docker_client() -> Result<Docker, DockerError> {
+    Ok(Docker::connect_with_defaults()?.with_timeout(DOCKER_CALL_TIMEOUT))
+}
+
+/// Whether testcontainers keeps the containers it starts instead of removing
+/// them on drop, as it does when [`TESTCONTAINERS_COMMAND`] is
+/// [`KEEP_COMMAND`].
+fn keeps_containers() -> bool {
+    env::var_os(TESTCONTAINERS_COMMAND).is_some_and(|command| command == KEEP_COMMAND)
+}
+
+/// Force-removes, with their anonymous volumes, the containers on the stack
+/// network `name`, for [`remove_network`]. They are the containers attached to
+/// it, which Docker requires gone before it removes the network, and those
+/// created on it but never started, which a start that timed out leaves
+/// behind. After a failed or cut-short start testcontainers keeps no handle on
+/// such a container, so nothing else removes it. The network's name is unique
+/// to its stack, so no other container is touched.
+///
+/// A container that is already gone, or whose removal is already in progress,
+/// as testcontainers' own drop may have it, counts as removed. A lookup or a
+/// removal that fails is reported on stderr, with the command that finishes
+/// the job, and the network's removal is still attempted.
+async fn remove_stack_containers(docker: &Docker, name: &str) {
+    let (attached, listed) = tokio::join!(
+        docker.inspect_network(name, None::<InspectNetworkOptions<&str>>),
+        docker.list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: HashMap::from([("network", vec![name])]),
+            ..ListContainersOptions::default()
+        })),
+    );
+    let mut ids = BTreeSet::new();
+    match attached {
+        Ok(network) => ids.extend(network.containers.unwrap_or_default().into_keys()),
+        // A network that is gone has no container attached.
+        Err(error) if has_status(&error, &[NOT_FOUND]) => {}
+        Err(error) => warn_unlisted(name, &error),
+    }
+    match listed {
+        // Docker's `network` filter also matches a prefix of a network ID, so
+        // only a container that names this network is kept.
+        Ok(containers) => ids.extend(
+            containers
+                .into_iter()
+                .filter(|container| {
+                    container
+                        .network_settings
+                        .as_ref()
+                        .and_then(|settings| settings.networks.as_ref())
+                        .is_some_and(|networks| networks.contains_key(name))
+                })
+                .filter_map(|container| container.id),
+        ),
+        Err(error) => warn_unlisted(name, &error),
+    }
+    for id in ids {
+        let removal = docker
+            .remove_container(
+                &id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..RemoveContainerOptions::default()
+                }),
+            )
+            .await;
+        match removal {
+            Ok(()) => {}
+            Err(error) if has_status(&error, &[NOT_FOUND, CONFLICT]) => {}
+            Err(error) => eprintln!(
+                "warning: carddemo-testkit left the Docker container {id} of the network \
+                 {name} behind (remove it with `docker rm -f -v {id}`): {error}"
+            ),
+        }
+    }
+}
+
+/// Reports that the containers on the stack network `name` could not be looked
+/// up, so any of them may outlive the stack.
+fn warn_unlisted(name: &str, error: &DockerError) {
+    eprintln!(
+        "warning: carddemo-testkit cannot look up the containers on the Docker network \
+         {name}, so any of them may be left behind (list them with \
+         `docker ps -a --filter network={name}`): {error}"
+    );
+}
+
+/// Whether `error` is a Docker API response with one of `statuses`.
+fn has_status(error: &DockerError, statuses: &[u16]) -> bool {
+    matches!(
+        error,
+        DockerError::DockerResponseServerError { status_code, .. }
+            if statuses.contains(status_code)
+    )
 }
 
 /// Starts the `PostgreSQL` container on `network`, connects a pool and migrates
@@ -479,6 +644,7 @@ async fn start_postgres(network: &str) -> (ContainerAsync<Postgres>, String, PgP
         .with_password(POSTGRES_PASSWORD)
         .with_tag(POSTGRES_TAG)
         .with_network(network)
+        .with_startup_timeout(CONTAINER_START_TIMEOUT)
         .start()
         .await
         .unwrap_or_else(|error| {
@@ -525,6 +691,7 @@ async fn start_rabbitmq(
         )
         .with_env_var("RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS", RABBITMQ_ERL_ARGS)
         .with_network(network)
+        .with_startup_timeout(CONTAINER_START_TIMEOUT)
         .start()
         .await
         .unwrap_or_else(|error| {
@@ -584,12 +751,25 @@ fn text_value(row: &PgRow, index: usize, sql: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use testcontainers::bollard::Docker;
-    use testcontainers::bollard::container::InspectContainerOptions;
-    use testcontainers::bollard::errors::Error as DockerError;
-    use testcontainers::bollard::network::InspectNetworkOptions;
+    use std::collections::HashMap;
+    use std::time::Duration;
 
-    use super::{AMQP_PORT, POSTGRES_PORT, TestStack};
+    use testcontainers::bollard::Docker;
+    use testcontainers::bollard::container::{
+        Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
+        StartContainerOptions,
+    };
+    use testcontainers::bollard::errors::Error as DockerError;
+    use testcontainers::bollard::models::HostConfig;
+    use testcontainers::bollard::network::InspectNetworkOptions;
+    use testcontainers::core::error::WaitContainerError;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{GenericImage, ImageExt, TestcontainersError};
+
+    use super::{
+        AMQP_PORT, POSTGRES_IMAGE, POSTGRES_PORT, POSTGRES_TAG, StackNetwork, TestStack,
+        docker_client,
+    };
     use crate::block_on;
 
     /// The only host address a stack's containers may publish on. Written out
@@ -687,6 +867,117 @@ mod tests {
                 })
             ),
             "the stack network {network} outlived the stack: {removed:?}"
+        );
+    }
+
+    /// Whether `result` is the Docker API's answer for a container or network
+    /// that does not exist.
+    fn is_not_found<T>(result: &Result<T, DockerError>) -> bool {
+        matches!(
+            result,
+            Err(DockerError::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })
+        )
+    }
+
+    /// The IDs of the containers, in any state, that Docker lists on `network`.
+    fn containers_on(docker: &Docker, network: &str) -> Vec<String> {
+        let listed = block_on(docker.list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: HashMap::from([("network", vec![network])]),
+            ..ListContainersOptions::default()
+        })))
+        .unwrap_or_else(|error| panic!("cannot list the containers on {network}: {error}"));
+        listed
+            .into_iter()
+            .filter_map(|container| container.id)
+            .collect()
+    }
+
+    /// Starts a container on `network` through the Docker API alone, so that no
+    /// testcontainers handle removes it, as after a drop cut short, and returns
+    /// its ID. It keeps running, so it holds an endpoint on the network.
+    async fn start_untracked(docker: &Docker, network: &str) -> String {
+        let created = docker
+            .create_container(
+                None::<CreateContainerOptions<String>>,
+                Config {
+                    image: Some(format!("{POSTGRES_IMAGE}:{POSTGRES_TAG}")),
+                    cmd: Some(vec![String::from("sleep"), String::from("infinity")]),
+                    host_config: Some(HostConfig {
+                        network_mode: Some(network.to_owned()),
+                        ..HostConfig::default()
+                    }),
+                    ..Config::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("cannot create a container on {network}: {error}"));
+        docker
+            .start_container(&created.id, None::<StartContainerOptions<String>>)
+            .await
+            .unwrap_or_else(|error| panic!("cannot start the container {}: {error}", created.id));
+        created.id
+    }
+
+    #[test]
+    fn network_teardown_removes_the_containers_left_on_it() {
+        let docker = docker_client()
+            .unwrap_or_else(|error| panic!("cannot reach the Docker daemon: {error}"));
+        // Created first, so that a panic below still sweeps the network.
+        let network = block_on(StackNetwork::create());
+        let name = network.name().to_owned();
+
+        // A start budget of zero runs out before `docker start` answers, so
+        // testcontainers fails as on a saturated daemon: after creating the
+        // container, and without a handle that would remove it.
+        let failed = block_on(
+            GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
+                .with_network(name.as_str())
+                .with_startup_timeout(Duration::ZERO)
+                .start(),
+        );
+        assert!(
+            matches!(
+                failed,
+                Err(TestcontainersError::WaitContainer(
+                    WaitContainerError::StartupTimeout
+                ))
+            ),
+            "a zero start budget did not time out: {failed:?}"
+        );
+        let running = block_on(start_untracked(&docker, &name));
+        let attached = block_on(docker.inspect_network(&name, None::<InspectNetworkOptions<&str>>))
+            .unwrap_or_else(|error| panic!("cannot inspect the stack network {name}: {error}"));
+        assert!(
+            attached
+                .containers
+                .unwrap_or_default()
+                .contains_key(&running),
+            "the running container {running} is not attached to {name}"
+        );
+        let left = containers_on(&docker, &name);
+        assert_eq!(
+            left.len(),
+            2,
+            "{name} should hold the failed start's container and {running}: {left:?}"
+        );
+        assert!(left.contains(&running), "{running} is not listed on {name}");
+
+        drop(network);
+        for id in &left {
+            let inspected = block_on(docker.inspect_container(id, None::<InspectContainerOptions>));
+            assert!(
+                is_not_found(&inspected),
+                "the container {id} outlived the stack network {name}: {inspected:?}"
+            );
+        }
+        let removed = block_on(docker.inspect_network(&name, None::<InspectNetworkOptions<&str>>));
+        assert!(
+            is_not_found(&removed),
+            "the stack network {name} outlived its teardown: {removed:?}"
         );
     }
 }
