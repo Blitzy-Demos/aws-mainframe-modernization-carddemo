@@ -61,7 +61,8 @@
 //! | `blank` | Any other key not entered: empty, spaces, `*` or `LOW-VALUES` |
 //! | `invalid` | Any other key: not 11 digits, or all zeros |
 //!
-//! `outcome` is recorded once the unit of work has ended:
+//! `outcome` is recorded once the unit of work has ended, or when the request
+//! is dropped before its answer:
 //!
 //! | `outcome` | Meaning |
 //! |---|---|
@@ -70,6 +71,7 @@
 //! | `failed` | A 5xx answer with nothing written: a failed read, no unit of work, or an input class held at `halt`; any unit of work was rolled back |
 //! | `committed` | The update's writes ran and committed; the status tells whether they all succeeded |
 //! | `rolled_back` | The commit failed, so the server discarded the update's writes |
+//! | `cancelled` | The request was dropped before its answer, its client gone: an open unit of work is rolled back as it is dropped, unless its commit had already reached the server |
 
 use axum::Json;
 use axum::extract::State;
@@ -197,6 +199,13 @@ pub async fn get_account(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<AccountResponse>, ApiError> {
+    crate::cancellable(Span::current(), view(&state, id)).await
+}
+
+/// The `GET /accounts/{id}` answer for the `{id}` segment `id`, run in the
+/// handler span of [`get_account`], on which it records the key and the
+/// `outcome`.
+async fn view(state: &AppState, id: String) -> Result<Json<AccountResponse>, ApiError> {
     record_key(span_key(&id, &account_view::edit_account_id(Some(&id))));
     let key = state.version_key();
     let mut uow = state.db().begin().await.map_err(rejected)?;
@@ -305,6 +314,24 @@ pub async fn update_account(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<String>,
     ApiJson(body): ApiJson<AccountUpdateRequest>,
+) -> Result<Json<AccountUpdateResponse>, ApiError> {
+    // Boxed: the update's future, which holds the fetched records and the
+    // validated changes across its awaits, is above clippy's `large_futures`
+    // bound, so it lives on the heap rather than inline in this one.
+    Box::pin(crate::cancellable(
+        Span::current(),
+        update(&state, id, body),
+    ))
+    .await
+}
+
+/// The `PUT /accounts/{id}` answer for the `{id}` segment `id` and `body`,
+/// run in the handler span of [`update_account`], on which it records the key
+/// and the `outcome`.
+async fn update(
+    state: &AppState,
+    id: String,
+    body: AccountUpdateRequest,
 ) -> Result<Json<AccountUpdateResponse>, ApiError> {
     record_key(update_span_key(&id));
     body.check(&id).map_err(rejected)?;

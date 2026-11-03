@@ -100,7 +100,9 @@ type PaymentAnswer = Result<(StatusCode, Json<PaymentResponse>), ApiError>;
 /// `transaction = "CB00"`, `user_id`, `account_id`, `tran_id` and `outcome`
 /// (`prompted`, `committed`, `rolled_back`, `rejected` for a 4xx answer before
 /// any write or `failed` for a 5xx one), the last recorded once the unit of
-/// work is committed or rolled back.
+/// work is committed or rolled back. A request dropped before its answer,
+/// its client gone, records `cancelled`: an open unit of work is rolled back
+/// as it is dropped, unless its commit had already reached the server.
 ///
 /// # Errors
 ///
@@ -156,7 +158,7 @@ pub async fn create_payment(
         tran_id = Empty,
         outcome = Empty,
     );
-    process(&state, body).instrument(span).await
+    crate::cancellable(span.clone(), process(&state, body).instrument(span)).await
 }
 
 /// COBIL00C PROCESS-ENTER-KEY up to the confirmation — P-COBIL00C-004 to

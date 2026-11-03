@@ -21,9 +21,11 @@
 //!
 //! Each request reads inside one unit of work that is rolled back, since it
 //! changes nothing, and records one handler span with `transaction`
-//! (`REWARDS`), `user_id`, `account_id` and `outcome` (AAP 0.6.2).
-//! `account_id` is the parsed 11-digit key, recorded once the path text
-//! parses. Path text that does not parse is never recorded, as it may hold
+//! (`REWARDS`), `user_id`, `account_id` and `outcome` (AAP 0.6.2): `ok`, the
+//! error body's `code`, or `cancelled` for a request dropped before its
+//! answer, its client gone, whose open unit of work is rolled back as it is
+//! dropped. `account_id` is the parsed 11-digit key, recorded once the path
+//! text parses. Path text that does not parse is never recorded, as it may hold
 //! anything a caller typed: the span records only `account_id_rejected`, the
 //! parse error's fixed text, and `account_id_len`, the text's length in
 //! bytes. A history request with a malformed `start_key` is answered before
@@ -214,9 +216,11 @@ pub async fn get_reward_balance(
         account_id_len = tracing::field::Empty,
         outcome = tracing::field::Empty,
     );
-    let result = read_balance(&state, &account_id)
-        .instrument(span.clone())
-        .await;
+    let result = crate::cancellable(
+        span.clone(),
+        read_balance(&state, &account_id).instrument(span.clone()),
+    )
+    .await;
     span.record("outcome", outcome_of(&result));
     result.map(|balance| Json(RewardBalanceResponse::from(&balance)))
 }
@@ -275,11 +279,14 @@ pub async fn get_reward_history(
         outcome = tracing::field::Empty,
     );
     let rows = query.page_size.map_or(HISTORY_PAGE_ROWS, PageSize::get);
-    let result = async {
-        let start = query.start_accrual_id()?;
-        read_history(&state, &account_id, start, rows).await
-    }
-    .instrument(span.clone())
+    let result = crate::cancellable(
+        span.clone(),
+        async {
+            let start = query.start_accrual_id()?;
+            read_history(&state, &account_id, start, rows).await
+        }
+        .instrument(span.clone()),
+    )
     .await;
     span.record("outcome", outcome_of(&result));
     result.map(Json)

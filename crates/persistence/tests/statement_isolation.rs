@@ -17,21 +17,34 @@
 //!    failed `ACCTDAT` read (V-COACTVWC-006);
 //! 4. commits, after which the write must be visible.
 //!
-//! The rename is undone before the next case. The test starts its own
+//! A second test hides `card_xref` to prove which CT00 statements read it.
+//! `COTRN00C` browses only `TRANSACT` [app/cbl/COTRN00C.cbl:L206-360], and
+//! parity is measured on the unfiltered browse (E-17), so every unfiltered
+//! statement of `TransactionReader::browse_transactions` (forward from
+//! `LOW-VALUES`, backward from a key, backward from `HIGH-VALUES`) and
+//! `highest_transaction` must answer from `transaction_master` alone, while
+//! the statement of each shape with the added `account_id` filter must fail
+//! with `42P01`, because it reads `card_xref`. With the table restored, each
+//! filtered statement must keep only the account's rows, the rows it drops not
+//! counting against the page size.
+//!
+//! Each rename is undone before the next case. Each test starts its own
 //! container through `carddemo_testkit::TestStack`, so it needs a running
 //! Docker daemon (AAP 0.10.4). Hiding and restoring a table, and reading the
-//! committed row, go through the stack's text-typed SQL helpers, so the test
-//! adds no compile-time query.
+//! committed row, go through the stack's text-typed SQL helpers, and live rows
+//! are written through the `TransactionWriter` port, so the tests add no
+//! compile-time query.
 
-use carddemo_domain::entities::{DisclosureGroupKey, TranCatBalanceKey};
+use carddemo_domain::entities::{DisclosureGroupKey, NewTransaction, TranCatBalanceKey};
 use carddemo_domain::numeric::{
-    AccountGroupId, AccountId, Alnum, AuthId, CardNumber, CustomerId, TranCategoryCode, TranId,
-    TranTypeCode, UserId,
+    AccountGroupId, AccountId, Alnum, AuthId, CardNumber, CustomerId, MerchantId, Money,
+    TranCategoryCode, TranId, TranTypeCode, UserId,
 };
 use carddemo_domain::ports::{
     AccountReader, AccountWriter, AuthorizationStore, Browse, CardReader, CustomerReader,
     CustomerWriter, Direction, DisclosureGroupReader, PortError, PortResult, TranCatBalanceStore,
-    TranTypeFileReader, TranTypeMasterStore, TransactionReader, UserStore, XrefReader,
+    TranTypeFileReader, TranTypeMasterStore, TransactionReader, TransactionWriter, UserStore,
+    XrefReader,
 };
 use carddemo_domain::rewards::RewardStore;
 use carddemo_persistence::seed::{self, SeedMode, SeedSources};
@@ -403,5 +416,186 @@ fn a_failed_read_leaves_the_unit_of_work_usable_and_its_earlier_write_committed(
         for case in &CASES {
             run_case(&stack, &db, case).await;
         }
+    });
+}
+
+/// The card the cross-reference maps to account 50
+/// [app/data/ASCII/cardxref.txt:L1].
+const ACCOUNT_50_CARD: &str = "0500024453765740";
+
+/// The test-only rename that hides `card_xref` from the CT00 browse.
+const HIDE_XREF: &str = "ALTER TABLE card_xref RENAME TO card_xref_hidden";
+
+/// The rename that restores it.
+const RESTORE_XREF: &str = "ALTER TABLE card_xref_hidden RENAME TO card_xref";
+
+/// `TRAN-ORIG-TS` and `TRAN-PROC-TS` of the live rows: the 26 characters of
+/// `X(26)` [app/cpy/CVTRA05Y.cpy:L16-17].
+const LIVE_TIMESTAMP: &str = "2022-07-01 12:00:00.000000";
+
+/// The live master of the CT00 browse test in TRAN-ID order, each TRAN-ID with
+/// its card. The cards alternate between account 1 and account 50, so every
+/// page filtered to account 1 skips a row of account 50.
+const LIVE_ROWS: [(&str, &str); 5] = [
+    ("0000000000000001", ACCOUNT_1_CARD),
+    ("0000000000000002", ACCOUNT_50_CARD),
+    ("0000000000000003", ACCOUNT_1_CARD),
+    ("0000000000000004", ACCOUNT_50_CARD),
+    ("0000000000000005", ACCOUNT_1_CARD),
+];
+
+/// The page size of the CT00 browse cases: fewer rows than account 1 holds,
+/// so a filter applied after the limit would give a short page.
+const BROWSE_PAGE: u16 = 2;
+
+/// One statement shape of the CT00 browse, with the TRAN-IDs of its page
+/// unfiltered and filtered to account 1.
+#[derive(Debug)]
+struct Shape {
+    start: Option<&'static str>,
+    direction: Direction,
+    unfiltered: [&'static str; 2],
+    filtered: [&'static str; 2],
+}
+
+/// The three starts `browse_transactions` has a statement pair for: forward
+/// from `LOW-VALUES`, backward from a key, and backward from `HIGH-VALUES`.
+const SHAPES: [Shape; 3] = [
+    Shape {
+        start: None,
+        direction: Direction::Forward,
+        unfiltered: ["0000000000000001", "0000000000000002"],
+        filtered: ["0000000000000001", "0000000000000003"],
+    },
+    Shape {
+        start: Some("0000000000000004"),
+        direction: Direction::Backward,
+        unfiltered: ["0000000000000004", "0000000000000003"],
+        filtered: ["0000000000000003", "0000000000000001"],
+    },
+    Shape {
+        start: None,
+        direction: Direction::Backward,
+        unfiltered: ["0000000000000005", "0000000000000004"],
+        filtered: ["0000000000000005", "0000000000000003"],
+    },
+];
+
+/// A `CVTRA05Y` record [app/cpy/CVTRA05Y.cpy:L4-18] with the TRAN-ID
+/// `tran_id` on the card `card`.
+fn live_record(tran_id: &str, card: &str) -> NewTransaction {
+    NewTransaction {
+        tran_id: TranId::move_from(tran_id),
+        tran_type_cd: TranTypeCode::move_from("01"),
+        tran_cat_cd: category(1),
+        tran_source: Alnum::move_from("POS TERM"),
+        tran_desc: Alnum::move_from("CT00 browse test purchase"),
+        tran_amt: Money::from_cents(1_000).expect("an S9(09)V99 amount"),
+        tran_merchant_id: MerchantId::new(800_000_001).expect("a 9(09) merchant ID"),
+        tran_merchant_name: Alnum::move_from("CT00 Browse Test Merchant"),
+        tran_merchant_city: Alnum::move_from("Seattle"),
+        tran_merchant_zip: Alnum::move_from("98101"),
+        tran_card_num: CardNumber::move_from(card),
+        tran_orig_ts: Alnum::move_from(LIVE_TIMESTAMP),
+        tran_proc_ts: Alnum::move_from(LIVE_TIMESTAMP),
+    }
+}
+
+/// Writes [`LIVE_ROWS`] as live rows in one unit of work and commits it: the
+/// seed leaves the transaction master empty (E-07).
+async fn write_live_rows(db: &Db) {
+    let mut uow = db.begin().await.expect("a unit of work");
+    for (tran_id, card) in LIVE_ROWS {
+        uow.store()
+            .write_transaction(live_record(tran_id, card))
+            .await
+            .unwrap_or_else(|error| panic!("{tran_id}: the live insert failed: {error}"));
+    }
+    uow.commit().await.expect("the live rows commit");
+}
+
+/// The TRAN-IDs of the page `shape` gives in `uow`, filtered to `account_id`.
+async fn browse_ids(
+    uow: &mut UnitOfWork,
+    shape: &Shape,
+    account_id: Option<AccountId>,
+) -> PortResult<Vec<String>> {
+    let browse = Browse {
+        start_key: shape.start.map(TranId::move_from),
+        direction: shape.direction,
+        limit: BROWSE_PAGE,
+    };
+    let rows = uow.store().browse_transactions(browse, account_id).await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.tran_id.trimmed().into_owned())
+        .collect())
+}
+
+#[test]
+fn the_unfiltered_ct00_browse_reads_only_the_master_and_the_account_filter_reads_card_xref() {
+    // Prepared on the test thread, outside every runtime, as the first test prepares it.
+    let prepared = seed::prepare(
+        SeedMode::Full,
+        &SeedSources::with_defaults(&fixtures::repo_root()),
+    );
+    block_on(async {
+        let stack = TestStack::postgres().await;
+        let db = Db::from_pool(stack.pool().clone());
+        seed::run(&db, prepared)
+            .await
+            .expect("the fixture seed loads");
+        write_live_rows(&db).await;
+
+        stack.exec_sql(HIDE_XREF).await;
+        let mut uow = db.begin().await.expect("a unit of work");
+        for shape in &SHAPES {
+            let ids = browse_ids(&mut uow, shape, None)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{shape:?}: the unfiltered browse failed without card_xref: {error}")
+                });
+            assert_eq!(ids, shape.unfiltered, "{shape:?}: the unfiltered page");
+            match browse_ids(&mut uow, shape, Some(account(1))).await {
+                Err(PortError::Unavailable(text)) => assert!(
+                    text.contains(UNDEFINED_TABLE),
+                    "{shape:?}: the filtered failure does not name {UNDEFINED_TABLE}: {text}"
+                ),
+                other => panic!(
+                    "{shape:?}: expected the filtered browse to fail with {UNDEFINED_TABLE}, \
+                     got {other:?}"
+                ),
+            }
+        }
+        let highest = uow
+            .store()
+            .highest_transaction()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the highest-key read failed without card_xref: {error}")
+            });
+        assert_eq!(
+            highest.map(|row| row.tran_id.trimmed().into_owned()),
+            Some(LIVE_ROWS[4].0.to_owned()),
+            "the highest-key read"
+        );
+        uow.rollback()
+            .await
+            .expect("the read-only unit of work ends");
+        stack.exec_sql(RESTORE_XREF).await;
+
+        let mut uow = db.begin().await.expect("a unit of work");
+        for shape in &SHAPES {
+            let ids = browse_ids(&mut uow, shape, Some(account(1)))
+                .await
+                .unwrap_or_else(|error| panic!("{shape:?}: the filtered browse failed: {error}"));
+            assert_eq!(
+                ids, shape.filtered,
+                "{shape:?}: the page filtered to account 1"
+            );
+        }
+        uow.rollback()
+            .await
+            .expect("the read-only unit of work ends");
     });
 }

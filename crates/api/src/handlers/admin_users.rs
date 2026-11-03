@@ -175,12 +175,13 @@ fn record_new_user_id(span: &Span, user_id: Option<&str>) {
 }
 
 /// Runs `work` inside `span` and records its `outcome`: the success label the
-/// work returns, or the error body's `code` (for example `NOT_FOUND`).
+/// work returns, or the error body's `code` (for example `NOT_FOUND`), or
+/// `cancelled` when the request is dropped before `work` completes.
 async fn traced<T>(
     span: &Span,
     work: impl Future<Output = Result<(T, &'static str), ApiError>>,
 ) -> Result<T, ApiError> {
-    match work.instrument(span.clone()).await {
+    match crate::cancellable(span.clone(), work.instrument(span.clone())).await {
         Ok((response, outcome)) => {
             span.record("outcome", outcome);
             Ok(response)

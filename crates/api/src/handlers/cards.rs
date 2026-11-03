@@ -34,7 +34,9 @@
 //! `CCUP`), the caller's `user_id`, the keys of the request and the `outcome`
 //! recorded once the unit of work has ended: `ok` for an answered read,
 //! `committed` for an update, `rejected` for a 4xx answer and `failed` for a
-//! 5xx one.
+//! 5xx one. A request dropped before its answer, its client gone, records
+//! `cancelled`: an open unit of work is rolled back as it is dropped, unless
+//! its commit had already reached the server.
 //!
 //! The account and card numbers reach the span only through their key edits,
 //! which the handler applies before anything else and the rule applies again:
@@ -239,7 +241,11 @@ pub async fn list_cards(
     ApiQuery(filters): ApiQuery<CardListQuery>,
     ApiQuery(page): ApiQuery<CardListPageQuery>,
 ) -> Result<Json<Page<CardSummary>>, ApiError> {
-    finish(list(&state, filters, page).await, OUTCOME_OK).map(Json)
+    finish(
+        crate::cancellable(Span::current(), list(&state, filters, page)).await,
+        OUTCOME_OK,
+    )
+    .map(Json)
 }
 
 /// COCRDSLC 2000-PROCESS-INPUTS, 9000-READ-DATA, 1200-SETUP-SCREEN-VARS,
@@ -304,7 +310,11 @@ pub async fn get_card(
     ApiPath(card_number): ApiPath<String>,
     ApiQuery(query): ApiQuery<CardViewQuery>,
 ) -> Result<Json<CardResponse>, ApiError> {
-    finish(view(&state, card_number, query).await, OUTCOME_OK).map(Json)
+    finish(
+        crate::cancellable(Span::current(), view(&state, card_number, query)).await,
+        OUTCOME_OK,
+    )
+    .map(Json)
 }
 
 /// COCRDUPC 1200-EDIT-MAP-INPUTS, 2000-DECIDE-ACTION, 9000-READ-DATA,
@@ -382,7 +392,11 @@ pub async fn update_card(
     ApiPath(card_number): ApiPath<String>,
     ApiJson(body): ApiJson<CardUpdateRequest>,
 ) -> Result<Json<CardUpdateResponse>, ApiError> {
-    finish(update(&state, card_number, body).await, OUTCOME_COMMITTED).map(Json)
+    finish(
+        crate::cancellable(Span::current(), update(&state, card_number, body)).await,
+        OUTCOME_COMMITTED,
+    )
+    .map(Json)
 }
 
 /// The `GET /cards` page for `filters` and `page`, read in a unit of work

@@ -93,7 +93,9 @@ use tracing::{Level, Span};
 /// `request_span` with the method, the matched route template and the HTTP
 /// version, and, when the response is ready, a `finished processing request`
 /// event with the status and latency. The handler spans, with `transaction`,
-/// `user_id`, the resource keys and `outcome`, open inside it. A request an
+/// `user_id`, the resource keys and `outcome`, open inside it. A handler
+/// whose request is dropped before it answers, its client having gone away,
+/// records `cancelled` as its `outcome` through `cancellable`. A request an
 /// extractor refuses, with 401, 403, or 400 for a body, query or path that
 /// does not deserialize, never reaches its handler, so the request span
 /// records the handler's `transaction` and `outcome` itself, through
@@ -267,6 +269,52 @@ fn record_unanswered(
     span.record("outcome", outcome);
 }
 
+/// The `outcome` of a request dropped before its handler answered: its client
+/// went away, for example by giving up waiting, and the server dropped the
+/// handler's future.
+const OUTCOME_CANCELLED: &str = "cancelled";
+
+/// Awaits `work`, the work of the handler whose span is `span`, and records
+/// [`OUTCOME_CANCELLED`] as `outcome` on `span` when this future is dropped
+/// before `work` completes.
+///
+/// The client abandoned the request before the handler answered: hyper drops
+/// the future of a request whose connection closes, so the handler stops at
+/// the await it had reached and never records an outcome of its own. A unit
+/// of work open at that point is rolled back as it is dropped, sqlx queueing
+/// the `ROLLBACK` on its connection, unless its `COMMIT` had already reached
+/// the server. The word is therefore `cancelled`, not `rolled_back`: the drop
+/// can come before any unit of work opens, or while its `COMMIT` is in flight.
+///
+/// Once `work` has completed nothing is recorded here: `work`, or its caller
+/// after it, records the outcome, and no handler awaits anything after that,
+/// so `outcome` is recorded once per request. A future dropped while its
+/// thread unwinds a panic records nothing, a panic being no cancellation. The
+/// guard is set when this future is first polled, and every handler awaits
+/// it at once. `work` runs in whatever span its caller instrumented it with:
+/// `span` is only recorded on, never entered.
+pub(crate) async fn cancellable<F: Future>(span: Span, work: F) -> F::Output {
+    let mut guard = CancelGuard(Some(span));
+    let output = work.await;
+    guard.0 = None;
+    output
+}
+
+/// The guard of [`cancellable`]: dropped while it still holds the handler
+/// span, it records [`OUTCOME_CANCELLED`] there, unless a panic is unwinding.
+struct CancelGuard(Option<Span>);
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(span) = self.0.take() {
+            span.record("outcome", OUTCOME_CANCELLED);
+        }
+    }
+}
+
 /// The `transaction` of the operation that serves a request with `method`,
 /// `uri` and `extensions`: [`handlers::transaction_code`] of its matched
 /// route template, or `None` when no route matched it.
@@ -393,8 +441,10 @@ fn is_preflight(headers: &HeaderMap) -> bool {
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, Once};
+    use std::task::{Context, Poll, Waker};
     use std::{fmt, io};
 
     use axum::Router;
@@ -406,10 +456,10 @@ mod tests {
     use carddemo_runtime::telemetry::subscriber_with_writer;
     use serde_json::Value;
     use tower::ServiceExt;
-    use tracing::field::{Field, Visit};
+    use tracing::field::{Empty, Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::subscriber::Interest;
-    use tracing::{Event, Level, Metadata, Subscriber};
+    use tracing::{Event, Level, Metadata, Span, Subscriber};
 
     use super::auth::extract::{authenticate, require_admin};
     use super::auth::jwt::{JwtKeys, UserType};
@@ -419,7 +469,7 @@ mod tests {
     use super::dto::authorizations::AuthIdPath;
     use super::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
     use super::pagination::PageQuery;
-    use super::{OTHER_METHOD, UNMATCHED_ROUTE, with_layers};
+    use super::{OTHER_METHOD, UNMATCHED_ROUTE, cancellable, with_layers};
 
     /// The admitted origin: the default `CARDDEMO_CORS_ORIGIN`.
     const ORIGIN: &str = "http://localhost:5173";
@@ -1563,5 +1613,124 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("a JSON line"))
             .collect();
         (answer, lines)
+    }
+
+    /// What the work a handler hands to [`cancellable`] does in a case of
+    /// `a_dropped_handler_records_cancelled_and_a_finished_one_its_own_outcome`.
+    #[derive(Debug, Clone, Copy)]
+    enum Work {
+        /// Still waiting, on a row lock for example, when its client goes
+        /// away and the future is dropped.
+        Pending,
+        /// Records this `outcome` on the handler span, then completes.
+        Records(&'static str),
+        /// Completes without recording; its caller then records this
+        /// `outcome`.
+        Answers(&'static str),
+        /// Panics while it runs.
+        Panics,
+    }
+
+    /// A handler span declaring `outcome`, as every handler span does.
+    fn handler_span() -> Span {
+        tracing::info_span!("handler", transaction = "CB00", outcome = Empty)
+    }
+
+    /// Runs `work` through [`cancellable`] on the handler span `span` as a
+    /// handler does, then drops it as hyper drops the future of a request
+    /// whose client went away: one poll, the outcome of work that answered
+    /// without one recorded by the caller, then the drop, complete or not.
+    fn run_cancellable(span: &Span, work: Work) {
+        let recording = span.clone();
+        let mut future = Box::pin(cancellable(span.clone(), async move {
+            match work {
+                Work::Pending => std::future::pending().await,
+                Work::Records(outcome) => {
+                    recording.record("outcome", outcome);
+                }
+                Work::Answers(_) => {}
+                Work::Panics => panic!("the handler's work panicked"),
+            }
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        let polled = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
+        match (&polled, work) {
+            (Ok(Poll::Pending), Work::Pending)
+            | (Ok(Poll::Ready(())), Work::Records(_))
+            | (Err(_), Work::Panics) => {}
+            (Ok(Poll::Ready(())), Work::Answers(outcome)) => {
+                span.record("outcome", outcome);
+            }
+            _ => panic!("{work:?} polled to {polled:?}"),
+        }
+        drop(future);
+    }
+
+    /// The JSON lines the API's telemetry subscriber, under the default
+    /// filter `info`, wrote while `f` ran with it as this thread's subscriber.
+    fn logged(f: impl FnOnce()) -> Vec<Value> {
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let (subscriber, guard) = subscriber_with_writer("api", "info", move || writer.clone())
+            .expect("valid directives");
+        tracing::subscriber::with_default(subscriber, f);
+        guard.shutdown().expect("the tracer provider shuts down");
+        let bytes = sink.0.lock().expect("the sink buffer").clone();
+        let text = String::from_utf8(bytes).expect("JSON lines are UTF-8");
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON line"))
+            .collect()
+    }
+
+    /// What [`Recorder`] saw on this thread while `f` ran, as [`capturing`]
+    /// gives it for a future.
+    fn captured(f: impl FnOnce()) -> Vec<Seen> {
+        install_recorder();
+        CAPTURE.set(Some(Vec::new()));
+        f();
+        CAPTURE.take().expect("the capture this call began")
+    }
+
+    #[test]
+    fn a_dropped_handler_records_cancelled_and_a_finished_one_its_own_outcome() {
+        // (the handler's work, the `outcome` its span ends with)
+        let cases = [
+            (Work::Pending, Some("cancelled")),
+            (Work::Records("committed"), Some("committed")),
+            (Work::Answers("ok"), Some("ok")),
+            // A panic is no cancellation, and its span records no outcome.
+            (Work::Panics, None),
+        ];
+        for (work, expected) in cases {
+            // The span the exporter writes, as the `api` binary writes it to
+            // stdout once the dropped future has closed it.
+            let lines = logged(|| run_cancellable(&handler_span(), work));
+            let spans: Vec<&Value> = lines.iter().filter(|line| line["type"] == "span").collect();
+            let [span] = spans.as_slice() else {
+                panic!("{work:?}: one span expected, got {lines:?}");
+            };
+            assert_eq!(span["name"], "handler", "{work:?}: {span}");
+            assert_eq!(
+                span["attributes"]["transaction"], "CB00",
+                "{work:?}: {span}"
+            );
+            assert_eq!(
+                span["attributes"].get("outcome").and_then(Value::as_str),
+                expected,
+                "{work:?}: {span}"
+            );
+
+            // Every value recorded on the span: the exporter keeps only the
+            // last value of a field, so `outcome` must be recorded once.
+            let seen = captured(|| run_cancellable(&handler_span(), work));
+            let recorded: Vec<&str> = seen
+                .iter()
+                .filter(|entry| entry.span.is_some() && entry.name == "handler")
+                .flat_map(|entry| &entry.values)
+                .filter(|(field, _)| *field == "outcome")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(recorded, expected.as_slice(), "{work:?}: {seen:?}");
+        }
     }
 }

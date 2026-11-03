@@ -239,17 +239,22 @@ const LOW_VALUES: &str = "";
 const LOW_VALUE: u8 = 0x00;
 
 /// `STARTBR` at `start` with `READNEXT`: live rows with a TRAN-ID of at least
-/// `start`, ascending, up to `limit`; with `account`, only rows whose card the
-/// cross-reference maps to that account (E-17).
+/// `start`, ascending, up to `limit`, read on `conn` by the static statement of
+/// the inputs present. Without `account` the statement reads only the view
+/// `transaction_master`, as `COTRN00C` reads only `TRANSACT`; with it, the
+/// statement keeps only rows whose card `card_xref` maps to that account
+/// (E-17).
 async fn select_forward(
     conn: &mut PgConnection,
     start: &str,
     account: Option<i64>,
     limit: i64,
 ) -> Result<Vec<TransactionRow>, sqlx::Error> {
-    sqlx::query_as!(
-        TransactionRow,
-        r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+    match account {
+        None => {
+            sqlx::query_as!(
+                TransactionRow,
+                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
        tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
        tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
        tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
@@ -258,31 +263,56 @@ async fn select_forward(
        tran_proc_ts AS "tran_proc_ts!"
 FROM transaction_master m
 WHERE m.tran_id >= $1
-  AND ($2::bigint IS NULL OR EXISTS (
+ORDER BY m.tran_id
+LIMIT $2"#,
+                start,
+                limit
+            )
+            .fetch_all(conn)
+            .await
+        }
+        Some(account) => {
+            sqlx::query_as!(
+                TransactionRow,
+                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+       tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
+       tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
+       tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
+       tran_merchant_city AS "tran_merchant_city!", tran_merchant_zip AS "tran_merchant_zip!",
+       tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
+       tran_proc_ts AS "tran_proc_ts!"
+FROM transaction_master m
+WHERE m.tran_id >= $1
+  AND EXISTS (
       SELECT 1 FROM card_xref x
-      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $2))
+      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $2)
 ORDER BY m.tran_id
 LIMIT $3"#,
-        start,
-        account,
-        limit
-    )
-    .fetch_all(conn)
-    .await
+                start,
+                account,
+                limit
+            )
+            .fetch_all(conn)
+            .await
+        }
+    }
 }
 
 /// `STARTBR` at `start` with `READPREV`: live rows with a TRAN-ID of at most
-/// `start`, descending, up to `limit`, filtered by `account` as
-/// [`select_forward`] filters.
+/// `start`, descending, up to `limit`, read by the static statement of the
+/// inputs present as [`select_forward`] reads: `transaction_master` alone
+/// without `account`, and the `card_xref` filter with it.
 async fn select_backward_from(
     conn: &mut PgConnection,
     start: &str,
     account: Option<i64>,
     limit: i64,
 ) -> Result<Vec<TransactionRow>, sqlx::Error> {
-    sqlx::query_as!(
-        TransactionRow,
-        r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+    match account {
+        None => {
+            sqlx::query_as!(
+                TransactionRow,
+                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
        tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
        tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
        tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
@@ -291,30 +321,18 @@ async fn select_backward_from(
        tran_proc_ts AS "tran_proc_ts!"
 FROM transaction_master m
 WHERE m.tran_id <= $1
-  AND ($2::bigint IS NULL OR EXISTS (
-      SELECT 1 FROM card_xref x
-      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $2))
 ORDER BY m.tran_id DESC
-LIMIT $3"#,
-        start,
-        account,
-        limit
-    )
-    .fetch_all(conn)
-    .await
-}
-
-/// `STARTBR` at `HIGH-VALUES` with `READPREV`: live rows from the highest
-/// TRAN-ID down, up to `limit`, filtered by `account` as [`select_forward`]
-/// filters.
-async fn select_backward_from_end(
-    conn: &mut PgConnection,
-    account: Option<i64>,
-    limit: i64,
-) -> Result<Vec<TransactionRow>, sqlx::Error> {
-    sqlx::query_as!(
-        TransactionRow,
-        r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+LIMIT $2"#,
+                start,
+                limit
+            )
+            .fetch_all(conn)
+            .await
+        }
+        Some(account) => {
+            sqlx::query_as!(
+                TransactionRow,
+                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
        tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
        tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
        tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
@@ -322,16 +340,73 @@ async fn select_backward_from_end(
        tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
        tran_proc_ts AS "tran_proc_ts!"
 FROM transaction_master m
-WHERE $1::bigint IS NULL OR EXISTS (
+WHERE m.tran_id <= $1
+  AND EXISTS (
+      SELECT 1 FROM card_xref x
+      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $2)
+ORDER BY m.tran_id DESC
+LIMIT $3"#,
+                start,
+                account,
+                limit
+            )
+            .fetch_all(conn)
+            .await
+        }
+    }
+}
+
+/// `STARTBR` at `HIGH-VALUES` with `READPREV`: live rows from the highest
+/// TRAN-ID down, up to `limit`, read by the static statement of the inputs
+/// present as [`select_forward`] reads: `transaction_master` alone without
+/// `account`, and the `card_xref` filter with it.
+async fn select_backward_from_end(
+    conn: &mut PgConnection,
+    account: Option<i64>,
+    limit: i64,
+) -> Result<Vec<TransactionRow>, sqlx::Error> {
+    match account {
+        None => {
+            sqlx::query_as!(
+                TransactionRow,
+                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+       tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
+       tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
+       tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
+       tran_merchant_city AS "tran_merchant_city!", tran_merchant_zip AS "tran_merchant_zip!",
+       tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
+       tran_proc_ts AS "tran_proc_ts!"
+FROM transaction_master m
+ORDER BY m.tran_id DESC
+LIMIT $1"#,
+                limit
+            )
+            .fetch_all(conn)
+            .await
+        }
+        Some(account) => {
+            sqlx::query_as!(
+                TransactionRow,
+                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+       tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
+       tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
+       tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
+       tran_merchant_city AS "tran_merchant_city!", tran_merchant_zip AS "tran_merchant_zip!",
+       tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
+       tran_proc_ts AS "tran_proc_ts!"
+FROM transaction_master m
+WHERE EXISTS (
       SELECT 1 FROM card_xref x
       WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $1)
 ORDER BY m.tran_id DESC
 LIMIT $2"#,
-        account,
-        limit
-    )
-    .fetch_all(conn)
-    .await
+                account,
+                limit
+            )
+            .fetch_all(conn)
+            .await
+        }
+    }
 }
 
 /// Inserts `record` as a live row and returns its new identity.
@@ -491,9 +566,22 @@ WHERE tran_id = $1"#,
     /// `None` is `LOW-VALUES` forward and `HIGH-VALUES` backward.
     ///
     /// `account_id` is the filter the REST resource adds and `COTRN00C` lacks
-    /// (E-17): a row is kept when `card_xref` maps its card to the account, and
-    /// the rows it drops do not count against the limit. An empty file or a
-    /// start beyond the last key gives an empty page, the `STARTBR` `NOTFND`.
+    /// (E-17): a row is kept when `card_xref` maps its card to the account. The
+    /// filter is part of the statement, so the rows it drops do not count
+    /// against the limit. An empty file or a start beyond the last key gives an
+    /// empty page, the `STARTBR` `NOTFND`.
+    ///
+    /// Each of the three starts (forward, backward from a key, backward from
+    /// the end) has two static statements, chosen by whether `account_id` is
+    /// present (`select_forward`, `select_backward_from`,
+    /// `select_backward_from_end`). Without it the statement reads only the
+    /// view `transaction_master`, as `COTRN00C` reads only `TRANSACT`, so the
+    /// unfiltered browse, the one parity is measured on, never waits on a lock
+    /// of `card_xref` nor fails with it. With it the statement adds the
+    /// `EXISTS` on `card_xref`. A single statement guarding the `EXISTS` with
+    /// `$n IS NULL OR` would name `card_xref` whatever the binding, and
+    /// `PostgreSQL` resolves and locks every relation a statement names before
+    /// it runs.
     async fn browse_transactions(
         &mut self,
         browse: Browse<TranId>,

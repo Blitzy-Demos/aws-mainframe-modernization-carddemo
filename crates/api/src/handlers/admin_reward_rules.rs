@@ -41,7 +41,9 @@
 //! `outcome`. The outcome is recorded after the unit of work has committed or
 //! rolled back (AAP 0.6.2): `listed`, `created`, `updated`, `deleted` or
 //! `unchanged` on success, else the error body's code (`INVALID`,
-//! `NOT_FOUND`, `UNEXPECTED`).
+//! `NOT_FOUND`, `UNEXPECTED`). A request dropped before its answer, its client
+//! gone, records `cancelled`: an open unit of work is rolled back as it is
+//! dropped, unless its commit had already reached the server.
 
 use std::future::Future;
 
@@ -127,12 +129,13 @@ fn record_rule_id(rule_id: RuleId) {
 ///
 /// `work` commits its unit of work, or rolls it back and awaits the
 /// `ROLLBACK`, before it returns, on success and failure alike, so the
-/// outcome is recorded after the commit or the rollback.
+/// outcome is recorded after the commit or the rollback. A request dropped
+/// before `work` completes records `cancelled`.
 async fn traced<T>(
     span: Span,
     work: impl Future<Output = Result<(T, &'static str), ApiError>>,
 ) -> Result<T, ApiError> {
-    let result = work.instrument(span.clone()).await;
+    let result = crate::cancellable(span.clone(), work.instrument(span.clone())).await;
     let outcome = match &result {
         Ok((_, outcome)) => outcome,
         Err(error) => error.body().code.as_str(),

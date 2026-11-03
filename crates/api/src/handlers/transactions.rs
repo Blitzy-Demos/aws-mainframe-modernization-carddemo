@@ -49,6 +49,7 @@
 //! | `failed` | A 5xx answer before any write: a failed read, no unit of work, an input class held at `halt` |
 //! | `committed` | A CT02 add whose unit of work committed |
 //! | `rolled_back` | A CT02 add that failed after validation, rolled back whole |
+//! | `cancelled` | A request dropped before its answer, its client gone: an open unit of work is rolled back as it is dropped, unless its commit had already reached the server |
 //!
 //! CT02 also records `reward_points` when the add accrued points. Each field
 //! is recorded at most once per request.
@@ -245,9 +246,11 @@ pub async fn list_transactions(
         account_id = Empty,
         outcome = Empty,
     );
-    let result = list_page(&state, filter, page, &span)
-        .instrument(span.clone())
-        .await;
+    let result = crate::cancellable(
+        span.clone(),
+        list_page(&state, filter, page, &span).instrument(span.clone()),
+    )
+    .await;
     span.record("outcome", read_outcome(&result));
     result.map(Json)
 }
@@ -321,7 +324,11 @@ pub async fn get_transaction(
         outcome = Empty,
     );
     let entered_length = tran_id.chars().count();
-    let result = view_one(&state, tran_id).instrument(span.clone()).await;
+    let result = crate::cancellable(
+        span.clone(),
+        view_one(&state, tran_id).instrument(span.clone()),
+    )
+    .await;
     record_tran_id(&span, &result, entered_length);
     span.record("outcome", read_outcome(&result));
     result.map(Json)
@@ -423,9 +430,11 @@ pub async fn create_transaction(
     ApiJson(body): ApiJson<TransactionAddRequest>,
 ) -> Result<(StatusCode, Json<TransactionAddResponse>), ApiError> {
     let span = add_span(&user.user_id);
-    let (outcome, result) = add_transaction(&state, body, &span)
-        .instrument(span.clone())
-        .await;
+    let (outcome, result) = crate::cancellable(
+        span.clone(),
+        add_transaction(&state, body, &span).instrument(span.clone()),
+    )
+    .await;
     span.record("outcome", outcome);
     result.map(|added| (StatusCode::CREATED, Json(added)))
 }

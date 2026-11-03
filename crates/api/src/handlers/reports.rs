@@ -147,7 +147,11 @@ pub async fn transaction_report(
     // Every error listed above is answered before any byte of a 200, as the
     // module documentation describes; the doc comment above is the OpenAPI
     // description.
-    let result = respond(&state, query, &span).instrument(span.clone()).await;
+    let result = crate::cancellable(
+        span.clone(),
+        respond(&state, query, &span).instrument(span.clone()),
+    )
+    .await;
     span.record("outcome", outcome(&result));
     result
 }

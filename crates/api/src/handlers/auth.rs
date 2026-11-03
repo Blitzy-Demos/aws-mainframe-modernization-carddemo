@@ -50,8 +50,9 @@
 //!
 //! [`login`] runs in a span with `transaction` `CC00`, the `user_id` that
 //! signed on (recorded on success only) and `outcome`: `ok` for an issued
-//! token, `rejected` for a 4xx answer and `failed` for a 5xx one. Neither the
-//! password, the stored hash nor the token is recorded or logged.
+//! token, `rejected` for a 4xx answer and `failed` for a 5xx one, or
+//! `cancelled` for a sign-on dropped before its answer, its client gone.
+//! Neither the password, the stored hash nor the token is recorded or logged.
 
 use std::future::{Ready, ready};
 
@@ -132,8 +133,8 @@ pub async fn login(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    let result = sign_on_user(&state, body).await;
     let span = Span::current();
+    let result = crate::cancellable(span.clone(), sign_on_user(&state, body)).await;
     if let Ok(response) = &result {
         span.record("user_id", response.user_id.as_str());
     }

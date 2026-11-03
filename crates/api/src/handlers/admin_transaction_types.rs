@@ -54,11 +54,13 @@
 //! token is used for telemetry only. Each request runs in a `handler` span
 //! with `transaction` (`CTLI` or `CTTU`), `user_id`, `type_code`, `origin`
 //! and, once the unit of work has ended, `outcome`: `ok`, or the error code
-//! of the response. `type_code` is the path code, the code of an add's body
-//! or the type code filter of a list, recorded only once
-//! [`check_type_code_key`] has passed it, so it is at most `X(2)`. A code
-//! that check rejects is never recorded: `key_rejected` holds the error's
-//! code and `key_len` its length in characters instead.
+//! of the response. A request dropped before its answer, its client gone,
+//! records `cancelled`: an open unit of work is rolled back as it is dropped,
+//! unless its commit had already reached the server. `type_code` is the path
+//! code, the code of an add's body or the type code filter of a list,
+//! recorded only once [`check_type_code_key`] has passed it, so it is at most
+//! `X(2)`. A code that check rejects is never recorded: `key_rejected` holds
+//! the error's code and `key_len` its length in characters instead.
 
 use axum::Json;
 use axum::extract::State;
@@ -472,12 +474,13 @@ const fn origin_name(origin: TranTypeOrigin) -> &'static str {
 
 /// Runs `work` inside `span`, then records its outcome on the span: `ok`, or
 /// the `code` of the error body. The work ends its own unit of work, so the
-/// outcome is recorded after the commit or rollback.
+/// outcome is recorded after the commit or rollback. A request dropped before
+/// `work` completes records `cancelled`.
 async fn traced<T>(
     span: Span,
     work: impl Future<Output = Result<T, ApiError>>,
 ) -> Result<T, ApiError> {
-    let result = work.instrument(span.clone()).await;
+    let result = crate::cancellable(span.clone(), work.instrument(span.clone())).await;
     match &result {
         Ok(_) => span.record("outcome", OUTCOME_OK),
         Err(error) => span.record("outcome", error.body().code.as_str()),

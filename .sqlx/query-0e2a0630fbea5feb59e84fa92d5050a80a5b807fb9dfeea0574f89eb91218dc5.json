@@ -1,0 +1,102 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT transaction_id AS \"transaction_id!\", tran_id AS \"tran_id!\",\n       tran_type_cd AS \"tran_type_cd!\", tran_cat_cd AS \"tran_cat_cd!\",\n       tran_source AS \"tran_source!\", tran_desc AS \"tran_desc!\", tran_amt AS \"tran_amt!\",\n       tran_merchant_id AS \"tran_merchant_id!\", tran_merchant_name AS \"tran_merchant_name!\",\n       tran_merchant_city AS \"tran_merchant_city!\", tran_merchant_zip AS \"tran_merchant_zip!\",\n       tran_card_num AS \"tran_card_num!\", tran_orig_ts AS \"tran_orig_ts!\",\n       tran_proc_ts AS \"tran_proc_ts!\"\nFROM transaction_master m\nWHERE m.tran_id >= $1\n  AND EXISTS (\n      SELECT 1 FROM card_xref x\n      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $2)\nORDER BY m.tran_id\nLIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "transaction_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "tran_id!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "tran_type_cd!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "tran_cat_cd!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "tran_source!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "tran_desc!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "tran_amt!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 7,
+        "name": "tran_merchant_id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "tran_merchant_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "tran_merchant_city!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "tran_merchant_zip!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "tran_card_num!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "tran_orig_ts!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "tran_proc_ts!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "0e2a0630fbea5feb59e84fa92d5050a80a5b807fb9dfeea0574f89eb91218dc5"
+}

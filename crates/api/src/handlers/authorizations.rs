@@ -61,7 +61,9 @@
 //! `outcome`, the error body's `code` (`EMPTY` or `INVALID`), is the
 //! rejection category. `outcome` is otherwise `ok` for a read, `committed` for
 //! a fraud mark, or the error body's `code` once the unit of work has been
-//! rolled back.
+//! rolled back. A request dropped before its answer, its client gone, records
+//! `cancelled`: an open unit of work is rolled back as it is dropped, unless
+//! its commit had already reached the server.
 
 use axum::Json;
 use axum::extract::State;
@@ -154,7 +156,8 @@ pub async fn list_authorizations(
     ApiQuery(query): ApiQuery<AuthSummaryQuery>,
     ApiQuery(page): ApiQuery<AuthSummaryPageQuery>,
 ) -> Result<Json<AuthSummaryResponse>, ApiError> {
-    let result = summary_page(&state, query, page.into()).await;
+    let result =
+        crate::cancellable(Span::current(), summary_page(&state, query, page.into())).await;
     record_outcome(&result, OUTCOME_OK);
     result.map(Json)
 }
@@ -262,7 +265,7 @@ pub async fn get_authorization(
     user: AuthUser,
     ApiPath(AuthIdPath { id }): ApiPath<AuthIdPath>,
 ) -> Result<Json<AuthDetailResponse>, ApiError> {
-    let result = detail_view(&state, &id).await;
+    let result = crate::cancellable(Span::current(), detail_view(&state, &id)).await;
     record_outcome(&result, OUTCOME_OK);
     result.map(Json)
 }
@@ -361,7 +364,7 @@ pub async fn toggle_fraud(
     user: AuthUser,
     ApiPath(AuthIdPath { id }): ApiPath<AuthIdPath>,
 ) -> Result<Json<FraudToggleResponse>, ApiError> {
-    let result = fraud_mark(&state, &id).await;
+    let result = crate::cancellable(Span::current(), fraud_mark(&state, &id)).await;
     record_outcome(&result, OUTCOME_COMMITTED);
     result.map(Json)
 }
