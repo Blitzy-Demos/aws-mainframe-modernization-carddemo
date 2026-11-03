@@ -26,8 +26,12 @@ use crate::exit::ExitStatus;
 /// one stderr line. The versions applied before a failing one stay applied, because each runs
 /// in its own database transaction.
 ///
-/// `_ctx` is unused, because the schema depends on no setting, clock or generation. The
-/// parameter keeps the `run(ctx, &db)` shape [`super::dispatch`] calls every job with.
+/// The job sets no count, so the job span holds `read`, `posted` and `rejected` as 0 whatever
+/// the outcome: the schema step reads, loads and turns away no record.
+///
+/// `_ctx` is unused, because the schema depends on no setting, clock or generation and the job
+/// counts nothing. The parameter keeps the `run(ctx, &db)` shape [`super::dispatch`] calls every
+/// job with.
 pub(crate) async fn run(_ctx: &JobContext, db: &Db) -> ExitStatus {
     match migrate::run(db).await {
         Ok(()) => {

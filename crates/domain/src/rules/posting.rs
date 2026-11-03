@@ -97,14 +97,21 @@ const RETURN_CODE_REJECTS: u8 = 4;
 const RETURN_CODE_CLEAN: u8 = 0;
 
 /// The VSAM file status of an `INVALID KEY` read or rewrite: record not found.
-const STATUS_NOT_FOUND: &str = "23";
+const STATUS_NOT_FOUND: [u8; 2] = *b"23";
 
 /// The VSAM file status of a `WRITE` whose key exists: duplicate key.
-const STATUS_DUPLICATE: &str = "22";
+const STATUS_DUPLICATE: [u8; 2] = *b"22";
 
 /// The status of `OPEN OUTPUT` on a loaded KSDS defined without `REUSE` —
 /// P-CBTRN02C-005 (E-32).
-const STATUS_NOT_REUSABLE: &str = "37";
+const STATUS_NOT_REUSABLE: [u8; 2] = *b"37";
+
+/// The `XREFFILE-STATUS` that `9300-DALYREJS-CLOSE` moves to `IO-STATUS`
+/// [app/cbl/CBTRN02C.cbl:L649]: `00`. The paragraph runs right after
+/// `9200-XREFFILE-CLOSE` [app/cbl/CBTRN02C.cbl:L221-224], which abends on any
+/// other status [app/cbl/CBTRN02C.cbl:L618-635], so `00` is the only value the
+/// field can hold there.
+const STATUS_XREF_CLOSED: [u8; 2] = *b"00";
 
 const DALYTRAN_OPEN: &str = "0000-DALYTRAN-OPEN";
 const TRANFILE_OPEN: &str = "0100-TRANFILE-OPEN";
@@ -188,10 +195,14 @@ impl PostingCounts {
 /// `ABENDING PROGRAM`. `batch posttran` prints them, then `ABEND 999`, and
 /// exits 16.
 ///
-/// The status line is shown only for a status the store reports. A port
-/// failure that has no VSAM file status (a lost connection, a lock timeout)
-/// and the job-level file errors carry none, and no status is made up for
-/// them, so their abend shows the text and `ABENDING PROGRAM` only.
+/// The job-level open, read and write errors of `DALYTRAN` and `DALYREJS`
+/// carry the status the batch adapter derives from the operating-system
+/// error, because the COBOL performs `9910-DISPLAY-IO-STATUS` on each of
+/// those paths. [`PostingAbend::dalyrejs_close`] carries the `00` of
+/// `XREFFILE-STATUS`, the field that paragraph displays. A store failure that
+/// has no VSAM counterpart (a lost connection, a lock timeout) carries none,
+/// and no status is made up for it, so its abend shows the text and
+/// `ABENDING PROGRAM` only.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub struct PostingAbend {
     /// The paragraph that abended, for example `2900-WRITE-TRANSACTION-FILE`.
@@ -200,8 +211,11 @@ pub struct PostingAbend {
     pub display: &'static str,
     /// The two-character file status `9910-DISPLAY-IO-STATUS` formats: `23`
     /// for a missing key, `22` for a duplicate key, `37` for the non-empty
-    /// transaction master; empty when the failure has no file status.
-    pub file_status: String,
+    /// transaction master, `00` for `9300-DALYREJS-CLOSE`, and for any other
+    /// job-level file error the status the batch adapter derives from the
+    /// operating-system error. `None` for a store failure with no VSAM
+    /// counterpart.
+    pub file_status: Option<[u8; 2]>,
     /// The port failure behind the abend, for the job's log event. Its text is
     /// adapter detail and is never part of the displayed lines.
     #[source]
@@ -210,10 +224,11 @@ pub struct PostingAbend {
 
 impl PostingAbend {
     /// CBTRN02C 0000-DALYTRAN-OPEN — P-CBTRN02C-221: the daily transaction
-    /// input cannot be opened [app/cbl/CBTRN02C.cbl:L236-252].
+    /// input cannot be opened [app/cbl/CBTRN02C.cbl:L236-252]; the paragraph
+    /// displays `DALYTRAN-STATUS`, here `file_status`.
     #[must_use]
-    pub fn dalytran_open() -> Self {
-        Self::job_level(DALYTRAN_OPEN, ERROR_OPENING_DALYTRAN, "")
+    pub fn dalytran_open(file_status: [u8; 2]) -> Self {
+        Self::job_level(DALYTRAN_OPEN, ERROR_OPENING_DALYTRAN, Some(file_status))
     }
 
     /// CBTRN02C 0100-TRANFILE-OPEN — P-CBTRN02C-005, P-CBTRN02C-219: `OPEN
@@ -225,30 +240,45 @@ impl PostingAbend {
         Self::job_level(
             TRANFILE_OPEN,
             ERROR_OPENING_TRANSACTION_FILE,
-            STATUS_NOT_REUSABLE,
+            Some(STATUS_NOT_REUSABLE),
         )
     }
 
     /// CBTRN02C 0300-DALYREJS-OPEN — P-CBTRN02C-223: the new `DALYREJS`
-    /// generation cannot be opened [app/cbl/CBTRN02C.cbl:L291-307].
+    /// generation cannot be opened [app/cbl/CBTRN02C.cbl:L291-307]; the
+    /// paragraph displays `DALYREJS-STATUS`, here `file_status`.
     #[must_use]
-    pub fn dalyrejs_open() -> Self {
-        Self::job_level(DALYREJS_OPEN, ERROR_OPENING_DALY_REJECTS_FILE, "")
+    pub fn dalyrejs_open(file_status: [u8; 2]) -> Self {
+        Self::job_level(
+            DALYREJS_OPEN,
+            ERROR_OPENING_DALY_REJECTS_FILE,
+            Some(file_status),
+        )
     }
 
     /// CBTRN02C 1000-DALYTRAN-GET-NEXT — P-CBTRN02C-007: a read of the daily
     /// transaction input fails other than at its end
-    /// [app/cbl/CBTRN02C.cbl:L345-369].
+    /// [app/cbl/CBTRN02C.cbl:L345-369]; the paragraph displays
+    /// `DALYTRAN-STATUS`, here `file_status`.
     #[must_use]
-    pub fn dalytran_read() -> Self {
-        Self::job_level(DALYTRAN_GET_NEXT, ERROR_READING_DALYTRAN_FILE, "")
+    pub fn dalytran_read(file_status: [u8; 2]) -> Self {
+        Self::job_level(
+            DALYTRAN_GET_NEXT,
+            ERROR_READING_DALYTRAN_FILE,
+            Some(file_status),
+        )
     }
 
     /// CBTRN02C 2500-WRITE-REJECT-REC — P-CBTRN02C-012: the reject record
-    /// cannot be written to `DALYREJS` [app/cbl/CBTRN02C.cbl:L446-465].
+    /// cannot be written to `DALYREJS` [app/cbl/CBTRN02C.cbl:L446-465]; the
+    /// paragraph displays `DALYREJS-STATUS`, here `file_status`.
     #[must_use]
-    pub fn reject_write() -> Self {
-        Self::job_level(WRITE_REJECT_REC, ERROR_WRITING_TO_REJECTS_FILE, "")
+    pub fn reject_write(file_status: [u8; 2]) -> Self {
+        Self::job_level(
+            WRITE_REJECT_REC,
+            ERROR_WRITING_TO_REJECTS_FILE,
+            Some(file_status),
+        )
     }
 
     /// CBTRN02C 9300-DALYREJS-CLOSE — P-CBTRN02C-020: the `DALYREJS`
@@ -256,28 +286,38 @@ impl PostingAbend {
     /// [app/cbl/CBTRN02C.cbl:L637-653].
     ///
     /// The paragraph moves `XREFFILE-STATUS`, not `DALYREJS-STATUS`, to
-    /// `IO-STATUS` before `9910-DISPLAY-IO-STATUS` [app/cbl/CBTRN02C.cbl:L649].
-    /// The audit row records no status for the path, so none is shown.
+    /// `IO-STATUS` before `9910-DISPLAY-IO-STATUS` [app/cbl/CBTRN02C.cbl:L649],
+    /// and that status is always `00` there, because the paragraph runs only
+    /// after `9200-XREFFILE-CLOSE` succeeded [app/cbl/CBTRN02C.cbl:L221-224]
+    /// [app/cbl/CBTRN02C.cbl:L618-635]. The abend therefore shows
+    /// `FILE STATUS IS: NNNN0000`, whatever stopped the close.
     #[must_use]
     pub fn dalyrejs_close() -> Self {
-        Self::job_level(DALYREJS_CLOSE, ERROR_CLOSING_DAILY_REJECTS_FILE, "")
+        Self::job_level(
+            DALYREJS_CLOSE,
+            ERROR_CLOSING_DAILY_REJECTS_FILE,
+            Some(STATUS_XREF_CLOSED),
+        )
     }
 
     /// The `FILE STATUS IS: NNNN…` line of [`PostingAbend::file_status`], or
-    /// `None` when the abend carries no two-character status.
+    /// `None` when the abend carries no status.
     #[must_use]
     pub fn file_status_line(&self) -> Option<String> {
-        <[u8; 2]>::try_from(self.file_status.as_bytes())
-            .ok()
-            .map(file_status_message)
+        self.file_status.map(file_status_message)
     }
 
-    /// An abend on a file the batch adapter handles itself, without a port.
-    fn job_level(paragraph: &'static str, display: &'static str, file_status: &str) -> Self {
+    /// An abend on a file the batch adapter handles itself, without a port,
+    /// with the status `9910-DISPLAY-IO-STATUS` shows for it, if any.
+    fn job_level(
+        paragraph: &'static str,
+        display: &'static str,
+        file_status: Option<[u8; 2]>,
+    ) -> Self {
         Self {
             paragraph,
             display,
-            file_status: file_status.to_owned(),
+            file_status,
             cause: None,
         }
     }
@@ -288,7 +328,7 @@ impl PostingAbend {
         Self {
             paragraph,
             display,
-            file_status: vsam_status(&error).to_owned(),
+            file_status: vsam_status(&error),
             cause: Some(error),
         }
     }
@@ -318,11 +358,11 @@ impl fmt::Display for PostingAbend {
 
 /// The VSAM file status a port outcome stands for: `23` for `NOTFND`, `22` for
 /// a duplicate key, and none for the failures that have no VSAM counterpart.
-fn vsam_status(error: &PortError) -> &'static str {
+fn vsam_status(error: &PortError) -> Option<[u8; 2]> {
     match error {
-        PortError::NotFound => STATUS_NOT_FOUND,
-        PortError::Duplicate => STATUS_DUPLICATE,
-        PortError::Restricted | PortError::Contention | PortError::Unavailable(_) => "",
+        PortError::NotFound => Some(STATUS_NOT_FOUND),
+        PortError::Duplicate => Some(STATUS_DUPLICATE),
+        PortError::Restricted | PortError::Contention | PortError::Unavailable(_) => None,
     }
 }
 
@@ -1081,7 +1121,7 @@ mod tests {
 
         assert_eq!(abend.paragraph, "2700-B-UPDATE-TCATBAL-REC");
         assert_eq!(abend.display, ERROR_REWRITING_TRANSACTION_BALANCE_FILE);
-        assert_eq!(abend.file_status, "");
+        assert_eq!(abend.file_status, None);
         assert_eq!(
             abend.to_string(),
             [ERROR_REWRITING_TRANSACTION_BALANCE_FILE, ABENDING_PROGRAM].join("\n")
@@ -1102,7 +1142,7 @@ mod tests {
         let abend = validate_and_post(&mut store, &purchase).expect_err("an abend");
 
         assert_eq!(abend.paragraph, "2900-WRITE-TRANSACTION-FILE");
-        assert_eq!(abend.file_status, "22");
+        assert_eq!(abend.file_status, Some(*b"22"));
         assert_eq!(abend.cause, Some(PortError::Duplicate));
         assert_eq!(
             abend.to_string(),
@@ -1127,14 +1167,14 @@ mod tests {
                 PortError::Unavailable("lost".to_owned()),
                 "2700-UPDATE-TCATBAL",
                 ERROR_READING_TRANSACTION_BALANCE_FILE,
-                "",
+                None,
             ),
             (
                 "write_tcatbal",
                 PortError::Duplicate,
                 "2700-A-CREATE-TCATBAL-REC",
                 ERROR_WRITING_TRANSACTION_BALANCE_FILE,
-                "22",
+                Some(*b"22"),
             ),
         ];
         for (method, error, paragraph, display, file_status) in cases {
@@ -1151,7 +1191,7 @@ mod tests {
                 PostingAbend {
                     paragraph,
                     display,
-                    file_status: file_status.to_owned(),
+                    file_status,
                     cause: Some(error),
                 },
                 "{method}"
@@ -1325,15 +1365,20 @@ mod tests {
 
     /// P-CBTRN02C-005, P-CBTRN02C-007, P-CBTRN02C-012, P-CBTRN02C-020,
     /// P-CBTRN02C-021, P-CBTRN02C-221, P-CBTRN02C-223: the job-level abends
-    /// display their text, the status line when the status is known, then
-    /// `ABENDING PROGRAM`.
+    /// display their text, the status line of the status they carry, then
+    /// `ABENDING PROGRAM`; `9300-DALYREJS-CLOSE` carries the `00` of
+    /// `XREFFILE-STATUS`.
     #[test]
     fn job_level_abends_display_their_lines_in_the_cobol_order() {
         let cases = [
             (
-                PostingAbend::dalytran_open(),
+                PostingAbend::dalytran_open(*b"35"),
                 "0000-DALYTRAN-OPEN",
-                vec![ERROR_OPENING_DALYTRAN, ABENDING_PROGRAM],
+                vec![
+                    ERROR_OPENING_DALYTRAN,
+                    "FILE STATUS IS: NNNN0035",
+                    ABENDING_PROGRAM,
+                ],
             ),
             (
                 PostingAbend::tranfile_open_not_empty(),
@@ -1345,24 +1390,40 @@ mod tests {
                 ],
             ),
             (
-                PostingAbend::dalyrejs_open(),
+                PostingAbend::dalyrejs_open(*b"30"),
                 "0300-DALYREJS-OPEN",
-                vec![ERROR_OPENING_DALY_REJECTS_FILE, ABENDING_PROGRAM],
+                vec![
+                    ERROR_OPENING_DALY_REJECTS_FILE,
+                    "FILE STATUS IS: NNNN0030",
+                    ABENDING_PROGRAM,
+                ],
             ),
             (
-                PostingAbend::dalytran_read(),
+                PostingAbend::dalytran_read(*b"30"),
                 "1000-DALYTRAN-GET-NEXT",
-                vec![ERROR_READING_DALYTRAN_FILE, ABENDING_PROGRAM],
+                vec![
+                    ERROR_READING_DALYTRAN_FILE,
+                    "FILE STATUS IS: NNNN0030",
+                    ABENDING_PROGRAM,
+                ],
             ),
             (
-                PostingAbend::reject_write(),
+                PostingAbend::reject_write(*b"30"),
                 "2500-WRITE-REJECT-REC",
-                vec![ERROR_WRITING_TO_REJECTS_FILE, ABENDING_PROGRAM],
+                vec![
+                    ERROR_WRITING_TO_REJECTS_FILE,
+                    "FILE STATUS IS: NNNN0030",
+                    ABENDING_PROGRAM,
+                ],
             ),
             (
                 PostingAbend::dalyrejs_close(),
                 "9300-DALYREJS-CLOSE",
-                vec![ERROR_CLOSING_DAILY_REJECTS_FILE, ABENDING_PROGRAM],
+                vec![
+                    ERROR_CLOSING_DAILY_REJECTS_FILE,
+                    "FILE STATUS IS: NNNN0000",
+                    ABENDING_PROGRAM,
+                ],
             ),
         ];
         for (abend, paragraph, lines) in cases {

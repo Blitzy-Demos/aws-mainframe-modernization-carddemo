@@ -39,13 +39,23 @@
 //!   catalog directory before it reads the current generation, and the [`PendingGeneration`]
 //!   holds it until it is cataloged, roll-off included, or dropped, so two `(+1)` allocations of
 //!   one GDG can never pick the same number. A held allocation lock is reported as
-//!   [`GenerationError::InUse`].
+//!   [`GenerationError::InUse`], which also names the process the lock file records and whether
+//!   it is running ([`LockHolder`]), read when the allocation is refused.
 //! - Statement lock: `creastmt` takes `.STATEMNT.lock` in `CARDDEMO_STATEMENT_DIR` for the
 //!   statement datasets it deletes and writes, from before `STEP030` to the end of the job.
 //!
 //! Every temporary file is created exclusively under a name unique to its process and allocation,
 //! and [`PendingGeneration::catalog`] publishes a generation as a hard link to its final name,
 //! which fails when that name exists, so a cataloged generation is never replaced.
+//!
+//! A job killed while it writes a generation also leaves that generation's temporary file
+//! `.<DATASET>.G<nnnn>V00.tmp-<pid>-<seq>` behind. [`Generations::begin_next`] sweeps such orphans
+//! once it holds the allocation lock and before it reads the current generation: it deletes each
+//! regular file of that GDG named exactly so whose process id is its own, because the lock it
+//! holds proves that the process has no pending generation of the GDG, or is that of a process
+//! that is not running. Whether a process is running is read from Linux's `/proc/<pid>`; where
+//! `/proc` is not mounted that cannot be told, and the file is kept. A sweep never fails the
+//! allocation: a file that cannot be deleted is logged. Lock files are never swept.
 //!
 //! # Record files
 //!
@@ -227,9 +237,11 @@ pub(crate) enum GenerationError {
     },
     /// `(+1)` was requested while the allocation lock of the GDG exists: another batch job is
     /// allocating it, or a job killed before it could release the lock left the file behind.
+    /// The text names the lock file and its holder, and tells the operator when the file may be
+    /// removed.
     #[error(
-        "{dataset}(+1): another batch job holds the allocation lock {}; remove that file only \
-         when no batch job is running, because a job killed before releasing the lock leaves it \
+        "{dataset}(+1): the allocation lock {} is held by {holder}; remove that file only when \
+         no batch job is running, because a job killed before releasing the lock leaves it \
          behind",
         path.display()
     )]
@@ -238,6 +250,8 @@ pub(crate) enum GenerationError {
         dataset: &'static str,
         /// The lock file, `<root>/.<DATASET>.lock`.
         path: PathBuf,
+        /// The process the lock file records, read when the allocation was refused.
+        holder: LockHolder,
     },
     /// A [`LockFile`] exists: another batch job holds the lock, or a job killed before it could
     /// release the lock left the file behind. The `(+1)` allocation lock reports this as
@@ -329,10 +343,17 @@ impl Generations {
     }
 
     /// Allocates the `(+1)` generation of `dataset`: the newest number + 1, or `G0001V00` for an
-    /// empty GDG. It creates the catalog directory, takes the allocation lock `.<DATASET>.lock`
-    /// before it reads the current generation, and creates the hidden temporary file
+    /// empty GDG. It creates the catalog directory, takes the allocation lock `.<DATASET>.lock`,
+    /// deletes the temporary files that killed jobs left for `dataset` (the module's "Lock files"
+    /// section), reads the current generation, and creates the hidden temporary file
     /// `.<DATASET>.G<nnnn>V00.tmp-<pid>-<seq>` that the generation is written to until it is
     /// cataloged. The returned [`PendingGeneration`] holds the lock; every error releases it.
+    ///
+    /// The sweep deletes a regular file named exactly `.<DATASET>.G<nnnn>V00.tmp-<pid>-<seq>`
+    /// whose `<pid>` is this process, which holds no other pending generation of `dataset` while
+    /// it holds the lock, or a process that `/proc` shows is not running. A file whose process is
+    /// running, or whose state cannot be told, is kept. Each deletion is logged at `info`; a sweep
+    /// failure is logged at `warn` and does not fail the allocation.
     ///
     /// # Errors
     ///
@@ -347,6 +368,7 @@ impl Generations {
     ) -> Result<PendingGeneration, GenerationError> {
         fs::create_dir_all(&self.root).map_err(|source| io_error(&self.root, source))?;
         let lock = allocation_lock(&self.root, dataset)?;
+        sweep_orphaned_temps(&self.root, dataset);
         let number = match self.current(dataset)? {
             None => FIRST_NUMBER,
             Some(newest) => newest
@@ -447,17 +469,74 @@ impl Drop for LockFile {
 ///
 /// # Errors
 ///
-/// [`GenerationError::InUse`] when the lock file exists, and [`GenerationError::Io`] when it
-/// cannot be created or written, as [`LockFile::acquire`] reports them.
+/// [`GenerationError::InUse`] when the lock file exists, with the holder the file records, and
+/// [`GenerationError::Io`] when it cannot be created or written, as [`LockFile::acquire`]
+/// reports them.
 fn allocation_lock(root: &Path, dataset: Dataset) -> Result<LockFile, GenerationError> {
     let path = root.join(format!(".{}.lock", dataset.name()));
     LockFile::acquire(path, "generation allocation lock").map_err(|err| match err {
         GenerationError::Locked { path, .. } => GenerationError::InUse {
             dataset: dataset.name(),
+            holder: LockHolder::read(&path),
             path,
         },
         other => other,
     })
+}
+
+/// The holder of a lock file a refused allocation found: the process id the file records and
+/// whether that process is running, read once, when the allocation is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockHolder {
+    /// The lock file records process `pid`.
+    Process {
+        /// The process id the lock file holds.
+        pid: u32,
+        /// Whether that process is running, as [`process_running`] tells it: `None` when that
+        /// cannot be told.
+        running: Option<bool>,
+    },
+    /// The lock file cannot be read or holds no process id, for example while its holder is
+    /// still writing it.
+    Unknown,
+}
+
+impl LockHolder {
+    /// The holder the lock file `path` records: the process id [`LockFile::acquire`] writes,
+    /// one decimal number followed by a line break.
+    fn read(path: &Path) -> Self {
+        let pid = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| decimal(text.trim_end_matches(['\n', '\r'])))
+            .and_then(|pid| u32::try_from(pid).ok());
+        match pid {
+            Some(pid) => Self::Process {
+                pid,
+                running: process_running(pid),
+            },
+            None => Self::Unknown,
+        }
+    }
+}
+
+impl fmt::Display for LockHolder {
+    /// For example `process 4242, which is not running`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Process {
+                pid,
+                running: Some(true),
+            } => write!(f, "process {pid}, which is running"),
+            Self::Process {
+                pid,
+                running: Some(false),
+            } => write!(f, "process {pid}, which is not running"),
+            Self::Process { pid, running: None } => {
+                write!(f, "process {pid}, which may or may not be running")
+            }
+            Self::Unknown => f.write_str("an unknown process"),
+        }
+    }
 }
 
 /// A `(+1)` generation being written: the `DISP=(NEW,CATLG,DELETE)` DD of a running step.
@@ -946,6 +1025,86 @@ fn scratch_beyond_limit(root: &Path, dataset: Dataset) {
     }
 }
 
+/// Deletes the temporary files of `dataset` under `root` that killed jobs left behind: the sweep
+/// [`Generations::begin_next`] makes while it holds the allocation lock of `dataset`.
+///
+/// A regular file named exactly as [`temp_name`] names a generation of `dataset` is deleted when
+/// the process id in its name ([`temp_name_pid`]) is this process, which holds no other pending
+/// generation of `dataset` while it holds the lock, or a process [`process_running`] shows is not
+/// running. Every other file is kept, a file whose process is running or may be running included.
+///
+/// The allocation goes on whatever the sweep meets: a directory, an entry or a file that cannot
+/// be read or deleted is logged at `warn` and skipped, and each deletion is logged at `info`. A
+/// file already gone when it is deleted needs nothing.
+fn sweep_orphaned_temps(root: &Path, dataset: Dataset) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                dataset = dataset.name(),
+                path = %root.display(),
+                %error,
+                "orphaned temporary generation file sweep skipped"
+            );
+            return;
+        }
+    };
+    let own_pid = process::id();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    dataset = dataset.name(),
+                    path = %root.display(),
+                    %error,
+                    "orphaned temporary generation file sweep stopped"
+                );
+                return;
+            }
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| temp_name_pid(dataset, name))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_file() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "orphaned temporary generation file not checked"
+                );
+                continue;
+            }
+        }
+        if pid != own_pid && process_running(pid) != Some(false) {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                dataset = dataset.name(),
+                path = %path.display(),
+                pid,
+                "orphaned temporary generation file deleted"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                dataset = dataset.name(),
+                path = %path.display(),
+                pid,
+                %error,
+                "orphaned temporary generation file not deleted"
+            ),
+        }
+    }
+}
+
 /// The absolute generation number of `file_name` when it is exactly
 /// `<DATASET>.G<nnnn>V00` for `dataset`, with `nnnn` from `0001` to `9999`.
 fn parse_number(dataset: Dataset, file_name: &str) -> Option<u16> {
@@ -979,6 +1138,64 @@ fn temp_name(file_name: &OsStr, sequence: u64) -> OsString {
     name
 }
 
+/// The process id in `file_name` when it is exactly the temporary name [`temp_name`] gives a
+/// generation of `dataset`: `.<DATASET>.G<nnnn>V00.tmp-<pid>-<seq>`, with `nnnn` as
+/// [`parse_number`] takes it and `<pid>` and `<seq>` as [`decimal`] takes them. `None` for
+/// every other name, the temporary names of other datasets and of statement files included.
+fn temp_name_pid(dataset: Dataset, file_name: &str) -> Option<u32> {
+    let (generation, suffix) = file_name.strip_prefix('.')?.split_once(".tmp-")?;
+    parse_number(dataset, generation)?;
+    let (pid, sequence) = suffix.split_once('-')?;
+    decimal(sequence)?;
+    u32::try_from(decimal(pid)?).ok()
+}
+
+/// The value of `text` when it is a decimal number as this module writes one, a process id or a
+/// sequence number: ASCII digits only, without a sign or a leading zero (`0` itself excepted),
+/// within `u64`.
+fn decimal(text: &str) -> Option<u64> {
+    let canonical =
+        text.bytes().all(|byte| byte.is_ascii_digit()) && (text == "0" || !text.starts_with('0'));
+    if canonical { text.parse().ok() } else { None }
+}
+
+/// Whether process `pid` is running, as Linux's process file system tells it: `/proc/<pid>`
+/// exists while the process does, until its parent reaps it, and for a thread id as well.
+/// `None` when that cannot be told: `/proc` is not mounted (it shows no `/proc/self`), as on
+/// systems without it, or the lookup fails other than with "not found".
+fn process_running(pid: u32) -> Option<bool> {
+    let proc_root = Path::new("/proc");
+    if !matches!(proc_root.join("self").try_exists(), Ok(true)) {
+        return None;
+    }
+    match fs::symlink_metadata(proc_root.join(pid.to_string())) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// The id of a process that has exited and been reaped, as a job killed while it held a lock or
+/// wrote a temporary file leaves its id behind: a child of the test binary run to completion.
+///
+/// # Panics
+///
+/// When the child cannot be run, or when [`process_running`] does not show it gone, so a test
+/// that needs a process that is not running fails where that cannot be told.
+#[cfg(test)]
+pub(crate) fn exited_pid() -> u32 {
+    let mut child = process::Command::new(std::env::current_exe().expect("the test binary path"))
+        .arg("--list")
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .expect("a child process starts");
+    let pid = child.id();
+    child.wait().expect("the child process exits");
+    assert_eq!(process_running(pid), Some(false), "process {pid} is gone");
+    pid
+}
+
 /// Deletes the temporary file `path`, reporting whether it was there. Best effort: a failure
 /// other than an absent file is logged, because the callers are already failing or dropping, or,
 /// in [`PendingGeneration::catalog`], have already cataloged the generation.
@@ -1006,7 +1223,7 @@ fn io_error(path: &Path, source: io::Error) -> GenerationError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::env;
     use std::ffi::OsStr;
     use std::fs;
@@ -1022,20 +1239,32 @@ mod tests {
     use tracing::{Instrument, Span};
 
     use super::{
-        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, blocking, create_temp,
-        encode_fixed_lines, read_records, read_records_async, remove_temp, write_replacing,
-        write_synced,
+        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, LockHolder, blocking,
+        create_temp, encode_fixed_lines, exited_pid, process_running, read_records,
+        read_records_async, remove_temp, write_replacing, write_synced,
     };
 
     /// A test directory under the system temporary directory, removed when the test ends.
     struct TestDir(PathBuf);
 
     impl TestDir {
+        /// A directory left by an earlier run with the same process id is stale and is removed
+        /// first. A failure to remove it, other than its absence, fails the test before it starts.
         fn new(test: &str) -> Self {
             let path = env::temp_dir().join(format!("carddemo-gdg-{}-{test}", process::id()));
-            // A directory left by an earlier run with the same process id is stale.
-            let _ = fs::remove_dir_all(&path);
+            Self::remove(&path).unwrap_or_else(|e| {
+                panic!("test directory {} is not removable: {e}", path.display())
+            });
             Self(path)
+        }
+
+        /// Removes `path` and everything under it. A directory that is not there, as when the
+        /// test never created it, is already removed, so `NotFound` counts as success.
+        fn remove(path: &Path) -> io::Result<()> {
+            match fs::remove_dir_all(path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                removed => removed,
+            }
         }
 
         fn path(&self) -> &Path {
@@ -1060,9 +1289,68 @@ mod tests {
     }
 
     impl Drop for TestDir {
+        /// Removes the directory. A failure other than its absence names the directory and the
+        /// error: it fails the test, or, while the test is already panicking, goes to stderr,
+        /// because a second panic during unwinding would abort the test binary.
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            if let Err(e) = Self::remove(&self.0) {
+                let message = format!("test directory {} is not removable: {e}", self.0.display());
+                if thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
+                }
+            }
         }
+    }
+
+    /// A regular file where the directory belongs cannot be removed as a directory, so each
+    /// removal path of [`TestDir`] meets an error other than `NotFound` and names the path:
+    /// `new` and `drop` panic, and a drop while a panic is already unwinding reports to stderr
+    /// and lets the original panic through instead of aborting the test binary.
+    #[test]
+    fn test_dir_reports_removal_errors_other_than_absence() {
+        let blocked = TestDir::new("cleanup-errors").path().to_path_buf();
+        assert!(
+            !blocked.exists(),
+            "the dropped helper found no directory to remove"
+        );
+
+        fs::write(&blocked, b"").expect("the blocking file is writable");
+        let created = std::panic::catch_unwind(|| TestDir::new("cleanup-errors"));
+        let dropped = std::panic::catch_unwind(|| drop(TestDir(blocked.clone())));
+        let unwound: thread::Result<()> = std::panic::catch_unwind(|| {
+            let _dir = TestDir(blocked.clone());
+            panic!("the test body failed");
+        });
+        let cleaned = fs::remove_file(&blocked);
+
+        let Err(created) = created else {
+            panic!("new removes a stale regular file")
+        };
+        let Err(dropped) = dropped else {
+            panic!("drop removes a regular file")
+        };
+        let Err(unwound) = unwound else {
+            panic!("the test body does not panic")
+        };
+        cleaned.expect("the blocking file is removable");
+        let removal = format!("test directory {} is not removable: ", blocked.display());
+        for payload in [&created, &dropped] {
+            let message = payload
+                .downcast_ref::<String>()
+                .expect("a formatted panic message");
+            assert!(message.starts_with(&removal), "{message}");
+            assert!(
+                message.len() > removal.len(),
+                "the error follows: {message}"
+            );
+        }
+        assert_eq!(
+            unwound.downcast_ref::<&str>(),
+            Some(&"the test body failed"),
+            "the original panic unwinds without a second one"
+        );
     }
 
     /// A six-byte `X(6)` test record, so the record helpers are exercised without a copybook.
@@ -1215,11 +1503,23 @@ mod tests {
         let error = generations
             .begin_next(Dataset::DalyRejs)
             .expect_err("the allocation is held");
+        let holder = LockHolder::Process {
+            pid: process::id(),
+            running: Some(true),
+        };
         assert!(
-            matches!(&error, GenerationError::InUse { dataset: "DALYREJS", path } if *path == lock),
+            matches!(
+                &error,
+                GenerationError::InUse { dataset: "DALYREJS", path, holder: found }
+                    if *path == lock && *found == holder
+            ),
             "{error:?}"
         );
-        assert_eq!(dir.names(), names, "a refused allocation creates nothing");
+        assert_eq!(
+            dir.names(),
+            names,
+            "a refused allocation creates nothing and sweeps nothing"
+        );
 
         let first = first.catalog().expect("generation catalogs");
         assert_eq!(first.to_string(), "DALYREJS.G0001V00");
@@ -1240,35 +1540,164 @@ mod tests {
         assert_eq!(dir.names(), ["DALYREJS.G0001V00", "DALYREJS.G0002V00"]);
     }
 
+    /// The id of a process that is running: this test process's parent.
+    fn running_pid() -> u32 {
+        let pid = std::os::unix::process::parent_id();
+        assert_eq!(process_running(pid), Some(true), "process {pid} runs");
+        pid
+    }
+
+    /// A lock file left behind refuses the allocation whatever it holds, is never taken over,
+    /// and leaves the directory unchanged, an orphaned temporary file included: the sweep runs
+    /// only once the lock is held. The text names the lock file and the holder it records.
     #[test]
     fn stale_allocation_lock_refuses_allocation() {
-        let dir = TestDir::new("stale-lock");
+        let exited = exited_pid();
+        let running = running_pid();
+        let cases = [
+            (
+                format!("{exited}\n"),
+                LockHolder::Process {
+                    pid: exited,
+                    running: Some(false),
+                },
+                format!("process {exited}, which is not running"),
+            ),
+            (
+                format!("{running}\n"),
+                LockHolder::Process {
+                    pid: running,
+                    running: Some(true),
+                },
+                format!("process {running}, which is running"),
+            ),
+            (
+                "not a process id\n".to_owned(),
+                LockHolder::Unknown,
+                "an unknown process".to_owned(),
+            ),
+            (
+                String::new(),
+                LockHolder::Unknown,
+                "an unknown process".to_owned(),
+            ),
+        ];
+        for (content, holder, holder_text) in cases {
+            let dir = TestDir::new("stale-lock");
+            fs::create_dir_all(dir.path()).expect("directory creates");
+            let lock = dir.path().join(".DALYREJS.lock");
+            fs::write(&lock, &content).expect("file writes");
+            let orphan = format!(".DALYREJS.G0001V00.tmp-{exited}-0");
+            fs::write(dir.path().join(&orphan), b"REJECT\n").expect("file writes");
+            let generations = Generations::new(dir.path());
+
+            let error = generations
+                .begin_next(Dataset::DalyRejs)
+                .expect_err("the lock exists");
+            assert!(
+                matches!(
+                    &error,
+                    GenerationError::InUse { dataset: "DALYREJS", path, holder: found }
+                        if *path == lock && *found == holder
+                ),
+                "{content:?}: {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "DALYREJS(+1): the allocation lock {} is held by {holder_text}; remove that \
+                     file only when no batch job is running, because a job killed before \
+                     releasing the lock leaves it behind",
+                    lock.display()
+                ),
+                "{content:?}"
+            );
+            assert_eq!(
+                dir.names(),
+                [orphan.as_str(), ".DALYREJS.lock"],
+                "{content:?}: nothing is created or swept"
+            );
+            assert_eq!(
+                fs::read_to_string(&lock).expect("lock is readable"),
+                content,
+                "the lock is never taken over"
+            );
+        }
+    }
+
+    /// The allocation deletes only the regular files named as a temporary generation file of its
+    /// own dataset whose process is this one or is not running, before it creates its own.
+    #[test]
+    fn allocation_sweeps_only_orphaned_temporary_files_of_its_dataset() {
+        let own = process::id();
+        let exited = exited_pid();
+        let running = running_pid();
+        // (name, created as a directory, kept by the sweep)
+        let cases = [
+            (format!(".DALYREJS.G0001V00.tmp-{own}-7"), false, false),
+            (format!(".DALYREJS.G0002V00.tmp-{exited}-0"), false, false),
+            (format!(".DALYREJS.G0003V00.tmp-{running}-0"), false, true),
+            (format!(".DALYREJS.G0003V00.tmp-{exited}-1"), true, true),
+            (format!(".SYSTRAN.G0001V00.tmp-{exited}-0"), false, true),
+            (
+                format!(".TRANSACT.BKUP.G0001V00.tmp-{exited}-0"),
+                false,
+                true,
+            ),
+            (format!(".STATEMNT.PS.tmp-{exited}-0"), false, true),
+            (format!(".DALYREJS.G0001V00.tmp-{exited}"), false, true),
+            (format!(".DALYREJS.G0001V00.tmp-{exited}-"), false, true),
+            (format!(".DALYREJS.G0001V00.tmp--{exited}-0"), false, true),
+            (format!(".DALYREJS.G0001V00.tmp-0{exited}-0"), false, true),
+            (format!(".DALYREJS.G0001V00.tmp-{exited}-0x"), false, true),
+            (
+                format!(".DALYREJS.G0001V00.tmp-{exited}-0.old"),
+                false,
+                true,
+            ),
+            (format!(".DALYREJS.G001V00.tmp-{exited}-0"), false, true),
+            (format!(".DALYREJS.G0000V00.tmp-{exited}-0"), false, true),
+            (format!(".DALYREJS.G0001V01.tmp-{exited}-0"), false, true),
+            (format!("DALYREJS.G0001V00.tmp-{exited}-0"), false, true),
+            (format!(".XDALYREJS.G0001V00.tmp-{exited}-0"), false, true),
+            (
+                ".DALYREJS.G0001V00.tmp-99999999999-0".to_owned(),
+                false,
+                true,
+            ),
+            ("DALYREJS.G0004V00".to_owned(), false, true),
+        ];
+        let dir = TestDir::new("sweep");
         fs::create_dir_all(dir.path()).expect("directory creates");
-        let lock = dir.path().join(".DALYREJS.lock");
-        fs::write(&lock, b"4242\n").expect("file writes");
+        for (name, directory, _) in &cases {
+            let path = dir.path().join(name);
+            if *directory {
+                fs::create_dir(&path).expect("directory creates");
+            } else {
+                fs::write(&path, b"REJECT\n").expect("file writes");
+            }
+        }
         let generations = Generations::new(dir.path());
 
-        let error = generations
+        let pending = generations
             .begin_next(Dataset::DalyRejs)
-            .expect_err("the lock exists");
-        assert!(
-            matches!(&error, GenerationError::InUse { dataset: "DALYREJS", path } if *path == lock),
-            "{error:?}"
-        );
+            .expect("the sweep never fails the allocation");
+
+        for (name, _, kept) in &cases {
+            assert_eq!(dir.path().join(name).exists(), *kept, "{name}");
+        }
+        drop(pending);
+        let mut left: Vec<&str> = cases
+            .iter()
+            .filter(|(_, _, kept)| *kept)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        left.sort_unstable();
+        assert_eq!(dir.names(), left, "the allocation's own files are gone");
         assert_eq!(
-            error.to_string(),
-            format!(
-                "DALYREJS(+1): another batch job holds the allocation lock {}; remove that file \
-                 only when no batch job is running, because a job killed before releasing the \
-                 lock leaves it behind",
-                lock.display()
-            )
-        );
-        assert_eq!(dir.names(), [".DALYREJS.lock"], "nothing else is created");
-        assert_eq!(
-            fs::read(&lock).expect("lock is readable"),
-            b"4242\n",
-            "the lock is never taken over"
+            catalog_empty(&generations, Dataset::DalyRejs).to_string(),
+            "DALYREJS.G0005V00",
+            "the cataloged generation stays the newest"
         );
     }
 
@@ -1678,13 +2107,14 @@ mod tests {
         assert_eq!(dir.names(), ["STATEMNT.PS"], "no temporary file is left");
     }
 
-    /// A shared in-memory sink standing in for standard output.
+    /// A shared in-memory sink standing in for standard output, also used by the job-span
+    /// tests of `crate::jobs`.
     #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct Capture(Arc<Mutex<Vec<u8>>>);
 
     impl Capture {
         /// The JSON lines written so far.
-        fn lines(&self) -> Vec<String> {
+        pub(crate) fn lines(&self) -> Vec<String> {
             let bytes = self.0.lock().expect("capture buffer").clone();
             String::from_utf8(bytes)
                 .expect("JSON lines are UTF-8")

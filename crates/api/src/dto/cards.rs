@@ -15,6 +15,11 @@
 //! it, so it is rejected with 400, kind `Invalid`, an empty `message` and the
 //! BMS fields of the overlong values, in the audit's `Order`.
 //!
+//! The `GET /cards` `start_key` is no map field but the COMMAREA card number
+//! `X(16)` a page returned ([`CardListPageQuery`]). A key longer than 16
+//! characters, holding a character outside ASCII or holding a NUL character
+//! is rejected with 400, kind `Invalid`, an empty `message` and no field.
+//!
 //! Responses carry the `CVACT02Y` `CARD-RECORD` fields the maps show, under the
 //! copybook names (`card_expiraion_date`, spelling kept) and the request-fixed
 //! keys `card_number` and `account_id`. The verification code `CARD-CVV-CD` is
@@ -38,15 +43,17 @@ use validator::{Validate, ValidationError};
 
 use crate::dto::{BmsField, id_string, reject_invalid, text};
 use crate::error::ApiError;
+use crate::pagination::{PageDirection, PageQuery, PageSize};
 
 /// The `message` of an overlong value: empty, because the validation audit
 /// records no over-length row for `COCRDLIC`, `COCRDSLC` or `COCRDUPC` and no
 /// COBOL text exists for an input the map field cannot hold.
 const OVER_LENGTH_MESSAGE: &str = "";
 
-/// The `message` of a `GET /cards` `start_key` holding a NUL character:
-/// empty, because the cursor is a REST input with no COBOL text and the
-/// validation audit records no row for it.
+/// The `message` of a `GET /cards` `start_key` longer than a card number,
+/// holding a character outside ASCII or holding a NUL character: empty,
+/// because the cursor is a REST input with no COBOL text and the validation
+/// audit records no row for it.
 const MALFORMED_START_KEY_MESSAGE: &str = "";
 
 /// `CARDSIDI PIC X(16)` [app/cpy-bms/COCRDUP.CPY:L66], the bound of the
@@ -201,11 +208,11 @@ fn update_field(name: &str) -> Option<CardUpdateField> {
 /// The filters of `GET /cards`, the `COCRDLI` map's `ACCTSID` and `CARDSID`
 /// input fields as entered.
 ///
-/// The page parameters are the separate
-/// [`PageQuery`](crate::pagination::PageQuery) extractor of the same query
-/// string, never `#[serde(flatten)]`ed into this struct: `serde_urlencoded`
-/// cannot deserialize a number through `flatten`, so the handler takes the
-/// filters and the page as two extractors and declares both in `params(..)`.
+/// The page parameters are the separate [`CardListPageQuery`] extractor of
+/// the same query string, never `#[serde(flatten)]`ed into this struct:
+/// `serde_urlencoded` cannot deserialize a number through `flatten`, so the
+/// handler takes the filters and the page as two extractors and declares both
+/// in `params(..)`.
 #[derive(Clone, Default, Deserialize, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct CardListQuery {
@@ -257,9 +264,11 @@ impl CardListQuery {
     /// gives with [`card_list::SCREEN_ROWS`] as its default.
     ///
     /// `start_key` becomes the browse key as the COBOL `MOVE` into the `X(16)`
-    /// first- and last-card keys of the COMMAREA makes it: padded with spaces
-    /// and cut after 16 characters. The keys a page returns are card numbers,
-    /// so a key passed back unchanged is never cut.
+    /// first- and last-card keys of the COMMAREA makes it: padded with spaces.
+    /// Call [`CardListPageQuery::check`] first: the `MOVE` would cut a longer
+    /// key after 16 bytes and store a non-ASCII one as its UTF-8 bytes, which
+    /// read back as other characters. The keys a page returns are card
+    /// numbers, so a key passed back unchanged passes that check.
     ///
     /// # Errors
     ///
@@ -288,6 +297,99 @@ impl CardListQuery {
             direction,
             page_size,
         })
+    }
+}
+
+/// The page position of `GET /cards`: `start_key`, `direction` and
+/// `page_size`.
+///
+/// COCRDLIC 9000-READ-FORWARD, 9100-READ-BACKWARDS — P-COCRDLIC-003,
+/// P-COCRDLIC-014: the parameters are those of [`PageQuery`], declared here
+/// so that the published `start_key` carries the `X(16)` width of the
+/// COMMAREA keys `WS-CA-FIRST-CARD-NUM` and `WS-CA-LAST-CARD-NUM` and the
+/// ASCII pattern that [`CardListPageQuery::check`] holds it to. `direction`
+/// and `page_size` are published and read exactly as `PageQuery` declares
+/// them, and the query converts into one, so [`PageQuery::resolve`] gives the
+/// browse its direction and its seven-row default (`WS-MAX-SCREEN-LINES`).
+/// An unknown `direction` or a `page_size` outside 1 to 100 fails to
+/// deserialize, so [`ApiQuery`](crate::error::ApiQuery) answers it 400 with
+/// code `INVALID`.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, IntoParams, Validate)]
+#[into_params(parameter_in = Query)]
+pub struct CardListPageQuery {
+    /// The card number the page starts from, `CARD-NUM` `X(16)` in ASCII
+    /// without NUL characters: a previous page's `next_key` or `prev_key`.
+    /// Forward (ENTER, PF8), the page starts at that card, inclusive;
+    /// backward (PF7), it holds the cards before it. Absent, both directions
+    /// read the first page.
+    // The published pattern leaves NUL out although `ascii_text` admits it:
+    // `CardListQuery::into_input` refuses any NUL, so the pattern states the
+    // keys the server accepts.
+    #[param(max_length = 16, pattern = "^[\\x01-\\x7F]*$")]
+    #[validate(length(max = 16), custom(function = "crate::dto::ascii_text"))]
+    pub start_key: Option<String>,
+    /// `forward` (ENTER and PF8, the default) or `backward` (PF7).
+    // Inlined, as `PageQuery` inlines it: query parameters register no
+    // component schema, so a reference to `PageDirection` would dangle.
+    #[param(inline)]
+    pub direction: Option<PageDirection>,
+    /// Rows on the page, from 1 to 100. Defaults to 7, the rows of the
+    /// `COCRDLI` screen.
+    #[param(value_type = Option<u16>, minimum = 1, maximum = 100)]
+    pub page_size: Option<PageSize>,
+}
+
+impl fmt::Debug for CardListPageQuery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CardListPageQuery")
+            .field("start_key", &self.start_key.as_deref().map(masked))
+            .field("direction", &self.direction)
+            .field("page_size", &self.page_size)
+            .finish()
+    }
+}
+
+impl CardListPageQuery {
+    /// Rejects a `start_key` longer than the card number `X(16)` or holding a
+    /// character above `U+007F`: 400 with an empty message and no field.
+    ///
+    /// COCRDLIC 9000-READ-FORWARD, 9100-READ-BACKWARDS — P-COCRDLIC-014: the
+    /// key is the COMMAREA card number the program set from the rows it
+    /// showed, which no operator types and no edit reads. Moved into
+    /// `X(16)`, a longer key, or the UTF-8 bytes of a non-ASCII one, would
+    /// start the browse at another card and come back in `prev_key` as other
+    /// text. No BMS field holds the key, so the error names none, as the NUL
+    /// refusal of [`CardListQuery::into_input`] names none.
+    ///
+    /// # Errors
+    ///
+    /// The 400 [`ApiError`] when `start_key` has more than 16 characters or
+    /// is not ASCII.
+    pub fn check(&self) -> Result<(), ApiError> {
+        self.validate().map_err(|errors| {
+            reject_invalid(
+                &errors,
+                |_: &str| None::<CardListField>,
+                MALFORMED_START_KEY_MESSAGE,
+            )
+        })
+    }
+}
+
+/// The shared pagination query of the card list, each parameter unchanged.
+impl From<CardListPageQuery> for PageQuery {
+    fn from(query: CardListPageQuery) -> Self {
+        let CardListPageQuery {
+            start_key,
+            direction,
+            page_size,
+        } = query;
+        Self {
+            start_key,
+            direction,
+            page_size,
+        }
     }
 }
 
@@ -596,11 +698,12 @@ mod tests {
     use utoipa::{IntoParams, PartialSchema};
 
     use super::{
-        CardListField, CardListQuery, CardResponse, CardSummary, CardUpdateField,
-        CardUpdateRequest, CardUpdateResponse, CardViewField, CardViewQuery,
+        CardListField, CardListPageQuery, CardListQuery, CardResponse, CardSummary,
+        CardUpdateField, CardUpdateRequest, CardUpdateResponse, CardViewField, CardViewQuery,
     };
     use crate::dto::BmsField;
     use crate::error::ApiError;
+    use crate::pagination::PageQuery;
 
     /// The first fixture card, of account 00000000050 (P-CVACT02Y-009)
     /// [app/data/ASCII/carddata.txt:L1].
@@ -717,8 +820,13 @@ mod tests {
             account_id: None,
             card_number: Some(CARD.to_owned()),
         };
+        let page = CardListPageQuery {
+            start_key: Some(CARD.to_owned()),
+            ..CardListPageQuery::default()
+        };
         let shown = [
             format!("{query:?}"),
+            format!("{page:?}"),
             format!("{:?}", CardSummary::from(&card)),
             format!("{:?}", CardResponse::from_card(&card, &token())),
             format!(
@@ -966,6 +1074,91 @@ mod tests {
         }
     }
 
+    /// The rule input of the `GET /cards` page query `text` as the handler
+    /// admits it: [`CardListPageQuery::check`], the defaults of
+    /// [`PageQuery::resolve`], then [`CardListQuery::into_input`].
+    fn admitted_page(text: &str) -> Result<CardListInput, ApiError> {
+        let uri: Uri = format!("/cards?{text}").parse().expect("a valid URI");
+        let Query(page) = Query::<CardListPageQuery>::try_from_uri(&uri).expect("deserializes");
+        page.check()?;
+        let (start_key, direction, rows) = PageQuery::from(page).resolve(card_list::SCREEN_ROWS);
+        CardListQuery::default().into_input(start_key, direction, rows)
+    }
+
+    #[test]
+    fn start_key_is_admitted_only_as_card_number_width_ascii_without_nul() {
+        let at_width = "ABCDEFGHIJKLMNO~";
+        let long = "A".repeat(20_000);
+        // (query text, the admitted start key, direction and rows, or `None`
+        // for the 400 with an empty message and no field)
+        let cases = [
+            (
+                format!("start_key={CARD}"),
+                Some((CARD, Direction::Forward, card_list::SCREEN_ROWS)),
+            ),
+            (
+                format!("start_key={at_width}&direction=backward&page_size=3"),
+                Some((at_width, Direction::Backward, 3)),
+            ),
+            (format!("start_key={CARD}9"), None),
+            (format!("start_key={long}"), None),
+            ("start_key=%C3%A9%C3%A9%C3%A9".to_owned(), None),
+            ("start_key=%E2%80%99%20OR".to_owned(), None),
+            (format!("start_key={CARD}%00"), None),
+            ("start_key=05000244%0053765".to_owned(), None),
+            ("start_key=%00&direction=backward".to_owned(), None),
+        ];
+        for (text, admitted) in cases {
+            match (admitted_page(&text), admitted) {
+                (Ok(input), Some((key, direction, rows))) => {
+                    assert_eq!(input.start_key, Some(CardNumber::move_from(key)), "{text}");
+                    assert_eq!(
+                        (input.direction, input.page_size),
+                        (direction, rows),
+                        "{text}"
+                    );
+                }
+                (Err(error), None) => {
+                    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{text}");
+                    assert_eq!(
+                        serde_json::to_value(error.body()).expect("serializes"),
+                        json!({"code": ErrorKind::Invalid.code(), "message": ""}),
+                        "{text}"
+                    );
+                }
+                (outcome, _) => panic!("{text}: unexpected {outcome:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn page_parameters_publish_a_card_number_start_key_and_the_shared_page() {
+        let parameters = query_parameters::<CardListPageQuery>();
+        let shared = query_parameters::<PageQuery>();
+        let names: Vec<&str> = parameters
+            .as_array()
+            .expect("a parameter list")
+            .iter()
+            .map(|parameter| parameter["name"].as_str().expect("a name"))
+            .collect();
+        assert_eq!(names, ["start_key", "direction", "page_size"]);
+        assert_eq!(
+            parameters[0]["schema"],
+            json!({"type": "string", "maxLength": 16, "pattern": "^[\\x01-\\x7F]*$"})
+        );
+        // `direction` and `page_size` are published exactly as `PageQuery`
+        // publishes them.
+        for (index, name) in names.iter().enumerate().skip(1) {
+            assert_eq!(shared[index]["name"], *name);
+            assert_eq!(
+                parameters[index]["schema"], shared[index]["schema"],
+                "{name}"
+            );
+        }
+        let text = parameters.to_string();
+        assert!(!text.contains("$ref"), "{text}");
+    }
+
     fn list_query(text: &str) -> CardListQuery {
         let uri: Uri = text.parse().expect("a valid URI");
         let Query(query) = Query::<CardListQuery>::try_from_uri(&uri).expect("deserializes");
@@ -1041,6 +1234,10 @@ mod tests {
             (
                 query_parameters::<CardViewQuery>(),
                 vec![("account_id", 11)],
+            ),
+            (
+                query_parameters::<CardListPageQuery>(),
+                vec![("start_key", 16)],
             ),
         ];
         for (parameters, expected) in cases {

@@ -18,7 +18,9 @@
 //!
 //! The caller runs all of it, and the reward accrual of the new transaction,
 //! in one database transaction; this module never reads the clock, writes
-//! nothing and computes no reward.
+//! nothing and computes no reward. [`edit_key_fields`] is the key edit of
+//! step 1 alone, without its read, for an adapter that names the key of a
+//! request before validating it.
 //!
 //! # The first message ends the request
 //!
@@ -446,53 +448,112 @@ pub async fn validate<S: XrefReader>(
     Ok(validated)
 }
 
+/// The key `VALIDATE-INPUT-KEY-FIELDS` reads the cross-reference by, as
+/// [`edit_key_fields`] accepts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditedKey {
+    /// An entered `ACTIDINI`, 11 digits: `READ-CXACAIX-FILE` reads by it, and
+    /// the card number is taken from the cross-reference (P-COTRN02C-005).
+    Account(AccountId),
+    /// An entered `CARDNINI`, 16 digits, with `ACTIDINI` blank:
+    /// `READ-CCXREF-FILE` reads by it, and the account is taken from the
+    /// cross-reference (P-COTRN02C-006).
+    Card(CardNumber),
+}
+
 /// COTRN02C VALIDATE-INPUT-KEY-FIELDS — P-COTRN02C-005 to P-COTRN02C-007,
 /// P-COTRN02C-027; V-COTRN02C-001 to V-COTRN02C-003.
 ///
-/// The `EVALUATE TRUE` of [app/cbl/COTRN02C.cbl:L193-230]: an entered account
-/// ID is tested first, then an entered card number.
+/// The key edit of the `EVALUATE TRUE` [app/cbl/COTRN02C.cbl:L193-230],
+/// without its cross-reference read: the entered `account_id` and
+/// `card_number`, absent being blank, each received into its map field as
+/// [`validate`] receives it. An entered account ID is tested first, then an
+/// entered card number.
 ///
 /// - Account ID entered: it must be 11 digits; `FUNCTION NUMVAL` of the digits
-///   is the account key (exact, P-COTRN02C-027), `READ-CXACAIX-FILE` reads its
-///   first cross-reference, and the card number is taken from it. An entered
-///   card number is then ignored.
-/// - Card number entered: it must be 16 digits, which are the key
-///   `READ-CCXREF-FILE` reads by; the account is taken from the
-///   cross-reference.
+///   is the account key (exact, P-COTRN02C-027). An entered card number is
+///   then ignored.
+/// - Card number entered: it must be 16 digits, which are the key.
 /// - Neither entered: rejected.
+///
+/// [`validate`] applies this edit before its read, so an adapter that records
+/// the key of a request before validating it records the key the rule reads
+/// by, or the refusal the rule answers with.
 ///
 /// # Errors
 ///
-/// Invalid on `ACTIDIN` or `CARDNIN` for a non-numeric key, empty on
-/// `ACTIDIN` when neither is entered, and the read failures of
-/// [`read_cxacaix_file`] and [`read_ccxref_file`].
+/// Invalid with [`ACCOUNT_ID_MUST_BE_NUMERIC`] on `ACTIDIN` for an entered
+/// account ID that is not 11 digits (V-COTRN02C-001), invalid with
+/// [`CARD_NUMBER_MUST_BE_NUMERIC`] on `CARDNIN` for an entered card number
+/// that is not 16 digits (V-COTRN02C-002), and empty with
+/// [`ACCOUNT_OR_CARD_NUMBER_MUST_BE_ENTERED`] on `ACTIDIN` when neither is
+/// entered (V-COTRN02C-003).
+pub fn edit_key_fields(
+    account_id: Option<&str>,
+    card_number: Option<&str>,
+) -> Result<EditedKey, DomainError> {
+    edit_received_keys(
+        &Received::from_text(account_id.unwrap_or_default()),
+        &Received::from_text(card_number.unwrap_or_default()),
+    )
+}
+
+/// [`edit_key_fields`] of the map fields `RECEIVE MAP` filled.
+fn edit_received_keys(
+    account_id: &Received<ACCOUNT_ID_LEN>,
+    card_number: &Received<CARD_NUMBER_LEN>,
+) -> Result<EditedKey, DomainError> {
+    if !account_id.is_blank() {
+        return account_id
+            .numeric()
+            .and_then(|field| field.as_text().parse::<AccountId>().ok())
+            .map(EditedKey::Account)
+            .ok_or_else(|| {
+                DomainError::invalid(ACCOUNT_ID_MUST_BE_NUMERIC).with_field(FIELD_ACTIDIN)
+            });
+    }
+    if !card_number.is_blank() {
+        return card_number
+            .numeric()
+            .map(|field| EditedKey::Card(CardNumber::from_alnum(field)))
+            .ok_or_else(|| {
+                DomainError::invalid(CARD_NUMBER_MUST_BE_NUMERIC).with_field(FIELD_CARDNIN)
+            });
+    }
+    Err(DomainError::empty(ACCOUNT_OR_CARD_NUMBER_MUST_BE_ENTERED).with_field(FIELD_ACTIDIN))
+}
+
+/// COTRN02C VALIDATE-INPUT-KEY-FIELDS — P-COTRN02C-005 to P-COTRN02C-007,
+/// P-COTRN02C-027; V-COTRN02C-001 to V-COTRN02C-003.
+///
+/// The `EVALUATE TRUE` of [app/cbl/COTRN02C.cbl:L193-230]: the key edit of
+/// [`edit_key_fields`], then the read by the edited key.
+///
+/// - Account key: `READ-CXACAIX-FILE` reads its first cross-reference, and the
+///   card number is taken from it.
+/// - Card key: `READ-CCXREF-FILE` reads by it; the account is taken from the
+///   cross-reference.
+///
+/// # Errors
+///
+/// The key edit's error, and the read failures of [`read_cxacaix_file`] and
+/// [`read_ccxref_file`].
 async fn validate_key_fields<S: XrefReader>(
     store: &mut S,
     account_id: &Received<ACCOUNT_ID_LEN>,
     card_number: &Received<CARD_NUMBER_LEN>,
 ) -> Result<(CardXref, CardNumber), DomainError> {
-    if !account_id.is_blank() {
-        let key = account_id
-            .numeric()
-            .and_then(|field| field.as_text().parse::<AccountId>().ok())
-            .ok_or_else(|| {
-                DomainError::invalid(ACCOUNT_ID_MUST_BE_NUMERIC).with_field(FIELD_ACTIDIN)
-            })?;
-        let xref = read_cxacaix_file(store, key).await?;
-        let card = xref.xref_card_num;
-        return Ok((xref, card));
+    match edit_received_keys(account_id, card_number)? {
+        EditedKey::Account(key) => {
+            let xref = read_cxacaix_file(store, key).await?;
+            let card = xref.xref_card_num;
+            Ok((xref, card))
+        }
+        EditedKey::Card(card) => {
+            let xref = read_ccxref_file(store, card).await?;
+            Ok((xref, card))
+        }
     }
-    if !card_number.is_blank() {
-        let card = card_number
-            .numeric()
-            .map(CardNumber::from_alnum)
-            .ok_or_else(|| {
-                DomainError::invalid(CARD_NUMBER_MUST_BE_NUMERIC).with_field(FIELD_CARDNIN)
-            })?;
-        let xref = read_ccxref_file(store, card).await?;
-        return Ok((xref, card));
-    }
-    Err(DomainError::empty(ACCOUNT_OR_CARD_NUMBER_MUST_BE_ENTERED).with_field(FIELD_ACTIDIN))
 }
 
 /// COTRN02C READ-CXACAIX-FILE — P-COTRN02C-008; V-COTRN02C-004,
@@ -996,10 +1057,10 @@ fn map_text<const N: usize>(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FIELD_ACTIDIN, FIELD_CARDNIN, FIELD_CONFIRM, FIELD_MCITY, FIELD_MID, FIELD_MNAME,
-        FIELD_MZIP, FIELD_TCATCD, FIELD_TDESC, FIELD_TORIGDT, FIELD_TPROCDT, FIELD_TRNAMT,
-        FIELD_TRNSRC, FIELD_TTYPCD, TransactionAddInput, ValidatedTransaction, allocated_tran_id,
-        build, copied_fields, validate, write_result,
+        EditedKey, FIELD_ACTIDIN, FIELD_CARDNIN, FIELD_CONFIRM, FIELD_MCITY, FIELD_MID,
+        FIELD_MNAME, FIELD_MZIP, FIELD_TCATCD, FIELD_TDESC, FIELD_TORIGDT, FIELD_TPROCDT,
+        FIELD_TRNAMT, FIELD_TRNSRC, FIELD_TTYPCD, TransactionAddInput, ValidatedTransaction,
+        allocated_tran_id, build, copied_fields, edit_key_fields, validate, write_result,
     };
     use crate::entities::{CardXref, NewTransaction, Transaction};
     use crate::error::DomainError;
@@ -1163,6 +1224,75 @@ mod tests {
             assert_eq!(validated.xref, xref(CARD_B, 1, 1), "{account_id:?}");
             assert_eq!(validated.card_number, CardNumber::move_from(CARD_B));
             assert_eq!(store.calls, ["read_xref_by_card"]);
+        }
+    }
+
+    // P-COTRN02C-005 to P-COTRN02C-007, P-COTRN02C-027; V-COTRN02C-001 to
+    // V-COTRN02C-003: the key edit alone is the key `validate` reads by, or the
+    // refusal it answers with before any read.
+    #[test]
+    fn the_key_edit_is_the_key_validate_reads_by_or_its_refusal() {
+        let account = |number: u64| -> Result<EditedKey, DomainError> {
+            Ok(EditedKey::Account(
+                AccountId::new(number).expect("an account of 11 digits"),
+            ))
+        };
+        let card = |number: &str| -> Result<EditedKey, DomainError> {
+            Ok(EditedKey::Card(CardNumber::move_from(number)))
+        };
+        let account_invalid = Err(invalid(ACCOUNT_ID_MUST_BE_NUMERIC, FIELD_ACTIDIN));
+        let card_invalid = Err(invalid(CARD_NUMBER_MUST_BE_NUMERIC, FIELD_CARDNIN));
+        let neither =
+            Err(DomainError::empty(ACCOUNT_OR_CARD_NUMBER_MUST_BE_ENTERED)
+                .with_field(FIELD_ACTIDIN));
+        // (account ID, card number) -> the edited key
+        let cases = [
+            (Some("00000000050"), None, account(50)),
+            (Some("00000000050"), Some("050002445376574X"), account(50)),
+            (Some("00000000050   "), Some(CARD_B), account(50)),
+            (Some("99999999999"), None, account(99_999_999_999)),
+            (Some("0000000005A"), Some(CARD_A), account_invalid.clone()),
+            (Some("50"), None, account_invalid.clone()),
+            (Some("000000000500"), None, account_invalid.clone()),
+            (Some("*"), Some(CARD_B), account_invalid.clone()),
+            (Some("\u{e9}"), None, account_invalid),
+            (None, Some(CARD_B), card(CARD_B)),
+            (Some(""), Some(CARD_B), card(CARD_B)),
+            (Some("           "), Some(CARD_B), card(CARD_B)),
+            (Some("\0\0"), Some(CARD_A), card(CARD_A)),
+            (None, Some("9999999999999999"), card("9999999999999999")),
+            (None, Some("050002445376574X"), card_invalid.clone()),
+            (Some(" "), Some("0500024453765"), card_invalid.clone()),
+            (None, Some("05000244537657401"), card_invalid),
+            (None, None, neither.clone()),
+            (Some("\0\0\0"), Some("   "), neither),
+        ];
+        for (account_id, card_number, expected) in cases {
+            let case = format!("{account_id:?} {card_number:?}");
+            let edited = edit_key_fields(account_id, card_number);
+            assert_eq!(edited, expected, "{case}");
+            let mut store = store();
+            let input = TransactionAddInput {
+                account_id: account_id.map(str::to_owned),
+                card_number: card_number.map(str::to_owned),
+                ..valid_input()
+            };
+            let validated = run(&mut store, input);
+            match edited {
+                Ok(EditedKey::Account(_)) => {
+                    assert_eq!(store.calls, ["read_xref_by_account"], "{case}");
+                }
+                Ok(EditedKey::Card(key)) => {
+                    assert_eq!(store.calls, ["read_xref_by_card"], "{case}");
+                    if let Ok(validated) = validated {
+                        assert_eq!(validated.card_number, key, "{case}");
+                    }
+                }
+                Err(refusal) => {
+                    assert_eq!(validated, Err(refusal), "{case}");
+                    assert!(store.calls.is_empty(), "{case}");
+                }
+            }
         }
     }
 

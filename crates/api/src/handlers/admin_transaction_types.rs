@@ -759,13 +759,14 @@ mod tests {
             self.lock().clone()
         }
 
-        /// The last value recorded under `field`, if any.
-        fn value(&self, field: &str) -> Option<String> {
+        /// Every value recorded under `field`, in the order it was recorded,
+        /// so a field recorded twice shows twice.
+        fn values_of(&self, field: &str) -> Vec<String> {
             self.lock()
                 .iter()
-                .rev()
-                .find(|(name, _)| *name == field)
+                .filter(|(name, _)| *name == field)
                 .map(|(_, value)| value.clone())
+                .collect()
         }
     }
 
@@ -902,24 +903,34 @@ mod tests {
                     (site.step)(&span, code)
                 });
                 let case = format!("{} with {code:?}", site.route);
+                // Each field holds exactly the values recorded under it, so a
+                // second recording of any of them fails the case.
                 assert_eq!(
-                    capture.value("transaction").as_deref(),
-                    Some(site.transaction),
+                    capture.values_of("transaction"),
+                    [site.transaction],
+                    "{case}"
+                );
+                assert_eq!(capture.values_of("user_id"), ["ADMIN001"], "{case}");
+                assert_eq!(
+                    capture.values_of("origin"),
+                    site.origin.as_slice(),
                     "{case}"
                 );
                 assert_eq!(
-                    capture.value("user_id").as_deref(),
-                    Some("ADMIN001"),
+                    capture.values_of("type_code"),
+                    recorded.as_slice(),
                     "{case}"
                 );
-                assert_eq!(capture.value("origin").as_deref(), site.origin, "{case}");
-                assert_eq!(capture.value("type_code").as_deref(), recorded, "{case}");
                 assert_eq!(
-                    capture.value("key_rejected").as_deref(),
-                    rejected_len.map(|_| "INVALID"),
+                    capture.values_of("key_rejected"),
+                    rejected_len.map(|_| "INVALID").as_slice(),
                     "{case}"
                 );
-                assert_eq!(capture.value("key_len").as_deref(), rejected_len, "{case}");
+                assert_eq!(
+                    capture.values_of("key_len"),
+                    rejected_len.as_slice(),
+                    "{case}"
+                );
                 assert!(
                     capture
                         .values()
@@ -947,8 +958,8 @@ mod tests {
             record_entered_type_code(&handler_span(CTLI, &admin(), None), None);
         });
         for field in ["type_code", "key_rejected", "key_len"] {
-            assert_eq!(capture.value(field), None, "{field}");
+            assert_eq!(capture.values_of(field), Vec::<String>::new(), "{field}");
         }
-        assert_eq!(capture.value("transaction").as_deref(), Some(CTLI));
+        assert_eq!(capture.values_of("transaction"), [CTLI]);
     }
 }

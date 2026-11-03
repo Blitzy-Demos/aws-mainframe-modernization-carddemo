@@ -5,8 +5,9 @@
 // (no-message, E-49). NUL characters alone pass where the rule reads them as LOW-VALUES:
 // exactly the field width for COUSR01C, which moves the entry into its X(n) field first,
 // and any number for COUSR02C. The password keeps NUL, being stored as its argon2id hash,
-// and so do the user type and the {id} key. Each member's regex issues match the pattern
-// the API document publishes for it.
+// and so do the user type and the {id} key. The list start key passes NUL characters only
+// as the 8 COUSR00C reads as LOW-VALUES, as the new user's ID does. Each member's and the
+// start key's regex issues match the pattern the API document publishes for it.
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
@@ -18,6 +19,7 @@ import {
   type UserAddFormValues,
   type UserUpdateFormInput,
   userAddSchema,
+  userListFilterSchema,
   userUpdateSchema,
 } from "./admin-users";
 
@@ -97,6 +99,53 @@ function shortNulEntries(width: number): string[] {
 function textEntries(width: number): string[] {
   return ["", " ".repeat(width), "x".repeat(width), "\u007f"];
 }
+
+/** The pattern the API document publishes for the start_key of GET /admin/users. */
+function publishedStartKeyPattern(): string {
+  const parameter = openapi.paths["/admin/users"].get.parameters.find(
+    (candidate) => candidate.name === "start_key",
+  );
+  const schema: { pattern?: string } | undefined = parameter?.schema;
+  if (schema?.pattern === undefined) {
+    throw new Error("GET /admin/users publishes no start_key pattern");
+  }
+  return schema.pattern;
+}
+
+/** The issues the list filter gives `entered` as its start_key. */
+function startKeyIssues(entered: string): z.ZodIssue[] {
+  const result = userListFilterSchema.safeParse({ start_key: entered });
+  return result.success
+    ? []
+    : result.error.issues.filter((issue) => issue.path[0] === "start_key");
+}
+
+describe("userListFilterSchema start_key", () => {
+  const width = 8;
+  const nulKeys = [
+    ...mixedNulEntries(width),
+    ...shortNulEntries(width),
+    `\u0000${" ".repeat(width - 1)}`,
+    "\u0000\u0000",
+  ];
+  const acceptedKeys = [...textEntries(width), "ADMIN001", "\u0000".repeat(width)];
+
+  it.each(nulKeys)("rejects %j with zod's regex issue and no audited text", (entered) => {
+    expectRegexIssueOnly(startKeyIssues(entered));
+  });
+
+  it.each(acceptedKeys)("accepts %j", (entered) => {
+    expect(startKeyIssues(entered)).toEqual([]);
+  });
+
+  it("gives its regex issue to exactly the keys the published pattern refuses", () => {
+    const published = new RegExp(publishedStartKeyPattern());
+    for (const entered of [...nulKeys, ...acceptedKeys, "\u00e9"]) {
+      const refused = hasRegexIssue(startKeyIssues(entered));
+      expect(refused, JSON.stringify(entered)).toBe(!published.test(entered));
+    }
+  });
+});
 
 describe("userAddSchema", () => {
   it("accepts the valid entry", () => {

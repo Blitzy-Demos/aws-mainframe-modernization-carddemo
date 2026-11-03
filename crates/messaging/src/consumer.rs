@@ -736,6 +736,8 @@ mod tests {
     use std::time::Duration;
 
     use futures_util::stream::AbortRegistration;
+    use lapin::acker::Acker;
+    use lapin::message::{BasicReturnMessage, Delivery};
     use lapin::publisher_confirm::Confirmation;
     use lapin::types::ShortString;
     use lapin::{BasicProperties, Channel, ChannelState};
@@ -788,17 +790,75 @@ mod tests {
         PublishFailure::Channel(lapin::Error::InvalidChannelState(ChannelState::Closed))
     }
 
+    /// A mandatory publish as the broker returns it when no queue is bound to
+    /// its routing key on the default exchange (`basic.return` 312 `NO_ROUTE`).
+    fn returned() -> Box<BasicReturnMessage> {
+        Box::new(BasicReturnMessage {
+            delivery: Delivery {
+                delivery_tag: 0,
+                exchange: "".into(),
+                routing_key: "QA.NOPE".into(),
+                redelivered: false,
+                properties: BasicProperties::default(),
+                data: b"REPLY".to_vec(),
+                // `Acker::default`, the only public constructor of `Acker`,
+                // builds the same unusable acker lapin gives every returned
+                // message, and logs a warning saying so. Nothing acks a
+                // returned publish, nor does this test.
+                acker: Acker::default(),
+            },
+            reply_code: 312,
+            reply_text: "NO_ROUTE".into(),
+        })
+    }
+
     #[test]
     fn only_an_unreturned_ack_is_delivered() {
-        assert!(classify(Confirmation::Ack(None)).is_ok());
-        assert!(matches!(
-            classify(Confirmation::NotRequested),
-            Err(PublishFailure::NotRequested)
-        ));
-        assert!(matches!(
-            classify(Confirmation::Nack(None)),
-            Err(PublishFailure::Nacked)
-        ));
+        /// A confirmation shape, a builder for it and the outcome it must get.
+        type Case = (
+            &'static str,
+            fn() -> Confirmation,
+            fn(&Result<(), PublishFailure>) -> bool,
+        );
+
+        // Every shape a publisher confirmation takes. `Confirmation` is not
+        // `Clone`, so each case builds its own.
+        let cases: [Case; 5] = [
+            (
+                "Ack(None)",
+                || Confirmation::Ack(None),
+                |outcome| matches!(outcome, Ok(())),
+            ),
+            (
+                "Ack(Some(returned))",
+                || Confirmation::Ack(Some(returned())),
+                |outcome| matches!(outcome, Err(PublishFailure::Returned)),
+            ),
+            (
+                "Nack(Some(returned))",
+                || Confirmation::Nack(Some(returned())),
+                |outcome| matches!(outcome, Err(PublishFailure::Nacked)),
+            ),
+            (
+                "Nack(None)",
+                || Confirmation::Nack(None),
+                |outcome| matches!(outcome, Err(PublishFailure::Nacked)),
+            ),
+            (
+                "NotRequested",
+                || Confirmation::NotRequested,
+                |outcome| matches!(outcome, Err(PublishFailure::NotRequested)),
+            ),
+        ];
+        let mut delivered = Vec::new();
+        for (shape, confirmation, expected) in cases {
+            let outcome = classify(confirmation());
+            assert!(expected(&outcome), "{shape} classified as {outcome:?}");
+            if outcome.is_ok() {
+                delivered.push(shape);
+            }
+        }
+        assert_eq!(delivered, ["Ack(None)"]);
     }
 
     #[test]

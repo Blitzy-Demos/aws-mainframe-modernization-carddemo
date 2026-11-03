@@ -35,10 +35,10 @@
 //!
 //! Only `POST /auth/login` and `POST /auth/logout` are public. Every other
 //! user route takes [`crate::auth::AuthUser`], so a request without a valid
-//! bearer token is 401. Every `/admin/**` route, the reward-rule routes
-//! included, takes [`crate::auth::AdminUser`], so a valid token whose
-//! `usr_type` is not `A` is 403. The acting user is always the verified
-//! token's, never a request field.
+//! bearer token, or whose token names no stored user, is 401. Every
+//! `/admin/**` route, the reward-rule routes included, takes
+//! [`crate::auth::AdminUser`], so a valid token whose `usr_type` is not `A` is
+//! 403. The acting user is always the verified token's, never a request field.
 
 // The declarations keep rustfmt's default alphabetical order, which the
 // `cargo fmt --check` gate enforces; `router()` keeps the transaction-table
@@ -55,9 +55,12 @@ pub mod reports;
 pub mod rewards;
 pub mod transactions;
 
+use axum::extract::Query;
+use axum::http::{Method, Uri};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::dto::admin_transaction_types::{TranTypeOrigin, TranTypeUpdateQuery};
 use crate::state::AppState;
 
 /// Every REST route of the `CardDemo` API: the 19 online transactions served
@@ -128,13 +131,75 @@ pub fn router() -> OpenApiRouter<AppState> {
         ))
 }
 
+/// The `transaction` the handler span of the [`router()`] operation serving
+/// `method` on the route template `route` records, or `None` when no operation
+/// serves them.
+///
+/// The code is the online transaction's (CC00, CAVW, …, CTLI), or `REWARDS`
+/// and `REWARD-RULES` for the rewards resources, as each handler names it.
+/// `HEAD` is the `GET` operation, whose handler axum runs for it.
+///
+/// `PUT /admin/transaction-types/{id}` serves both CTTU and CTLI: it is CTLI
+/// when `uri`'s query is a [`TranTypeUpdateQuery`] with `origin=list`, and
+/// CTTU otherwise, a query that does not deserialize included, as the handler
+/// decides from the same query.
+///
+/// When an extractor refuses a request, so that no handler span opens,
+/// `crate::transaction_of` looks the code up here and `crate::record_refusal`
+/// puts it on the request span.
+pub(crate) fn transaction_code(method: &Method, route: &str, uri: &Uri) -> Option<&'static str> {
+    let method = if method == Method::HEAD {
+        Method::GET.as_str()
+    } else {
+        method.as_str()
+    };
+    let code = match (method, route) {
+        ("POST", "/auth/login" | "/auth/logout") => "CC00",
+        ("GET", "/accounts/{id}") => "CAVW",
+        ("PUT", "/accounts/{id}") => "CAUP",
+        ("GET", "/cards") => "CCLI",
+        ("GET", "/cards/{id}") => "CCDL",
+        ("PUT", "/cards/{id}") => "CCUP",
+        ("GET", "/transactions") => "CT00",
+        ("POST", "/transactions") => "CT02",
+        ("GET", "/transactions/{id}") => "CT01",
+        ("GET", "/reports/transactions") => "CR00",
+        ("POST", "/payments") => "CB00",
+        ("GET", "/authorizations") => "CPVS",
+        ("GET" | "PUT", "/authorizations/{id}") => "CPVD",
+        ("GET", "/admin/users") => "CU00",
+        ("POST", "/admin/users") => "CU01",
+        ("GET" | "PUT", "/admin/users/{id}") => "CU02",
+        ("DELETE", "/admin/users/{id}") => "CU03",
+        ("GET", "/admin/transaction-types") | ("DELETE", "/admin/transaction-types/{id}") => "CTLI",
+        ("POST", "/admin/transaction-types") => "CTTU",
+        ("PUT", "/admin/transaction-types/{id}") => tran_type_update_code(uri),
+        ("GET", "/rewards/balance/{account_id}" | "/rewards/history/{account_id}") => "REWARDS",
+        ("GET" | "POST", "/admin/reward-rules")
+        | ("PUT" | "DELETE", "/admin/reward-rules/{id}") => "REWARD-RULES",
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// The transaction of `PUT /admin/transaction-types/{id}` with `uri`: CTLI
+/// for the `origin=list` inline update, else CTTU, from the query the
+/// handler's `ApiQuery<TranTypeUpdateQuery>` deserializes.
+fn tran_type_update_code(uri: &Uri) -> &'static str {
+    match Query::<TranTypeUpdateQuery>::try_from_uri(uri).map(|Query(query)| query.origin) {
+        Ok(Some(TranTypeOrigin::List)) => "CTLI",
+        Ok(None) | Err(_) => "CTTU",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use axum::http::{Method, Uri};
     use serde_json::Value;
 
-    use super::router;
+    use super::{router, transaction_code};
 
     /// Every operation the registry must serve: path, method, `operationId`.
     const OPERATIONS: [(&str, &str, &str); 30] = [
@@ -177,6 +242,46 @@ mod tests {
     const HTTP_METHODS: [&str; 8] = [
         "get", "put", "post", "delete", "options", "head", "patch", "trace",
     ];
+
+    /// The `transaction` each operation's handler span records, by
+    /// `operationId`; `update_tran_type` without `origin=list`.
+    const TRANSACTIONS: [(&str, &str); 30] = [
+        ("login", "CC00"),
+        ("logout", "CC00"),
+        ("get_account", "CAVW"),
+        ("update_account", "CAUP"),
+        ("list_cards", "CCLI"),
+        ("get_card", "CCDL"),
+        ("update_card", "CCUP"),
+        ("list_transactions", "CT00"),
+        ("create_transaction", "CT02"),
+        ("get_transaction", "CT01"),
+        ("transaction_report", "CR00"),
+        ("create_payment", "CB00"),
+        ("list_authorizations", "CPVS"),
+        ("get_authorization", "CPVD"),
+        ("toggle_fraud", "CPVD"),
+        ("list_users", "CU00"),
+        ("create_user", "CU01"),
+        ("get_user", "CU02"),
+        ("update_user", "CU02"),
+        ("delete_user", "CU03"),
+        ("list_tran_types", "CTLI"),
+        ("create_tran_type", "CTTU"),
+        ("update_tran_type", "CTTU"),
+        ("delete_tran_type", "CTLI"),
+        ("get_reward_balance", "REWARDS"),
+        ("get_reward_history", "REWARDS"),
+        ("list_reward_rules", "REWARD-RULES"),
+        ("create_reward_rule", "REWARD-RULES"),
+        ("update_reward_rule", "REWARD-RULES"),
+        ("delete_reward_rule", "REWARD-RULES"),
+    ];
+
+    /// `name`, a lower-case [`HTTP_METHODS`] entry, as a method.
+    fn method(name: &str) -> Method {
+        Method::from_bytes(name.to_ascii_uppercase().as_bytes()).expect("an HTTP method")
+    }
 
     /// The document half of the registry, as JSON.
     fn document() -> Value {
@@ -233,6 +338,86 @@ mod tests {
         }
         let ids: BTreeSet<&str> = expected.values().copied().collect();
         assert_eq!(ids.len(), 30, "operation IDs are unique");
+    }
+
+    #[test]
+    fn transaction_code_names_each_operation_s_code_and_nothing_else() {
+        let codes: BTreeMap<&str, &str> = TRANSACTIONS.into_iter().collect();
+        let ids: BTreeSet<&str> = OPERATIONS.iter().map(|(_, _, id)| *id).collect();
+        assert_eq!(codes.len(), 30, "one code per operation");
+        assert_eq!(codes.keys().copied().collect::<BTreeSet<_>>(), ids);
+
+        // The code of each (path, method) an operation serves; `HEAD` runs the
+        // `GET` operation's handler.
+        let served: BTreeMap<(&str, &str), &str> = OPERATIONS
+            .iter()
+            .map(|(path, name, id)| ((*path, *name), codes[id]))
+            .collect();
+        let no_query = Uri::from_static("/");
+        let paths: BTreeSet<&str> = OPERATIONS.iter().map(|(path, _, _)| *path).collect();
+        for path in paths {
+            for name in HTTP_METHODS {
+                let operation = if name == "head" { "get" } else { name };
+                assert_eq!(
+                    transaction_code(&method(name), path, &no_query),
+                    served.get(&(path, operation)).copied(),
+                    "{name} {path}"
+                );
+            }
+        }
+
+        // A route template the registry does not hold, or no route at all.
+        for route in [
+            "unmatched",
+            "",
+            "/",
+            "/accounts",
+            "/accounts/{account_id}",
+            "/api/accounts/{id}",
+            "/admin/users/{user_id}",
+            "/rewards/redeem",
+        ] {
+            for name in HTTP_METHODS {
+                assert_eq!(
+                    transaction_code(&method(name), route, &no_query),
+                    None,
+                    "{name} {route}"
+                );
+            }
+        }
+        let extension = Method::from_bytes(b"PROPFIND").expect("a method token");
+        assert_eq!(transaction_code(&extension, "/cards", &no_query), None);
+    }
+
+    #[test]
+    fn the_shared_tran_type_update_is_ctli_only_with_origin_list() {
+        const ROUTE: &str = "/admin/transaction-types/{id}";
+        for (query, code) in [
+            ("", "CTTU"),
+            ("?", "CTTU"),
+            ("?origin=list", "CTLI"),
+            ("?origin=%6Cist", "CTLI"),
+            ("?origin=list&description=x", "CTLI"),
+            ("?origin=", "CTTU"),
+            ("?origin=LIST", "CTTU"),
+            ("?origin=bogus", "CTTU"),
+            ("?origin=list&origin=list", "CTTU"),
+            ("?Origin=list", "CTTU"),
+        ] {
+            let uri: Uri = format!("/admin/transaction-types/01{query}")
+                .parse()
+                .expect("a URI");
+            assert_eq!(
+                transaction_code(&Method::PUT, ROUTE, &uri),
+                Some(code),
+                "{query}"
+            );
+            assert_eq!(
+                transaction_code(&Method::DELETE, ROUTE, &uri),
+                Some("CTLI"),
+                "{query}"
+            );
+        }
     }
 
     #[test]

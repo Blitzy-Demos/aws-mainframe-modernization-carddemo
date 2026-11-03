@@ -104,8 +104,10 @@ const PAGE_ROWS: u16 = 1_000;
 /// - 400 with the audited `CORPT00C` message and its BMS field when an edit
 ///   fails or the request is not confirmed: no report type, an empty or
 ///   invalid custom date part, a date `CSUTLDTC` rejects, a blank, `N` or
-///   other confirmation (V-CORPT00C-001 to V-CORPT00C-018); also a query
-///   value longer than its field.
+///   other confirmation (V-CORPT00C-001 to V-CORPT00C-018).
+/// - 400 with no message, before those edits, when a query value is longer
+///   than its field (on `SDTYYYY`, `EDTYYYY` or `CONFIRM`) or the confirmation
+///   holds a character above `U+007F` (on `CONFIRM`).
 /// - 401 without a valid bearer token.
 /// - 500 `Unexpected error` when the database fails, when a report record's
 ///   cross-reference, type or category is missing from `card_xref`,

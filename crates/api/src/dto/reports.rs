@@ -9,7 +9,11 @@
 //! `CONFIRM` is `confirm` (E-48). Every edit of `PROCESS-ENTER-KEY` and
 //! `SUBMIT-JOB-TO-INTRDR` [app/cbl/CORPT00C.cbl:L208-510] runs in
 //! `carddemo_domain::rules::report_request`, which must see the parts exactly
-//! as typed; the query only bounds each field's length.
+//! as typed. The query bounds each field's length and holds `confirm` to
+//! ASCII: the rule quotes an invalid confirmation back from `CONFIRMI X(1)`,
+//! which a character of more than one byte does not fit. The dates get no
+//! encoding check, because the rule's `NUMVAL-C` value edits read every part
+//! and answer a non-ASCII one with that part's audited text.
 //!
 //! [`ReportResponse`] carries the report `CBTRN03C` writes for the confirmed
 //! range: the TDQ `JOBS` submission of the `TRANREPT` job becomes a
@@ -70,10 +74,11 @@ impl From<ReportTypeParam> for ReportType {
 
 /// The query of `GET /reports/transactions`: the `CORPT0A` input of one ENTER.
 ///
-/// Every value reaches the rule as entered. Only the declared lengths are
-/// checked here ([`ReportQuery::check`]); the empty, value and `CSUTLDTC`
-/// edits and the confirmation belong to `report_request::request`, whose
-/// first failure answers in the COBOL order (P-CORPT00C-002).
+/// Every value reaches the rule as entered. Only the declared lengths and the
+/// ASCII text of `confirm` are checked here ([`ReportQuery::check`]); the
+/// empty, value and `CSUTLDTC` edits and the confirmation belong to
+/// `report_request::request`, whose first failure answers in the COBOL order
+/// (P-CORPT00C-002).
 #[derive(Debug, Clone, Default, Deserialize, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct ReportQuery {
@@ -98,18 +103,25 @@ pub struct ReportQuery {
     #[param(max_length = 10)]
     #[validate(length(max = DATE_TEXT_LEN))]
     pub end_date: Option<String>,
-    /// `CONFIRM X(1)`: `Y` or `y` runs the report, which the SPA confirmation
-    /// dialog sends; absent or blank asks for confirmation (V-CORPT00C-016),
-    /// `N` or `n` clears the form (V-CORPT00C-017), any other value is
-    /// rejected (V-CORPT00C-018).
+    /// `CONFIRM X(1)` in ASCII: `Y` or `y` runs the report, which the SPA
+    /// confirmation dialog sends; absent or blank asks for confirmation
+    /// (V-CORPT00C-016), `N` or `n` clears the form (V-CORPT00C-017), any
+    /// other value is rejected and quoted back (V-CORPT00C-018). A character
+    /// above `U+007F` is rejected before those edits, with no message (E-49).
+    // CORPT00C SUBMIT-JOB-TO-INTRDR — V-CORPT00C-018: the rule moves the value
+    // byte for byte into `CONFIRMI X(1)` to quote it back, which would cut a
+    // character of two to four bytes to nothing and answer `""`. The ASCII
+    // check stands because that echo is the only answer the edit has for such
+    // a value (see the module's notes on the encoding).
     #[serde(default)]
-    #[param(max_length = 1)]
-    #[validate(length(max = 1))]
+    #[param(max_length = 1, pattern = "^[\\x00-\\x7F]*$")]
+    #[validate(length(max = 1), custom(function = "crate::dto::ascii_text"))]
     pub confirm: Option<String>,
 }
 
 impl ReportQuery {
-    /// The declared field lengths, checked before the rule runs.
+    /// The declared field lengths and the ASCII text of `confirm`, checked
+    /// before the rule runs.
     ///
     /// The date parts are not checked against their map fields here:
     /// `report_request` rejects a part longer than `SDTMMI X(2)`, `SDTDDI
@@ -117,13 +129,20 @@ impl ReportQuery {
     /// COBOL order reaches its edit (E-28, V-CORPT00C-008 to V-CORPT00C-013).
     /// A check here would answer ahead of the earlier edits, the missing
     /// report type and the empty parts included, and without the audited text.
+    /// For the same reason the dates get no encoding check: the `NUMVAL-C`
+    /// value edits read each part and answer a non-ASCII one with that part's
+    /// message. The confirmation edit has no such answer: it quotes any value
+    /// other than `Y`, `N` or blank back from `CONFIRMI X(1)`
+    /// (V-CORPT00C-018), which a character of more than one byte does not
+    /// fit, so `confirm` is held to ASCII here.
     ///
     /// # Errors
     ///
     /// 400 `Invalid` with no message when `start_date` or `end_date` is longer
-    /// than 10 characters or `confirm` longer than 1. A date stands on the
-    /// field of its first part, `SDTYYYY` or `EDTYYYY`; `confirm` on
-    /// `CONFIRM`. The fields come in the audit order.
+    /// than 10 characters, or `confirm` is longer than 1 or holds a character
+    /// above `U+007F` (E-49). A date stands on the field of its first part,
+    /// `SDTYYYY` or `EDTYYYY`; `confirm` on `CONFIRM`. The fields come in the
+    /// audit order.
     pub fn check(&self) -> Result<(), ApiError> {
         self.validate()
             .map_err(|errors| reject_invalid(&errors, length_field, OVER_LENGTH_MESSAGE))
@@ -380,7 +399,8 @@ pub enum ReportRequestField {
     #[serde(rename = "EDTYYYY")]
     EndYear,
     /// `CONFIRMI X(1)`: the confirmation prompt and an invalid confirmation
-    /// (V-CORPT00C-016, V-CORPT00C-018), and a `confirm` longer than 1.
+    /// (V-CORPT00C-016, V-CORPT00C-018), a `confirm` longer than 1, and a
+    /// non-ASCII `confirm`.
     #[serde(rename = "CONFIRM")]
     Confirm,
 }
@@ -603,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn check_rejects_only_the_declared_lengths_in_audit_order() {
+    fn check_rejects_only_the_declared_lengths_and_a_non_ascii_confirm_in_audit_order() {
         let date_over = "20221-01-01";
         let cases = [
             (Some(date_over), None, None, vec!["SDTYYYY"]),
@@ -615,6 +635,21 @@ mod tests {
                 Some("YY"),
                 vec!["SDTYYYY", "EDTYYYY", "CONFIRM"],
             ),
+            // One character of two, three or four bytes: no echo from
+            // `CONFIRMI X(1)` could quote it (E-49).
+            (None, None, Some("\u{e9}"), vec!["CONFIRM"]),
+            (None, None, Some("\u{20ac}"), vec!["CONFIRM"]),
+            (None, None, Some("\u{ff}"), vec!["CONFIRM"]),
+            (None, None, Some("\u{1f600}"), vec!["CONFIRM"]),
+            (None, None, Some("\u{80}"), vec!["CONFIRM"]),
+            // Too long and not ASCII: one entry for the field.
+            (None, None, Some("\u{e9}\u{e9}"), vec!["CONFIRM"]),
+            (
+                Some(date_over),
+                None,
+                Some("\u{e9}"),
+                vec!["SDTYYYY", "CONFIRM"],
+            ),
         ];
         for (start_date, end_date, confirm, fields) in cases {
             let query = ReportQuery {
@@ -623,7 +658,7 @@ mod tests {
                 end_date: end_date.map(str::to_owned),
                 confirm: confirm.map(str::to_owned),
             };
-            let error = query.check().expect_err("a field is too long");
+            let error = query.check().expect_err("a field fails its check");
             assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{fields:?}");
             let fields: Vec<Value> = fields
                 .into_iter()
@@ -636,12 +671,22 @@ mod tests {
         }
 
         // At their limits the fields pass, a date part longer than its map
-        // field included: the rule answers it in the COBOL order.
+        // field included: the rule answers it in the COBOL order. So does
+        // non-ASCII date text, which the value edits answer, and every ASCII
+        // confirmation, low-values included.
         for (start_date, end_date, confirm) in [
             (Some("2022-01-01"), Some("2022-07-06"), Some("Y")),
             (Some("2022-001-1"), Some("1-2-345678"), Some(" ")),
             (Some(""), Some(""), Some("")),
             (None, None, None),
+            (Some("2022-0\u{e9}-01"), Some("\u{e9}022-07-06"), Some("X")),
+            (
+                Some("\u{1f600}\u{1f600}\u{1f600}\u{1f600}-\u{20ac}\u{20ac}-\u{ff}\u{ff}"),
+                Some("2022-07-\u{e9}"),
+                Some("\u{0}"),
+            ),
+            (None, None, Some("y")),
+            (None, None, Some("\u{7f}")),
         ] {
             let query = ReportQuery {
                 report_type: None,
@@ -693,6 +738,28 @@ mod tests {
                 "report_type=custom&start_date=2022-01-01&end_date=2022-07-32&confirm=Y",
                 messages::END_DATE_NOT_A_VALID_DAY,
                 "EDTDD",
+            ),
+            // A non-ASCII part passes the query check and gets its value
+            // edit's text, in the COBOL order.
+            (
+                "report_type=custom&start_date=2022-0%C3%A9-01&end_date=2022-07-06&confirm=Y",
+                messages::START_DATE_NOT_A_VALID_MONTH,
+                "SDTMM",
+            ),
+            (
+                "report_type=custom&start_date=2022-01-%C3%A9&end_date=2022-07-06&confirm=Y",
+                messages::START_DATE_NOT_A_VALID_DAY,
+                "SDTDD",
+            ),
+            (
+                "report_type=custom&start_date=%C3%A9022-01-01&end_date=2022-07-06&confirm=Y",
+                messages::START_DATE_NOT_A_VALID_YEAR,
+                "SDTYYYY",
+            ),
+            (
+                "report_type=custom&start_date=2022-01-01&end_date=2022-%E2%82%AC-06&confirm=Y",
+                messages::END_DATE_NOT_A_VALID_MONTH,
+                "EDTMM",
             ),
         ];
         for (text, message, field) in cases {
@@ -858,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn query_parameters_document_the_lengths_and_report_types() {
+    fn query_parameters_document_the_lengths_patterns_and_report_types() {
         let params = serde_json::to_value(ReportQuery::into_params(|| Some(ParameterIn::Query)))
             .expect("the parameters serialize");
         let params = params.as_array().expect("a parameter list");
@@ -883,5 +950,14 @@ mod tests {
         assert_eq!(params[1]["schema"]["maxLength"], 10);
         assert_eq!(params[2]["schema"]["maxLength"], 10);
         assert_eq!(params[3]["schema"]["maxLength"], 1);
+        // Only the confirmation is held to ASCII; the dates are the rule's.
+        assert_eq!(params[3]["schema"]["pattern"], "^[\\x00-\\x7F]*$");
+        for index in [1, 2] {
+            assert!(
+                params[index]["schema"].get("pattern").is_none(),
+                "{}",
+                text(index)
+            );
+        }
     }
 }

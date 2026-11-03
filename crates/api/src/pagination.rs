@@ -226,9 +226,10 @@ impl PageQuery {
 
 /// One page of a list: `{items, next_key, prev_key, message?}`.
 ///
-/// The keys are the start keys of the neighbouring pages, as the rule's page
-/// gives them: zero-padded or space-trimmed key text that a following request
-/// passes back unchanged as `start_key`.
+/// The keys are the start keys of the forward (PF8) and backward (PF7)
+/// requests from this page, as the rule's page gives them: zero-padded or
+/// space-trimmed key text that a following request passes back unchanged as
+/// `start_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Page<T> {
     /// The rows of the page, in the list's key order. Empty when the page
@@ -240,8 +241,14 @@ pub struct Page<T> {
     // when absent, so the published schema says so.
     #[schema(required = true)]
     pub next_key: Option<String>,
-    /// The `start_key` of the previous page, read with `direction=backward`;
-    /// `null` when no page precedes it.
+    /// The `start_key` of the backward (PF7) request from this page, read
+    /// with `direction=backward`; `null` when the list offers no backward
+    /// request from the page. A key does not promise rows before the page:
+    /// where the program's PF7 stays live on its first page (`GET /cards`,
+    /// `GET /admin/users`), the first page carries its first key, and the
+    /// backward request from it answers with the program's no-previous-page
+    /// text in `message` (E-54). The other lists give `null` on the first page
+    /// read without a `start_key`.
     #[schema(required = true)]
     pub prev_key: Option<String>,
     /// The page-boundary text the COBOL program shows with this page, such as
@@ -508,7 +515,7 @@ mod tests {
                 "items": [],
                 "next_key": null,
                 "prev_key": null,
-                "message": "You are already at the top of the page...",
+                "message": messages::YOU_ARE_ALREADY_AT_THE_TOP_OF_THE_PAGE,
             })
         );
     }

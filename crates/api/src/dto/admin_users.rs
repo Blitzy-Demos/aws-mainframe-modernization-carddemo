@@ -41,8 +41,11 @@
 //! ([`crate::dto::storable_text`], [`crate::dto::storable_text_of_width`]):
 //! `COUSR02C` reads NUL characters alone as blank, whatever their number,
 //! while `COUSR01C` first moves the entry into its `X(n)` field, padded with
-//! spaces, so only `n` of them stay `LOW-VALUES`. The password keeps NUL,
-//! being stored as its argon2id hash, and so does the one-byte user type,
+//! spaces, so only `n` of them stay `LOW-VALUES`. The list's start key is
+//! the `USRSEC` key the browse binds as text, and `COUSR00C` reads its NUL
+//! characters as `LOW-VALUES` only when they fill its `X(8)` field, so it is
+//! held to the new user's ID rule ([`check_user_list_start_key`]). The
+//! password keeps NUL, being stored as its argon2id hash, and so does the one-byte user type,
 //! which is NUL-free or the full-width `LOW-VALUES`. None of these edits has
 //! a `COUSR0nC` path or text, so all are answered alike: 400 `Invalid` on the
 //! field with an empty message. A blank or missing field passes and reaches
@@ -59,7 +62,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
-use super::{BmsField, ascii_text, bms_errors, id_string, reject_invalid, text};
+use super::{
+    BmsField, ascii_text, bms_errors, id_string, reject_invalid, storable_text_of_width, text,
+};
 use crate::error::ApiError;
 use crate::pagination::{Page, PageDirection, PageQuery, PageSize};
 
@@ -70,8 +75,8 @@ use crate::pagination::{Page, PageDirection, PageQuery, PageSize};
 const USER_ID_LEN: usize = 8;
 
 /// The `message` of a field or key longer than its BMS field, holding a
-/// character outside ASCII, or, for a name or new user ID, holding NUL
-/// characters the rule would store.
+/// character outside ASCII, or, for a name, a new user ID or the list's
+/// start key, holding NUL characters the rule would store or browse by.
 ///
 /// A 3270 field never sends more than its `PIC X(n)` width, holds one byte
 /// per character and never sends NUL characters beside other text, so no
@@ -315,8 +320,8 @@ impl BmsField for UserDeleteField {
 
 /// Rejects a user ID key longer than `PIC X(8)` or holding a character
 /// outside ASCII: the `{id}` path segment of `GET`, `PUT` and
-/// `DELETE /admin/users/{id}` (`USRIDINI`) and the `start_key` of
-/// `GET /admin/users`.
+/// `DELETE /admin/users/{id}` (`USRIDINI`) and, as the first step of
+/// [`check_user_list_start_key`], the `start_key` of `GET /admin/users`.
 ///
 /// `COUSR00C` `PROCESS-PAGE-FORWARD`, `COUSR02C` and `COUSR03C`
 /// `PROCESS-ENTER-KEY` and `COUSR03C` `DELETE-USER-INFO` move the key into
@@ -328,6 +333,8 @@ impl BmsField for UserDeleteField {
 /// passes, blank, empty and low-values included: the rule answers a blank key
 /// with its own message (V-COUSR02C-001, V-COUSR02C-004, V-COUSR03C-004) or,
 /// for the list, starts at the top of the file.
+/// [`check_user_list_start_key`] also refuses the NUL characters the list
+/// would browse by.
 ///
 /// # Errors
 ///
@@ -348,14 +355,55 @@ pub(crate) fn check_user_id_key(value: &str, field: impl BmsField) -> Result<(),
     Ok(())
 }
 
+/// COUSR00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY — P-COUSR00C-003,
+/// P-COUSR00C-009 (E-49).
+///
+/// The check of the `start_key` of `GET /admin/users` (`USRIDINI`):
+/// [`check_user_id_key`], then NUL characters refused unless they are exactly
+/// the 8 of `LOW-VALUES` ([`crate::dto::storable_text_of_width`]).
+///
+/// `COUSR00C` tests the key for `SPACES` or `LOW-VALUES` as its `X(8)` field
+/// holds it and otherwise moves it into `SEC-USR-ID`, the key the browse
+/// starts at [app/cbl/COUSR00C.cbl:L218-222] [app/cbl/COUSR00C.cbl:L239-243].
+/// The rule reads a key the same way: moved into `X(8)`, padded with spaces,
+/// then tested. So spaces of any number, empty included, and exactly 8 NUL
+/// characters start at the top of the file, while any other key holding a NUL
+/// is browsed as entered. The browse binds it as the text of the `USRSEC` key,
+/// which cannot hold NUL (E-07), so it could only fail with the database
+/// failure text of V-COUSR00C-004. A 3270 field never sends NUL characters
+/// beside other text, so such a key has no COBOL counterpart and is answered
+/// as an over-length or non-ASCII key is (E-49). The `{id}` path segment keeps
+/// [`check_user_id_key`] alone: `COUSR02C` and `COUSR03C` read NUL characters
+/// alone as blank, whatever their number.
+///
+/// # Errors
+///
+/// 400 with code `INVALID`, an empty message and [`UserListField::UsrIdIn`]
+/// as the one error field, when `value` holds more than 8 characters, a
+/// character above `U+007F`, or a NUL character without being exactly 8 of
+/// them.
+pub(crate) fn check_user_list_start_key(value: &str) -> Result<(), ApiError> {
+    let field = UserListField::UsrIdIn;
+    check_user_id_key(value, field)?;
+    if storable_text_of_width::<USER_ID_LEN>(value).is_err() {
+        return Err(ApiError::no_message(
+            ErrorKind::Invalid,
+            OVER_LENGTH,
+            bms_errors([field], OVER_LENGTH),
+        ));
+    }
+    Ok(())
+}
+
 /// The query of `GET /admin/users` (CU00): `start_key`, `direction` and
 /// `page_size`.
 ///
 /// `COUSR00C` `PROCESS-ENTER-KEY`, `PROCESS-PF7-KEY` and `PROCESS-PF8-KEY` —
 /// P-COUSR00C-003, P-COUSR00C-004. The parameters are those of
 /// [`PageQuery`], declared here so that the published `start_key` carries
-/// the `USRIDINI PIC X(8)` width and the ASCII pattern that
-/// [`check_user_id_key`] holds it to. `direction` and `page_size` are
+/// the `USRIDINI PIC X(8)` width and the pattern that
+/// [`check_user_list_start_key`] holds it to: ASCII, with NUL characters only
+/// as the 8 of `LOW-VALUES`. `direction` and `page_size` are
 /// published and read exactly as `PageQuery` declares them, and the query
 /// converts into one, so [`PageQuery::resolve`] gives the browse its
 /// direction and its 10-row default. An unknown `direction` or a `page_size`
@@ -364,13 +412,15 @@ pub(crate) fn check_user_id_key(value: &str, field: impl BmsField) -> Result<(),
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct UserListQuery {
-    /// The user ID the page starts from, `USRIDINI` `X(8)` in ASCII, case
-    /// kept: the search field, or a key a page returned. Forward, the page
-    /// starts at the first user ID at or after it; backward, it holds the
-    /// users before that one. Absent, empty, all spaces or all low-values is
-    /// the top of the file: the first page forward, and backward an empty
-    /// page with `You are already at the top of the page...`.
-    #[param(max_length = 8, pattern = "^[\\x00-\\x7F]*$")]
+    /// The user ID the page starts from, `USRIDINI` `X(8)` in ASCII without
+    /// NUL characters, case kept, or exactly 8 NUL characters, the
+    /// `LOW-VALUES` of the top of the file: the search field, or a key a page
+    /// returned. Forward, the page starts at the first user ID at or after
+    /// it; backward, it holds the users before that one. Absent, empty, all
+    /// spaces or the 8 low-values is the top of the file: the first page
+    /// forward, and backward an empty page with
+    /// `You are already at the top of the page...`.
+    #[param(max_length = 8, pattern = "^(?:\\x00{8}|[\\x01-\\x7F]*)$")]
     pub start_key: Option<String>,
     /// `forward` (ENTER and PF8, the default) or `backward` (PF7).
     // Inlined, as `PageQuery` inlines it: query parameters register no
@@ -702,6 +752,7 @@ mod tests {
     use super::{
         UserAddField, UserAddRequest, UserDeleteField, UserListField, UserListQuery,
         UserMessageResponse, UserSummary, UserUpdateField, UserUpdateRequest, check_user_id_key,
+        check_user_list_start_key,
     };
     use crate::dto::BmsField;
     use crate::error::ApiError;
@@ -1301,6 +1352,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn list_start_key_refuses_nul_except_the_eight_low_values() {
+        let refused = Some(over_length(&["USRIDIN"]));
+        // (start key, answer of the list check): NUL characters pass only as
+        // the 8 `LOW-VALUES` that start at the top of the file, and any other
+        // key holding one is refused as an over-length or non-ASCII key is.
+        let cases = [
+            ("\0", refused.clone()),
+            ("A\0", refused.clone()),
+            ("\0       ", refused.clone()),
+            ("\0\0", refused.clone()),
+            ("\0\0\0\0\0\0\0", refused.clone()),
+            ("ADMIN00\0", refused.clone()),
+            ("\0\0\0\0\0\0\0\0", None),
+            ("", None),
+            ("ADMIN001", None),
+            ("        ", None),
+            ("\u{7f}", None),
+            ("\0\0\0\0\0\0\0\0\0", refused.clone()),
+            ("ADMIN0012", refused.clone()),
+            ("USER000\u{e9}", refused.clone()),
+            ("\u{1f600}", refused),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(
+                rejection(check_user_list_start_key(key)),
+                expected,
+                "{key:?}"
+            );
+        }
+        // The `{id}` check still passes them: `COUSR02C` and `COUSR03C` answer
+        // NUL characters alone as the blank ID, and a mixed key names no user.
+        for key in ["\0", "A\0", "\0       ", "\0\0"] {
+            assert_eq!(key_outcomes(key), [None, None, None], "{key:?}");
+        }
+    }
+
     /// The query of `GET /admin/users?{text}` as `T`, as the list's query
     /// extractor reads it, or the 400 it answers.
     fn list_query<T: DeserializeOwned>(text: &str) -> Result<T, ApiError> {
@@ -1383,11 +1471,6 @@ mod tests {
                 },
                 "message": message,
             })
-        );
-        assert!(
-            response
-                .message
-                .starts_with("User user0099 has been added ...")
         );
 
         let unchanged = UserMessageResponse::new(&record, messages::PLEASE_MODIFY_TO_UPDATE);

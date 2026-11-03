@@ -39,13 +39,16 @@
 //! logs the cause of each failure other than `NOTFND`. The `CCPAUERY` record
 //! and the error-queue record keep only the legacy codes, so this log line is
 //! where the database cause stays; it carries the [`PortError`] text, which
-//! holds no server detail line.
+//! holds no server detail line. A `BEGIN`, `COMMIT` or `ROLLBACK` that fails
+//! is logged by `carddemo-persistence` once, at the flow's line that called
+//! [`bounded`].
 //!
 //! The timer is tokio's `time` driver. sqlx's `runtime-tokio` support, which
 //! `carddemo-persistence` enables, compiles it into every build of this
 //! crate, and the `mq` binary's runtime and the test runtime enable it.
 
 use std::future::Future;
+use std::panic::Location;
 use std::time::Duration;
 
 use carddemo_domain::entities::{
@@ -57,6 +60,7 @@ use carddemo_domain::ports::{
     AccountReader, AuthorizationStore, Browse, CustomerReader, Direction, PortError, PortResult,
     XrefReader,
 };
+use carddemo_persistence::PersistenceError;
 
 /// How long one database call may take: the pool's own acquire timeout, so a
 /// call waits no longer for the database than `Db::begin` waits for a
@@ -70,37 +74,75 @@ pub(crate) const DB_DEADLINE: Duration = Duration::from_secs(30);
 /// still finish within the call's deadline.
 pub const STATEMENT_TIMEOUT: Duration = DB_DEADLINE.saturating_sub(Duration::from_secs(5));
 
+/// The error of a database call [`bounded`] runs: a port outcome, or a
+/// `carddemo-persistence` failure of `Db::begin`, `UnitOfWork::commit` or
+/// `UnitOfWork::rollback`.
+pub(crate) trait CallError {
+    /// The error as the call's [`PortError`], with the one event a failure
+    /// logs placed at `location`, the line that started the call.
+    fn into_port_error_at(self, location: &'static Location<'static>) -> PortError;
+}
+
+impl CallError for PortError {
+    /// The outcome as it is, logging nothing: the store method behind it
+    /// logged its statement where it failed.
+    fn into_port_error_at(self, _location: &'static Location<'static>) -> PortError {
+        self
+    }
+}
+
+impl CallError for PersistenceError {
+    /// [`PersistenceError::into_port_error`] at `location`.
+    fn into_port_error_at(self, location: &'static Location<'static>) -> PortError {
+        self.into_port_error(location)
+    }
+}
+
 /// Runs the database call `operation`, named `call` in its failure, for at
 /// most [`DB_DEADLINE`].
+///
+/// The function is not `async`: it takes the caller's code location first,
+/// through `#[track_caller]`, and returns the future that runs the call, so
+/// the `database statement failed` event of a failed `BEGIN`, `COMMIT` or
+/// `ROLLBACK` names the flow's line that started the call, not this module or
+/// the standard-library frame that would invoke a conversion passed as a
+/// function value. Callers still write `bounded(call, operation).await`.
 ///
 /// # Errors
 ///
 /// The [`PortError`] mapping of the call's own failure, or
 /// [`PortError::Unavailable`] when the deadline elapses first.
-pub(crate) async fn bounded<T, E>(
+#[track_caller]
+pub(crate) fn bounded<T, E>(
     call: &'static str,
     operation: impl Future<Output = Result<T, E>>,
-) -> PortResult<T>
+) -> impl Future<Output = PortResult<T>>
 where
-    PortError: From<E>,
+    E: CallError,
 {
-    bounded_by(DB_DEADLINE, call, operation).await
+    bounded_by(DB_DEADLINE, call, operation)
 }
 
-/// [`bounded`] with the deadline `deadline`.
-async fn bounded_by<T, E>(
+/// [`bounded`] with the deadline `deadline`, its failure logged at the code
+/// location of the caller of [`bounded`], or of this function when it is
+/// called directly.
+#[track_caller]
+fn bounded_by<T, E>(
     deadline: Duration,
     call: &'static str,
     operation: impl Future<Output = Result<T, E>>,
-) -> PortResult<T>
+) -> impl Future<Output = PortResult<T>>
 where
-    PortError: From<E>,
+    E: CallError,
 {
-    match tokio::time::timeout(deadline, operation).await {
-        Ok(result) => result.map_err(PortError::from),
-        Err(_elapsed) => Err(PortError::Unavailable(format!(
-            "{call} did not complete within its database deadline of {deadline:?}"
-        ))),
+    let location = Location::caller();
+    async move {
+        match tokio::time::timeout(deadline, operation).await {
+            Ok(result) => result.map_err(|err| err.into_port_error_at(location)),
+            Err(_elapsed) => Err(PortError::Unavailable(format!(
+                "{call} did not complete within its database deadline of {deadline:?}"
+            ))),
+        }
     }
 }
 
@@ -211,17 +253,45 @@ impl<S: AuthorizationStore + Send> AuthorizationStore for BoundedStore<S> {
 #[cfg(test)]
 mod tests {
     use std::future;
+    use std::io;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use carddemo_domain::entities::Account;
     use carddemo_domain::numeric::AccountId;
     use carddemo_domain::ports::{AccountReader, PortError, PortResult};
+    use carddemo_persistence::PersistenceError;
     use carddemo_testkit::block_on;
 
     use super::{BoundedStore, DB_DEADLINE, STATEMENT_TIMEOUT, bounded, bounded_by};
 
     /// A deadline short enough for a test to wait it out.
     const SHORT: Duration = Duration::from_millis(20);
+
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            let bytes = self.0.lock().expect("capture buffer").clone();
+            String::from_utf8(bytes).expect("JSON lines are UTF-8")
+        }
+    }
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// An account file whose reads answer `NOTFND`, or never answer.
     struct Accounts {
@@ -293,6 +363,42 @@ mod tests {
                 future::ready(Err::<(), _>(error.clone())),
             ));
             assert_eq!(outcome, Err(error));
+        }
+    }
+
+    #[test]
+    fn a_failed_call_is_logged_at_the_line_that_started_it() {
+        // The persistence event of a failed BEGIN, COMMIT or ROLLBACK names
+        // the flow's call: never this module, nor the standard-library frame
+        // of a conversion passed as a function value.
+        let failed = future::ready(Err::<(), _>(PersistenceError::Corrupt {
+            table: "accounts",
+            column: "acct_curr_bal",
+            reason: "more than 10 integer digits".to_owned(),
+        }));
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let (subscriber, guard) =
+            carddemo_runtime::telemetry::subscriber_with_writer("mq", "info", move || sink.clone())
+                .expect("valid directives");
+        let (call, line) = (bounded("commit", failed), line!());
+        let outcome = tracing::subscriber::with_default(subscriber, || block_on(call));
+        guard.shutdown().expect("the tracer provider shuts down");
+        assert!(
+            matches!(&outcome, Err(PortError::Unavailable(text)) if text.contains("acct_curr_bal")),
+            "{outcome:?}"
+        );
+        let text = capture.text();
+        let mut lines = text.lines();
+        let event = lines.next().expect("one JSON line");
+        assert_eq!(lines.next(), None, "{text}");
+        for expected in [
+            r#""level":"WARN""#.to_owned(),
+            r#""message":"persistence error reported as unavailable""#.to_owned(),
+            format!(r#""code.filepath":"{}""#, file!()),
+            format!(r#""code.lineno":{line}"#),
+        ] {
+            assert!(event.contains(&expected), "{expected} missing from {event}");
         }
     }
 

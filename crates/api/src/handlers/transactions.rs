@@ -41,24 +41,50 @@
 //! Each handler runs inside one INFO span named after its operation, with
 //! `transaction` (`CT00`, `CT01`, `CT02`), the signed-on `user_id`, the
 //! resource keys and `outcome`, recorded once the unit of work has finished:
-//! `ok` or `rejected` for the reads, and `committed`, `rolled_back` (a failure
-//! after validation) or `rejected` (the request refused before any write) for
-//! CT02, which also records `reward_points` when the add accrued points. The
-//! card number is never recorded.
+//!
+//! | `outcome` | Recorded for |
+//! |---|---|
+//! | `ok` | A CT00 or CT01 read that returned its result |
+//! | `rejected` | A 4xx answer before any write: a rejected edit, a key not found, an unconfirmed CT02 add |
+//! | `failed` | A 5xx answer before any write: a failed read, no unit of work, an input class held at `halt` |
+//! | `committed` | A CT02 add whose unit of work committed |
+//! | `rolled_back` | A CT02 add that failed after validation, rolled back whole |
+//!
+//! CT02 also records `reward_points` when the add accrued points. Each field
+//! is recorded at most once per request.
 //!
 //! A key is recorded only in the form its check gave it, never as entered:
-//! `account_id` is the typed account of the CT00 filter or of the validated
-//! CT02 add, and `tran_id` the TRAN-ID that CT02 allocated or that the CT01
-//! read found. A CT00 filter or a CT02 body that fails its check records
-//! neither key. A CT01 Tran ID that found no transaction records no part of
-//! its text, only `tran_id_length`, its count of characters, and
-//! `tran_id_rejected`:
+//! `account_id` is the typed account of the CT00 filter, and `tran_id` the
+//! TRAN-ID that CT02 allocated or that the CT01 read found. A CT00 filter that
+//! fails its check records no key. A CT01 Tran ID that found no transaction
+//! records no part of its text, only `tran_id_length`, its count of
+//! characters, and `tran_id_rejected`:
 //!
 //! | `tran_id_rejected` | The Tran ID |
 //! |---|---|
 //! | `blank` | Was not entered: empty, spaces or `LOW-VALUES` (V-COTRN01C-001) |
 //! | `not_found` | Names no live transaction (V-COTRN01C-002) |
 //! | `unread` | Was never looked up: the read failed or no unit of work could be opened |
+//!
+//! The CT02 key reaches the span through `transaction_add::edit_key_fields`,
+//! the `VALIDATE-INPUT-KEY-FIELDS` key edit the rule applies before its
+//! cross-reference read, which the handler applies first, before the body's
+//! own check, so every CT02 span carries the key or why it was refused. The
+//! account ID is tested first, and the card number only when the account ID
+//! is blank, as the edit tests them. An account ID the edit accepts is
+//! recorded as `account_id`, its 11 digits. A card number the edit accepts is
+//! recorded as `card_number`, masked to its last four digits as
+//! `CardNumber`'s `Debug` shows it, and, once validation has read its
+//! cross-reference, that record's account as `account_id`. A refused key
+//! records no part of its text, only `account_id_length` or
+//! `card_number_length`, its count of characters, and `account_id_rejected`
+//! or `card_number_rejected`:
+//!
+//! | `*_rejected` | The key |
+//! |---|---|
+//! | `too_long` | Longer than its map field, `ACTIDIN` X(11) or `CARDNIN` X(16), whatever it holds: the member [`TransactionAddRequest::check`] refuses |
+//! | `blank` | Neither key entered, recorded as `account_id_rejected` (V-COTRN02C-003) |
+//! | `invalid` | Any other refused key: not a number of its field's width (V-COTRN02C-001, V-COTRN02C-002) |
 
 use axum::Json;
 use axum::extract::State;
@@ -66,15 +92,19 @@ use axum::http::StatusCode;
 use carddemo_domain::clock::Clock;
 use carddemo_domain::entities::Transaction;
 use carddemo_domain::error::ErrorKind;
+use carddemo_domain::numeric::AccountId;
 use carddemo_domain::ports::{PortError, PortResult, TransactionWriter};
 use carddemo_domain::rewards::{AccrualInput, RewardEngine};
-use carddemo_domain::rules::transaction_add::{self, ValidatedTransaction};
+use carddemo_domain::rules::transaction_add::{
+    self, EditedKey, FIELD_ACTIDIN, ValidatedTransaction,
+};
 use carddemo_domain::rules::transaction_list;
 use carddemo_domain::rules::transaction_view::{self, TransactionViewInput};
 use carddemo_persistence::UnitOfWork;
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span};
 
+use super::cards::masked_card_number;
 use crate::auth::AuthUser;
 use crate::dto::id_string;
 use crate::dto::transactions::{
@@ -87,9 +117,13 @@ use crate::state::AppState;
 /// `outcome` of a read that returned its result.
 const OUTCOME_OK: &str = "ok";
 
-/// `outcome` of a request refused before anything was written: a rejected
-/// edit, a failed read, or a unit of work that could not be opened.
+/// `outcome` of a request answered with a 4xx status before anything was
+/// written: a rejected edit or a key not found.
 const OUTCOME_REJECTED: &str = "rejected";
+
+/// `outcome` of a request answered with a 5xx status before anything was
+/// written: a failed read, or a unit of work that could not be opened.
+const OUTCOME_FAILED: &str = "failed";
 
 /// `outcome` of a CT02 add whose unit of work committed.
 const OUTCOME_COMMITTED: &str = "committed";
@@ -106,6 +140,65 @@ const TRAN_ID_NOT_FOUND: &str = "not_found";
 
 /// `tran_id_rejected` of a CT01 Tran ID that was never looked up.
 const TRAN_ID_UNREAD: &str = "unread";
+
+/// `CARDNINI PIC X(16)` [app/cpy-bms/COTRN02.CPY:L66]: a CT02 card number
+/// longer than this is [`KEY_TOO_LONG`].
+const CARD_NUMBER_LEN: usize = 16;
+
+/// `account_id_rejected` of a CT02 body that enters neither key.
+const KEY_BLANK: &str = "blank";
+
+/// `*_rejected` of a CT02 key longer than its map field, whatever it holds.
+const KEY_TOO_LONG: &str = "too_long";
+
+/// `*_rejected` of any other CT02 key the edit refused.
+const KEY_INVALID: &str = "invalid";
+
+/// The key of a CT02 body as the handler span records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AddSpanKey {
+    /// The account ID the key edit accepted, recorded as `account_id`.
+    Account(AccountId),
+    /// The card number the key edit accepted, the account ID being blank,
+    /// masked by [`masked_card_number`] and recorded as `card_number`.
+    Card(String),
+    /// A refused account ID, or no key entered: `category` is recorded as
+    /// `account_id_rejected` and `length`, the account ID's count of
+    /// characters, as `account_id_length`.
+    AccountRefused {
+        category: &'static str,
+        length: usize,
+    },
+    /// A refused card number, the account ID being blank: `category` is
+    /// recorded as `card_number_rejected` and `length`, the card number's
+    /// count of characters, as `card_number_length`.
+    CardRefused {
+        category: &'static str,
+        length: usize,
+    },
+}
+
+impl AddSpanKey {
+    /// Records this key on `span`; the fields it does not set stay empty.
+    fn record(&self, span: &Span) {
+        match self {
+            Self::Account(account_id) => {
+                span.record("account_id", display(account_id));
+            }
+            Self::Card(masked) => {
+                span.record("card_number", masked.as_str());
+            }
+            Self::AccountRefused { category, length } => {
+                span.record("account_id_rejected", *category)
+                    .record("account_id_length", *length);
+            }
+            Self::CardRefused { category, length } => {
+                span.record("card_number_rejected", *category)
+                    .record("card_number_length", *length);
+            }
+        }
+    }
+}
 
 /// COTRN00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,
 /// PROCESS-PAGE-FORWARD/BACKWARD, SEND-TRNLST-SCREEN — P-COTRN00C-005 to
@@ -329,15 +422,7 @@ pub async fn create_transaction(
     user: AuthUser,
     ApiJson(body): ApiJson<TransactionAddRequest>,
 ) -> Result<(StatusCode, Json<TransactionAddResponse>), ApiError> {
-    let span = tracing::info_span!(
-        "create_transaction",
-        transaction = "CT02",
-        user_id = %user.user_id,
-        account_id = Empty,
-        tran_id = Empty,
-        reward_points = Empty,
-        outcome = Empty,
-    );
+    let span = add_span(&user.user_id);
     let (outcome, result) = add_transaction(&state, body, &span)
         .instrument(span.clone())
         .await;
@@ -345,19 +430,44 @@ pub async fn create_transaction(
     result.map(|added| (StatusCode::CREATED, Json(added)))
 }
 
-/// The CT02 add with the `outcome` it ended in: validation in a fresh unit of
-/// work, then the writes in the same unit, committed only when every one of
-/// them succeeded.
+/// The CT02 handler span of the signed-on `user_id`, its key, `tran_id`,
+/// `reward_points` and `outcome` fields empty until recorded.
+fn add_span(user_id: &str) -> Span {
+    tracing::info_span!(
+        "create_transaction",
+        transaction = "CT02",
+        user_id = user_id,
+        account_id = Empty,
+        account_id_rejected = Empty,
+        account_id_length = Empty,
+        card_number = Empty,
+        card_number_rejected = Empty,
+        card_number_length = Empty,
+        tran_id = Empty,
+        reward_points = Empty,
+        outcome = Empty,
+    )
+}
+
+/// The CT02 add with the `outcome` it ended in: the key the body names
+/// recorded on `span`, validation in a fresh unit of work, then the writes in
+/// the same unit, committed only when every one of them succeeded.
 async fn add_transaction(
     state: &AppState,
     body: TransactionAddRequest,
     span: &Span,
 ) -> (&'static str, Result<TransactionAddResponse, ApiError>) {
+    let key = add_span_key(body.account_id.as_deref(), body.card_number.as_deref());
+    key.record(span);
     let (mut uow, validated) = match validate_request(state, body).await {
         Ok(opened) => opened,
-        Err(err) => return (OUTCOME_REJECTED, Err(err)),
+        Err(err) => return (unwritten_outcome(&err), Err(err)),
     };
-    span.record("account_id", display(validated.account_id()));
+    // A card-keyed add learns its account from the cross-reference that
+    // validation read; an account-keyed add has recorded it already.
+    if !matches!(key, AddSpanKey::Account(_)) {
+        span.record("account_id", display(validated.account_id()));
+    }
     match insert_and_accrue(&mut uow, &validated, state.clock(), span).await {
         Ok(added) => match uow.commit().await {
             Ok(()) => (OUTCOME_COMMITTED, Ok(added)),
@@ -398,6 +508,56 @@ async fn validate_request(
     }
 }
 
+/// COTRN02C VALIDATE-INPUT-KEY-FIELDS — P-COTRN02C-005 to P-COTRN02C-007;
+/// V-COTRN02C-001 to V-COTRN02C-003
+///
+/// The account ID `account_id` and card number `card_number` of a CT02 body
+/// as the span records them, through `transaction_add::edit_key_fields`, the
+/// key edit `transaction_add::validate` applies to the same texts.
+///
+/// An account ID longer than the 11 characters of `ACTIDINI X(11)`, or, with
+/// the account ID blank, a card number longer than the 16 of `CARDNINI X(16)`,
+/// is the member [`TransactionAddRequest::check`] refuses before any edit, and
+/// is recorded as [`KEY_TOO_LONG`] whatever it holds. Any other key is
+/// recorded as the edit decides: the account or the masked card it accepted,
+/// [`KEY_BLANK`] when neither is entered, else [`KEY_INVALID`] for the key it
+/// refused. No part of a refused key's text is kept.
+fn add_span_key(account_id: Option<&str>, card_number: Option<&str>) -> AddSpanKey {
+    let account_length = account_id.map_or(0, |text| text.chars().count());
+    if account_length > AccountId::WIDTH {
+        return AddSpanKey::AccountRefused {
+            category: KEY_TOO_LONG,
+            length: account_length,
+        };
+    }
+    let card_length = card_number.map_or(0, |text| text.chars().count());
+    match transaction_add::edit_key_fields(account_id, card_number) {
+        Ok(EditedKey::Account(account)) => AddSpanKey::Account(account),
+        Err(error)
+            if error.kind != ErrorKind::Empty && error.first_field() == Some(FIELD_ACTIDIN) =>
+        {
+            AddSpanKey::AccountRefused {
+                category: KEY_INVALID,
+                length: account_length,
+            }
+        }
+        // The account ID is blank from here on, so the card number is the key.
+        _ if card_length > CARD_NUMBER_LEN => AddSpanKey::CardRefused {
+            category: KEY_TOO_LONG,
+            length: card_length,
+        },
+        Ok(EditedKey::Card(card)) => AddSpanKey::Card(masked_card_number(&card)),
+        Err(error) if error.kind == ErrorKind::Empty => AddSpanKey::AccountRefused {
+            category: KEY_BLANK,
+            length: account_length,
+        },
+        Err(_) => AddSpanKey::CardRefused {
+            category: KEY_INVALID,
+            length: card_length,
+        },
+    }
+}
+
 /// COTRN02C ADD-TRANSACTION, WRITE-TRANSACT-FILE — P-COTRN02C-020 to
 /// P-COTRN02C-025; V-COTRN02C-029 to V-COTRN02C-033; `RewardEngine`
 /// (AAP 0.3.5): lock the account the accrual credits, allocate the TRAN-ID,
@@ -424,8 +584,12 @@ async fn insert_and_accrue(
     uow.lock_account_reference(validated.account_id()).await?;
     // An allocation failure gets the audited `COTRN02C` browse messages, an
     // empty live master its not-found (V-COTRN02C-029 to V-COTRN02C-031),
-    // rather than the generic unexpected error.
-    let allocated = uow.next_tran_id().await.map_err(PortError::from);
+    // rather than the generic unexpected error. The conversion is called here
+    // rather than passed to `map_err`, so a failure it logs names this line.
+    let allocated = match uow.next_tran_id().await {
+        Ok(tran_id) => Ok(tran_id),
+        Err(err) => Err(PortError::from(err)),
+    };
     log_unavailable("allocate TRAN-ID", &allocated);
     let tran_id = transaction_add::allocated_tran_id(allocated)?;
     span.record("tran_id", display(tran_id));
@@ -464,24 +628,233 @@ async fn roll_back(uow: UnitOfWork) {
     }
 }
 
-/// The `outcome` of a read handler's `result`.
-const fn read_outcome<T>(result: &Result<T, ApiError>) -> &'static str {
+/// The `outcome` of a read handler's `result`: [`OUTCOME_OK`] for its result,
+/// else that of [`unwritten_outcome`].
+fn read_outcome<T>(result: &Result<T, ApiError>) -> &'static str {
     match result {
         Ok(_) => OUTCOME_OK,
-        Err(_) => OUTCOME_REJECTED,
+        Err(error) => unwritten_outcome(error),
+    }
+}
+
+/// The `outcome` of `error` answering a request before anything was written:
+/// [`OUTCOME_FAILED`] for a 5xx status, [`OUTCOME_REJECTED`] for any other.
+fn unwritten_outcome(error: &ApiError) -> &'static str {
+    if error.status().is_server_error() {
+        OUTCOME_FAILED
+    } else {
+        OUTCOME_REJECTED
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
     use carddemo_domain::error::DomainError;
     use carddemo_domain::messages::{
         TRAN_ID_CAN_NOT_BE_EMPTY, TRANSACTION_ID_NOT_FOUND, UNABLE_TO_LOOKUP_TRANSACTION,
     };
+    use carddemo_domain::numeric::AccountId;
     use carddemo_domain::rules::transaction_view::TRAN_ID_FIELD;
+    use serde_json::{Map, Value, json};
+    use tracing::field::display;
 
-    use super::{TRAN_ID_BLANK, TRAN_ID_NOT_FOUND, TRAN_ID_UNREAD, tran_id_rejection};
+    use super::{
+        AddSpanKey, KEY_BLANK, KEY_INVALID, KEY_TOO_LONG, OUTCOME_FAILED, OUTCOME_OK,
+        OUTCOME_REJECTED, TRAN_ID_BLANK, TRAN_ID_NOT_FOUND, TRAN_ID_UNREAD, add_span, add_span_key,
+        read_outcome, tran_id_rejection, unwritten_outcome,
+    };
     use crate::error::ApiError;
+
+    /// The first fixture card, of account 00000000050 (P-CVACT02Y-009)
+    /// [app/data/ASCII/carddata.txt:L1].
+    const CARD: &str = "0500024453765740";
+
+    /// [`CARD`] as the span shows it.
+    const MASKED_CARD: &str = "************5740";
+
+    /// The span key of the account `number`, as the edit accepted it.
+    fn account(number: u64) -> AddSpanKey {
+        AddSpanKey::Account(AccountId::new(number).expect("an account number of 11 digits"))
+    }
+
+    const fn account_refused(category: &'static str, length: usize) -> AddSpanKey {
+        AddSpanKey::AccountRefused { category, length }
+    }
+
+    const fn card_refused(category: &'static str, length: usize) -> AddSpanKey {
+        AddSpanKey::CardRefused { category, length }
+    }
+
+    #[test]
+    fn the_ct02_span_key_is_the_edited_key_or_only_the_refusal_class_and_length() {
+        let masked = || AddSpanKey::Card(MASKED_CARD.to_owned());
+        // (account ID, card number) -> what the span records
+        let cases = [
+            (Some("00000000050"), None, account(50)),
+            (Some("00000000050"), Some(CARD), account(50)),
+            // The account wins: the card is ignored, whatever it holds.
+            (Some("00000000050"), Some("05000244537657401"), account(50)),
+            // An account the cross-reference does not know (404), and one
+            // whose add fails a data edit (400 TRNAMT).
+            (Some("99999999999"), None, account(99_999_999_999)),
+            (Some("00000000001"), None, account(1)),
+            (None, Some(CARD), masked()),
+            (Some(""), Some(CARD), masked()),
+            (Some("           "), Some(CARD), masked()),
+            (Some("\0\0"), Some(CARD), masked()),
+            (None, None, account_refused(KEY_BLANK, 0)),
+            (Some("   "), Some(""), account_refused(KEY_BLANK, 3)),
+            (
+                Some("\0\0\0\0\0\0\0\0\0\0\0"),
+                Some("    "),
+                account_refused(KEY_BLANK, 11),
+            ),
+            (
+                Some("0000000005A"),
+                Some(CARD),
+                account_refused(KEY_INVALID, 11),
+            ),
+            (Some("50"), None, account_refused(KEY_INVALID, 2)),
+            (Some("*"), Some(CARD), account_refused(KEY_INVALID, 1)),
+            (Some("\u{e9}"), None, account_refused(KEY_INVALID, 1)),
+            (
+                Some("000000000500"),
+                None,
+                account_refused(KEY_TOO_LONG, 12),
+            ),
+            (
+                Some("            "),
+                Some(CARD),
+                account_refused(KEY_TOO_LONG, 12),
+            ),
+            (
+                None,
+                Some("050002445376574X"),
+                card_refused(KEY_INVALID, 16),
+            ),
+            (
+                Some(" "),
+                Some("0500024453765"),
+                card_refused(KEY_INVALID, 13),
+            ),
+            (None, Some("5740"), card_refused(KEY_INVALID, 4)),
+            (
+                None,
+                Some("05000244537657401"),
+                card_refused(KEY_TOO_LONG, 17),
+            ),
+            // Over-length members the body check refuses although the edit
+            // would read them as the card, or as no key.
+            (
+                None,
+                Some("0500024453765740 "),
+                card_refused(KEY_TOO_LONG, 17),
+            ),
+            (
+                Some(""),
+                Some("                 "),
+                card_refused(KEY_TOO_LONG, 17),
+            ),
+        ];
+        for (account_id, card_number, expected) in cases {
+            assert_eq!(
+                add_span_key(account_id, card_number),
+                expected,
+                "{account_id:?}, {card_number:?}"
+            );
+        }
+    }
+
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The `account_id*` and `card_number*` attributes the span exporter of
+    /// the API's telemetry subscriber wrote for a CT02 handler span on which
+    /// `record` ran.
+    fn exported_key_attributes(record: impl FnOnce(&tracing::Span)) -> Map<String, Value> {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let (subscriber, guard) =
+            carddemo_runtime::telemetry::subscriber_with_writer("api", "info", move || {
+                sink.clone()
+            })
+            .expect("valid directives");
+        tracing::subscriber::with_default(subscriber, || record(&add_span("USER0001")));
+        guard.shutdown().expect("the tracer provider shuts down");
+        let bytes = capture.0.lock().expect("capture buffer").clone();
+        let text = String::from_utf8(bytes).expect("JSON lines are UTF-8");
+        let spans: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("a JSON line"))
+            .filter(|line| line["type"] == "span" && line["name"] == "create_transaction")
+            .collect();
+        let [span] = spans.as_slice() else {
+            panic!("one CT02 span expected: {text}");
+        };
+        assert_eq!(span["attributes"]["transaction"], "CT02", "{text}");
+        assert_eq!(span["attributes"]["user_id"], "USER0001", "{text}");
+        span["attributes"]
+            .as_object()
+            .expect("an attribute object")
+            .iter()
+            .filter(|(name, _)| name.starts_with("account_id") || name.starts_with("card_number"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn the_ct02_span_exports_each_key_under_its_declared_fields() {
+        // (key, account of the validated card-keyed add) -> exported attributes.
+        // `tracing-opentelemetry` carries an unsigned length through its debug
+        // form, as it carries the `CAVW`, `CAUP` and `CCDL` lengths, so the
+        // exporter writes it as a string.
+        let cases = [
+            (account(50), None, json!({"account_id": "00000000050"})),
+            (
+                AddSpanKey::Card(MASKED_CARD.to_owned()),
+                Some(50),
+                json!({"card_number": MASKED_CARD, "account_id": "00000000050"}),
+            ),
+            (
+                account_refused(KEY_INVALID, 11),
+                None,
+                json!({"account_id_rejected": "invalid", "account_id_length": "11"}),
+            ),
+            (
+                card_refused(KEY_TOO_LONG, 17),
+                None,
+                json!({"card_number_rejected": "too_long", "card_number_length": "17"}),
+            ),
+        ];
+        for (key, validated_account, expected) in cases {
+            let attributes = exported_key_attributes(|span| {
+                key.record(span);
+                if let Some(number) = validated_account {
+                    let account_id = AccountId::new(number).expect("an account of 11 digits");
+                    span.record("account_id", display(account_id));
+                }
+            });
+            assert_eq!(Value::Object(attributes), expected, "{key:?}");
+        }
+    }
 
     #[test]
     fn a_tran_id_that_found_no_transaction_is_recorded_only_by_its_failure_class() {
@@ -506,5 +879,36 @@ mod tests {
         }
         // No unit of work could be opened, so the Tran ID was never edited.
         assert_eq!(tran_id_rejection(&ApiError::unexpected()), TRAN_ID_UNREAD);
+    }
+
+    #[test]
+    fn an_answer_before_any_write_is_failed_for_a_5xx_status_and_rejected_otherwise() {
+        // (read result, `outcome`)
+        let cases = [
+            (Ok(()), OUTCOME_OK),
+            (
+                Err(DomainError::empty(TRAN_ID_CAN_NOT_BE_EMPTY).with_field(TRAN_ID_FIELD)),
+                OUTCOME_REJECTED,
+            ),
+            (
+                Err(DomainError::not_found(TRANSACTION_ID_NOT_FOUND).with_field(TRAN_ID_FIELD)),
+                OUTCOME_REJECTED,
+            ),
+            (
+                Err(DomainError::unexpected(UNABLE_TO_LOOKUP_TRANSACTION).with_field(TRAN_ID_FIELD)),
+                OUTCOME_FAILED,
+            ),
+        ];
+        for (result, outcome) in cases {
+            let result = result.map_err(ApiError::from);
+            assert_eq!(read_outcome(&result), outcome, "{result:?}");
+            if let Err(error) = &result {
+                assert_eq!(unwritten_outcome(error), outcome, "{error:?}");
+            }
+        }
+        // No unit of work could be opened.
+        let unopened = ApiError::unexpected();
+        assert_eq!(unwritten_outcome(&unopened), OUTCOME_FAILED);
+        assert_eq!(read_outcome::<()>(&Err(unopened)), OUTCOME_FAILED);
     }
 }

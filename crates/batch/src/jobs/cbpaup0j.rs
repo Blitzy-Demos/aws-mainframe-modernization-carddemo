@@ -9,8 +9,9 @@
 //! in-memory count decrements (E-35) all live in the rule.
 //!
 //! `DISPLAY` output becomes `tracing` events inside the job span: the parameters, the day, then
-//! either the four end-of-job counts or the abend. The span's `read` and `deleted` fields carry
-//! the summaries and details read and deleted.
+//! either the four end-of-job counts or the abend. The span's `read` field carries the
+//! summaries and details read, its `deleted` field those deleted once the deletes are
+//! committed, and `posted` and `rejected` are 0.
 //!
 //! The card is unrestricted text, so no telemetry carries it whole. The span's `sysin` field and
 //! the `PARM RECEIVED` event hold only the 17-byte `PRM-INFO` receiver, with the card's byte
@@ -68,20 +69,24 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Cbpaup0jArgs) -> ExitS
     if let Err(abend) = &outcome {
         log_abend(abend);
     }
-    // The span totals are recorded only once the deletes they count are committed.
+    let (read, deleted) = totals(match &outcome {
+        Ok(counts) => *counts,
+        Err(abend) => abend.counts,
+    });
+    // The rows read count however the commit ends. The deletes count only once committed, so
+    // `deleted` is recorded after the commit. `posted` and `rejected` stay 0: CBPAUP0C only
+    // deletes, and its deletions are `deleted`.
+    ctx.counts.set_read(read);
     if let Err(err) = uow.commit().await {
         return setup_failure("pending authorization purge commit failed", err);
     }
+    Span::current().record("deleted", deleted);
     match outcome {
         Ok(counts) => {
-            record_totals(counts);
             log_counts(counts);
             ExitStatus::Success
         }
-        Err(abend) => {
-            record_totals(abend.counts);
-            ExitStatus::abend_from(&abend, None)
-        }
+        Err(abend) => ExitStatus::abend_from(&abend, None),
     }
 }
 
@@ -152,14 +157,6 @@ const fn totals(counts: PurgeCounts) -> (u64, u64) {
             .summaries_deleted
             .saturating_add(counts.details_deleted),
     )
-}
-
-/// Records [`totals`] in the `read` and `deleted` fields of the job span.
-fn record_totals(counts: PurgeCounts) {
-    let (read, deleted) = totals(counts);
-    let span = Span::current();
-    span.record("read", read);
-    span.record("deleted", deleted);
 }
 
 /// CBPAUP0C MAIN-PARA — P-CBPAUP0C-002, P-CBPAUP0C-003, P-CBPAUP0C-005, P-CBPAUP0C-007.

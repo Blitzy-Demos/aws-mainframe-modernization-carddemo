@@ -26,6 +26,7 @@
 //! [`crate::generations`].
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
 use carddemo_domain::entities::Transaction;
@@ -40,7 +41,7 @@ use carddemo_domain::rules::transaction_report::{self, ReportAbend, ReportRun, U
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
-use super::{JobContext, backup_live_master, setup_failure};
+use super::{JobContext, JobCounts, backup_live_master, count_of, setup_failure};
 use crate::cli::TranreptArgs;
 use crate::exit::ExitStatus;
 use crate::generations::{
@@ -84,8 +85,9 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &TranreptArgs) -> ExitS
         Err(status) => return status,
     };
     let generations = ctx.generations.clone();
+    let counts = Arc::clone(&ctx.counts);
     let bkup = backup.generation.clone();
-    let daly = match blocking(move || sort_step(&generations, &bkup, &start, &end)).await {
+    let daly = match blocking(move || sort_step(&generations, &counts, &bkup, &start, &end)).await {
         Ok(Ok(daly)) => daly,
         Ok(Err(status)) => return status,
         Err(cancelled) => {
@@ -104,8 +106,10 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &TranreptArgs) -> ExitS
 /// `TRAN-CARD-NUM,263,16,ZD`, and `SORTOUT` `TRANSACT.DALY(+1)` `DCB=(*.SORTIN)`.
 ///
 /// Allocates `TRANSACT.DALY(+1)` in `generations`, reads every record of `bkup`, writes the
-/// records [`select`] keeps and catalogs the generation. The number of backup records is recorded
-/// in `read` and the number of sorted records in `written` on the current span.
+/// records [`select`] keeps and catalogs the generation. The number of backup records is set in
+/// `read` in `counts`, whose `posted` and `rejected` stay 0 because TRANREPT loads no record and
+/// turns none away, and the number of sorted records is recorded in `written` on the current
+/// span.
 ///
 /// The step is synchronous from the allocation to the catalog: [`run`] runs it on Tokio's
 /// blocking pool, inside the job span, so an uncataloged `TRANSACT.DALY(+1)` is deleted there.
@@ -118,6 +122,7 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &TranreptArgs) -> ExitS
 ///   cataloged, and `TRANSACT.BKUP(+1)` stays cataloged.
 fn sort_step(
     generations: &Generations,
+    counts: &JobCounts,
     bkup: &Generation,
     start: &Alnum<10>,
     end: &Alnum<10>,
@@ -128,7 +133,7 @@ fn sort_step(
     let sortin = read_records::<TransactionLayout>(&bkup.path)
         .map_err(|err| setup_failure("TRANSACT.BKUP(+1) read failed", err))?;
     let read = sortin.len();
-    Span::current().record("read", read);
+    counts.set_read(count_of(read));
     let selected = select(start, end, sortin)?;
     sortout
         .append_records::<TransactionLayout>(&selected)

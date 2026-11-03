@@ -4,10 +4,13 @@
 //! The program runs as one `PROCESS-ENTER-KEY` [app/cbl/COBIL00C.cbl:L154-244]
 //! that the replacement splits at the TRAN-ID allocation:
 //!
-//! 1. [`prepare`]: the account-ID and confirmation edits, the account read for
-//!    update, the nothing-to-pay guard, the confirmation prompt and, for a
-//!    confirmed payment, the `CXACAIX` cross-reference read
-//!    [app/cbl/COBIL00C.cbl:L156-211].
+//! 1. [`prepare`]: the account-ID and confirmation edits ([`edit_entry`]),
+//!    the account read for update, the nothing-to-pay guard, the confirmation
+//!    prompt and, for a confirmed payment, the `CXACAIX` cross-reference read
+//!    [app/cbl/COBIL00C.cbl:L156-211]. The edits read no store, so an adapter
+//!    runs [`edit_entry`] before it opens one, and their answers stand
+//!    whatever the state of the files; [`prepare`] repeats them with the same
+//!    answer.
 //! 2. The caller allocates the TRAN-ID: `STARTBR` at `HIGH-VALUES`, `READPREV`,
 //!    `ENDBR` and `ADD 1` [app/cbl/COBIL00C.cbl:L212-219] are the shared,
 //!    serialized allocation of `crates/persistence/src/ids.rs`, which also
@@ -162,6 +165,22 @@ pub enum BillPaymentStep {
     Ready(PaymentDraft),
 }
 
+/// The outcome of [`edit_entry`] when no edit failed: what the entry asks of
+/// the files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryEdit {
+    /// Confirmation `N` or `n`: the payment is cancelled and nothing is read
+    /// (P-COBIL00C-006), the [`BillPaymentStep::Cancelled`] outcome of
+    /// [`prepare`] (V-COBIL00C-002).
+    Cancelled,
+    /// Confirmation `Y` or `y`: the account read for update and the
+    /// cross-reference read follow (`CONF-PAY-YES`, P-COBIL00C-005).
+    Confirmed,
+    /// Confirmation blank or `LOW-VALUES`: the account read for update and the
+    /// confirmation prompt follow (P-COBIL00C-007).
+    Unconfirmed,
+}
+
 /// A payment whose transaction write and account rewrite both succeeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentSuccess {
@@ -186,14 +205,54 @@ fn is_blank_entry(text: Option<&str>) -> bool {
     })
 }
 
+/// COBIL00C PROCESS-ENTER-KEY — P-COBIL00C-004 to P-COBIL00C-008;
+/// V-COBIL00C-001 to V-COBIL00C-003.
+///
+/// The edits of the entry that come before any file is read, in the COBOL
+/// order [app/cbl/COBIL00C.cbl:L156-191]:
+///
+/// 1. `ACTIDINI = SPACES OR LOW-VALUES` rejects a blank account ID whatever
+///    the confirmation holds (V-COBIL00C-001).
+/// 2. `EVALUATE CONFIRMI`: `N` or `n` cancels ([`EntryEdit::Cancelled`],
+///    V-COBIL00C-002), any value but `Y`, `y`, `N`, `n`, blank and
+///    `LOW-VALUES` is rejected (V-COBIL00C-003), and `Y`, `y`
+///    ([`EntryEdit::Confirmed`]) and blank ([`EntryEdit::Unconfirmed`]) go on
+///    to `READ-ACCTDAT-FILE`.
+///
+/// The edits read no store, so an adapter runs this before it opens one:
+/// their answers stand whatever the state of the files. [`prepare`] runs it
+/// first, with the same answer.
+///
+/// # Errors
+///
+/// [`ErrorKind::Empty`](crate::error::ErrorKind::Empty) with
+/// `Acct ID can NOT be empty...` on `ACTIDIN` for a blank account ID, and
+/// [`ErrorKind::Invalid`](crate::error::ErrorKind::Invalid) with
+/// `Invalid value. Valid values are (Y/N)...` on `CONFIRM` for any other
+/// confirmation value.
+pub fn edit_entry(input: &BillPaymentInput) -> Result<EntryEdit, DomainError> {
+    if is_blank_entry(input.account_id.as_deref()) {
+        return Err(DomainError::empty(ACCT_ID_CAN_NOT_BE_EMPTY).with_field(FIELD_ACTIDIN));
+    }
+    match input.confirm {
+        Confirm::Yes => Ok(EntryEdit::Confirmed),
+        Confirm::Blank => Ok(EntryEdit::Unconfirmed),
+        Confirm::No => Ok(EntryEdit::Cancelled),
+        Confirm::Other(_) => {
+            Err(DomainError::invalid(INVALID_VALUE_VALID_VALUES_ARE_Y_N).with_field(FIELD_CONFIRM))
+        }
+    }
+}
+
 /// COBIL00C PROCESS-ENTER-KEY — P-COBIL00C-004 to P-COBIL00C-011,
 /// P-COBIL00C-020; V-COBIL00C-001 to V-COBIL00C-010.
 ///
 /// The edits and reads before the TRAN-ID allocation, in the COBOL order
 /// [app/cbl/COBIL00C.cbl:L156-211]:
 ///
-/// 1. A blank account ID is rejected before anything else (V-COBIL00C-001).
-/// 2. The confirmation is classified: `N` cancels without reading
+/// 1. [`edit_entry`] rejects a blank account ID before anything else
+///    (V-COBIL00C-001).
+/// 2. [`edit_entry`] classifies the confirmation: `N` cancels without reading
 ///    ([`BillPaymentStep::Cancelled`], V-COBIL00C-002), any value but `Y`, `N`
 ///    and blank is rejected without reading (V-COBIL00C-003).
 /// 3. `Y` and blank read the account for update (`READ-ACCTDAT-FILE`).
@@ -206,28 +265,20 @@ fn is_blank_entry(text: Option<&str>) -> bool {
 ///
 /// # Errors
 ///
-/// The [`DomainError`] of the first edit or read that fails: empty account ID
-/// (`ACTIDIN`), invalid confirmation (`CONFIRM`), account not found or not
-/// readable, nothing to pay, cross-reference not found or not readable (all
-/// `ACTIDIN`).
+/// The [`DomainError`] of the first edit or read that fails: the
+/// [`edit_entry`] errors, empty account ID (`ACTIDIN`) and invalid
+/// confirmation (`CONFIRM`); then account not found or not readable, nothing
+/// to pay, cross-reference not found or not readable (all `ACTIDIN`).
 pub async fn prepare<S: AccountReader + XrefReader>(
     store: &mut S,
     input: BillPaymentInput,
 ) -> Result<BillPaymentStep, DomainError> {
-    if is_blank_entry(input.account_id.as_deref()) {
-        return Err(DomainError::empty(ACCT_ID_CAN_NOT_BE_EMPTY).with_field(FIELD_ACTIDIN));
-    }
-    let key = input.account_key();
-    let confirmed = match input.confirm {
-        Confirm::Yes => true,
-        Confirm::Blank => false,
-        Confirm::No => return Ok(BillPaymentStep::Cancelled),
-        Confirm::Other(_) => {
-            return Err(
-                DomainError::invalid(INVALID_VALUE_VALID_VALUES_ARE_Y_N).with_field(FIELD_CONFIRM)
-            );
-        }
+    let confirmed = match edit_entry(&input)? {
+        EntryEdit::Confirmed => true,
+        EntryEdit::Unconfirmed => false,
+        EntryEdit::Cancelled => return Ok(BillPaymentStep::Cancelled),
     };
+    let key = input.account_key();
     let account = read_account(store, key).await?;
     // `IF ACCT-CURR-BAL <= ZEROS AND ACTIDINI NOT = SPACES AND LOW-VALUES`
     // [app/cbl/COBIL00C.cbl:L197-205]: the account ID is known not to be blank.
@@ -475,8 +526,8 @@ mod tests {
     use chrono::{DateTime, TimeZone, Timelike, Utc};
 
     use super::{
-        BillPaymentInput, BillPaymentStep, FIELD_ACTIDIN, FIELD_CONFIRM, PaymentDraft,
-        PaymentSuccess, build_transaction, pay, prepare,
+        BillPaymentInput, BillPaymentStep, EntryEdit, FIELD_ACTIDIN, FIELD_CONFIRM, PaymentDraft,
+        PaymentSuccess, build_transaction, edit_entry, pay, prepare,
     };
     use crate::clock::FixedClock;
     use crate::entities::{Account, CardXref};
@@ -607,6 +658,42 @@ mod tests {
                 "{account_entry:?} {confirm:?}"
             );
             assert!(store.calls.is_empty(), "{account_entry:?} {confirm:?}");
+        }
+    }
+
+    /// V-COBIL00C-001 to V-COBIL00C-003, P-COBIL00C-004 to P-COBIL00C-008: the
+    /// store-free entry edits answer the blank account ID first, then classify
+    /// the confirmation, and leave `Y`, `y`, blank and `LOW-VALUES` to the
+    /// reads, whatever the account entry holds.
+    #[test]
+    fn the_entry_edits_classify_without_a_store() {
+        let empty = Err(on_actidin(DomainError::empty(ACCT_ID_CAN_NOT_BE_EMPTY)));
+        let invalid =
+            Err(DomainError::invalid(INVALID_VALUE_VALID_VALUES_ARE_Y_N).with_field(FIELD_CONFIRM));
+        let cases = [
+            (None, Some("Y"), empty.clone()),
+            (Some(""), None, empty.clone()),
+            (Some("           "), Some("N"), empty.clone()),
+            (Some("\0\0\0\0\0\0\0\0\0\0\0"), Some("X"), empty),
+            (Some(ACCOUNT_ENTRY), Some("N"), Ok(EntryEdit::Cancelled)),
+            (Some("0000000000A"), Some("n"), Ok(EntryEdit::Cancelled)),
+            (Some(ACCOUNT_ENTRY), Some("X"), invalid.clone()),
+            (Some("99999999999"), Some("?"), invalid.clone()),
+            (Some(ACCOUNT_ENTRY), Some("YY"), invalid),
+            (Some(ACCOUNT_ENTRY), Some("Y"), Ok(EntryEdit::Confirmed)),
+            (Some(ACCOUNT_ENTRY), Some("y"), Ok(EntryEdit::Confirmed)),
+            (Some("0000000000A"), Some("Y"), Ok(EntryEdit::Confirmed)),
+            (Some(ACCOUNT_ENTRY), None, Ok(EntryEdit::Unconfirmed)),
+            (Some(ACCOUNT_ENTRY), Some(""), Ok(EntryEdit::Unconfirmed)),
+            (Some(ACCOUNT_ENTRY), Some(" "), Ok(EntryEdit::Unconfirmed)),
+            (Some(ACCOUNT_ENTRY), Some("\0"), Ok(EntryEdit::Unconfirmed)),
+        ];
+        for (account_entry, confirm, expected) in cases {
+            assert_eq!(
+                edit_entry(&input(account_entry, confirm)),
+                expected,
+                "{account_entry:?} {confirm:?}"
+            );
         }
     }
 

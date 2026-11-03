@@ -357,8 +357,9 @@ export interface paths {
          *
          *     # Errors
          *
-         *     - 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`
-         *       or holding a character outside ASCII, and for a query that does not
+         *     - 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`,
+         *       holding a character outside ASCII, or holding a NUL character without
+         *       being the 8 of `LOW-VALUES` (E-49), and for a query that does not
          *       deserialize (a `page_size` outside 1 to 100, an unknown `direction`).
          *     - 401 without a valid bearer token; 403 for a token that is not an
          *       administrator's.
@@ -715,11 +716,15 @@ export interface paths {
          *     otherwise. Without `start_key` both directions read the first page from
          *     the lowest card number: backward is PF7 on the first entry, which re-reads
          *     that page with 'NO PREVIOUS PAGES TO DISPLAY'
-         *     [app/cbl/COCRDLIC.cbl:L439-454]. The `account_id` and `card_number`
-         *     filters reach the rule as entered, so a filter that is neither blank nor a
-         *     number of its width is answered with the `2210-EDIT-ACCOUNT` or
-         *     `2220-EDIT-CARD` text. An empty page is a page: 200 with `items: []` and
-         *     the text the COBOL shows with it.
+         *     [app/cbl/COCRDLIC.cbl:L439-454]. Because PF7 stays live on the first
+         *     page, every non-empty page, the first included, carries its first card as
+         *     `prev_key`, and the backward request from the first page's `prev_key`
+         *     answers as that PF7 does (E-54); an empty page read from a `start_key`
+         *     carries that key. The `account_id` and `card_number` filters reach the
+         *     rule as entered, so a filter that is neither blank nor a number of its
+         *     width is answered with the `2210-EDIT-ACCOUNT` or `2220-EDIT-CARD` text.
+         *     An empty page is a page: 200 with `items: []` and the text the COBOL shows
+         *     with it.
          *
          *     # Errors
          *
@@ -729,8 +734,9 @@ export interface paths {
          *       `CARDSID` (V-COCRDLIC-001, V-COCRDLIC-002).
          *     - 400 with code `INVALID` when the page parameters do not deserialize,
          *       and with code `INVALID`, an empty `message` and no field when
-         *       `start_key` holds a NUL character, which no card number holds; no card
-         *       is read.
+         *       `start_key` is longer than the 16 characters of a card number, holds a
+         *       character outside ASCII or holds a NUL character, none of which a card
+         *       number holds; no card is read.
          *     - 401 without a valid bearer token.
          *     - 500 with the `CARDDAT` file-error text at `ACCTSID` when a card read
          *       fails (V-COCRDLIC-008, V-COCRDLIC-010), or 'Unexpected error' when the
@@ -869,8 +875,10 @@ export interface paths {
          *     - 400 with the audited `CORPT00C` message and its BMS field when an edit
          *       fails or the request is not confirmed: no report type, an empty or
          *       invalid custom date part, a date `CSUTLDTC` rejects, a blank, `N` or
-         *       other confirmation (V-CORPT00C-001 to V-CORPT00C-018); also a query
-         *       value longer than its field.
+         *       other confirmation (V-CORPT00C-001 to V-CORPT00C-018).
+         *     - 400 with no message, before those edits, when a query value is longer
+         *       than its field (on `SDTYYYY`, `EDTYYYY` or `CONFIRM`) or the confirmation
+         *       holds a character above `U+007F` (on `CONFIRM`).
          *     - 401 without a valid bearer token.
          *     - 500 `Unexpected error` when the database fails, when a report record's
          *       cross-reference, type or category is missing from `card_xref`,
@@ -1723,9 +1731,10 @@ export interface components {
         /**
          * @description One page of a list: `{items, next_key, prev_key, message?}`.
          *
-         *     The keys are the start keys of the neighbouring pages, as the rule's page
-         *     gives them: zero-padded or space-trimmed key text that a following request
-         *     passes back unchanged as `start_key`.
+         *     The keys are the start keys of the forward (PF8) and backward (PF7)
+         *     requests from this page, as the rule's page gives them: zero-padded or
+         *     space-trimmed key text that a following request passes back unchanged as
+         *     `start_key`.
          */
         Page_CardSummary: {
             /**
@@ -1751,17 +1760,24 @@ export interface components {
              */
             next_key: string | null;
             /**
-             * @description The `start_key` of the previous page, read with `direction=backward`;
-             *     `null` when no page precedes it.
+             * @description The `start_key` of the backward (PF7) request from this page, read
+             *     with `direction=backward`; `null` when the list offers no backward
+             *     request from the page. A key does not promise rows before the page:
+             *     where the program's PF7 stays live on its first page (`GET /cards`,
+             *     `GET /admin/users`), the first page carries its first key, and the
+             *     backward request from it answers with the program's no-previous-page
+             *     text in `message` (E-54). The other lists give `null` on the first page
+             *     read without a `start_key`.
              */
             prev_key: string | null;
         };
         /**
          * @description One page of a list: `{items, next_key, prev_key, message?}`.
          *
-         *     The keys are the start keys of the neighbouring pages, as the rule's page
-         *     gives them: zero-padded or space-trimmed key text that a following request
-         *     passes back unchanged as `start_key`.
+         *     The keys are the start keys of the forward (PF8) and backward (PF7)
+         *     requests from this page, as the rule's page gives them: zero-padded or
+         *     space-trimmed key text that a following request passes back unchanged as
+         *     `start_key`.
          */
         Page_RewardAccrualResponse: {
             /**
@@ -1816,17 +1832,24 @@ export interface components {
              */
             next_key: string | null;
             /**
-             * @description The `start_key` of the previous page, read with `direction=backward`;
-             *     `null` when no page precedes it.
+             * @description The `start_key` of the backward (PF7) request from this page, read
+             *     with `direction=backward`; `null` when the list offers no backward
+             *     request from the page. A key does not promise rows before the page:
+             *     where the program's PF7 stays live on its first page (`GET /cards`,
+             *     `GET /admin/users`), the first page carries its first key, and the
+             *     backward request from it answers with the program's no-previous-page
+             *     text in `message` (E-54). The other lists give `null` on the first page
+             *     read without a `start_key`.
              */
             prev_key: string | null;
         };
         /**
          * @description One page of a list: `{items, next_key, prev_key, message?}`.
          *
-         *     The keys are the start keys of the neighbouring pages, as the rule's page
-         *     gives them: zero-padded or space-trimmed key text that a following request
-         *     passes back unchanged as `start_key`.
+         *     The keys are the start keys of the forward (PF8) and backward (PF7)
+         *     requests from this page, as the rule's page gives them: zero-padded or
+         *     space-trimmed key text that a following request passes back unchanged as
+         *     `start_key`.
          */
         Page_TranTypeResponse: {
             /**
@@ -1850,17 +1873,24 @@ export interface components {
              */
             next_key: string | null;
             /**
-             * @description The `start_key` of the previous page, read with `direction=backward`;
-             *     `null` when no page precedes it.
+             * @description The `start_key` of the backward (PF7) request from this page, read
+             *     with `direction=backward`; `null` when the list offers no backward
+             *     request from the page. A key does not promise rows before the page:
+             *     where the program's PF7 stays live on its first page (`GET /cards`,
+             *     `GET /admin/users`), the first page carries its first key, and the
+             *     backward request from it answers with the program's no-previous-page
+             *     text in `message` (E-54). The other lists give `null` on the first page
+             *     read without a `start_key`.
              */
             prev_key: string | null;
         };
         /**
          * @description One page of a list: `{items, next_key, prev_key, message?}`.
          *
-         *     The keys are the start keys of the neighbouring pages, as the rule's page
-         *     gives them: zero-padded or space-trimmed key text that a following request
-         *     passes back unchanged as `start_key`.
+         *     The keys are the start keys of the forward (PF8) and backward (PF7)
+         *     requests from this page, as the rule's page gives them: zero-padded or
+         *     space-trimmed key text that a following request passes back unchanged as
+         *     `start_key`.
          */
         Page_TransactionResponse: {
             /**
@@ -1915,17 +1945,24 @@ export interface components {
              */
             next_key: string | null;
             /**
-             * @description The `start_key` of the previous page, read with `direction=backward`;
-             *     `null` when no page precedes it.
+             * @description The `start_key` of the backward (PF7) request from this page, read
+             *     with `direction=backward`; `null` when the list offers no backward
+             *     request from the page. A key does not promise rows before the page:
+             *     where the program's PF7 stays live on its first page (`GET /cards`,
+             *     `GET /admin/users`), the first page carries its first key, and the
+             *     backward request from it answers with the program's no-previous-page
+             *     text in `message` (E-54). The other lists give `null` on the first page
+             *     read without a `start_key`.
              */
             prev_key: string | null;
         };
         /**
          * @description One page of a list: `{items, next_key, prev_key, message?}`.
          *
-         *     The keys are the start keys of the neighbouring pages, as the rule's page
-         *     gives them: zero-padded or space-trimmed key text that a following request
-         *     passes back unchanged as `start_key`.
+         *     The keys are the start keys of the forward (PF8) and backward (PF7)
+         *     requests from this page, as the rule's page gives them: zero-padded or
+         *     space-trimmed key text that a following request passes back unchanged as
+         *     `start_key`.
          */
         Page_UserSummary: {
             /**
@@ -1959,8 +1996,14 @@ export interface components {
              */
             next_key: string | null;
             /**
-             * @description The `start_key` of the previous page, read with `direction=backward`;
-             *     `null` when no page precedes it.
+             * @description The `start_key` of the backward (PF7) request from this page, read
+             *     with `direction=backward`; `null` when the list offers no backward
+             *     request from the page. A key does not promise rows before the page:
+             *     where the program's PF7 stays live on its first page (`GET /cards`,
+             *     `GET /admin/users`), the first page carries its first key, and the
+             *     backward request from it answers with the program's no-previous-page
+             *     text in `message` (E-54). The other lists give `null` on the first page
+             *     read without a `start_key`.
              */
             prev_key: string | null;
         };
@@ -2150,16 +2193,19 @@ export interface components {
              *     date-time of at most microsecond precision, converted to UTC: a
              *     fraction digit after the 6th must be `0`, and second `60` (a leap
              *     second) is refused, because the stored timestamp keeps whole
-             *     microseconds and no leap second. The day must exist in its month.
+             *     microseconds and no leap second. The day must exist in its month, and
+             *     the instant converted to UTC must lie in years 0000 to 9999, the
+             *     four-digit years an RFC 3339 date-time writes, so that the rule is
+             *     returned in a form this endpoint accepts back.
              * @example 2022-01-01T00:00:00Z
              */
             active_from: string;
             /**
              * Format: date-time
              * @description The end of the active window, exclusive, as an RFC 3339 date-time of
-             *     at most microsecond precision, converted to UTC, held to the same
-             *     constraints as `active_from`. Absent or `null` leaves the rule
-             *     open-ended.
+             *     at most microsecond precision, converted to UTC, which must lie in
+             *     years 0000 to 9999, held to the same constraints as `active_from`.
+             *     Absent or `null` leaves the rule open-ended.
              * @example 2030-01-01T00:00:00Z
              */
             active_to?: string | null;
@@ -2208,13 +2254,14 @@ export interface components {
         RewardRuleResponse: {
             /**
              * Format: date-time
-             * @description The first instant the rule is active, inclusive, in RFC 3339 UTC.
+             * @description The first instant the rule is active, inclusive, in RFC 3339 UTC, in
+             *     years 0000 to 9999 as the request requires.
              */
             active_from: string;
             /**
              * Format: date-time
-             * @description The end of the active window, exclusive, in RFC 3339 UTC; `null` for an
-             *     open-ended rule.
+             * @description The end of the active window, exclusive, in RFC 3339 UTC, in years 0000
+             *     to 9999 as the request requires; `null` for an open-ended rule.
              */
             active_to: string | null;
             /**
@@ -3370,12 +3417,14 @@ export interface operations {
         parameters: {
             query?: {
                 /**
-                 * @description The user ID the page starts from, `USRIDINI` `X(8)` in ASCII, case
-                 *     kept: the search field, or a key a page returned. Forward, the page
-                 *     starts at the first user ID at or after it; backward, it holds the
-                 *     users before that one. Absent, empty, all spaces or all low-values is
-                 *     the top of the file: the first page forward, and backward an empty
-                 *     page with `You are already at the top of the page...`.
+                 * @description The user ID the page starts from, `USRIDINI` `X(8)` in ASCII without
+                 *     NUL characters, case kept, or exactly 8 NUL characters, the
+                 *     `LOW-VALUES` of the top of the file: the search field, or a key a page
+                 *     returned. Forward, the page starts at the first user ID at or after
+                 *     it; backward, it holds the users before that one. Absent, empty, all
+                 *     spaces or the 8 low-values is the top of the file: the first page
+                 *     forward, and backward an empty page with
+                 *     `You are already at the top of the page...`.
                  */
                 start_key?: string;
                 /** @description `forward` (ENTER and PF8, the default) or `backward` (PF7). */
@@ -3401,7 +3450,7 @@ export interface operations {
                     "application/json": components["schemas"]["Page_UserSummary"];
                 };
             };
-            /** @description A start key longer than 8 characters or not ASCII, or a malformed query */
+            /** @description A start key longer than 8 characters, not ASCII, or holding a NUL character other than the 8 of LOW-VALUES, or a malformed query */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -4007,16 +4056,18 @@ export interface operations {
                  */
                 card_number?: string;
                 /**
-                 * @description The key the page starts at, as the list shows it. Absent for the first
-                 *     page forward; what an absent key reads backward is the list's own, as
-                 *     its operation states.
+                 * @description The card number the page starts from, `CARD-NUM` `X(16)` in ASCII
+                 *     without NUL characters: a previous page's `next_key` or `prev_key`.
+                 *     Forward (ENTER, PF8), the page starts at that card, inclusive;
+                 *     backward (PF7), it holds the cards before it. Absent, both directions
+                 *     read the first page.
                  */
                 start_key?: string;
-                /** @description `forward` (next page, the default) or `backward` (previous page). */
+                /** @description `forward` (ENTER and PF8, the default) or `backward` (PF7). */
                 direction?: "forward" | "backward";
                 /**
-                 * @description Rows on the page, from 1 to 100. Defaults to the rows of the list's
-                 *     screen.
+                 * @description Rows on the page, from 1 to 100. Defaults to 7, the rows of the
+                 *     `COCRDLI` screen.
                  */
                 page_size?: number;
             };
@@ -4035,7 +4086,7 @@ export interface operations {
                     "application/json": components["schemas"]["Page_CardSummary"];
                 };
             };
-            /** @description A filter or page parameter the COBOL edits reject, or a start key holding a NUL character */
+            /** @description A filter or page parameter the COBOL edits reject, or a start key longer than 16 characters, not ASCII or holding a NUL character */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -4304,10 +4355,11 @@ export interface operations {
                  */
                 end_date?: string;
                 /**
-                 * @description `CONFIRM X(1)`: `Y` or `y` runs the report, which the SPA confirmation
-                 *     dialog sends; absent or blank asks for confirmation (V-CORPT00C-016),
-                 *     `N` or `n` clears the form (V-CORPT00C-017), any other value is
-                 *     rejected (V-CORPT00C-018).
+                 * @description `CONFIRM X(1)` in ASCII: `Y` or `y` runs the report, which the SPA
+                 *     confirmation dialog sends; absent or blank asks for confirmation
+                 *     (V-CORPT00C-016), `N` or `n` clears the form (V-CORPT00C-017), any
+                 *     other value is rejected and quoted back (V-CORPT00C-018). A character
+                 *     above `U+007F` is rejected before those edits, with no message (E-49).
                  */
                 confirm?: string;
             };

@@ -278,7 +278,7 @@ impl TryFrom<RewardBalanceRow> for RewardBalance {
 /// transaction. The trait in `carddemo_domain::rewards::ports` states the
 /// contract; each method below adds how this adapter meets it.
 ///
-/// Failures map through the crate's SQLSTATE mapping (`crate::port_error`):
+/// Failures map through the crate's SQLSTATE mapping (`crate::port_error_at`):
 /// `23505` is `PortError::Duplicate`, `23503` `PortError::Restricted`, a lock
 /// conflict `PortError::Contention`, and every other failure, a `BIGINT`
 /// overflow (`22003`) included, `PortError::Unavailable`. The engine keeps the

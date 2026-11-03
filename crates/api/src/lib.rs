@@ -63,15 +63,17 @@ use std::task::{Context, Poll};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::MatchedPath;
-use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, header};
+use axum::http::{Extensions, HeaderMap, HeaderValue, Method, Request, Response, Uri, header};
+use axum::middleware::map_response;
 use error::ApiError;
 use tower::{Layer, Service};
 use tower_http::cors::{AllowOrigin, Cors, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tracing::field::Empty;
 use tracing::{Level, Span};
 
 /// The HTTP server: every route of [`handlers::router()`] with `state`, behind
-/// the request trace layer and the CORS layer.
+/// the request trace layer, the response header layer and the CORS layer.
 ///
 /// The routes come from the same registry [`spec`] documents, so the server
 /// serves exactly the documented operations, and no route serves the document
@@ -91,12 +93,28 @@ use tracing::{Level, Span};
 /// `request_span` with the method, the matched route template and the HTTP
 /// version, and, when the response is ready, a `finished processing request`
 /// event with the status and latency. The handler spans, with `transaction`,
-/// `user_id`, the resource keys and `outcome`, open inside it. Both the span
-/// and the event are at INFO, not `tower-http`'s default DEBUG, because the
-/// default `RUST_LOG=info` filter would otherwise drop them, and with them the
-/// request span every API write must emit as a JSON line through
-/// `carddemo_runtime::telemetry`. Neither records the URI or a header, so no
-/// card number, query text or bearer token reaches the logs from them.
+/// `user_id`, the resource keys and `outcome`, open inside it. A request an
+/// extractor refuses, with 401, 403, or 400 for a body, query or path that
+/// does not deserialize, never reaches its handler, so the request span
+/// records the handler's `transaction` and `outcome` itself, through
+/// `record_refusal`, with the `user_id` of its token once that token has
+/// verified. Both the span and the event are at INFO, not
+/// `tower-http`'s default DEBUG, because the default `RUST_LOG=info` filter
+/// would otherwise drop them, and with them the request span every API write
+/// must emit as a JSON line through `carddemo_runtime::telemetry`. Neither
+/// records the URI or a header, so no card number, query text or bearer token
+/// reaches the logs from them.
+///
+/// # Response header layer
+///
+/// Every answer, the 404 and 405 answers and CORS preflights included,
+/// carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+/// The answers hold per-account and admin data (balances, card numbers,
+/// reward points, user records, reward rules), so no browser or intermediary
+/// may keep a copy, and no browser may read a body as any type other than its
+/// declared `Content-Type`. Each header is added only to an answer that does
+/// not carry it already: a handler that sets its own value keeps it, and no
+/// answer carries either header twice.
 ///
 /// # CORS layer
 ///
@@ -118,14 +136,19 @@ pub fn app(state: AppState) -> Router {
 }
 
 /// Gives `router` the 404 and 405 answers of [`app`], puts the CORS layer on
-/// its routes, then wraps everything in the trace layer.
+/// its routes, then wraps everything in the response header layer and that in
+/// the trace layer.
 ///
 /// The 405 answer must be set before any layer: it replaces the default
 /// fallback of each route's method router, which a layer would already have
 /// wrapped. The CORS layer is a route layer, so it wraps each route's
 /// operations and 405 answer but not the 404 of the router's fallback. The
-/// trace layer wraps the routes and the fallback alike, so every request,
-/// preflights included, opens a request span.
+/// response header layer, [`add_response_headers`], wraps the routes, outside
+/// the CORS layer, and the fallback alike, so the preflight, 404 and 405
+/// answers get its headers as the operations' answers do, and the CORS layer
+/// answers exactly as it would without it. The trace layer is outermost and
+/// wraps the routes and the fallback alike, so every request, preflights
+/// included, opens a request span.
 ///
 /// Kept apart from [`app`] so the layers are tested over a stand-in router,
 /// without the database handle an [`AppState`] holds.
@@ -134,6 +157,7 @@ fn with_layers(router: Router, cors_origin: HeaderValue) -> Router {
         .fallback(|| async { ApiError::route_not_found() })
         .method_not_allowed_fallback(|| async { ApiError::method_not_allowed() })
         .route_layer(RoutedCorsLayer(cors_layer(cors_origin)))
+        .layer(map_response(add_response_headers))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(request_span)
@@ -157,6 +181,12 @@ const OTHER_METHOD: &str = "_OTHER";
 ///   else [`UNMATCHED_ROUTE`];
 /// - `version`: the HTTP version, such as `HTTP/1.1`.
 ///
+/// It also declares `transaction`, `user_id` and `outcome`, empty. They are
+/// recorded only by [`record_refusal`], for a request an extractor refuses
+/// before its handler span opens, and `user_id` only when the request's token
+/// verified before the refusal. A field never recorded is not exported, so
+/// the span of every other request carries the three fields above only.
+///
 /// The URI is never recorded: its path holds the resource keys, card numbers
 /// among them, and its query any text at all, before any authentication or
 /// validation. Nor are the headers, so a bearer token never reaches the logs.
@@ -170,7 +200,83 @@ fn request_span(request: &Request<Body>) -> Span {
         method = bounded_method(request.method()),
         route,
         version = ?request.version(),
+        transaction = Empty,
+        user_id = Empty,
+        outcome = Empty,
     )
+}
+
+/// The `outcome` of a request an extractor refused: the word the handler
+/// spans record for a request they answer with a 4xx status.
+const OUTCOME_REJECTED: &str = "rejected";
+
+/// Records on the current span, at extraction the request span of
+/// [`request_span`], that an extractor refused the request, so the request
+/// span carries what the handler span would have:
+///
+/// - `transaction`: `transaction`, the code [`transaction_of`] gives the
+///   request, when it has one;
+/// - `user_id`: `user_id`, the verified token's `sub`, when the request's
+///   token verified before the refusal: the admin check's 403, or a body,
+///   query or path refused after [`auth::AuthUser`] or [`auth::AdminUser`]
+///   kept the verified user in the request's extensions. A token that did not
+///   verify, and the public `POST /auth/login`, give none;
+/// - `outcome`: [`OUTCOME_REJECTED`].
+///
+/// Extraction runs inside the trace layer's span and before a handler opens
+/// its own, and axum stops at the first extractor that refuses, so each
+/// refused request records them once, on its request span. An extractor
+/// records them before it logs the refusal, so its event carries them in its
+/// span context. The refused input is never recorded: a rejection's text can
+/// quote the body, query or path the client wrote.
+pub(crate) fn record_refusal(transaction: Option<&'static str>, user_id: Option<&str>) {
+    record_unanswered(transaction, user_id, OUTCOME_REJECTED);
+}
+
+/// The `outcome` of a request an extractor answered with a 5xx status: the
+/// word the handler spans record for a 5xx answer.
+const OUTCOME_FAILED: &str = "failed";
+
+/// Records on the current span, as [`record_refusal`] does, that an extractor
+/// answered the request with a 5xx status before its handler span opened:
+/// [`auth::AuthUser`]'s read of the token's user failed, or its unit of work
+/// could not be opened or rolled back. `outcome` is [`OUTCOME_FAILED`] and no
+/// `user_id` is recorded, because the user was not confirmed.
+///
+/// It is recorded before the failure's detail is logged, so that event
+/// carries it in its span context. A rollback that fails after a refusal was
+/// recorded records `failed` over `rejected`, the 500 being the answer.
+pub(crate) fn record_failure(transaction: Option<&'static str>) {
+    record_unanswered(transaction, None, OUTCOME_FAILED);
+}
+
+/// Records `transaction` and `user_id`, when given, and `outcome` on the
+/// current span, the request span while extraction runs.
+fn record_unanswered(
+    transaction: Option<&'static str>,
+    user_id: Option<&str>,
+    outcome: &'static str,
+) {
+    let span = Span::current();
+    if let Some(transaction) = transaction {
+        span.record("transaction", transaction);
+    }
+    if let Some(user_id) = user_id {
+        span.record("user_id", user_id);
+    }
+    span.record("outcome", outcome);
+}
+
+/// The `transaction` of the operation that serves a request with `method`,
+/// `uri` and `extensions`: [`handlers::transaction_code`] of its matched
+/// route template, or `None` when no route matched it.
+pub(crate) fn transaction_of(
+    method: &Method,
+    uri: &Uri,
+    extensions: &Extensions,
+) -> Option<&'static str> {
+    let route = extensions.get::<MatchedPath>()?;
+    handlers::transaction_code(method, route.as_str(), uri)
 }
 
 /// `method`'s name when it is one of the nine standard HTTP methods, else
@@ -188,6 +294,21 @@ fn bounded_method(method: &Method) -> &str {
         | Method::TRACE => method.as_str(),
         _ => OTHER_METHOD,
     }
+}
+
+/// The response header layer of [`app`]: `response` with
+/// `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, each added
+/// only when `response` does not carry that header already, so a value its
+/// handler set wins and neither header is ever sent twice.
+async fn add_response_headers(mut response: Response<Body>) -> Response<Body> {
+    let headers = response.headers_mut();
+    headers
+        .entry(header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    response
 }
 
 /// The CORS policy of [`app`] for the one admitted `origin`.
@@ -272,33 +393,54 @@ fn is_preflight(headers: &HeaderMap) -> bool {
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
-    use std::fmt;
-    use std::sync::Once;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, Once};
+    use std::{fmt, io};
 
     use axum::Router;
     use axum::body::{Body, to_bytes};
+    use axum::extract::FromRequestParts;
+    use axum::http::request::Parts;
     use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
-    use axum::routing::get;
+    use axum::routing::{get, post, put};
+    use carddemo_runtime::telemetry::subscriber_with_writer;
+    use serde_json::Value;
     use tower::ServiceExt;
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::subscriber::Interest;
     use tracing::{Event, Level, Metadata, Subscriber};
 
-    use super::error::{ApiError, ErrorBody};
+    use super::auth::extract::{authenticate, require_admin};
+    use super::auth::jwt::{JwtKeys, UserType};
+    use super::dto::accounts::AccountUpdateRequest;
+    use super::dto::admin_transaction_types::{TranTypeUpdateQuery, TranTypeUpdateRequest};
+    use super::dto::auth::LoginRequest;
+    use super::dto::authorizations::AuthIdPath;
+    use super::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
+    use super::pagination::PageQuery;
     use super::{OTHER_METHOD, UNMATCHED_ROUTE, with_layers};
 
     /// The admitted origin: the default `CARDDEMO_CORS_ORIGIN`.
     const ORIGIN: &str = "http://localhost:5173";
 
+    /// The path of [`layered`]'s route whose GET answer sets its own
+    /// `Cache-Control`.
+    const CACHED: &str = "/cached";
+
     /// A stand-in for the registry: one path with a GET and a PUT, as
-    /// `/accounts/{id}` has.
+    /// `/accounts/{id}` has, and [`CACHED`], whose GET sets its own
+    /// `Cache-Control: max-age=60`.
     fn layered() -> Router {
-        let routes = Router::new().route(
-            "/accounts/{id}",
-            get(|| async { "account" }).put(|| async { "updated" }),
-        );
+        let routes = Router::new()
+            .route(
+                "/accounts/{id}",
+                get(|| async { "account" }).put(|| async { "updated" }),
+            )
+            .route(
+                CACHED,
+                get(|| async { ([(header::CACHE_CONTROL, "max-age=60")], "cached") }),
+            );
         with_layers(routes, HeaderValue::from_static(ORIGIN))
     }
 
@@ -328,11 +470,16 @@ mod tests {
         )
     }
 
-    /// Sends `request` through [`layered`] and returns the answer's status,
-    /// headers and body, after making [`Recorder`] the process's subscriber.
+    /// Sends `request` through [`layered`], as [`send_to`] does.
     async fn send(request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
+        send_to(layered(), request).await
+    }
+
+    /// Sends `request` through `router` and returns the answer's status,
+    /// headers and body, after making [`Recorder`] the process's subscriber.
+    async fn send_to(router: Router, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
         install_recorder();
-        let response = layered()
+        let response = router
             .oneshot(request)
             .await
             .expect("the router is infallible");
@@ -536,6 +683,79 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn every_answer_is_no_store_and_nosniff_unless_its_handler_sets_its_own() {
+        const ACCOUNT: &str = "/accounts/00000000001";
+        const NO_STORE: &str = "no-store";
+        let admitted: &[(HeaderName, &str)] = &[(header::ORIGIN, ORIGIN)];
+        // (the request, its status, the one `Cache-Control` value it gets)
+        let cases = [
+            (
+                request(Method::GET, ACCOUNT, admitted),
+                StatusCode::OK,
+                NO_STORE,
+            ),
+            (
+                request(Method::HEAD, ACCOUNT, admitted),
+                StatusCode::OK,
+                NO_STORE,
+            ),
+            (
+                request(Method::PUT, ACCOUNT, admitted),
+                StatusCode::OK,
+                NO_STORE,
+            ),
+            (preflight(ORIGIN), StatusCode::OK, NO_STORE),
+            (preflight("http://evil.example"), StatusCode::OK, NO_STORE),
+            (
+                request(Method::OPTIONS, ACCOUNT, admitted),
+                StatusCode::METHOD_NOT_ALLOWED,
+                NO_STORE,
+            ),
+            (
+                request(Method::DELETE, ACCOUNT, admitted),
+                StatusCode::METHOD_NOT_ALLOWED,
+                NO_STORE,
+            ),
+            (
+                request(Method::GET, "/no-such-path", admitted),
+                StatusCode::NOT_FOUND,
+                NO_STORE,
+            ),
+            (
+                request(Method::HEAD, "/no-such-path", admitted),
+                StatusCode::NOT_FOUND,
+                NO_STORE,
+            ),
+            (
+                request(Method::GET, CACHED, admitted),
+                StatusCode::OK,
+                "max-age=60",
+            ),
+        ];
+        for (request, status, cache_control) in cases {
+            let case = format!(
+                "{} {} {:?}",
+                request.method(),
+                request.uri(),
+                request.headers()
+            );
+            let (answered, headers, _) = send(request).await;
+            assert_eq!(answered, status, "{case}");
+            for (name, expected) in [
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CACHE_CONTROL, cache_control),
+            ] {
+                let sent: Vec<&str> = headers
+                    .get_all(&name)
+                    .iter()
+                    .map(|value| value.to_str().expect("an ASCII header"))
+                    .collect();
+                assert_eq!(sent, [expected], "{case}: {name}");
+            }
+        }
+    }
+
     /// A span or event the recording subscriber saw.
     #[derive(Debug)]
     struct Seen {
@@ -608,7 +828,7 @@ mod tests {
     ///
     /// The subscriber becomes visible to other threads only after the cached
     /// interests are rebuilt for it, so a callsite first hit in between would
-    /// cache `never`. Every request goes through [`send`], which calls this
+    /// cache `never`. Every request goes through [`send_to`], which calls this
     /// first, and [`Once`] holds each caller until the recorder is installed:
     /// no thread reaches the trace layer's callsites before then.
     fn install_recorder() {
@@ -754,9 +974,18 @@ mod tests {
             assert_eq!(spans.len(), 1, "{case}: {seen:?}");
             assert_eq!(spans[0].level, Level::INFO, "{case}");
             assert_eq!(spans[0].target, env!("CARGO_CRATE_NAME"), "{case}");
+            // `transaction`, `user_id` and `outcome` are declared for a refusal
+            // and stay unrecorded here.
             assert_eq!(
                 spans[0].fields,
-                BTreeSet::from(["method", "route", "version"]),
+                BTreeSet::from([
+                    "method",
+                    "route",
+                    "version",
+                    "transaction",
+                    "user_id",
+                    "outcome"
+                ]),
                 "{case}"
             );
             assert_eq!(
@@ -790,5 +1019,549 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Stand-ins for registry operations that take [`ApiJson`], [`ApiPath`]
+    /// and [`ApiQuery`], on the registry's route templates and with the
+    /// operations' DTOs, so a refusal names the operation the registry serves
+    /// there.
+    fn extracting() -> Router {
+        let routes = Router::new()
+            .route(
+                "/auth/login",
+                post(|ApiJson(_): ApiJson<LoginRequest>| async { "signed on" }),
+            )
+            .route(
+                "/accounts/{id}",
+                get(|ApiPath(_): ApiPath<String>| async { "account" }).put(
+                    |ApiPath(_): ApiPath<String>, ApiJson(_): ApiJson<AccountUpdateRequest>| async {
+                        "updated"
+                    },
+                ),
+            )
+            .route(
+                "/cards",
+                get(|ApiQuery(_): ApiQuery<PageQuery>| async { "cards" }),
+            )
+            .route(
+                "/authorizations/{id}",
+                get(|ApiPath(_): ApiPath<AuthIdPath>| async { "authorization" }),
+            )
+            .route(
+                "/admin/transaction-types/{id}",
+                put(
+                    |ApiPath(_): ApiPath<String>,
+                     ApiQuery(_): ApiQuery<TranTypeUpdateQuery>,
+                     ApiJson(_): ApiJson<TranTypeUpdateRequest>| async {
+                        "type updated"
+                    },
+                ),
+            );
+        with_layers(routes, HeaderValue::from_static(ORIGIN))
+    }
+
+    /// The `Content-Type` of a JSON body.
+    const JSON: Option<&str> = Some("application/json");
+
+    /// A sign-on body that deserializes.
+    const LOGIN: &str = r#"{"user_id":"USER0001","password":"PASSW0RD"}"#;
+
+    /// A transaction type update body that deserializes.
+    const DESCRIPTION: &str = r#"{"description":"PURCHASE"}"#;
+
+    /// The type update path with the CTLI query.
+    const TYPE_LIST: &str = "/admin/transaction-types/01?origin=list";
+
+    /// The client-written text of [`EXTRACTED`]: a numeric password, a
+    /// numeric SSN part, a query value, a password and an account key.
+    const EXTRACTED_TEXT: [&str; 4] = ["918273645", "TopSecret99", "PASSW0RD", "00000000001"];
+
+    /// One request through [`extracting`]: (method, URI, content type, body,
+    /// status, the refused request's `transaction`, or `None` when every
+    /// extractor passes).
+    type Extracted = (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        u16,
+        Option<&'static str>,
+    );
+
+    /// The requests of
+    /// `an_extractor_refusal_is_recorded_on_the_request_span_and_a_pass_is_not`.
+    const EXTRACTED: [Extracted; 14] = [
+        // A numeric password, malformed JSON, no JSON content type.
+        (
+            "POST",
+            "/auth/login",
+            JSON,
+            r#"{"user_id":"USER0001","password":918273645}"#,
+            400,
+            Some("CC00"),
+        ),
+        (
+            "POST",
+            "/auth/login",
+            JSON,
+            r#"{"user_id":"#,
+            400,
+            Some("CC00"),
+        ),
+        ("POST", "/auth/login", None, LOGIN, 400, Some("CC00")),
+        // A numeric SSN part.
+        (
+            "PUT",
+            "/accounts/00000000001",
+            JSON,
+            r#"{"cust_ssn_1":918273645}"#,
+            400,
+            Some("CAUP"),
+        ),
+        // A path segment that is no UTF-8, into a string and into a struct.
+        ("GET", "/accounts/%FF", None, "", 400, Some("CAVW")),
+        ("GET", "/authorizations/%FF", None, "", 400, Some("CPVD")),
+        // A query value that does not deserialize.
+        (
+            "GET",
+            "/cards?page_size=TopSecret99",
+            None,
+            "",
+            400,
+            Some("CCLI"),
+        ),
+        // The shared type update: CTLI with `origin=list`, else CTTU.
+        ("PUT", TYPE_LIST, JSON, "{", 400, Some("CTLI")),
+        (
+            "PUT",
+            "/admin/transaction-types/01",
+            JSON,
+            "{",
+            400,
+            Some("CTTU"),
+        ),
+        (
+            "PUT",
+            "/admin/transaction-types/01?origin=TopSecret99",
+            JSON,
+            DESCRIPTION,
+            400,
+            Some("CTTU"),
+        ),
+        // Every extractor passes.
+        ("POST", "/auth/login", JSON, LOGIN, 200, None),
+        ("PUT", TYPE_LIST, JSON, DESCRIPTION, 200, None),
+        ("GET", "/cards?page_size=7", None, "", 200, None),
+        ("GET", "/accounts/00000000001", None, "", 200, None),
+    ];
+
+    #[tokio::test]
+    async fn an_extractor_refusal_is_recorded_on_the_request_span_and_a_pass_is_not() {
+        for (method, uri, content_type, body, status, refusal) in EXTRACTED {
+            let case = format!("{method} {uri} {body}");
+            let request = content_type
+                .into_iter()
+                .fold(
+                    Request::builder().method(method).uri(uri),
+                    |builder, value| builder.header(header::CONTENT_TYPE, value),
+                )
+                .body(Body::from(body))
+                .expect("a valid request");
+            let ((answered, _, answer), lines) = send_logged(extracting(), request).await;
+            assert_eq!(answered.as_u16(), status, "{case}");
+            if refusal.is_some() {
+                let error: ErrorBody = serde_json::from_slice(&answer).expect("an error body");
+                assert_eq!(error.code, "INVALID", "{case}");
+            }
+
+            // The stand-ins open no span, so the request span is the only one.
+            let spans: Vec<&Value> = lines.iter().filter(|line| line["type"] == "span").collect();
+            let [span] = spans.as_slice() else {
+                panic!("{case}: one span expected, got {lines:?}");
+            };
+            assert_eq!(span["name"], "request", "{case}: {span}");
+            let attributes = &span["attributes"];
+            assert_eq!(attributes["method"], method, "{case}: {span}");
+            assert_eq!(attributes["version"], "HTTP/1.1", "{case}: {span}");
+            assert!(attributes["route"].is_string(), "{case}: {span}");
+            assert!(attributes.get("user_id").is_none(), "{case}: {span}");
+            if let Some(transaction) = refusal {
+                assert_eq!(attributes["transaction"], transaction, "{case}: {span}");
+                assert_eq!(attributes["outcome"], "rejected", "{case}: {span}");
+            } else {
+                assert!(attributes.get("transaction").is_none(), "{case}: {span}");
+                assert!(attributes.get("outcome").is_none(), "{case}: {span}");
+            }
+
+            // No event but the trace layer's is written, and nothing the
+            // client wrote reaches a line.
+            for line in &lines {
+                if line["type"] != "span" {
+                    let target = line["target"].as_str().unwrap_or_default();
+                    assert!(target.starts_with("tower_http::"), "{case}: {line}");
+                }
+                let text = line.to_string();
+                for withheld in EXTRACTED_TEXT {
+                    assert!(!text.contains(withheld), "{case}: {text}");
+                }
+            }
+        }
+    }
+
+    /// The secret of the token keys [`signed_on_extracting`] verifies with.
+    const SECRET: &str = "test-secret";
+
+    /// The lifetime of the tokens the tests issue, in seconds.
+    const TTL_SECS: u64 = 3600;
+
+    /// `AuthUser`'s extraction as its `FromRequestParts` impl runs it,
+    /// `authenticate`, on a router whose state is the token keys: an
+    /// `AppState` cannot be built without a database handle.
+    struct SignedOn;
+
+    impl FromRequestParts<Arc<JwtKeys>> for SignedOn {
+        type Rejection = ApiError;
+
+        async fn from_request_parts(
+            parts: &mut Parts,
+            keys: &Arc<JwtKeys>,
+        ) -> Result<Self, Self::Rejection> {
+            authenticate(parts, keys).map(|_| Self)
+        }
+    }
+
+    /// `AdminUser`'s extraction, as [`SignedOn`] stands for `AuthUser`'s:
+    /// `authenticate`, then `require_admin`.
+    struct SignedOnAdmin;
+
+    impl FromRequestParts<Arc<JwtKeys>> for SignedOnAdmin {
+        type Rejection = ApiError;
+
+        async fn from_request_parts(
+            parts: &mut Parts,
+            keys: &Arc<JwtKeys>,
+        ) -> Result<Self, Self::Rejection> {
+            let user = authenticate(parts, keys)?;
+            require_admin(parts, user).map(|_| Self)
+        }
+    }
+
+    /// [`extracting`]'s operations with their extractors in the order the
+    /// registry's handlers declare them: the signed-on user first, then the
+    /// path, query and body. The public sign-on takes its body only.
+    fn signed_on_extracting(keys: Arc<JwtKeys>) -> Router {
+        let routes = Router::new()
+            .route(
+                "/auth/login",
+                post(|ApiJson(_): ApiJson<LoginRequest>| async { "signed on" }),
+            )
+            .route(
+                "/accounts/{id}",
+                get(|_: SignedOn, ApiPath(_): ApiPath<String>| async { "account" }).put(
+                    |_: SignedOn,
+                     ApiPath(_): ApiPath<String>,
+                     ApiJson(_): ApiJson<AccountUpdateRequest>| async {
+                        "updated"
+                    },
+                ),
+            )
+            .route(
+                "/cards",
+                get(|_: SignedOn, ApiQuery(_): ApiQuery<PageQuery>| async { "cards" }),
+            )
+            .route(
+                "/authorizations/{id}",
+                get(|_: SignedOn, ApiPath(_): ApiPath<AuthIdPath>| async { "authorization" }),
+            )
+            .route(
+                "/admin/transaction-types/{id}",
+                put(
+                    |_: SignedOnAdmin,
+                     ApiPath(_): ApiPath<String>,
+                     ApiQuery(_): ApiQuery<TranTypeUpdateQuery>,
+                     ApiJson(_): ApiJson<TranTypeUpdateRequest>| async {
+                        "type updated"
+                    },
+                ),
+            )
+            .with_state(keys);
+        with_layers(routes, HeaderValue::from_static(ORIGIN))
+    }
+
+    /// The bearer token a request of [`SIGNED_ON`] presents.
+    #[derive(Debug, Clone, Copy)]
+    enum Token {
+        /// USER0001's, of type `U`.
+        User,
+        /// ADMIN001's, of type `A`.
+        Admin,
+        /// ADMIN001's, signed with another secret.
+        Forged,
+    }
+
+    /// An account update body with a numeric SSN part.
+    const NUMERIC_SSN: &str = r#"{"cust_ssn_1":918273645}"#;
+
+    /// One request through [`signed_on_extracting`]: (the token it presents,
+    /// if any, method, URI, JSON body, empty for none, status, and the refused
+    /// request's `transaction` and `user_id`, or `None` when every extractor
+    /// passes).
+    type SignedOnRequest = (
+        Option<Token>,
+        &'static str,
+        &'static str,
+        &'static str,
+        u16,
+        Option<(&'static str, Option<&'static str>)>,
+    );
+
+    /// The requests of
+    /// `a_refusal_after_a_verified_token_records_its_user_id_and_no_other_does`.
+    const SIGNED_ON: [SignedOnRequest; 15] = [
+        // A body, path or query refused after the token verified.
+        (
+            Some(Token::User),
+            "PUT",
+            "/accounts/00000000001",
+            NUMERIC_SSN,
+            400,
+            Some(("CAUP", Some("USER0001"))),
+        ),
+        (
+            Some(Token::User),
+            "GET",
+            "/accounts/%FF",
+            "",
+            400,
+            Some(("CAVW", Some("USER0001"))),
+        ),
+        (
+            Some(Token::User),
+            "GET",
+            "/authorizations/%FF",
+            "",
+            400,
+            Some(("CPVD", Some("USER0001"))),
+        ),
+        (
+            Some(Token::User),
+            "GET",
+            "/cards?page_size=TopSecret99",
+            "",
+            400,
+            Some(("CCLI", Some("USER0001"))),
+        ),
+        (
+            Some(Token::Admin),
+            "PUT",
+            TYPE_LIST,
+            "{",
+            400,
+            Some(("CTLI", Some("ADMIN001"))),
+        ),
+        (
+            Some(Token::Admin),
+            "PUT",
+            "/admin/transaction-types/01?origin=TopSecret99",
+            DESCRIPTION,
+            400,
+            Some(("CTTU", Some("ADMIN001"))),
+        ),
+        (
+            Some(Token::Admin),
+            "PUT",
+            "/admin/transaction-types/%FF?origin=list",
+            DESCRIPTION,
+            400,
+            Some(("CTLI", Some("ADMIN001"))),
+        ),
+        // The admin check refuses a user before the body is read.
+        (
+            Some(Token::User),
+            "PUT",
+            TYPE_LIST,
+            "{",
+            403,
+            Some(("CTLI", Some("USER0001"))),
+        ),
+        // A token that does not verify, or none: refused before the body.
+        (
+            Some(Token::Forged),
+            "PUT",
+            "/accounts/00000000001",
+            NUMERIC_SSN,
+            401,
+            Some(("CAUP", None)),
+        ),
+        (
+            None,
+            "GET",
+            "/cards?page_size=TopSecret99",
+            "",
+            401,
+            Some(("CCLI", None)),
+        ),
+        // The public sign-on verifies no token, not even a valid one.
+        (
+            Some(Token::User),
+            "POST",
+            "/auth/login",
+            r#"{"user_id":"USER0001","password":918273645}"#,
+            400,
+            Some(("CC00", None)),
+        ),
+        // Every extractor passes.
+        (
+            Some(Token::User),
+            "PUT",
+            "/accounts/00000000001",
+            "{}",
+            200,
+            None,
+        ),
+        (
+            Some(Token::User),
+            "GET",
+            "/cards?page_size=7",
+            "",
+            200,
+            None,
+        ),
+        (Some(Token::Admin), "PUT", TYPE_LIST, DESCRIPTION, 200, None),
+        (Some(Token::User), "POST", "/auth/login", LOGIN, 200, None),
+    ];
+
+    /// The token `keys` issue for `user_id` of type `usr_type`.
+    fn issued(keys: &JwtKeys, user_id: &str, usr_type: UserType) -> String {
+        keys.issue(user_id, usr_type).expect("issues").token
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_a_verified_token_records_its_user_id_and_no_other_does() {
+        let keys = Arc::new(JwtKeys::new(SECRET, TTL_SECS));
+        let user = issued(&keys, "USER0001", UserType::User);
+        let admin = issued(&keys, "ADMIN001", UserType::Admin);
+        let other_secret = JwtKeys::new("other-secret", TTL_SECS);
+        let forged = issued(&other_secret, "ADMIN001", UserType::Admin);
+        for (token, method, uri, body, status, refusal) in SIGNED_ON {
+            let case = format!("{token:?} {method} {uri} {body}");
+            let presented = token.map(|token| match token {
+                Token::User => &user,
+                Token::Admin => &admin,
+                Token::Forged => &forged,
+            });
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some(presented) = presented {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {presented}"));
+            }
+            if !body.is_empty() {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+            }
+            let request = builder.body(Body::from(body)).expect("a valid request");
+            let router = signed_on_extracting(Arc::clone(&keys));
+            let ((answered, _, answer), lines) = send_logged(router, request).await;
+            assert_eq!(answered.as_u16(), status, "{case}");
+            if refusal.is_some() {
+                let error: ErrorBody = serde_json::from_slice(&answer).expect("an error body");
+                let code = match status {
+                    401 => "UNAUTHENTICATED",
+                    403 => "FORBIDDEN",
+                    _ => "INVALID",
+                };
+                assert_eq!(error.code, code, "{case}");
+            }
+
+            // The stand-ins open no span, so the request span is the only one.
+            let spans: Vec<&Value> = lines.iter().filter(|line| line["type"] == "span").collect();
+            let [span] = spans.as_slice() else {
+                panic!("{case}: one span expected, got {lines:?}");
+            };
+            assert_eq!(span["name"], "request", "{case}: {span}");
+            let attributes = &span["attributes"];
+            if let Some((transaction, user_id)) = refusal {
+                assert_eq!(attributes["transaction"], transaction, "{case}: {span}");
+                assert_eq!(attributes["outcome"], "rejected", "{case}: {span}");
+                assert_eq!(
+                    attributes.get("user_id").and_then(Value::as_str),
+                    user_id,
+                    "{case}: {span}"
+                );
+            } else {
+                for field in ["transaction", "user_id", "outcome"] {
+                    assert!(attributes.get(field).is_none(), "{case}: {span}");
+                }
+            }
+
+            // Only a 401 or 403 writes an application event, its warning, and
+            // no token, secret or client-written text reaches a line.
+            let warned = lines
+                .iter()
+                .filter(|line| line["type"] != "span")
+                .filter(|line| {
+                    let target = line["target"].as_str().unwrap_or_default();
+                    !target.starts_with("tower_http::")
+                })
+                .count();
+            assert_eq!(warned, usize::from(matches!(status, 401 | 403)), "{case}");
+            for line in &lines {
+                let text = line.to_string();
+                let tokens = [user.as_str(), admin.as_str(), forged.as_str()];
+                for withheld in EXTRACTED_TEXT.into_iter().chain(tokens) {
+                    assert!(!text.contains(withheld), "{case}: {text}");
+                }
+                for withheld in [SECRET, "other-secret"] {
+                    assert!(!text.contains(withheld), "{case}: {text}");
+                }
+            }
+        }
+    }
+
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("sink buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Sends `request` through `router`, as [`send_to`] does, with the API's
+    /// telemetry subscriber under the default filter `info` as this thread's
+    /// subscriber, and returns the answer with the JSON lines it wrote.
+    ///
+    /// [`Recorder`] keeps no current span, so it cannot show what an
+    /// extractor records on the span it runs in; this subscriber's registry
+    /// does, and its lines are what the `api` binary writes to stdout.
+    async fn send_logged(
+        router: Router,
+        request: Request<Body>,
+    ) -> ((StatusCode, HeaderMap, Vec<u8>), Vec<Value>) {
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let (subscriber, guard) = subscriber_with_writer("api", "info", move || writer.clone())
+            .expect("valid directives");
+        let answer = {
+            // `#[tokio::test]` polls the request on this thread only, so the
+            // thread's default covers every span and event it makes.
+            let _default = tracing::subscriber::set_default(subscriber);
+            send_to(router, request).await
+        };
+        guard.shutdown().expect("the tracer provider shuts down");
+        let bytes = sink.0.lock().expect("the sink buffer").clone();
+        let text = String::from_utf8(bytes).expect("JSON lines are UTF-8");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON line"))
+            .collect();
+        (answer, lines)
     }
 }

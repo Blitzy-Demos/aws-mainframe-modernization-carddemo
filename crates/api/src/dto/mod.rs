@@ -17,13 +17,16 @@
 //!   `reject_invalid` before any rule runs, are the BMS field width
 //!   (`#[validate(length(max))]`) and the encoding checks that apply to the
 //!   member: ASCII ([`ascii_text`]) where a rule moves the value byte for
-//!   byte into an `X(n)` field with no edit that reads those bytes, and, for
-//!   free text a rule stores, no NUL character beside other text
-//!   ([`storable_text`], [`storable_text_of_width`]), which `PostgreSQL` text
-//!   cannot hold. Where a program's audited edit reads the value, that edit
-//!   answers it and no encoding check precedes it: the `COTRTUPC` type code
-//!   and description (`admin_transaction_types`), and the sign-on fields,
-//!   which get the width check and then the `COSGN00C` blank edits (`auth`).
+//!   byte into an `X(n)` field with no edit that reads those bytes, or with
+//!   an edit whose answer quotes that field back (the `CORPT00C`
+//!   confirmation, `reports`), and, for free text a rule stores, no NUL
+//!   character beside other text ([`storable_text`],
+//!   [`storable_text_of_width`]), which `PostgreSQL` text cannot hold. Where
+//!   a program's audited edit reads the value, that edit answers it and no
+//!   encoding check precedes it: the `COTRTUPC` type code and description
+//!   (`admin_transaction_types`), the `CORPT00C` date parts (`reports`), and
+//!   the sign-on fields, which get the width check and then the `COSGN00C`
+//!   blank edits (`auth`).
 //!   The reward DTOs (`admin_reward_rules`, `rewards`) serve no COBOL program
 //!   or BMS map and are the exception: their requests carry their own
 //!   required members and request-written checks.

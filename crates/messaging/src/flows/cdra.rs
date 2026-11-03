@@ -134,7 +134,7 @@ impl Flow for CdraFlow {
             Ok(request) => request,
             Err(disposition) => return disposition,
         };
-        let mut file = AccountFile::new(&self.db);
+        let mut file = AccountFile::new(&self.db, req.message_id.as_deref().unwrap_or(""));
         let outcome = mq_account_reply::process(&mut file, &request, &self.input_queue).await;
         file.close().await;
         map_outcome(outcome, req)
@@ -177,7 +177,10 @@ impl Flow for CdraFlow {
 /// The read is the program's only file access, so a unit of work that cannot
 /// be begun fails the read like any other non-`NOTFND` failure: the domain
 /// rule turns it into the `ERROR WHILE READING ACCTFILE` record and no reply
-/// (P-COACCT01-015).
+/// (P-COACCT01-015). The record keeps only the legacy codes, so each such
+/// failure is logged here at `error`, with the flow, the request's
+/// `message_id`, the call, the account key and the database cause, as CP00
+/// logs its `C001` record; the event also marks the message span as failed.
 ///
 /// The `BEGIN`, the read and the `ROLLBACK` each run under the limits of
 /// `crate::db_deadline`. A read the server cancels at the statement timeout,
@@ -190,29 +193,38 @@ impl Flow for CdraFlow {
 struct AccountFile<'d> {
     /// The pool the unit of work is begun on.
     db: &'d Db,
+    /// The request's `message_id`, empty when it has none, for the failure
+    /// events.
+    message_id: &'d str,
     /// The unit of work, once the first read has begun it.
     uow: Option<UnitOfWork>,
 }
 
 impl<'d> AccountFile<'d> {
-    /// The file of one request, not yet opened.
-    fn new(db: &'d Db) -> Self {
-        Self { db, uow: None }
+    /// The file of the request `message_id`, not yet opened.
+    fn new(db: &'d Db, message_id: &'d str) -> Self {
+        Self {
+            db,
+            message_id,
+            uow: None,
+        }
     }
 
-    /// The unit of work every read runs in, begun by the first call.
+    /// The unit of work every read runs in, begun by the first call. `id` is
+    /// the account the calling read is for, named by [`log_begin_failure`]
+    /// when the `BEGIN` fails.
     ///
     /// # Errors
     ///
     /// The [`PortError`] mapping of the `Db::begin` failure, in practice
     /// [`PortError::Unavailable`]: no connection, a failed `BEGIN`, or a
     /// `BEGIN` past the database deadline.
-    async fn unit_of_work(&mut self) -> PortResult<&mut UnitOfWork> {
+    async fn unit_of_work(&mut self, id: AccountId) -> PortResult<&mut UnitOfWork> {
         let uow = match self.uow.take() {
             Some(uow) => uow,
-            None => bounded("begin", self.db.begin()).await.inspect_err(|err| {
-                tracing::warn!(error = %err, "account unit of work could not begin");
-            })?,
+            None => bounded("begin", self.db.begin())
+                .await
+                .inspect_err(|err| log_begin_failure(self.message_id, id, err))?,
         };
         Ok(self.uow.insert(uow))
     }
@@ -264,13 +276,44 @@ fn log_unproven(req: &Request, escalation: &'static str) {
     );
 }
 
-/// Logs a read failure other than `NOTFND`. The domain rule keeps only its
-/// outcome, the error record, so the adapter detail is written here.
-fn log_read_failure<T>(result: PortResult<T>) -> PortResult<T> {
+/// COACCT01 4000-PROCESS-REQUEST-REPLY — P-COACCT01-015: logs at `error` the
+/// `BEGIN` that failed before account `id` of request `message_id` was read.
+/// The read fails with it, so the request ends in the error record and no
+/// reply; the domain rule keeps only that outcome, so the cause is written
+/// here.
+fn log_begin_failure(message_id: &str, id: AccountId, err: &PortError) {
+    tracing::error!(
+        flow = CdraFlow::NAME,
+        message_id,
+        call = "begin",
+        account_id = %id,
+        error = %err,
+        "account unit of work could not begin"
+    );
+}
+
+/// COACCT01 4000-PROCESS-REQUEST-REPLY — P-COACCT01-015: logs at `error` a
+/// failure other than `NOTFND` of the read `call` of account `id` for request
+/// `message_id`, and returns `result`. The domain rule keeps only its
+/// outcome, the error record, so the adapter detail is written here; `NOTFND`
+/// is the ordinary outcome the COBOL branches on and is not logged.
+fn log_read_failure<T>(
+    message_id: &str,
+    call: &'static str,
+    id: AccountId,
+    result: PortResult<T>,
+) -> PortResult<T> {
     if let Err(err) = &result
         && !matches!(err, PortError::NotFound)
     {
-        tracing::warn!(error = %err, "account read failed other than NOTFND");
+        tracing::error!(
+            flow = CdraFlow::NAME,
+            message_id,
+            call,
+            account_id = %id,
+            error = %err,
+            "account read failed other than NOTFND"
+        );
     }
     result
 }
@@ -279,21 +322,19 @@ impl AccountReader for AccountFile<'_> {
     /// COACCT01 4000-PROCESS-REQUEST-REPLY `EXEC CICS READ DATASET(ACCTDAT)`
     /// [app/app-vsam-mq/cbl/COACCT01.cbl:L396-404] — P-COACCT01-012.
     async fn read_account(&mut self, id: AccountId) -> PortResult<Account> {
-        let uow = self.unit_of_work().await?;
-        log_read_failure(bounded("read_account", uow.store().read_account(id)).await)
+        let call = "read_account";
+        let uow = self.unit_of_work(id).await?;
+        let read = bounded(call, uow.store().read_account(id)).await;
+        log_read_failure(self.message_id, call, id, read)
     }
 
     /// Never called by `COACCT01`, which reads without `UPDATE`; it reads the
     /// same file in the same unit of work so the port stays complete.
     async fn read_account_for_update(&mut self, id: AccountId) -> PortResult<Account> {
-        let uow = self.unit_of_work().await?;
-        log_read_failure(
-            bounded(
-                "read_account_for_update",
-                uow.store().read_account_for_update(id),
-            )
-            .await,
-        )
+        let call = "read_account_for_update";
+        let uow = self.unit_of_work(id).await?;
+        let read = bounded(call, uow.store().read_account_for_update(id)).await;
+        log_read_failure(self.message_id, call, id, read)
     }
 }
 
@@ -350,12 +391,18 @@ fn reply_failure_record(failure: &PublishFailure) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
     use carddemo_domain::format::{self, REPLY_BUFFER_LEN};
     use carddemo_domain::messages;
+    use carddemo_domain::numeric::AccountId;
+    use carddemo_domain::ports::PortError;
     use carddemo_domain::rules::mq_account_reply::{self, ReplyOutcome};
 
     use super::{
-        CdraFlow, PROCESS_PARAGRAPH, REPLY_QUEUE, map_outcome, receive, reply_failure_record,
+        CdraFlow, PROCESS_PARAGRAPH, REPLY_QUEUE, log_begin_failure, log_read_failure, map_outcome,
+        receive, reply_failure_record,
     };
     use crate::consumer::{Disposition, Flow, PublishFailure, Reply, Request};
     use crate::error_queue;
@@ -399,6 +446,31 @@ mod tests {
     /// `text` moved into an `X(n)` field `width` bytes wide.
     fn field(text: &str, width: usize) -> Vec<u8> {
         format!("{text:<width$}").into_bytes()
+    }
+
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            let bytes = self.0.lock().expect("capture buffer").clone();
+            String::from_utf8(bytes).expect("JSON lines are UTF-8")
+        }
+    }
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -483,6 +555,81 @@ mod tests {
                 .iter()
                 .all(|b| *b == b' ')
         );
+    }
+
+    #[test]
+    fn a_failed_begin_or_read_is_one_error_event_that_fails_the_message_span() {
+        // P-COACCT01-015: a BEGIN or an account read that fails other than
+        // NOTFND ends the request in the error record without a reply. Its
+        // cause is one ERROR event with the request's context, which marks
+        // the message span as failed, as CP00's C001 record does; NOTFND is
+        // an ordinary outcome and logs nothing.
+        let id = AccountId::new(2).expect("an account number");
+        let timed_out = PortError::Unavailable(
+            "pool timed out while waiting for an open connection".to_owned(),
+        );
+        let begin = "account unit of work could not begin";
+        let read = "account read failed other than NOTFND";
+        let cases = [
+            ("begin", timed_out.clone(), Some(begin)),
+            ("read_account", timed_out, Some(read)),
+            ("read_account_for_update", PortError::Contention, Some(read)),
+            ("read_account", PortError::NotFound, None),
+        ];
+        for (call, error, message) in cases {
+            let capture = Capture::default();
+            let sink = capture.clone();
+            let (subscriber, guard) =
+                carddemo_runtime::telemetry::subscriber_with_writer("mq", "info", move || {
+                    sink.clone()
+                })
+                .expect("valid directives");
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("message", flow = CdraFlow::NAME);
+                let _entered = span.enter();
+                if call == "begin" {
+                    log_begin_failure("cdra-msg-0001", id, &error);
+                } else {
+                    let failed = Err::<(), _>(error.clone());
+                    let result = log_read_failure("cdra-msg-0001", call, id, failed);
+                    assert_eq!(result, Err(error.clone()), "{call}");
+                }
+            });
+            guard.shutdown().expect("the tracer provider shuts down");
+            let text = capture.text();
+            let (spans, events): (Vec<&str>, Vec<&str>) = text
+                .lines()
+                .partition(|line| line.contains("\"type\":\"span\""));
+            assert_eq!(spans.len(), 1, "{text}");
+            let Some(message) = message else {
+                assert_eq!(events, Vec::<&str>::new(), "{call}");
+                assert!(
+                    spans[0].contains("\"status\":{\"code\":\"unset\"}"),
+                    "{text}"
+                );
+                continue;
+            };
+            assert_eq!(events.len(), 1, "{text}");
+            assert!(events[0].contains("\"level\":\"ERROR\""), "{text}");
+            let fields = events[0]
+                .split_once("\"fields\":{")
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map_or("", |(fields, _)| fields);
+            for expected in [
+                format!("\"message\":\"{message}\""),
+                "\"flow\":\"CDRA\"".to_owned(),
+                "\"message_id\":\"cdra-msg-0001\"".to_owned(),
+                format!("\"call\":\"{call}\""),
+                "\"account_id\":\"00000000002\"".to_owned(),
+                format!("\"error\":\"{error}\""),
+            ] {
+                assert!(fields.contains(&expected), "{expected} missing from {text}");
+            }
+            assert!(
+                spans[0].contains("\"status\":{\"code\":\"error\""),
+                "{text}"
+            );
+        }
     }
 
     #[test]

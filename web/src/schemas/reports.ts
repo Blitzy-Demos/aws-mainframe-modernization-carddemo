@@ -16,8 +16,11 @@
  * the audit order of the `V-CORPT00C` rows: the report type; for a custom
  * report the six empty checks, then the six value edits, then each date's
  * `YYYY-MM-DD` form, start before end; last the confirmation. A query value
- * longer than its OpenAPI `maxLength` fails its own field and stops the rule,
- * as the server checks the lengths before the rule runs.
+ * longer than its OpenAPI `maxLength`, or a confirmation outside its OpenAPI
+ * ASCII `pattern`, fails its own field with zod's default text and stops the
+ * rule, as the server checks both before the rule runs and answers them with
+ * no message (E-49). The dates have no such pattern: the server's value edits
+ * answer a non-ASCII date part with that part's text.
  */
 import { z } from "zod";
 
@@ -97,6 +100,14 @@ const DATE_TEXT_MAX_LENGTH = 10;
 
 /** The OpenAPI `maxLength` of `confirm`: `CONFIRMI X(1)`. */
 const CONFIRM_MAX_LENGTH = 1;
+
+/**
+ * ASCII text, the OpenAPI `pattern` of `confirm`, which the server checks
+ * before the rule because the rule quotes the confirmation back from its
+ * one-byte field: the issue keeps zod's default regex text, as the server's
+ * answer has no message.
+ */
+const ASCII_TEXT = /^[\x00-\x7F]*$/;
 
 /** One date part: its map field width, its value limit and its two texts. */
 interface DatePartRule {
@@ -271,21 +282,17 @@ function customRangeRejection(
 }
 
 /**
- * `CONFIRMI X(1)` as `DELIMITED BY SPACE` reads it: the one-byte field holds
- * an ASCII character as entered, while a character the server encodes in more
- * than one byte does not fit and leaves the field a space, read as nothing.
- */
-const confirmFieldText = (value: string): string =>
-  /^[\x00-\x7f]$/.test(value) ? value : "";
-
-/**
  * The confirmation edit (V-CORPT00C-018): `Y`, `y`, `N`, `n` and a blank value
  * are the server's to answer (it runs the report, clears the form, or asks for
- * confirmation); any other value is quoted back.
+ * confirmation); any other value is quoted back as entered, which
+ * `CONFIRMI X(1)` holds for one ASCII character. A non-ASCII value is never
+ * quoted: its own field check answers it, and the server rejects it before
+ * this edit runs.
  */
 function confirmRejection(confirm: string | undefined): Rejection | undefined {
   if (
     confirm === undefined ||
+    !ASCII_TEXT.test(confirm) ||
     isSpacesOrLowValues(confirm) ||
     /^[YyNn]$/.test(confirm)
   ) {
@@ -294,17 +301,22 @@ function confirmRejection(confirm: string | undefined): Rejection | undefined {
   const { invalidConfirmQuote, invalidConfirmTail } = REPORT_MESSAGES;
   return {
     field: "confirm",
-    message: `${invalidConfirmQuote}${confirmFieldText(confirm)}${invalidConfirmTail}`,
+    message: `${invalidConfirmQuote}${confirm}${invalidConfirmTail}`,
   };
 }
 
-/** An optional query text: `""` is not sent, any other value goes as entered. */
-const optionalText = (maxLength: number) =>
-  z
-    .string()
-    .max(maxLength)
+/**
+ * An optional query text within `maxLength` and, when given, matching
+ * `pattern`: `""` is not sent, any other value goes as entered. A value that
+ * fails either check leaves the form object invalid, so the rule refinement
+ * does not run, as the server checks both before its rule.
+ */
+const optionalText = (maxLength: number, pattern?: RegExp) => {
+  const text = z.string().max(maxLength);
+  return (pattern === undefined ? text : text.regex(pattern))
     .optional()
     .transform((value) => (value === "" ? undefined : value));
+};
 
 /**
  * The CR00 request form. Its output is the query `GET /reports/transactions`
@@ -319,7 +331,7 @@ export const reportRequestSchema = z
     }),
     start_date: optionalText(DATE_TEXT_MAX_LENGTH),
     end_date: optionalText(DATE_TEXT_MAX_LENGTH),
-    confirm: optionalText(CONFIRM_MAX_LENGTH),
+    confirm: optionalText(CONFIRM_MAX_LENGTH, ASCII_TEXT),
   })
   .superRefine((values, ctx) => {
     const rejection =

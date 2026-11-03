@@ -97,9 +97,12 @@ const NO_FURTHER_INFORMATION: [u8; 2] = *b"30";
 /// Runs `batch intcalc` with `args` on `db`, and returns how CBACT04C ended: exit 0 at the end
 /// of the category balance file, 16 on an abend or a setup failure.
 ///
-/// Once `SYSTRAN(+1)` is open, the counts `read` (`WS-RECORD-COUNT`, the balance records handed
-/// to the rule) and `written` (the interest records written to `SYSTRAN(+1)`) are recorded on the
-/// job span however the reading ends.
+/// Once `SYSTRAN(+1)` is open, however the reading ends, `read` (`WS-RECORD-COUNT`, the balance
+/// records handed to the rule) and `posted` (the accounts `1050-UPDATE-ACCOUNT` rewrote in a
+/// committed unit of work, the summary's `accounts_updated` at the end of the file) are set in
+/// the job's counts, whose `rejected` stays 0 because CBACT04C rejects no record, and `written`
+/// (the interest records written to `SYSTRAN(+1)`) is recorded on the job span. A run that
+/// ends before `SYSTRAN(+1)` is open has read nothing and leaves every count 0.
 pub(super) async fn run(ctx: &JobContext, db: &Db, args: &IntcalcArgs) -> ExitStatus {
     let parm = match parm_date(args) {
         Ok(parm) => parm,
@@ -116,6 +119,7 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &IntcalcArgs) -> ExitSt
         groups: DisclosureGroups::new(),
         systran,
         read: 0,
+        posted: 0,
         written: 0,
     };
     let outcome = job.read_file().await;
@@ -277,7 +281,7 @@ impl<S: DisclosureGroupReader + Send> DisclosureGroupReader for RecordStore<'_, 
 }
 
 /// One `batch intcalc` run: the CBACT04C state the rule keeps, the open `SYSTRAN(+1)` and the
-/// counts the job span records.
+/// counts the job reports.
 struct IntcalcJob<'a> {
     /// The settings, the processing clock and the generation catalog of the run.
     ctx: &'a JobContext,
@@ -291,6 +295,10 @@ struct IntcalcJob<'a> {
     systran: PendingGeneration,
     /// `WS-RECORD-COUNT`: the balance records read.
     read: u64,
+    /// The accounts `1050-UPDATE-ACCOUNT` rewrote in a committed unit of work: the rule's
+    /// count of rewrites as the last committed record left it, so a rewrite whose unit of work
+    /// failed to commit is not counted.
+    posted: u64,
     /// The interest records written to `SYSTRAN(+1)`.
     written: u64,
 }
@@ -331,6 +339,9 @@ impl IntcalcJob<'_> {
     /// - The abend of the failing paragraph, after the unit of work is committed: the account
     ///   rewrite the rule made before the failure persists (P-CBACT04C-010).
     /// - A setup failure when the unit of work cannot begin or commit.
+    ///
+    /// Each committed unit of work brings [`IntcalcJob::posted`] up to the rule's count of
+    /// account rewrites.
     async fn process(&mut self, record: &TranCatBalance) -> Result<(), ExitStatus> {
         self.read += 1;
         display_record(record);
@@ -356,12 +367,39 @@ impl IntcalcJob<'_> {
             Err(abend) => Err(abend),
         };
         match written {
-            Ok(()) => uow
-                .commit()
-                .await
-                .map_err(|err| setup_failure("balance record unit of work commit failed", err)),
-            Err(abend) => Err(commit_then_abend(uow, &abend).await),
+            Ok(()) => {
+                uow.commit().await.map_err(|err| {
+                    setup_failure("balance record unit of work commit failed", err)
+                })?;
+                self.posted = self.accounts_updated();
+                Ok(())
+            }
+            Err(abend) => Err(self.commit_then_abend(uow, &abend).await),
         }
+    }
+
+    /// CBACT04C 9999-ABEND-PROGRAM after a failed paragraph of the loop — P-CBACT04C-010,
+    /// P-CBACT04C-188: commits the record's unit of work, whose account rewrite persists under
+    /// `RECOVERY(NONE)` and is then counted in [`IntcalcJob::posted`], then reports `abend`.
+    async fn commit_then_abend(&mut self, uow: UnitOfWork, abend: &InterestAbend) -> ExitStatus {
+        match uow.commit().await {
+            Ok(()) => self.posted = self.accounts_updated(),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "account rewrite before the abend could not be committed"
+                );
+            }
+        }
+        abend_status(abend)
+    }
+
+    /// The accounts `1050-UPDATE-ACCOUNT` has rewritten so far, committed or not: the
+    /// `accounts_updated` that [`InterestRun::finish`] would report now. The rule keeps its
+    /// counts to itself until the end of the file, so they are read from a copy of the run,
+    /// which leaves the run itself going on.
+    fn accounts_updated(&self) -> u64 {
+        self.interest.clone().finish().accounts_updated
     }
 
     /// CBACT04C 1300-B-WRITE-TX `WRITE FD-TRANFILE-REC FROM TRAN-RECORD`
@@ -398,11 +436,13 @@ impl IntcalcJob<'_> {
         }
     }
 
-    /// Records `read` and `written` on the job span.
+    /// Sets `read` and `posted` in the job's counts and records `written` on the job span.
+    /// `rejected` stays 0: CBACT04C has no reject file and turns no balance record away.
     fn record_counts(&self) {
-        let span = Span::current();
-        span.record("read", self.read);
-        span.record("written", self.written);
+        let counts = &self.ctx.counts;
+        counts.set_read(self.read);
+        counts.set_posted(self.posted);
+        Span::current().record("written", self.written);
     }
 
     /// CBACT04C end of file and closes [app/cbl/CBACT04C.cbl:L188-230] — P-CBACT04C-003,
@@ -457,19 +497,6 @@ fn display_record(record: &TranCatBalance) {
         tran_cat_bal = %record.tran_cat_bal,
         "TRAN-CAT-BAL-RECORD"
     );
-}
-
-/// CBACT04C 9999-ABEND-PROGRAM after a failed paragraph of the loop — P-CBACT04C-010,
-/// P-CBACT04C-188: commits the record's unit of work, whose account rewrite persists under
-/// `RECOVERY(NONE)`, then reports `abend`.
-async fn commit_then_abend(uow: UnitOfWork, abend: &InterestAbend) -> ExitStatus {
-    if let Err(err) = uow.commit().await {
-        tracing::error!(
-            error = %err,
-            "account rewrite before the abend could not be committed"
-        );
-    }
-    abend_status(abend)
 }
 
 /// CBACT04C 9999-ABEND-PROGRAM [app/cbl/CBACT04C.cbl:L628-632] — P-CBACT04C-188,

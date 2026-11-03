@@ -14,11 +14,16 @@
 //!   without a valid token: no `Authorization` header, more than one, another
 //!   scheme, or a token that is malformed, tampered with, signed with another
 //!   key or algorithm, expired, or whose `usr_type` claim is not exactly `A`
-//!   or `U`.
+//!   or `U`. A verified token is then held to `USRSEC` as COSGN00C
+//!   `READ-USER-SEC-FILE` reads it [app/cbl/COSGN00C.cbl:L209-219]: a token
+//!   whose `sub` names no stored user, one deleted since sign-on included, is
+//!   401 too, and a failed read is 500. This read precedes every handler, so
+//!   a protected route whose database cannot be reached answers that 500
+//!   before any of its own edits, store-free ones included.
 //! - [`AdminUser`] authenticates first and checks the role second. A request
-//!   without a valid token is therefore 401 on `/admin/**` routes too, and
-//!   only a valid token whose `usr_type` is not `A` is 403
-//!   ([`ApiError::forbidden`]).
+//!   without a valid token, or whose token names no stored user, is therefore
+//!   401 on `/admin/**` routes too, and only a valid token whose `usr_type` is
+//!   not `A` is 403 ([`ApiError::forbidden`]).
 //!
 //! The COBOL keeps users out of admin functions only through menu routing:
 //! COSGN00C transfers an `A` user to COADM01C and every other user to
@@ -33,18 +38,39 @@
 //!
 //! Every rejection is logged at `warn` level, so the default `RUST_LOG=info`
 //! keeps it. A 401 is the event `bearer token rejected` with a fixed `reason`:
-//! `missing_or_malformed_header`, or the token's
-//! [`JwtError::reason`](crate::auth::JwtError::reason). A 403 is the event
+//! `missing_or_malformed_header`, the token's
+//! [`JwtError::reason`](crate::auth::JwtError::reason), or `unknown_subject`
+//! for a verified token whose `sub` names no stored user. A 403 is the event
 //! `admin access denied` with the verified `user_id`. No event carries the
 //! token, the header value, a claim value the token was rejected for, the
 //! decoder's message or the secret.
+//!
+//! A refused request never reaches its handler, so no handler span opens for
+//! it. Before either event, the refusal is recorded on the request span
+//! through `crate::record_refusal`: the `transaction` of the operation the
+//! request asks for, `outcome` `rejected`, and for a 403 the verified
+//! `user_id`. Each event therefore carries them in its span context. A 500 of
+//! the `USRSEC` read, or of its unit of work, is recorded the same way
+//! through `crate::record_failure`, with `outcome` `failed` and no user,
+//! before its detail is logged.
+//!
+//! A verified user is also kept in the request's extensions, where
+//! `verified_user` finds it. Every handler takes its [`AuthUser`] or
+//! [`AdminUser`] before its body, query and path extractors, so when one of
+//! those refuses a request whose token verified, its refusal records that
+//! `user_id` as well. A request whose token did not verify or names no stored
+//! user, and a request to the public `POST /auth/login`, keep no user, so
+//! their refusals record none.
 
 use std::ops::Deref;
 
 use axum::extract::FromRequestParts;
-use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use axum::http::{Extensions, HeaderMap};
+use carddemo_domain::numeric::UserId;
+use carddemo_domain::ports::{PortError, UserStore};
+use carddemo_persistence::PersistenceError;
 
 use crate::auth::jwt::{Claims, JwtKeys, UserType};
 use crate::error::ApiError;
@@ -58,11 +84,15 @@ const BEARER_SCHEME: &str = "Bearer";
 /// `Authorization: Bearer <token>` header, the cases [`bearer_token`] refuses.
 const REASON_MISSING_OR_MALFORMED_HEADER: &str = "missing_or_malformed_header";
 
+/// The logged `reason` of a verified token whose `sub` names no stored user,
+/// the case [`require_signed_on_user`] refuses.
+const REASON_UNKNOWN_SUBJECT: &str = "unknown_subject";
+
 /// The signed-on user of a request, from its verified bearer token.
 ///
 /// It stands for the COMMAREA fields `CDEMO-USER-ID` and `CDEMO-USER-TYPE`
 /// [app/cpy/COCOM01Y.cpy:L25-28]. Any route that takes it answers 401 to a
-/// request without a valid token.
+/// request without a valid token, or whose token names no stored user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthUser {
     /// The token's `sub` claim verbatim: the upper-cased user ID the sign-on
@@ -93,9 +123,10 @@ impl AuthUser {
 
 /// A signed-on admin: an [`AuthUser`] whose type is [`UserType::Admin`].
 ///
-/// Every `/admin/**` route takes it. A request without a valid token is 401,
-/// and a valid token of any other type is 403. It dereferences to the
-/// [`AuthUser`], so a handler reads the admin's ID as `admin.user_id`.
+/// Every `/admin/**` route takes it. A request without a valid token, or
+/// whose token names no stored user, is 401, and a valid token of any other
+/// type is 403. It dereferences to the [`AuthUser`], so a handler reads the
+/// admin's ID as `admin.user_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminUser(pub AuthUser);
 
@@ -125,56 +156,169 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .then_some(token)
 }
 
-/// The signed-on user of a request with `headers`, whose bearer token `keys`
+/// The signed-on user of the request `parts` head, whose bearer token `keys`
 /// verify.
+///
+/// This checks the token alone. Whether its `sub` still names a stored user
+/// is [`require_signed_on_user`]'s check, which [`AuthUser`] makes next.
+///
+/// The user is also kept in the head's extensions, where [`verified_user`]
+/// finds it. axum hands the same extensions to every later extractor of the
+/// request, so the extractor of its body, query or path can name the user
+/// when it refuses the request. [`AuthUser`] removes it again when the
+/// subject check refuses the request.
 ///
 /// # Errors
 ///
 /// [`ApiError::unauthenticated`] (401) when the request has no single bearer
 /// token, or when `keys` reject the token: malformed, signed with another key
 /// or algorithm, expired, missing a required claim, or with a `usr_type`
-/// claim other than `A` or `U`. Each is logged at `warn` level with its fixed
-/// `reason` only: `missing_or_malformed_header`, or
-/// [`JwtError::reason`](crate::auth::JwtError::reason).
-pub(crate) fn authenticate(headers: &HeaderMap, keys: &JwtKeys) -> Result<AuthUser, ApiError> {
-    let Some(token) = bearer_token(headers) else {
-        tracing::warn!(
-            reason = REASON_MISSING_OR_MALFORMED_HEADER,
-            "bearer token rejected"
-        );
-        return Err(ApiError::unauthenticated());
-    };
-    keys.verify(token)
+/// claim other than `A` or `U`. No user is kept then. The refusal is recorded
+/// on the request span (`crate::record_refusal`, no user), then logged at
+/// `warn` level with its fixed `reason` only: `missing_or_malformed_header`,
+/// or [`JwtError::reason`](crate::auth::JwtError::reason).
+pub(crate) fn authenticate(parts: &mut Parts, keys: &JwtKeys) -> Result<AuthUser, ApiError> {
+    let user = bearer_token(&parts.headers)
+        .ok_or(REASON_MISSING_OR_MALFORMED_HEADER)
+        .and_then(|token| keys.verify(token).map_err(|err| err.reason()))
         .map(AuthUser::from_claims)
-        .map_err(|err| {
-            tracing::warn!(reason = err.reason(), "bearer token rejected");
+        .map_err(|reason| {
+            crate::record_refusal(
+                crate::transaction_of(&parts.method, &parts.uri, &parts.extensions),
+                None,
+            );
+            tracing::warn!(reason, "bearer token rejected");
             ApiError::unauthenticated()
-        })
+        })?;
+    parts.extensions.insert(user.clone());
+    Ok(user)
 }
 
-/// `user` as an [`AdminUser`] when its type is [`UserType::Admin`].
+/// The user [`authenticate`] verified for the request whose `extensions`
+/// these are, or `None` when no extractor has authenticated it yet, when its
+/// token did not verify or names no stored user, or when its route is public.
+pub(crate) fn verified_user(extensions: &Extensions) -> Option<&AuthUser> {
+    extensions.get::<AuthUser>()
+}
+
+/// COSGN00C READ-USER-SEC-FILE [app/cbl/COSGN00C.cbl:L209-219], repeated for
+/// a verified token: `user` when `USRSEC` still holds a user with its ID.
+///
+/// A token verifies until it expires, while the user its `sub` names may have
+/// been deleted since sign-on (`DELETE /admin/users/{id}`), or may never have
+/// existed when the token was signed with the key outside `POST /auth/login`.
+/// The ID is read back as sign-on read it, through [`UserStore::read_user`],
+/// byte for byte. Nothing else of the stored record is compared: the actor's
+/// type stays the verified token's `usr_type`.
+///
+/// `transaction` is the code of the operation the request asks for
+/// (`crate::transaction_of`). A refusal is recorded on the request span with
+/// it before it is logged: `crate::record_refusal` for the 401, with no user,
+/// and `crate::record_failure` for a failed read.
 ///
 /// # Errors
 ///
-/// [`ApiError::forbidden`] (403) for every other type, logged at `warn` level
-/// with the user ID: the verified `sub` claim, not a secret.
-pub(crate) fn require_admin(user: AuthUser) -> Result<AdminUser, ApiError> {
+/// - [`ApiError::unauthenticated`] (401) when no user has the ID
+///   ([`PortError::NotFound`]), or when the `sub` claim cannot be a
+///   `SEC-USR-ID PIC X(08)` (more than 8 characters, or one above `U+00FF`)
+///   and so is never read. Each is logged at `warn` level with the reason
+///   `unknown_subject` only, never the user ID.
+/// - The 500 of [`ApiError::from`] a [`PortError`] for any other failure of
+///   the read, whose detail goes to the log only.
+pub(crate) async fn require_signed_on_user<S: UserStore>(
+    store: &mut S,
+    user: AuthUser,
+    transaction: Option<&'static str>,
+) -> Result<AuthUser, ApiError> {
+    let Ok(id) = UserId::from_trimmed(&user.user_id) else {
+        return Err(unknown_subject(transaction));
+    };
+    match store.read_user(id).await {
+        Ok(_) => Ok(user),
+        Err(PortError::NotFound) => Err(unknown_subject(transaction)),
+        Err(err) => {
+            crate::record_failure(transaction);
+            Err(ApiError::from(err))
+        }
+    }
+}
+
+/// The 401 of a verified token whose `sub` names no stored user, recorded on
+/// the request span for `transaction`, then logged with its fixed reason
+/// only.
+fn unknown_subject(transaction: Option<&'static str>) -> ApiError {
+    crate::record_refusal(transaction, None);
+    tracing::warn!(reason = REASON_UNKNOWN_SUBJECT, "bearer token rejected");
+    ApiError::unauthenticated()
+}
+
+/// `user`, signed on for the request `parts` heads, as an [`AdminUser`] when
+/// its type is [`UserType::Admin`].
+///
+/// # Errors
+///
+/// [`ApiError::forbidden`] (403) for every other type. The refusal is
+/// recorded on the request span with the user ID (`crate::record_refusal`),
+/// then logged at `warn` level with it: the verified `sub` claim, not a
+/// secret.
+pub(crate) fn require_admin(parts: &Parts, user: AuthUser) -> Result<AdminUser, ApiError> {
     if user.is_admin() {
         Ok(AdminUser(user))
     } else {
+        crate::record_refusal(
+            crate::transaction_of(&parts.method, &parts.uri, &parts.extensions),
+            Some(&user.user_id),
+        );
         tracing::warn!(user_id = %user.user_id, "admin access denied");
         Err(ApiError::forbidden())
     }
 }
 
+/// The subject check of `user` ([`require_signed_on_user`]) for the
+/// operation `transaction`, in a unit of work of its own.
+///
+/// The read writes nothing, so the unit of work is rolled back once it has
+/// answered, whatever it answered, and its connection goes back to the pool
+/// before the handler opens its own.
+///
+/// # Errors
+///
+/// The subject check's error, or 500 when the unit of work cannot be opened
+/// or rolled back. Each 500 is recorded on the request span
+/// (`crate::record_failure`) before its detail is logged.
+async fn signed_on_user(
+    state: &AppState,
+    user: AuthUser,
+    transaction: Option<&'static str>,
+) -> Result<AuthUser, ApiError> {
+    let failed = |err: PersistenceError| {
+        crate::record_failure(transaction);
+        ApiError::from(err)
+    };
+    let mut uow = state.db().begin().await.map_err(failed)?;
+    let signed_on = require_signed_on_user(&mut uow.store(), user, transaction).await;
+    uow.rollback().await.map_err(failed)?;
+    signed_on
+}
+
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = ApiError;
 
+    /// Verifies the bearer token (`authenticate`), then reads its user
+    /// (`require_signed_on_user`) in a unit of work of its own
+    /// (`signed_on_user`). A request the subject check refuses keeps no user
+    /// in its extensions.
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        authenticate(&parts.headers, state.jwt())
+        let user = authenticate(parts, state.jwt())?;
+        let transaction = crate::transaction_of(&parts.method, &parts.uri, &parts.extensions);
+        let signed_on = signed_on_user(state, user, transaction).await;
+        if signed_on.is_err() {
+            parts.extensions.remove::<Self>();
+        }
+        signed_on
     }
 }
 
@@ -182,13 +326,14 @@ impl FromRequestParts<AppState> for AdminUser {
     type Rejection = ApiError;
 
     /// Authenticates before it checks the role, so a request without a valid
-    /// token is 401, never 403.
+    /// token, or whose token names no stored user (a deleted admin's
+    /// included), is 401, never 403.
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let user = AuthUser::from_request_parts(parts, state).await?;
-        require_admin(user)
+        require_admin(parts, user)
     }
 }
 
@@ -198,17 +343,29 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use axum::body::to_bytes;
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::extract::State;
     use axum::http::header::AUTHORIZATION;
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::http::request::Parts;
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
     use axum::response::IntoResponse;
+    use axum::routing::get;
+    use carddemo_domain::entities::UserSecurity;
     use carddemo_domain::messages;
+    use carddemo_domain::numeric::{Alnum, UserId};
+    use carddemo_domain::ports::{Browse, PortError, PortResult, UserStore};
     use carddemo_runtime::telemetry::subscriber_with_writer;
+    use carddemo_testkit::block_on;
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
     use serde::Serialize;
     use serde_json::{Value, json};
+    use tower::ServiceExt;
 
-    use super::{AdminUser, AuthUser, authenticate, bearer_token, require_admin};
+    use super::{
+        AdminUser, AuthUser, authenticate, bearer_token, require_admin, require_signed_on_user,
+        verified_user,
+    };
     use crate::auth::jwt::{Claims, JwtKeys, UserType};
     use crate::error::ApiError;
 
@@ -260,6 +417,14 @@ mod tests {
 
     fn authorization(text: &str) -> HeaderMap {
         headers(&[HeaderValue::from_str(text).expect("a header value")])
+    }
+
+    /// The head of a `GET /` request with `headers`, as an extractor gets it
+    /// outside a router: no matched route, so no transaction code.
+    fn head(headers: HeaderMap) -> Parts {
+        let (mut parts, ()) = Request::new(()).into_parts();
+        parts.headers = headers;
+        parts
     }
 
     fn assert_unauthenticated(result: Result<AuthUser, ApiError>, case: &str) {
@@ -386,7 +551,7 @@ mod tests {
             ),
         ];
         for (case, map) in cases {
-            assert_unauthenticated(authenticate(&map, &keys), case);
+            assert_unauthenticated(authenticate(&mut head(map), &keys), case);
         }
     }
 
@@ -433,12 +598,12 @@ mod tests {
         ];
         for (case, token) in cases {
             let map = authorization(&format!("Bearer {token}"));
-            assert_unauthenticated(authenticate(&map, &keys), case);
+            assert_unauthenticated(authenticate(&mut head(map), &keys), case);
         }
 
         let map = authorization(&format!("Bearer {}", sign(Algorithm::HS256, &current)));
         assert!(
-            authenticate(&map, &keys).is_ok(),
+            authenticate(&mut head(map), &keys).is_ok(),
             "the control token verifies"
         );
     }
@@ -448,8 +613,8 @@ mod tests {
         let keys = keys();
         let token = token(&keys, "ADMIN001", UserType::Admin);
         for scheme in ["Bearer", "bearer"] {
-            let map = authorization(&format!("{scheme} {token}"));
-            let user = authenticate(&map, &keys).expect("an admin token authenticates");
+            let mut parts = head(authorization(&format!("{scheme} {token}")));
+            let user = authenticate(&mut parts, &keys).expect("an admin token authenticates");
             assert_eq!(
                 user,
                 AuthUser {
@@ -460,7 +625,7 @@ mod tests {
             );
             assert!(user.is_admin(), "{scheme}");
 
-            let admin = require_admin(user.clone()).expect("an admin passes");
+            let admin = require_admin(&parts, user.clone()).expect("an admin passes");
             assert_eq!(admin, AdminUser(user), "{scheme}");
             assert_eq!(admin.user_id, "ADMIN001", "{scheme}");
             assert!(admin.is_admin(), "{scheme}");
@@ -480,12 +645,60 @@ mod tests {
             ("ADMIN001", "AA"),
         ] {
             let issued = token(&keys, user_id, UserType::from_code(code));
-            let map = authorization(&format!("Bearer {issued}"));
-            let user = authenticate(&map, &keys).expect("a valid token authenticates");
+            let mut parts = head(authorization(&format!("Bearer {issued}")));
+            let user = authenticate(&mut parts, &keys).expect("a valid token authenticates");
             assert_eq!(user.user_id, user_id, "the sub claim verbatim for {code:?}");
             assert_eq!(user.usr_type, UserType::User, "{code:?}");
             assert!(!user.is_admin(), "{code:?}");
-            assert_forbidden(require_admin(user), code);
+            assert_forbidden(require_admin(&parts, user), code);
+        }
+    }
+
+    #[test]
+    fn authentication_keeps_the_verified_user_in_the_extensions_and_a_refusal_keeps_none() {
+        let keys = keys();
+        let user = AuthUser {
+            user_id: "USER0001".to_owned(),
+            usr_type: UserType::User,
+        };
+        let admin = AuthUser {
+            user_id: "ADMIN001".to_owned(),
+            usr_type: UserType::Admin,
+        };
+        let forged = token(
+            &JwtKeys::new("other-secret", TTL_SECS),
+            "ADMIN001",
+            UserType::Admin,
+        );
+        // (case, the `Authorization` value if any, the user kept, if any)
+        let cases = [
+            (
+                "user token",
+                Some(format!(
+                    "Bearer {}",
+                    token(&keys, "USER0001", UserType::User)
+                )),
+                Some(&user),
+            ),
+            (
+                "admin token",
+                Some(format!(
+                    "bearer {}",
+                    token(&keys, "ADMIN001", UserType::Admin)
+                )),
+                Some(&admin),
+            ),
+            ("no header", None, None),
+            ("bad signature", Some(format!("Bearer {forged}")), None),
+            ("garbage token", Some("Bearer not-a-jwt".to_owned()), None),
+            ("basic auth", Some(format!("Basic {forged}")), None),
+        ];
+        for (case, value, kept) in cases {
+            let mut parts = head(value.as_deref().map_or_else(HeaderMap::new, authorization));
+            assert_eq!(verified_user(&parts.extensions), None, "{case}: before");
+            let result = authenticate(&mut parts, &keys);
+            assert_eq!(result.as_ref().ok(), kept, "{case}");
+            assert_eq!(verified_user(&parts.extensions), kept, "{case}: after");
         }
     }
 
@@ -538,8 +751,8 @@ mod tests {
             ),
         ];
         for (case, value, reason) in cases {
-            let map = value.as_deref().map_or_else(HeaderMap::new, authorization);
-            let (result, lines) = logged(|| authenticate(&map, &keys));
+            let mut parts = head(value.as_deref().map_or_else(HeaderMap::new, authorization));
+            let (result, lines) = logged(|| authenticate(&mut parts, &keys));
             assert_unauthenticated(result, case);
             let [line] = lines.as_slice() else {
                 panic!("{case}: one event expected, got {lines:?}");
@@ -572,8 +785,10 @@ mod tests {
     fn a_403_is_logged_at_warn_with_the_user_id_and_a_pass_is_not_logged() {
         let keys = keys();
         let user_token = token(&keys, "USER0001", UserType::User);
-        let user_map = authorization(&format!("Bearer {user_token}"));
-        let (denied, lines) = logged(|| authenticate(&user_map, &keys).and_then(require_admin));
+        let mut user_parts = head(authorization(&format!("Bearer {user_token}")));
+        let (denied, lines) = logged(|| {
+            authenticate(&mut user_parts, &keys).and_then(|user| require_admin(&user_parts, user))
+        });
         assert_forbidden(denied, "a user token");
         let [line] = lines.as_slice() else {
             panic!("one event expected, got {lines:?}");
@@ -586,19 +801,165 @@ mod tests {
         );
         assert!(!line.to_string().contains(&user_token), "{line}");
 
-        let admin_map = authorization(&format!(
+        let mut admin_parts = head(authorization(&format!(
             "Bearer {}",
             token(&keys, "ADMIN001", UserType::Admin)
-        ));
-        let (admitted, lines) = logged(|| authenticate(&admin_map, &keys).and_then(require_admin));
+        )));
+        let (admitted, lines) = logged(|| {
+            authenticate(&mut admin_parts, &keys).and_then(|user| require_admin(&admin_parts, user))
+        });
         assert!(admitted.is_ok(), "an admin token passes");
         assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// The `GET /accounts/{id}` stand-in: [`AuthUser`]'s extraction as its
+    /// `FromRequestParts` impl runs it, on a router without an `AppState`.
+    async fn signed_on(
+        State(keys): State<Arc<JwtKeys>>,
+        mut parts: Parts,
+    ) -> Result<String, ApiError> {
+        authenticate(&mut parts, &keys).map(|user| user.user_id)
+    }
+
+    /// The `GET /admin/users` stand-in: [`AdminUser`]'s extraction as its
+    /// `FromRequestParts` impl runs it.
+    async fn signed_on_admin(
+        State(keys): State<Arc<JwtKeys>>,
+        mut parts: Parts,
+    ) -> Result<String, ApiError> {
+        let user = authenticate(&mut parts, &keys)?;
+        require_admin(&parts, user).map(|admin| admin.0.user_id)
+    }
+
+    /// The status of `GET uri` with the `Authorization` value `credential`,
+    /// if any, through the API's layers over the two stand-ins, and the JSON
+    /// lines the API's telemetry subscriber writes meanwhile.
+    fn served(uri: &str, credential: Option<&str>) -> (StatusCode, Vec<Value>) {
+        let routes = Router::new()
+            .route("/accounts/{id}", get(signed_on))
+            .route("/admin/users", get(signed_on_admin))
+            .with_state(Arc::new(keys()));
+        let app = crate::with_layers(routes, HeaderValue::from_static("http://localhost:5173"));
+        let request = credential
+            .into_iter()
+            .fold(Request::get(uri), |builder, value| {
+                builder.header(AUTHORIZATION, value)
+            })
+            .body(Body::empty())
+            .expect("a valid request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        logged(|| {
+            runtime.block_on(async {
+                app.oneshot(request)
+                    .await
+                    .expect("the router is infallible")
+                    .status()
+            })
+        })
+    }
+
+    /// A refused request's `transaction` and verified `user_id`, if any.
+    type Refusal = (&'static str, Option<&'static str>);
+
+    /// Asserts that `lines`, written for one request, hold one request span
+    /// line. For a `refusal` it carries the refusal's `transaction`, `outcome`
+    /// `rejected` and `user_id`, if any, and the one warning carries the same
+    /// in its span context. For `None` it carries none of the three, and no
+    /// warning is written.
+    fn assert_refusal_recorded(case: &str, lines: &[Value], refusal: Option<Refusal>) {
+        let spans: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "span" && line["name"] == "request")
+            .collect();
+        let [span] = spans.as_slice() else {
+            panic!("{case}: one request span expected, got {lines:?}");
+        };
+        let attributes = &span["attributes"];
+        let warnings: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["level"] == "WARN")
+            .collect();
+        let Some((transaction, user_id)) = refusal else {
+            for field in ["transaction", "user_id", "outcome"] {
+                assert!(attributes.get(field).is_none(), "{case}: {span}");
+            }
+            assert!(warnings.is_empty(), "{case}: {warnings:?}");
+            return;
+        };
+        let [warning] = warnings.as_slice() else {
+            panic!("{case}: one warning expected, got {lines:?}");
+        };
+        let context = &warning["span"];
+        assert_eq!(context["name"], "request", "{case}: {warning}");
+        for recorded in [attributes, context] {
+            assert_eq!(recorded["transaction"], transaction, "{case}: {recorded}");
+            assert_eq!(recorded["outcome"], "rejected", "{case}: {recorded}");
+            assert_eq!(
+                recorded.get("user_id").and_then(Value::as_str),
+                user_id,
+                "{case}: {recorded}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_on_the_request_span_and_in_its_event_s_span_context() {
+        const ACCOUNT: &str = "/accounts/00000000001";
+        const ADMIN_USERS: &str = "/admin/users";
+        const CAVW: Option<Refusal> = Some(("CAVW", None));
+        let keys = keys();
+        let user = format!("Bearer {}", token(&keys, "USER0001", UserType::User));
+        let admin = format!("Bearer {}", token(&keys, "ADMIN001", UserType::Admin));
+        let other_secret = JwtKeys::new("other-secret", TTL_SECS);
+        let forged = format!(
+            "Bearer {}",
+            token(&other_secret, "ADMIN001", UserType::Admin)
+        );
+        let garbage = "Bearer not-a-jwt".to_owned();
+        let basic = "Basic QURNSU4wMDE6UEFTU1dPUkQ=".to_owned();
+        let denied = Some(("CU00", Some("USER0001")));
+        // (case, URI, `Authorization`, status, the refused request's
+        // `transaction` and `user_id`, or `None` when the request passes)
+        let cases = [
+            ("no token", ACCOUNT, None, 401, CAVW),
+            ("bad signature", ACCOUNT, Some(&forged), 401, CAVW),
+            ("garbage token", ACCOUNT, Some(&garbage), 401, CAVW),
+            ("basic auth", ACCOUNT, Some(&basic), 401, CAVW),
+            (
+                "admin, no token",
+                ADMIN_USERS,
+                None,
+                401,
+                Some(("CU00", None)),
+            ),
+            ("admin, user token", ADMIN_USERS, Some(&user), 403, denied),
+            ("user token", ACCOUNT, Some(&user), 200, None),
+            ("admin, admin token", ADMIN_USERS, Some(&admin), 200, None),
+        ];
+        for (case, uri, credential, status, refusal) in cases {
+            let (answered, lines) = served(uri, credential.map(String::as_str));
+            assert_eq!(answered.as_u16(), status, "{case}");
+            assert_refusal_recorded(case, &lines, refusal);
+
+            for line in &lines {
+                let text = line.to_string();
+                for withheld in [SECRET, "other-secret", "00000000001"] {
+                    assert!(!text.contains(withheld), "{case}: {text}");
+                }
+                for value in [&user, &admin, &forged, &garbage, &basic] {
+                    let presented = value.split_once(' ').map_or(value.as_str(), |(_, t)| t);
+                    assert!(!text.contains(presented), "{case}: {text}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
     async fn rejections_carry_the_catalog_messages() {
         let keys = keys();
-        let missing = authenticate(&HeaderMap::new(), &keys).expect_err("no token");
+        let missing = authenticate(&mut head(HeaderMap::new()), &keys).expect_err("no token");
         assert_eq!(
             message_of(missing).await,
             (
@@ -607,12 +968,12 @@ mod tests {
             )
         );
 
-        let map = authorization(&format!(
+        let mut parts = head(authorization(&format!(
             "Bearer {}",
             token(&keys, "USER0001", UserType::User)
-        ));
-        let user = authenticate(&map, &keys).expect("a user token authenticates");
-        let denied = require_admin(user).expect_err("a user is not an admin");
+        )));
+        let user = authenticate(&mut parts, &keys).expect("a user token authenticates");
+        let denied = require_admin(&parts, user).expect_err("a user is not an admin");
         assert_eq!(
             message_of(denied).await,
             (
@@ -620,5 +981,247 @@ mod tests {
                 Value::from(messages::ADMIN_ACCESS_REQUIRED)
             )
         );
+    }
+
+    /// The adapter detail of a failed `USRSEC` read, which must reach the log
+    /// only.
+    const READ_DETAIL: &str = "connection reset by 10.0.0.7:5432 while reading users";
+
+    /// A `USRSEC` holding at most one user, which records the key of every
+    /// `read_user` and fails every other call, since the subject check makes
+    /// none.
+    #[derive(Default)]
+    struct OneUserStore {
+        /// The stored user, if any.
+        user: Option<UserSecurity>,
+        /// The failure every read answers instead, if any.
+        failure: Option<PortError>,
+        /// The key of each `read_user`, in order.
+        reads: Vec<UserId>,
+    }
+
+    /// The `SEC-USR-ID` key of `user_id`, as persistence builds it from the
+    /// stored text.
+    fn key(user_id: &str) -> UserId {
+        UserId::from_trimmed(user_id).expect("an X(08) user ID")
+    }
+
+    impl OneUserStore {
+        /// A store holding the user `user_id` with the `SEC-USR-TYPE` code.
+        fn holding(user_id: &str, code: &str) -> Self {
+            Self {
+                user: Some(UserSecurity {
+                    sec_usr_id: key(user_id),
+                    sec_usr_fname: Alnum::move_from("FIRST"),
+                    sec_usr_lname: Alnum::move_from("LAST"),
+                    password_hash: String::new(),
+                    sec_usr_type: Alnum::move_from(code),
+                }),
+                ..Self::default()
+            }
+        }
+
+        /// A store whose every read fails with `failure`.
+        fn failing(failure: PortError) -> Self {
+            Self {
+                failure: Some(failure),
+                ..Self::default()
+            }
+        }
+    }
+
+    /// The failure of a call the subject check never makes.
+    fn not_made(call: &str) -> PortError {
+        PortError::Unavailable(format!("the subject check makes no {call}"))
+    }
+
+    impl UserStore for OneUserStore {
+        async fn read_user(&mut self, id: UserId) -> PortResult<UserSecurity> {
+            self.reads.push(id);
+            if let Some(failure) = &self.failure {
+                return Err(failure.clone());
+            }
+            self.user
+                .clone()
+                .filter(|user| user.sec_usr_id == id)
+                .ok_or(PortError::NotFound)
+        }
+
+        async fn read_user_for_update(&mut self, _id: UserId) -> PortResult<UserSecurity> {
+            Err(not_made("read_user_for_update"))
+        }
+
+        async fn browse_users(&mut self, _browse: Browse<UserId>) -> PortResult<Vec<UserSecurity>> {
+            Err(not_made("browse_users"))
+        }
+
+        async fn insert_user(&mut self, _user: UserSecurity) -> PortResult<()> {
+            Err(not_made("insert_user"))
+        }
+
+        async fn update_user(&mut self, _user: UserSecurity) -> PortResult<()> {
+            Err(not_made("update_user"))
+        }
+
+        async fn delete_user(&mut self, _id: UserId) -> PortResult<()> {
+            Err(not_made("delete_user"))
+        }
+    }
+
+    fn token_user(user_id: &str, usr_type: UserType) -> AuthUser {
+        AuthUser {
+            user_id: user_id.to_owned(),
+            usr_type,
+        }
+    }
+
+    /// The subject check of `user` against `store`, and the log lines it
+    /// writes.
+    fn checked(
+        store: &mut OneUserStore,
+        user: AuthUser,
+    ) -> (Result<AuthUser, ApiError>, Vec<Value>) {
+        logged(|| block_on(require_signed_on_user(store, user, None)))
+    }
+
+    #[test]
+    fn a_stored_subject_passes_unchanged_with_the_type_of_its_token() {
+        // (user ID, stored `SEC-USR-TYPE`, the token's type). The stored type
+        // is never compared: a demoted admin keeps the token's `A`.
+        for (user_id, code, usr_type) in [
+            ("ADMIN001", "A", UserType::Admin),
+            ("USER0001", "U", UserType::User),
+            ("ADMIN002", "U", UserType::Admin),
+            ("ADMéN01", "A", UserType::Admin),
+        ] {
+            let mut store = OneUserStore::holding(user_id, code);
+            let user = token_user(user_id, usr_type);
+            let (result, lines) = checked(&mut store, user.clone());
+            assert_eq!(result.expect(user_id), user, "{user_id}");
+            assert!(lines.is_empty(), "{user_id}: {lines:?}");
+            assert_eq!(store.reads, [key(user_id)], "{user_id}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_subject_is_401_logged_with_its_reason_only() {
+        let admin = || OneUserStore::holding("ADMIN001", "A");
+        // (case, store, the token's `sub`, whether the ID is read)
+        let cases = [
+            ("deleted", OneUserStore::default(), "ADMIN001", true),
+            ("never stored", admin(), "NOBODY99", true),
+            ("another case", admin(), "admin001", true),
+            ("9 characters", admin(), "ADMIN0012", false),
+            ("above U+00FF", admin(), "ADM€N001", false),
+        ];
+        for (case, mut store, sub, read) in cases {
+            let (result, lines) = checked(&mut store, token_user(sub, UserType::Admin));
+            let err = result.expect_err(case);
+            assert_eq!(err.status(), StatusCode::UNAUTHORIZED, "{case}");
+            assert_eq!(
+                serde_json::to_value(err.body()).expect("the body serializes"),
+                json!({"code": "UNAUTHENTICATED", "message": messages::AUTHENTICATION_REQUIRED}),
+                "{case}"
+            );
+            let expected_reads = if read { vec![key(sub)] } else { Vec::new() };
+            assert_eq!(store.reads, expected_reads, "{case}");
+            let [line] = lines.as_slice() else {
+                panic!("{case}: one event expected, got {lines:?}");
+            };
+            assert_eq!(line["level"], "WARN", "{case}");
+            assert_eq!(line["target"], "carddemo_api::auth::extract", "{case}");
+            assert_eq!(
+                line["fields"],
+                json!({"message": "bearer token rejected", "reason": "unknown_subject"}),
+                "{case}"
+            );
+            assert!(!line.to_string().contains(sub), "{case}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_failed_user_read_is_500_without_its_detail() {
+        for failure in [
+            PortError::Unavailable(READ_DETAIL.to_owned()),
+            PortError::Contention,
+        ] {
+            let case = failure.to_string();
+            let mut store = OneUserStore::failing(failure);
+            let (result, lines) = checked(&mut store, token_user("ADMIN001", UserType::Admin));
+            let err = result.expect_err(&case);
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR, "{case}");
+            assert_eq!(err.body(), ApiError::unexpected().body(), "{case}");
+            let body = serde_json::to_string(err.body()).expect("the body serializes");
+            assert!(!body.contains(READ_DETAIL), "{case}: {body}");
+            assert_eq!(store.reads, [key("ADMIN001")], "{case}");
+            // The detail is logged once, as an error: a failed read is not an
+            // unknown subject.
+            let [line] = lines.as_slice() else {
+                panic!("{case}: one event expected, got {lines:?}");
+            };
+            assert_eq!(line["level"], "ERROR", "{case}");
+            assert_eq!(line["fields"]["error"], case.as_str(), "{case}");
+        }
+    }
+
+    /// The subject check of `user` against `store` for a `CAVW` request,
+    /// inside a stand-in for the request span with its three empty refusal
+    /// fields, and the log lines it writes: the events, then the span line.
+    fn checked_in_request_span(
+        store: &mut OneUserStore,
+        user: AuthUser,
+    ) -> (Result<AuthUser, ApiError>, Vec<Value>) {
+        logged(|| {
+            tracing::info_span!(
+                "request",
+                transaction = tracing::field::Empty,
+                user_id = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+            )
+            .in_scope(|| block_on(require_signed_on_user(store, user, Some("CAVW"))))
+        })
+    }
+
+    #[test]
+    fn a_subject_check_refusal_is_on_the_request_span_before_its_event() {
+        // (case, store, the request span's `outcome`, the event's level)
+        let cases = [
+            (
+                "unknown subject",
+                OneUserStore::default(),
+                "rejected",
+                "WARN",
+            ),
+            (
+                "failed read",
+                OneUserStore::failing(PortError::Unavailable(READ_DETAIL.to_owned())),
+                "failed",
+                "ERROR",
+            ),
+        ];
+        for (case, mut store, outcome, level) in cases {
+            let (result, lines) =
+                checked_in_request_span(&mut store, token_user("ADMIN001", UserType::Admin));
+            assert!(result.is_err(), "{case}");
+            let [event, span] = lines.as_slice() else {
+                panic!("{case}: one event and one span line expected, got {lines:?}");
+            };
+            assert_eq!(event["level"], level, "{case}");
+            // The event carries the refusal in its span context, and the
+            // unconfirmed user is recorded nowhere.
+            assert_eq!(
+                event["span"],
+                json!({"name": "request", "transaction": "CAVW", "outcome": outcome}),
+                "{case}"
+            );
+            assert_eq!(span["type"], "span", "{case}");
+            assert_eq!(span["attributes"]["transaction"], "CAVW", "{case}");
+            assert_eq!(span["attributes"]["outcome"], outcome, "{case}");
+            assert!(
+                span["attributes"].get("user_id").is_none(),
+                "{case}: {span}"
+            );
+            assert!(!event.to_string().contains("ADMIN001"), "{case}: {event}");
+        }
     }
 }

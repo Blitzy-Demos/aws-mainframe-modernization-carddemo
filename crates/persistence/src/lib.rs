@@ -70,7 +70,7 @@ pub use tx::{PgStore, UnitOfWork};
 
 use std::borrow::Cow;
 use std::panic::Location;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use carddemo_codec::CodecError;
 use carddemo_domain::auth::PasswordError;
@@ -184,41 +184,55 @@ pub enum PersistenceError {
     },
 }
 
-impl From<PersistenceError> for PortError {
+impl PersistenceError {
     /// Keeps a port outcome as it is, maps a database failure through its
     /// SQLSTATE, and reports every other failure as
     /// [`PortError::Unavailable`] with the error's text.
     ///
-    /// The failure is logged once here, as [`port_error`] logs it: a database
-    /// failure through that mapping, any other failure but a port outcome as
-    /// one `warn` event whose text, like every [`PersistenceError`] text,
-    /// names no stored value. A port outcome passes through unlogged: the
-    /// statement behind it was logged where it failed, and `NotFound` is never
-    /// logged.
+    /// The failure is logged once here, at `location`, as `port_error_at`
+    /// logs it: a database failure through that mapping, any other failure
+    /// but a port outcome as one `warn` event whose text, like every
+    /// [`PersistenceError`] text, names no stored value. A port outcome passes
+    /// through unlogged: the statement behind it was logged where it failed,
+    /// and `NotFound` is never logged.
     ///
-    /// The event's code location is the caller of `from`: the call site of `?`
-    /// or of a direct call. A conversion passed as a function value, as in
-    /// `map_err(PortError::from)`, reports the standard-library frame that
-    /// invokes it; a [`PersistenceError::Corrupt`] text names its table and
-    /// column instead.
-    #[track_caller]
-    fn from(err: PersistenceError) -> Self {
-        match err {
-            PersistenceError::Port(port) => port,
-            PersistenceError::Sqlx(source) => port_error(&source),
+    /// `PortError::from` is this conversion at the caller's code location. A
+    /// caller that converts the error away from the call that failed, such as
+    /// a wrapper that runs the call under a deadline, takes that call's
+    /// location through `#[track_caller]` and passes it here, so the event
+    /// names the failing call and not the wrapper.
+    #[must_use]
+    pub fn into_port_error(self, location: &'static Location<'static>) -> PortError {
+        match self {
+            Self::Port(port) => port,
+            Self::Sqlx(source) => port_error_at(&source, location),
             other => {
                 let text = other.to_string();
-                let location = Location::caller();
                 tracing::warn!(
                     outcome = OUTCOME_UNAVAILABLE,
                     error = %text,
-                    code.filepath = location.file(),
+                    code.filepath = code_filepath(location),
                     code.lineno = location.line(),
                     "persistence error reported as unavailable"
                 );
-                Self::Unavailable(text)
+                PortError::Unavailable(text)
             }
         }
+    }
+}
+
+impl From<PersistenceError> for PortError {
+    /// [`PersistenceError::into_port_error`] at the caller of `from`: the call
+    /// site of `?` or of a direct call.
+    ///
+    /// A conversion passed as a function value, as in
+    /// `map_err(PortError::from)`, reports the standard-library frame that
+    /// invokes it, so that form is kept to errors whose text locates them,
+    /// such as a [`PersistenceError::Corrupt`], which names its table and
+    /// column.
+    #[track_caller]
+    fn from(err: PersistenceError) -> Self {
+        err.into_port_error(Location::caller())
     }
 }
 
@@ -226,7 +240,7 @@ impl From<PersistenceError> for PortError {
 const OUTCOME_UNAVAILABLE: &str = "Unavailable";
 
 /// Maps a sqlx failure onto the outcome the COBOL programs branch on, and logs
-/// it once.
+/// it once at `location`, the code location of the failed statement.
 ///
 /// - A query that had to return a row and found none is
 ///   [`PortError::NotFound`]: the CICS `NOTFND`, Db2 `SQLCODE` +100 or IMS
@@ -242,19 +256,12 @@ const OUTCOME_UNAVAILABLE: &str = "Unavailable";
 /// shown to the user.
 ///
 /// Every outcome but `NotFound`, which the programs branch on as a normal
-/// result, is logged as one `database statement failed` event at the caller's
-/// code location ([`port_error_at`] lists its fields), so the cause of a
-/// failure stays in the log however the rules and the adapters turn the
-/// outcome into a COBOL message.
-#[must_use]
-#[track_caller]
-pub(crate) fn port_error(err: &sqlx::Error) -> PortError {
-    port_error_at(err, Location::caller())
-}
-
-/// [`port_error`] with the code location of the failed statement given
-/// explicitly: `crate::tx::savepoint` and `crate::tx::settle` capture it where
-/// a store method calls them and hand it on once the statement has run.
+/// result, is logged as one `database statement failed` event, so the cause
+/// of a failure stays in the log however the rules and the adapters turn the
+/// outcome into a COBOL message. `crate::tx::savepoint` and
+/// `crate::tx::settle` capture `location` where a store method calls them and
+/// hand it on once the statement has run;
+/// [`PersistenceError::into_port_error`] hands on its own.
 ///
 /// The event, at `warn` for [`PortError::Contention`] and
 /// [`PortError::Unavailable`] and at `info` for [`PortError::Duplicate`] and
@@ -268,7 +275,8 @@ pub(crate) fn port_error(err: &sqlx::Error) -> PortError {
 ///   row contents such as a social security number or a password hash; for
 ///   any other sqlx error its own text;
 /// - `table` and `constraint`: the names the server reported, when it did;
-/// - `code.filepath` and `code.lineno`: `location`.
+/// - `code.filepath` and `code.lineno`: `location`, its file relative to the
+///   workspace root ([`code_filepath`]).
 #[must_use]
 pub(crate) fn port_error_at(err: &sqlx::Error, location: &'static Location<'static>) -> PortError {
     match err {
@@ -304,7 +312,7 @@ pub(crate) fn port_error_at(err: &sqlx::Error, location: &'static Location<'stat
     }
 }
 
-/// The SQLSTATE half of [`port_error`]. The text of an unmapped error is
+/// The SQLSTATE half of [`port_error_at`]. The text of an unmapped error is
 /// [`database_text`].
 fn database_port_error(db: &dyn DatabaseError) -> PortError {
     match db.code().as_deref() {
@@ -355,7 +363,7 @@ impl Failure<'_> {
             PortError::Unavailable(_) => OUTCOME_UNAVAILABLE,
         };
         let sqlstate = self.sqlstate.as_deref();
-        let file = self.location.file();
+        let file = code_filepath(self.location);
         let line = self.location.line();
         if matches!(self.outcome, PortError::Duplicate | PortError::Restricted) {
             tracing::info!(
@@ -383,13 +391,43 @@ impl Failure<'_> {
     }
 }
 
+/// The `code.filepath` of a failure event at `location`: its file relative to
+/// the workspace root, as `file!()` names it.
+///
+/// `Location::file` is the path rustc was given for the source. A call site
+/// compiled in its own crate keeps the workspace-relative path cargo passes,
+/// but one compiled into a dependent crate, such as a generic or `async`
+/// function of this crate instantiated by the binary that awaits it, carries
+/// the build checkout's absolute path. The event therefore names the same
+/// repository file either way and never a host directory. A file outside the
+/// workspace, such as a standard-library or registry source, keeps its path.
+pub(crate) fn code_filepath(location: &'static Location<'static>) -> &'static str {
+    relative_to(workspace_root(), location.file())
+}
+
+/// The root of the workspace this crate was built in: two levels above its
+/// manifest directory, `crates/persistence`. `None` only for a manifest
+/// directory with fewer ancestors, which leaves every path as it is.
+fn workspace_root() -> Option<&'static Path> {
+    Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2)
+}
+
+/// `file` relative to `root` when it lies under it, compared component by
+/// component, and otherwise `file` unchanged.
+fn relative_to<'f>(root: Option<&Path>, file: &'f str) -> &'f str {
+    root.and_then(|root| Path::new(file).strip_prefix(root).ok())
+        .and_then(Path::to_str)
+        .unwrap_or(file)
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
     use std::collections::BTreeMap;
     use std::error::Error;
     use std::fmt;
-    use std::path::PathBuf;
+    use std::panic::Location;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, PoisonError};
 
     use carddemo_codec::{CodecError, CodecErrorKind};
@@ -401,7 +439,14 @@ mod tests {
     use tracing::subscriber::Interest;
     use tracing::{Event, Level, Metadata, Subscriber};
 
-    use super::{PersistenceError, PortError, port_error};
+    use super::{PersistenceError, PortError, port_error_at, relative_to, workspace_root};
+
+    /// [`port_error_at`] at the caller's code location, as a store method's
+    /// savepoint hands its own on.
+    #[track_caller]
+    fn port_error(err: &sqlx::Error) -> PortError {
+        port_error_at(err, Location::caller())
+    }
 
     /// A database error with a chosen SQLSTATE, standing in for the server's.
     ///
@@ -647,6 +692,51 @@ mod tests {
         assert_eq!(codec_source.and_then(|e| e.record), Some(3));
 
         assert!(corrupt().source().is_none());
+    }
+
+    #[test]
+    fn code_filepaths_are_relative_to_the_workspace_root() {
+        let build = Some(Path::new("/build/carddemo"));
+        let shim = "/rustc/6b00bc38/library/core/src/ops/function.rs";
+        let cases = [
+            // A call site compiled into a dependent crate: the absolute path.
+            (
+                build,
+                "/build/carddemo/crates/persistence/src/repos/tran_types.rs",
+                "crates/persistence/src/repos/tran_types.rs",
+            ),
+            // A call site compiled in its own crate: already relative.
+            (
+                build,
+                "crates/messaging/src/flows/cdra.rs",
+                "crates/messaging/src/flows/cdra.rs",
+            ),
+            // A sibling directory that shares the root's text, not its
+            // components.
+            (
+                build,
+                "/build/carddemo-old/crates/persistence/src/lib.rs",
+                "/build/carddemo-old/crates/persistence/src/lib.rs",
+            ),
+            // A file outside the workspace.
+            (build, shim, shim),
+            // No root to strip.
+            (
+                None,
+                "/build/carddemo/crates/persistence/src/lib.rs",
+                "/build/carddemo/crates/persistence/src/lib.rs",
+            ),
+            // This build's root: the absolute path becomes what `file!()`
+            // names.
+            (
+                workspace_root(),
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"),
+                file!(),
+            ),
+        ];
+        for (root, file, expected) in cases {
+            assert_eq!(relative_to(root, file), expected, "{root:?} {file}");
+        }
     }
 
     /// One event a [`Capture`] saw: its level and its fields, each as text.

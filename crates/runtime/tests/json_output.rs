@@ -3,15 +3,30 @@
 //! Every finished span is one `"type":"span"` line from the JSON span exporter,
 //! every log event is one line from the `tracing-subscriber` JSON formatter, and
 //! an event below the filter level is not written at all. The scenario emits the
-//! three write-span families the binaries produce: an API request with its
-//! handler span, a batch job with its reject and halt events, and a message flow.
+//! three write-span families the binaries produce, with the names and fields the
+//! binaries give them:
+//!
+//! - an API `request` span (`method`, `route`, `version`) holding the CAUP
+//!   handler span `update_account`, inside which sqlx writes a `sqlx::query`
+//!   statement event, as enabled by `sqlx::query=debug`;
+//! - a batch `job` span with its reject and halt events;
+//! - an MQ `message` span.
+//!
+//! Every event line has a string `level`, a string `target` and a `fields`
+//! object. An application event also has a `fields.message`; a dependency's
+//! event, such as sqlx's statement event, may carry structured fields only. An
+//! event emitted inside a span carries that span's `trace_id` and `span_id`,
+//! equal to the IDs of the span's line, and an event outside every span carries
+//! neither.
 //!
 //! The subscriber comes from [`subscriber_with_writer`] over an in-memory capture
 //! and is installed only for the scenario's closure, so no global state is set
 //! and nothing reaches the real standard output.
 
+use std::fmt;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use carddemo_runtime::telemetry::{TelemetryError, subscriber_with_writer};
 use serde_json::Value;
@@ -19,16 +34,37 @@ use tracing_subscriber::fmt::MakeWriter;
 
 const SERVICE: &str = "carddemo-test";
 
+/// The binaries' default filter, `info`, plus sqlx's statement events, which
+/// sqlx writes at DEBUG.
+const DIRECTIVES: &str = "info,sqlx::query=debug";
+
+/// Target of this test's own events, which stand in for the binaries' code.
+const APP_TARGET: &str = module_path!();
+/// Target of sqlx's statement events.
+const SQLX_QUERY_TARGET: &str = "sqlx::query";
+
 const START_EVENT: &str = "telemetry json output test start";
 const CAUP_EVENT: &str = "account update committed";
 const REJECT_EVENT: &str = "daily transaction rejected";
 const HALT_EVENT: &str = "posting halted by the reward engine";
 const DEBUG_EVENT: &str = "debug event must be filtered out";
 
-const REQUEST_SPAN: &str = "http_request";
-const HANDLER_SPAN: &str = "handler";
+/// The API's request span, from its `TraceLayer`.
+const REQUEST_SPAN: &str = "request";
+/// The CAUP handler span, named after the API's handler function.
+const HANDLER_SPAN: &str = "update_account";
 const JOB_SPAN: &str = "job";
-const MESSAGE_SPAN: &str = "mq_message";
+const MESSAGE_SPAN: &str = "message";
+
+/// The request span's `version`: the `Debug` text of `http::Version::HTTP_11`.
+const HTTP_VERSION: &str = "HTTP/1.1";
+
+/// sqlx's `summary` of [`SQLX_STATEMENT`]: its first four words, then ` …`.
+const SQLX_SUMMARY: &str = "UPDATE accounts SET acct_active_status …";
+/// sqlx's `db.statement` for a statement longer than its summary: the SQL
+/// between two leading newlines and a trailing one.
+const SQLX_STATEMENT: &str =
+    "\n\nUPDATE accounts SET acct_active_status = $2 WHERE account_id = $1\n";
 
 const ACCOUNT_ID: &str = "00000000001";
 /// `TRAN-ID` of record 1 of `app/data/ASCII/dailytran.txt`.
@@ -75,19 +111,54 @@ impl<'a> MakeWriter<'a> for Capture {
     }
 }
 
-/// API family: the request span and, inside it, the CAUP handler span whose
-/// `outcome` is recorded once the write has committed, before the span closes.
+/// Stand-in for the `http::Version` the API records, `Debug`-formatted, as the
+/// request span's `version`.
+struct Http11;
+
+impl fmt::Debug for Http11 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(HTTP_VERSION)
+    }
+}
+
+/// The statement event sqlx writes once a query has run: structured fields
+/// only, without a message, at DEBUG, its default level for statements.
+fn emit_sqlx_query() {
+    let elapsed = Duration::from_micros(412);
+    tracing::debug!(
+        target: SQLX_QUERY_TARGET,
+        summary = SQLX_SUMMARY,
+        db.statement = SQLX_STATEMENT,
+        rows_affected = 1_u64,
+        rows_returned = 0_u64,
+        ?elapsed,
+        elapsed_secs = elapsed.as_secs_f64(),
+    );
+}
+
+/// API family: the request span and, inside it, the CAUP handler span. The
+/// handler records the account key it validated, runs its statement and, once
+/// the write has committed, records `outcome` before the span closes.
 fn emit_api_request() {
-    let request = tracing::info_span!(REQUEST_SPAN, method = "PUT", route = "/accounts/{id}");
+    let request = tracing::info_span!(
+        REQUEST_SPAN,
+        method = "PUT",
+        route = "/accounts/{id}",
+        version = ?Http11,
+    );
     request.in_scope(|| {
         let handler = tracing::info_span!(
             HANDLER_SPAN,
             transaction = "CAUP",
             user_id = "ADMIN001",
-            account_id = ACCOUNT_ID,
+            account_id = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
-        handler.in_scope(|| tracing::info!("{CAUP_EVENT}"));
+        handler.in_scope(|| {
+            handler.record("account_id", ACCOUNT_ID);
+            emit_sqlx_query();
+            tracing::info!("{CAUP_EVENT}");
+        });
         handler.record("outcome", "committed");
     });
 }
@@ -258,7 +329,14 @@ fn assert_span_lines(exported: &[&Value]) {
     assert_ne!(message["trace_id"], request["trace_id"], "{message}");
     assert_ne!(message["trace_id"], job["trace_id"], "{message}");
 
-    assert_attributes(request, &[("method", "PUT"), ("route", "/accounts/{id}")]);
+    assert_attributes(
+        request,
+        &[
+            ("method", "PUT"),
+            ("route", "/accounts/{id}"),
+            ("version", HTTP_VERSION),
+        ],
+    );
     assert_attributes(
         handler,
         &[
@@ -282,22 +360,80 @@ fn assert_span_lines(exported: &[&Value]) {
     );
 }
 
-/// Every event line has a level and a message; the scenario's events are present
-/// at their levels, with the context of the span they were emitted in.
-fn assert_event_lines(events: &[&Value]) {
+/// Whether `target` is the application's: this test's own target, standing in
+/// for the binaries' code, or one of its modules. Any other target, such as
+/// `sqlx::query`, is a dependency's.
+fn is_application_target(target: &str) -> bool {
+    target
+        .strip_prefix(APP_TARGET)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+}
+
+/// `true` when event line `line` carries the `trace_id` and `span_id` of span
+/// line `span`, both as strings.
+fn joins(line: &Value, span: &Value) -> bool {
+    line["trace_id"].is_string()
+        && line["span_id"].is_string()
+        && line["trace_id"] == span["trace_id"]
+        && line["span_id"] == span["span_id"]
+}
+
+/// An event line emitted inside a span carries the `trace_id` and `span_id` of
+/// the span line its `span` names; one emitted outside every span carries
+/// neither key.
+fn assert_joins_its_span(line: &Value, exported: &[&Value]) {
+    if let Some(span) = line.get("span") {
+        let name = span["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("event span without a name: {line}"));
+        let owner = find_span(exported, name);
+        assert!(
+            joins(line, owner),
+            "event line does not carry the IDs of its span line {owner}: {line}"
+        );
+    } else {
+        assert!(
+            line.get("trace_id").is_none() && line.get("span_id").is_none(),
+            "event line outside every span carries a trace or span ID: {line}"
+        );
+    }
+}
+
+/// Every event line has a string `level`, a string `target` and a `fields`
+/// object, an application event line a `fields.message` as well, and each joins
+/// its span line by ID. The scenario's events are present at their levels, with
+/// the context of the span they were emitted in, and sqlx's statement event has
+/// structured fields and no message.
+fn assert_event_lines(events: &[&Value], exported: &[&Value]) {
     for &line in events {
         assert!(
             line["level"].is_string(),
             "event line without a level: {line}"
         );
+        let target = line["target"]
+            .as_str()
+            .unwrap_or_else(|| panic!("event line without a target: {line}"));
         assert!(
-            line["fields"]["message"].is_string(),
-            "event line without fields.message: {line}"
+            line["fields"].is_object(),
+            "event line without a fields object: {line}"
         );
+        if is_application_target(target) {
+            assert!(
+                line["fields"]["message"].is_string(),
+                "application event line without fields.message: {line}"
+            );
+        }
+        assert_joins_its_span(line, exported);
     }
+    let handler = find_span(exported, HANDLER_SPAN);
+    let job = find_span(exported, JOB_SPAN);
 
     let start = find_event(events, START_EVENT);
     assert_eq!(start["level"], "INFO", "{start}");
+    assert_eq!(start["target"], APP_TARGET, "{start}");
+    assert!(start.get("span").is_none(), "{start}");
+    assert!(start.get("trace_id").is_none(), "{start}");
+    assert!(start.get("span_id").is_none(), "{start}");
 
     let caup = find_event(events, CAUP_EVENT);
     assert_eq!(caup["level"], "INFO", "{caup}");
@@ -310,23 +446,43 @@ fn assert_event_lines(events: &[&Value]) {
         .filter_map(|entry| entry["name"].as_str())
         .collect();
     assert_eq!(entered, [REQUEST_SPAN, HANDLER_SPAN], "{caup}");
+    assert!(joins(caup, handler), "{caup}");
+
+    let query = events
+        .iter()
+        .copied()
+        .find(|line| line["target"] == SQLX_QUERY_TARGET)
+        .unwrap_or_else(|| panic!("no {SQLX_QUERY_TARGET} event line: {events:?}"));
+    assert_eq!(query["level"], "DEBUG", "{query}");
+    assert!(query["fields"].get("message").is_none(), "{query}");
+    assert_eq!(query["fields"]["summary"], SQLX_SUMMARY, "{query}");
+    assert_eq!(query["fields"]["db.statement"], SQLX_STATEMENT, "{query}");
+    assert_eq!(query["fields"]["rows_affected"], 1, "{query}");
+    assert_eq!(query["fields"]["rows_returned"], 0, "{query}");
+    assert!(query["fields"]["elapsed"].is_string(), "{query}");
+    assert!(query["fields"]["elapsed_secs"].is_number(), "{query}");
+    assert_eq!(query["span"]["name"], HANDLER_SPAN, "{query}");
+    assert!(joins(query, handler), "{query}");
 
     let reject = find_event(events, REJECT_EVENT);
     assert_eq!(reject["level"], "WARN", "{reject}");
     assert_eq!(reject["fields"]["reason"], 102, "{reject}");
     assert_eq!(reject["fields"]["tran_id"], TRAN_ID, "{reject}");
     assert_eq!(reject["span"]["name"], JOB_SPAN, "{reject}");
+    assert!(joins(reject, job), "{reject}");
 
     let halt = find_event(events, HALT_EVENT);
     assert_eq!(halt["level"], "ERROR", "{halt}");
     assert_eq!(halt["fields"]["tran_id"], TRAN_ID, "{halt}");
+    assert_eq!(halt["span"]["name"], JOB_SPAN, "{halt}");
+    assert!(joins(halt, job), "{halt}");
 }
 
 #[test]
 fn json_lines_only() {
     let capture = Capture::default();
     let (subscriber, guard) =
-        subscriber_with_writer(SERVICE, "info", capture.clone()).expect("valid directives");
+        subscriber_with_writer(SERVICE, DIRECTIVES, capture.clone()).expect("valid directives");
     tracing::subscriber::with_default(subscriber, || {
         tracing::info!("{START_EVENT}");
         emit_api_request();
@@ -355,7 +511,7 @@ fn json_lines_only() {
         "a line is neither a span line nor an event line: {output}"
     );
     assert_span_lines(&exported);
-    assert_event_lines(&events);
+    assert_event_lines(&events, &exported);
 }
 
 #[test]

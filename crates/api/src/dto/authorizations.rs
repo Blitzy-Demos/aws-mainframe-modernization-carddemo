@@ -1079,7 +1079,7 @@ mod tests {
         );
         assert_eq!(at_end.next_id, None);
         let json = to_json(&at_end);
-        assert_eq!(json["message"], "Already at the last Authorization...");
+        assert_eq!(json["message"], messages::ALREADY_AT_THE_LAST_AUTHORIZATION);
         assert_eq!(json["next_id"], Value::Null);
         assert_eq!(
             at_end,

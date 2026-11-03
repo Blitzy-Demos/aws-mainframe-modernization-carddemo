@@ -32,28 +32,33 @@
 //!   (exit 16): a `(0)` generation that is not cataloged, a SORTIN file that cannot be read or
 //!   decoded, and a failure to allocate, write or catalog `TRANSACT.COMBINED(+1)`. No
 //!   `TRANSACT.COMBINED(+1)` is then cataloged, `STEP10` does not run and the live master is
-//!   untouched.
+//!   untouched. A SORTIN that cannot be read or decoded is named by its dataset, generation and
+//!   path. The job span holds the two SORTIN generations in `input` once both are resolved,
+//!   `read` the SORTIN records read before the failure (the `TRANSACT.BKUP(0)` records when
+//!   `SYSTRAN(0)` is the one that fails), and `posted` 0 and `rejected` 0.
 //! - `STEP10` failures, after `TRANSACT.COMBINED(+1)` is cataloged, are setup failures (exit 16)
 //!   too: a combined file that cannot be read or decoded, a unit of work that cannot begin, a
 //!   record that cannot be loaded, and a commit that fails. The cataloged
 //!   `TRANSACT.COMBINED(+1)` stays, and the live master is as the run found it, because the load
 //!   never began or is rolled back whole, so a rerun starts from the same live master. The job
-//!   span records `posted` 0 and in `rejected` the duplicate records met before the failure,
-//!   and one `warn` event gives the records the uncommitted load inserted, revived and found
+//!   span holds `posted` 0 and in `rejected` the duplicate records met before the failure, and
+//!   one `warn` event gives the records the uncommitted load inserted, revived and found
 //!   duplicate.
 //! - Two different records with one TRAN-ID in the SORT input stop the job before
 //!   `TRANSACT.COMBINED(+1)` is allocated: an equivalence halt (exit 16, E-38).
 
 use std::fmt;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
 use carddemo_domain::numeric::TranId;
 use carddemo_persistence::repos::LoadOutcome;
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
+use tracing::field::display;
 
-use super::{JobContext, setup_failure};
+use super::{JobContext, JobCounts, count_of, setup_failure};
 use crate::exit::ExitStatus;
 use crate::generations::{
     Dataset, Generation, Generations, blocking, read_records, read_records_async,
@@ -77,12 +82,13 @@ const EQUAL_KEY_ESCALATION: &str = "E-38";
 /// COMBTRAN: `STEP05R` on the blocking pool, then `STEP10` on the generation it cataloged.
 pub(super) async fn run(ctx: &JobContext, db: &Db) -> ExitStatus {
     let generations = ctx.generations.clone();
-    let sorted = match blocking(move || sort_step(&generations)).await {
+    let counts = Arc::clone(&ctx.counts);
+    let sorted = match blocking(move || sort_step(&generations, &counts)).await {
         Ok(sorted) => sorted,
         Err(cancelled) => return setup_failure("STEP05R SORT did not complete", cancelled),
     };
     match sorted {
-        Ok(combined) => repro_step(db, &combined).await,
+        Ok(combined) => repro_step(db, &combined, &ctx.counts).await,
         Err(status) => status,
     }
 }
@@ -96,10 +102,14 @@ struct SortIn {
 /// STEP05R `PGM=SORT` [app/jcl/COMBTRAN.jcl:L22-37] — P-COMBTRAN-001, P-COMBTRAN-004,
 /// P-COMBTRAN-009.
 ///
-/// Reads `TRANSACT.BKUP(0)` and then `SYSTRAN(0)`, the SORTIN concatenation order, sorts the
-/// records by [`sort_by_tran_id`] and writes them to `TRANSACT.COMBINED(+1)`, 350-byte `CVTRA05Y`
-/// records as read, FILLER included (`DCB=(*.SORTIN)`), each followed by `LF`. Records the
-/// number of SORTIN records in `read` and of combined records in `written` on the job span.
+/// Resolves `TRANSACT.BKUP(0)` and `SYSTRAN(0)` and records their generation names, in SORTIN
+/// concatenation order and separated by a comma (`TRANSACT.BKUP.G0001V00,SYSTRAN.G0001V00`), in
+/// `input` on the job span before either is read, so a SORTIN that cannot be read still shows
+/// the inputs. Then reads both, in that order, sorts the records by [`sort_by_tran_id`] and
+/// writes them to `TRANSACT.COMBINED(+1)` ([`write_combined`]). Sets `read` in `counts` to the
+/// SORTIN records read, once `TRANSACT.BKUP(0)` is read and again once `SYSTRAN(0)` is, so a
+/// `SYSTRAN(0)` that cannot be read leaves the `TRANSACT.BKUP(0)` records counted. `posted` and
+/// `rejected` stay 0 when the step fails, because `STEP10` then never runs.
 ///
 /// Synchronous throughout: `run` calls it on the blocking pool, where the job span is current.
 ///
@@ -107,17 +117,43 @@ struct SortIn {
 ///
 /// - A setup failure (exit 16) when a `(0)` generation is not cataloged or cannot be read, or
 ///   `TRANSACT.COMBINED(+1)` cannot be allocated, written or cataloged. The audit records no
-///   condition code for these, and a missing input is a JCL error that runs no step at all.
+///   condition code for these, and a missing input is a JCL error that runs no step at all. A
+///   SORTIN that cannot be read or decoded is named by its dataset, generation and path
+///   ([`read_sortin`]).
 /// - An equivalence halt (exit 16, E-38) when two different records share a TRAN-ID. Nothing is
 ///   allocated or written.
-fn sort_step(generations: &Generations) -> Result<Generation, ExitStatus> {
-    let backup = read_sortin(generations, Dataset::TransactBkup)?;
-    let systran = read_sortin(generations, Dataset::SysTran)?;
+fn sort_step(generations: &Generations, counts: &JobCounts) -> Result<Generation, ExitStatus> {
+    let backup = current_sortin(generations, Dataset::TransactBkup)?;
+    let systran = current_sortin(generations, Dataset::SysTran)?;
+    Span::current().record("input", display(format_args!("{backup},{systran}")));
+    let backup = read_sortin(backup)?;
+    counts.set_read(count_of(backup.records.len()));
+    let systran = read_sortin(systran)?;
+    counts.set_read(count_of(backup.records.len() + systran.records.len()));
+    write_combined(generations, backup, systran)
+}
+
+/// STEP05R `SORT FIELDS=(TRAN-ID,A)` and `SORTOUT` [app/jcl/COMBTRAN.jcl:L28-37] —
+/// P-COMBTRAN-001, P-COMBTRAN-004, P-COMBTRAN-009: the records of `backup` then `systran`, the
+/// SORTIN concatenation, sorted by [`sort_by_tran_id`] and written to `TRANSACT.COMBINED(+1)`,
+/// 350-byte `CVTRA05Y` records as read, FILLER included (`DCB=(*.SORTIN)`), each followed by
+/// `LF`. Records the number of combined records in `written` on the job span.
+///
+/// # Errors
+///
+/// - A setup failure (exit 16) when `TRANSACT.COMBINED(+1)` cannot be allocated, written or
+///   cataloged.
+/// - An equivalence halt (exit 16, E-38) when two different records share a TRAN-ID. Nothing is
+///   allocated or written.
+fn write_combined(
+    generations: &Generations,
+    backup: SortIn,
+    systran: SortIn,
+) -> Result<Generation, ExitStatus> {
     let backup_records = backup.records.len();
     let mut records = backup.records;
     records.extend(systran.records);
     let read = records.len();
-    Span::current().record("read", read);
     let sorted = sort_by_tran_id(records).map_err(|conflict| {
         let halt = EqualKeyHalt {
             conflict,
@@ -153,22 +189,42 @@ fn sort_step(generations: &Generations) -> Result<Generation, ExitStatus> {
     Ok(combined)
 }
 
-/// The `(0)` generation of `dataset` and its records, read with the `CVTRA05Y` layout.
+/// The `(0)` generation of `dataset`, one SORTIN of the concatenation.
 ///
 /// # Errors
 ///
-/// A setup failure (exit 16) when no generation is cataloged or its file cannot be read or
-/// decoded.
-fn read_sortin(generations: &Generations, dataset: Dataset) -> Result<SortIn, ExitStatus> {
-    let generation = generations
+/// A setup failure (exit 16) when no generation is cataloged, naming the dataset
+/// (`SYSTRAN(0): no generation is cataloged`), or the catalog cannot be listed.
+fn current_sortin(generations: &Generations, dataset: Dataset) -> Result<Generation, ExitStatus> {
+    generations
         .require_current(dataset)
-        .map_err(|err| setup_failure("SORTIN generation not cataloged", err))?;
-    let records = read_records::<TransactionLayout>(&generation.path)
-        .map_err(|err| setup_failure("SORTIN read failed", err))?;
-    Ok(SortIn {
-        generation,
-        records,
-    })
+        .map_err(|err| setup_failure("SORTIN generation not cataloged", err))
+}
+
+/// `generation` and its records, read with the `CVTRA05Y` layout.
+///
+/// # Errors
+///
+/// A setup failure (exit 16) when the file cannot be read or decoded. Both SORTIN datasets hold
+/// `CVTRA05Y` records, so the text names the one that failed by its dataset, its generation and
+/// its path before the cause, for example `SYSTRAN(0) SYSTRAN.G0001V00 at
+/// var/batch/SYSTRAN.G0001V00: record file decode failed: CVTRA05Y record 1 …`. The same text is
+/// the `error` of the logged event.
+fn read_sortin(generation: Generation) -> Result<SortIn, ExitStatus> {
+    match read_records::<TransactionLayout>(&generation.path) {
+        Ok(records) => Ok(SortIn {
+            generation,
+            records,
+        }),
+        Err(err) => Err(setup_failure(
+            "SORTIN read failed",
+            format!(
+                "{}(0) {generation} at {}: {err}",
+                generation.dataset.name(),
+                generation.path.display()
+            ),
+        )),
+    }
 }
 
 /// Two different records of the SORT input with one TRAN-ID, by their positions in the SORTIN
@@ -260,8 +316,8 @@ impl fmt::Display for EqualKeyHalt<'_> {
 /// Reads `TRANSACT.COMBINED(+1)`, the `TRANSACT` DD of the step, from the file `STEP05R`
 /// cataloged, on the blocking pool, loads its records into the live master in file order by
 /// [`load_records`] inside one unit of work, and commits. Once the load is committed, [`finish`]
-/// records the loaded records in `posted` and the duplicate records in `rejected` on the job
-/// span, and the step ends with the `REPRO` condition code:
+/// sets `posted` in `counts` to the loaded records and `rejected` to the duplicate records, and
+/// the step ends with the `REPRO` condition code:
 ///
 /// - 0 when every record loaded, an empty file included (P-COMBTRAN-002, P-COMBTRAN-005);
 /// - 8 after one to three duplicate records (P-COMBTRAN-003, P-COMBTRAN-008);
@@ -272,14 +328,15 @@ impl fmt::Display for EqualKeyHalt<'_> {
 /// read or decoded or the unit of work cannot begin, before any record is loaded; when a record
 /// cannot be loaded, after which the load is rolled back; or when the commit fails. Each leaves
 /// the cataloged `TRANSACT.COMBINED(+1)` in place and the live master as the run found it, and
-/// records `posted` 0 and in `rejected` the duplicate records met before the failure.
-async fn repro_step(db: &Db, combined: &Generation) -> ExitStatus {
+/// leaves `posted` 0 and `rejected` the duplicate records met before the failure.
+async fn repro_step(db: &Db, combined: &Generation, counts: &JobCounts) -> ExitStatus {
     let mut tally = ReproTally::default();
     let records = match read_records_async::<TransactionLayout>(combined.path.clone()).await {
         Ok(records) => records,
         Err(err) => {
             return not_committed(
                 tally,
+                counts,
                 setup_failure("TRANSACT.COMBINED(+1) read failed", err),
             );
         }
@@ -289,6 +346,7 @@ async fn repro_step(db: &Db, combined: &Generation) -> ExitStatus {
         Err(err) => {
             return not_committed(
                 tally,
+                counts,
                 setup_failure("live transaction master load failed", err),
             );
         }
@@ -297,15 +355,16 @@ async fn repro_step(db: &Db, combined: &Generation) -> ExitStatus {
         if let Err(err) = uow.rollback().await {
             tracing::error!(error = %err, "live transaction master load not rolled back");
         }
-        return not_committed(tally, status);
+        return not_committed(tally, counts, status);
     }
     if let Err(err) = uow.commit().await {
         return not_committed(
             tally,
+            counts,
             setup_failure("live transaction master load failed", err),
         );
     }
-    finish(tally, records.len())
+    finish(tally, records.len(), counts)
 }
 
 /// The `REPRO` record loop of STEP10 [app/jcl/COMBTRAN.jcl:L48] — P-COMBTRAN-003: each record,
@@ -355,12 +414,13 @@ async fn load_records(
     Ok(())
 }
 
-/// The end of STEP10 once the load is committed: the counts on the job span, one end event, and
-/// the condition code as the job's exit status.
-fn finish(tally: ReproTally, read: usize) -> ExitStatus {
+/// The end of STEP10 once the load is committed, `read` combined records having been read: the
+/// loaded and duplicate records in `counts`, one end event, and the condition code as the job's
+/// exit status.
+fn finish(tally: ReproTally, read: usize, counts: &JobCounts) -> ExitStatus {
     let condition_code = tally.condition_code();
     let loaded = tally.loaded();
-    tally.record_on_span(loaded);
+    tally.set_counts(counts, loaded);
     tracing::info!(
         read,
         inserted = tally.inserted,
@@ -374,13 +434,13 @@ fn finish(tally: ReproTally, read: usize) -> ExitStatus {
 }
 
 /// The end of STEP10 when the load is not committed, a failure the COBOL has no counterpart
-/// for: the job span records `posted` 0, since the live master keeps none of the load, and in
+/// for: `counts` holds `posted` 0, since the live master keeps none of the load, and in
 /// `rejected` the duplicate records met before the failure. One `warn` event reports the
 /// records the uncommitted load handled (`inserted`, `revived`, `duplicates` and their sum
 /// `attempted`) beside `posted` 0. Returns `status`, the failure that ended the step.
-fn not_committed(tally: ReproTally, status: ExitStatus) -> ExitStatus {
+fn not_committed(tally: ReproTally, counts: &JobCounts, status: ExitStatus) -> ExitStatus {
     const POSTED: usize = 0;
-    tally.record_on_span(POSTED);
+    tally.set_counts(counts, POSTED);
     tracing::warn!(
         inserted = tally.inserted,
         revived = tally.revived,
@@ -420,12 +480,11 @@ impl ReproTally {
         }
     }
 
-    /// Records `posted`, the records the live master keeps from the load, and the duplicate
-    /// records in `rejected` on the job span.
-    fn record_on_span(&self, posted: usize) {
-        let span = Span::current();
-        span.record("posted", posted);
-        span.record("rejected", self.duplicates);
+    /// Sets `posted` in `counts` to `posted`, the records the live master keeps from the load,
+    /// and `rejected` to the duplicate records.
+    fn set_counts(&self, counts: &JobCounts, posted: usize) {
+        counts.set_posted(count_of(posted));
+        counts.set_rejected(count_of(self.duplicates));
     }
 
     /// The records written to the live master: inserted or revived.
@@ -457,6 +516,7 @@ impl ReproTally {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::io::ErrorKind;
     use std::path::PathBuf;
@@ -469,10 +529,12 @@ mod tests {
     use carddemo_persistence::repos::LoadOutcome;
     use carddemo_runtime::config::Settings;
 
-    use super::{ReproTally, finish, sort_step};
+    use super::{ReproTally, finish, not_committed, sort_step};
+    use crate::cli::Command;
     use crate::exit::ExitStatus;
     use crate::generations::{Dataset, Generation, read_records};
-    use crate::jobs::JobContext;
+    use crate::jobs::tests::job_span_line;
+    use crate::jobs::{JobContext, JobCounts, count_of};
 
     /// A 350-byte `CVTRA05Y` record with `tran_id` and `desc`, the other fields fixed and
     /// FILLER spaces: `TRAN-AMT` `0000001000{` is +100.00.
@@ -578,7 +640,8 @@ mod tests {
     }
 
     fn sorted(dir: &BatchDir) -> Generation {
-        sort_step(&dir.context().generations).unwrap_or_else(|status| panic!("{status:?}"))
+        sort_step(&dir.context().generations, &JobCounts::default())
+            .unwrap_or_else(|status| panic!("{status:?}"))
     }
 
     fn read(generation: &Generation) -> String {
@@ -679,7 +742,7 @@ mod tests {
         let interest = record("0000000000000009", "INTEREST 9");
         dir.write("TRANSACT.BKUP.G0002V00", &[&first, &backed_up]);
         dir.write("SYSTRAN.G0004V00", &[&interest]);
-        let status = sort_step(&dir.context().generations).err();
+        let status = sort_step(&dir.context().generations, &JobCounts::default()).err();
         let expected = ExitStatus::EquivalenceHalt {
             lines: vec![
                 "TRANSACT.COMBINED(+1) not written: TRAN-ID 0000000000000009 keys two different \
@@ -704,12 +767,134 @@ mod tests {
             &[&record("0000000000000001", "BACKUP")],
         );
         assert_eq!(
-            sort_step(&dir.context().generations).err(),
+            sort_step(&dir.context().generations, &JobCounts::default()).err(),
             Some(ExitStatus::SetupFailure(
                 "SYSTRAN(0): no generation is cataloged".to_owned()
             ))
         );
         assert_eq!(dir.files(), ["TRANSACT.BKUP.G0001V00"]);
+    }
+
+    /// The 350-byte record `record(tran_id, desc)` with `00000XX145F` over `TRAN-AMT`, bytes
+    /// 132 to 142: a non-digit `X` in the numeric field.
+    fn bad_amount(tran_id: &str, desc: &str) -> String {
+        let mut bytes = record(tran_id, desc).into_bytes();
+        bytes[132..143].copy_from_slice(b"00000XX145F");
+        String::from_utf8(bytes).unwrap_or_else(|e| panic!("ASCII record: {e}"))
+    }
+
+    #[test]
+    fn a_sortin_that_cannot_be_decoded_is_named_by_dataset_generation_and_path() {
+        let good = record("0000000000000001", "GOOD");
+        // (fault, bytes of the corrupt generation file)
+        let faults = [
+            (
+                "amount",
+                format!("{}\n", bad_amount("0000000000000001", "BAD")),
+            ),
+            ("truncated", format!("{good}\n{}", &good[..341])),
+            ("crlf", format!("{good}\r\n")),
+        ];
+        // (dataset, the corrupt generation, the sound one)
+        let datasets = [
+            (
+                "TRANSACT.BKUP",
+                "TRANSACT.BKUP.G0002V00",
+                "SYSTRAN.G0001V00",
+            ),
+            ("SYSTRAN", "SYSTRAN.G0001V00", "TRANSACT.BKUP.G0002V00"),
+        ];
+        let mut texts = BTreeSet::new();
+        for (dataset, corrupt, sound) in datasets {
+            for (fault, bytes) in &faults {
+                let dir = BatchDir::new(&format!("decode-{dataset}-{fault}"));
+                dir.write(sound, &[&good]);
+                let path = dir.0.join(corrupt);
+                fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+                let cause = read_records::<TransactionLayout>(&path)
+                    .err()
+                    .unwrap_or_else(|| panic!("{corrupt} {fault} must not decode"));
+
+                let status = sort_step(&dir.context().generations, &JobCounts::default()).err();
+
+                let text = format!("{dataset}(0) {corrupt} at {}: {cause}", path.display());
+                assert_eq!(
+                    status.as_ref().map(ExitStatus::render),
+                    Some(vec![format!("SETUP FAILURE: {text}")]),
+                    "{corrupt} {fault}"
+                );
+                assert_eq!(
+                    status,
+                    Some(ExitStatus::SetupFailure(text.clone())),
+                    "{corrupt} {fault}"
+                );
+                assert_eq!(
+                    dir.files(),
+                    ["SYSTRAN.G0001V00", "TRANSACT.BKUP.G0002V00"],
+                    "{corrupt} {fault}: nothing is written"
+                );
+                texts.insert(text);
+            }
+        }
+        assert_eq!(
+            texts.len(),
+            6,
+            "each corrupt SORTIN has its own text: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn the_job_span_holds_the_sortin_generations_and_the_step05r_counts() {
+        let backup = [
+            record("0000000000000001", "BACKUP 1"),
+            record("0000000000000009", "BACKUP 9"),
+        ];
+        let input = r#""input":"TRANSACT.BKUP.G0002V00,SYSTRAN.G0001V00""#;
+        // STEP05R alone loads and rejects nothing, so `posted` and `rejected` are 0 on every
+        // path; STEP10 sets them once it has loaded the combined file.
+        let unloaded = [r#""posted":"0""#, r#""rejected":"0""#];
+        // (case, the SYSTRAN(0) record, span fragments present, span fragments absent). The
+        // exporter writes an unsigned count as a decimal string.
+        let cases: [(&str, String, &[&str], &[&str]); 3] = [
+            // The two TRANSACT.BKUP(0) records were read before SYSTRAN(0) failed.
+            (
+                "SYSTRAN does not decode",
+                bad_amount("0000000000000005", "INTEREST 5"),
+                &[input, r#""read":"2""#],
+                &[r#""written""#],
+            ),
+            (
+                "E-38 halt",
+                record("0000000000000009", "INTEREST 9"),
+                &[input, r#""read":"3""#],
+                &[r#""written""#],
+            ),
+            (
+                "sorted",
+                record("0000000000000005", "INTEREST 5"),
+                &[input, r#""read":"3""#, r#""written":"3""#],
+                &[],
+            ),
+        ];
+        for (case, interest, present, absent) in cases {
+            let dir = BatchDir::new(&format!("span-{}", case.replace(' ', "-")));
+            dir.write("TRANSACT.BKUP.G0002V00", &backup.iter().collect::<Vec<_>>());
+            dir.write("SYSTRAN.G0001V00", &[&interest]);
+            let generations = dir.context().generations;
+            let counts = JobCounts::default();
+
+            let (span, outcome) = job_span_line(&Command::Combtran, &counts, || {
+                sort_step(&generations, &counts)
+            });
+
+            assert_eq!(outcome.is_ok(), case == "sorted", "{case}: {outcome:?}");
+            for fragment in present.iter().chain(&unloaded) {
+                assert!(span.contains(fragment), "{case}: {fragment} in {span}");
+            }
+            for fragment in absent {
+                assert!(!span.contains(fragment), "{case}: no {fragment} in {span}");
+            }
+        }
     }
 
     /// One `REPRO` row of the audit: the combined file, the records whose TRAN-ID is live, and
@@ -797,12 +982,41 @@ mod tests {
             );
             let read =
                 usize::try_from(case.records).unwrap_or_else(|e| panic!("{}: {e}", case.row));
+            let counts = JobCounts::default();
             assert_eq!(
-                finish(tally, read),
+                finish(tally, read, &counts),
                 ExitStatus::ReproCondition(case.exit),
                 "{}",
                 case.row
             );
+            // STEP10 leaves `read` to STEP05R.
+            assert_eq!(
+                (counts.read(), counts.posted(), counts.rejected()),
+                (0, count_of(case.loaded), count_of(case.rejected)),
+                "{}",
+                case.row
+            );
         }
+    }
+
+    #[test]
+    fn a_load_not_committed_posts_nothing_and_keeps_its_duplicates() {
+        let mut tally = ReproTally::default();
+        for outcome in [
+            LoadOutcome::Inserted(TransactionRowId::from(1)),
+            LoadOutcome::DuplicateLive,
+            LoadOutcome::Revived(TransactionRowId::from(3)),
+            LoadOutcome::DuplicateLive,
+        ] {
+            assert!(tally.count(outcome).is_continue(), "{tally:?}");
+        }
+        let counts = JobCounts::default();
+        let failure = ExitStatus::SetupFailure("commit failed".to_owned());
+
+        assert_eq!(not_committed(tally, &counts, failure.clone()), failure);
+        assert_eq!(
+            (counts.read(), counts.posted(), counts.rejected()),
+            (0, 0, 2)
+        );
     }
 }

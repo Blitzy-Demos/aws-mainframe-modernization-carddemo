@@ -68,7 +68,8 @@ use tracing::field::Empty;
 
 use crate::auth::AuthUser;
 use crate::dto::cards::{
-    CardListQuery, CardResponse, CardSummary, CardUpdateRequest, CardUpdateResponse, CardViewQuery,
+    CardListPageQuery, CardListQuery, CardResponse, CardSummary, CardUpdateRequest,
+    CardUpdateResponse, CardViewQuery,
 };
 use crate::dto::id_string;
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
@@ -180,11 +181,15 @@ impl SpanKey {
 /// otherwise. Without `start_key` both directions read the first page from
 /// the lowest card number: backward is PF7 on the first entry, which re-reads
 /// that page with 'NO PREVIOUS PAGES TO DISPLAY'
-/// [app/cbl/COCRDLIC.cbl:L439-454]. The `account_id` and `card_number`
-/// filters reach the rule as entered, so a filter that is neither blank nor a
-/// number of its width is answered with the `2210-EDIT-ACCOUNT` or
-/// `2220-EDIT-CARD` text. An empty page is a page: 200 with `items: []` and
-/// the text the COBOL shows with it.
+/// [app/cbl/COCRDLIC.cbl:L439-454]. Because PF7 stays live on the first
+/// page, every non-empty page, the first included, carries its first card as
+/// `prev_key`, and the backward request from the first page's `prev_key`
+/// answers as that PF7 does (E-54); an empty page read from a `start_key`
+/// carries that key. The `account_id` and `card_number` filters reach the
+/// rule as entered, so a filter that is neither blank nor a number of its
+/// width is answered with the `2210-EDIT-ACCOUNT` or `2220-EDIT-CARD` text.
+/// An empty page is a page: 200 with `items: []` and the text the COBOL shows
+/// with it.
 ///
 /// # Errors
 ///
@@ -194,8 +199,9 @@ impl SpanKey {
 ///   `CARDSID` (V-COCRDLIC-001, V-COCRDLIC-002).
 /// - 400 with code `INVALID` when the page parameters do not deserialize,
 ///   and with code `INVALID`, an empty `message` and no field when
-///   `start_key` holds a NUL character, which no card number holds; no card
-///   is read.
+///   `start_key` is longer than the 16 characters of a card number, holds a
+///   character outside ASCII or holds a NUL character, none of which a card
+///   number holds; no card is read.
 /// - 401 without a valid bearer token.
 /// - 500 with the `CARDDAT` file-error text at `ACCTSID` when a card read
 ///   fails (V-COCRDLIC-008, V-COCRDLIC-010), or 'Unexpected error' when the
@@ -204,10 +210,10 @@ impl SpanKey {
     get,
     path = "/cards",
     tag = "cards",
-    params(CardListQuery, PageQuery),
+    params(CardListQuery, CardListPageQuery),
     responses(
         (status = 200, description = "One page of cards in card-number order, with the keys of its neighbours and the COBOL page text", body = Page<CardSummary>),
-        (status = 400, description = "A filter or page parameter the COBOL edits reject, or a start key holding a NUL character", body = ErrorBody),
+        (status = 400, description = "A filter or page parameter the COBOL edits reject, or a start key longer than 16 characters, not ASCII or holding a NUL character", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 500, description = "The card file could not be read", body = ErrorBody),
     ),
@@ -231,7 +237,7 @@ pub async fn list_cards(
     user: AuthUser,
     State(state): State<AppState>,
     ApiQuery(filters): ApiQuery<CardListQuery>,
-    ApiQuery(page): ApiQuery<PageQuery>,
+    ApiQuery(page): ApiQuery<CardListPageQuery>,
 ) -> Result<Json<Page<CardSummary>>, ApiError> {
     finish(list(&state, filters, page).await, OUTCOME_OK).map(Json)
 }
@@ -384,14 +390,15 @@ pub async fn update_card(
 async fn list(
     state: &AppState,
     filters: CardListQuery,
-    page: PageQuery,
+    page: CardListPageQuery,
 ) -> Result<Page<CardSummary>, ApiError> {
     record_keys(list_keys(
         filters.account_id.as_deref(),
         filters.card_number.as_deref(),
     ));
     filters.check()?;
-    let (start_key, direction, page_size) = page.resolve(card_list::SCREEN_ROWS);
+    page.check()?;
+    let (start_key, direction, page_size) = PageQuery::from(page).resolve(card_list::SCREEN_ROWS);
     let input = filters.into_input(start_key, direction, page_size)?;
     let mut uow = state.db().begin().await?;
     let listed = card_list::list(&mut uow.store(), input).await;
@@ -572,8 +579,9 @@ fn refused(entered: Option<&str>, width: usize, blank: bool) -> SpanKey {
 /// `card`, a card number its edit accepted, as a span shows it: its text
 /// without trailing spaces, each character but the last
 /// [`CARD_NUMBER_SHOWN`] replaced by `*`, or all of them when it has no more
-/// than that many: the mask of `CardNumber`'s `Debug`.
-fn masked_card_number(card: &CardNumber) -> String {
+/// than that many: the mask of `CardNumber`'s `Debug`. The CT02 span records
+/// its card key through it too.
+pub(super) fn masked_card_number(card: &CardNumber) -> String {
     let trimmed = card.trimmed();
     let count = trimmed.chars().count();
     let hidden = if count > CARD_NUMBER_SHOWN {

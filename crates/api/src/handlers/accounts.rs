@@ -66,7 +66,8 @@
 //! | `outcome` | Meaning |
 //! |---|---|
 //! | `ok` | 200 with nothing written: the account shown, or no change detected |
-//! | `rejected` | An error answer with nothing written; any unit of work was rolled back |
+//! | `rejected` | A 4xx answer with nothing written; any unit of work was rolled back |
+//! | `failed` | A 5xx answer with nothing written: a failed read, no unit of work, or an input class held at `halt`; any unit of work was rolled back |
 //! | `committed` | The update's writes ran and committed; the status tells whether they all succeeded |
 //! | `rolled_back` | The commit failed, so the server discarded the update's writes |
 
@@ -101,8 +102,11 @@ pub const MISSING_VERSION_MESSAGE: &str = "";
 /// `outcome` of a 200 answer that wrote nothing.
 const OUTCOME_OK: &str = "ok";
 
-/// `outcome` of an error answer that wrote nothing.
+/// `outcome` of a 4xx answer that wrote nothing.
 const OUTCOME_REJECTED: &str = "rejected";
+
+/// `outcome` of a 5xx answer that wrote nothing.
+const OUTCOME_FAILED: &str = "failed";
 
 /// `outcome` of an update whose writes ran and committed.
 const OUTCOME_COMMITTED: &str = "committed";
@@ -472,10 +476,21 @@ async fn refuse(uow: UnitOfWork, err: DomainError) -> ApiError {
 }
 
 /// `err` as the answer of a request that wrote nothing, with `outcome`
-/// recorded as `rejected`.
+/// recorded as [`unwritten_outcome`] gives it.
 fn rejected(err: impl Into<ApiError>) -> ApiError {
-    record_outcome(OUTCOME_REJECTED);
-    err.into()
+    let error = err.into();
+    record_outcome(unwritten_outcome(&error));
+    error
+}
+
+/// The `outcome` of `error` answering a request that wrote nothing:
+/// [`OUTCOME_FAILED`] for a 5xx status, [`OUTCOME_REJECTED`] for any other.
+fn unwritten_outcome(error: &ApiError) -> &'static str {
+    if error.status().is_server_error() {
+        OUTCOME_FAILED
+    } else {
+        OUTCOME_REJECTED
+    }
 }
 
 /// Records `outcome` on the handler's span.
@@ -540,7 +555,8 @@ fn record_key(key: SpanKey) {
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
-    use carddemo_domain::error::ErrorKind;
+    use carddemo_domain::error::{DomainError, ErrorKind};
+    use carddemo_domain::messages;
     use carddemo_domain::numeric::AccountId;
     use carddemo_domain::rules::account_view;
     use serde_json::{Value, json};
@@ -548,9 +564,10 @@ mod tests {
     use utoipa_axum::routes;
 
     use super::{
-        KEY_BLANK, KEY_INVALID, KEY_TOO_LONG, MISSING_VERSION_MESSAGE, SpanKey, request_version,
-        span_key, update_span_key,
+        KEY_BLANK, KEY_INVALID, KEY_TOO_LONG, MISSING_VERSION_MESSAGE, OUTCOME_FAILED,
+        OUTCOME_REJECTED, SpanKey, request_version, span_key, unwritten_outcome, update_span_key,
     };
+    use crate::error::ApiError;
     use crate::state::AppState;
 
     /// A well-formed token: 16 lower-case hex digits.
@@ -629,6 +646,27 @@ mod tests {
         for (key_of, entered, expected) in cases {
             assert_eq!(key_of(entered), expected, "{entered:?}");
         }
+    }
+
+    #[test]
+    fn an_answer_that_wrote_nothing_is_failed_for_a_5xx_status_and_rejected_otherwise() {
+        // (kind of the rule's error, `outcome`)
+        let cases = [
+            (ErrorKind::Invalid, OUTCOME_REJECTED),
+            (ErrorKind::Empty, OUTCOME_REJECTED),
+            (ErrorKind::NotFound, OUTCOME_REJECTED),
+            (ErrorKind::Conflict, OUTCOME_REJECTED),
+            // A failed read, or an input class held at `halt` (E-26, E-47).
+            (ErrorKind::Unexpected, OUTCOME_FAILED),
+        ];
+        for (kind, outcome) in cases {
+            let error = ApiError::from(DomainError::new(kind, messages::UNEXPECTED_ERROR));
+            assert_eq!(unwritten_outcome(&error), outcome, "{kind:?}");
+        }
+        // No unit of work could be opened.
+        assert_eq!(unwritten_outcome(&ApiError::unexpected()), OUTCOME_FAILED);
+        let missing_version = request_version(None).expect_err("no version token");
+        assert_eq!(unwritten_outcome(&missing_version), OUTCOME_REJECTED);
     }
 
     #[test]

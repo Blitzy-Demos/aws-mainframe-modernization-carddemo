@@ -102,6 +102,7 @@ use chrono::DateTime;
 use rust_decimal::Decimal;
 use sqlx::PgConnection;
 
+use crate::tx::commit_transaction;
 use crate::{Db, PersistenceError};
 
 /// `ACCTDATA.PS`, the `ACCTFILE` input [app/jcl/ACCTFILE.jcl:L57].
@@ -467,8 +468,11 @@ fn read_sources(sources: &SeedSources) -> PreparedSources {
 /// refreshing or copying the reference data in one database transaction. It
 /// reads no file and does no argon2 work.
 ///
-/// The transaction commits only when every step has succeeded. On any error
-/// it is dropped, which rolls it back, so the database is unchanged.
+/// The transaction commits only when every step has succeeded. On an error
+/// before the commit it is dropped, which rolls it back. A `COMMIT` the server
+/// fails has already rolled it back, and the commit, through the
+/// crate-internal `commit_transaction` of `crate::tx`, sends no `ROLLBACK`
+/// after it. Either way the database is unchanged.
 ///
 /// A source error [`prepare`] kept is returned where the load reaches that
 /// source, after the statements before it and before any insert of its own,
@@ -507,7 +511,7 @@ pub async fn run(db: &Db, prepared: PreparedSeed) -> Result<SeedReport, Persiste
     if report.skipped {
         tx.rollback().await?;
     } else {
-        tx.commit().await?;
+        commit_transaction(&mut tx).await?;
     }
     log_report(mode, &report);
     Ok(report)

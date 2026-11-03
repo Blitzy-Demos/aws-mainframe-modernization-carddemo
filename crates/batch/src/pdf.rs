@@ -20,6 +20,13 @@
 //! This module receives formatted text lines only, never a money or points value. That is why it
 //! is the one place the workspace float ban admits `f32`: printpdf takes page geometry in
 //! millimetres and the font size in points as `f32`.
+//!
+//! The lines are also all it receives, so it takes no instant. printpdf writes the host clock
+//! into the `/CreationDate` and `/ModDate` of the document information dictionary, and the
+//! statement job (`jobs::creastmt`) replaces both with its job clock's instant, the
+//! `CARDDEMO_CLOCK_OVERRIDE` instant when that is set, once this module has rendered the
+//! document. Those two entries are the document's only dates: printpdf writes no XMP metadata
+//! stream for the document built here.
 
 use printpdf::lopdf;
 use printpdf::{BuiltinFont, Mm, PdfDocument};

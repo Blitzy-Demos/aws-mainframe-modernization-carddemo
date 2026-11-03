@@ -16,8 +16,8 @@
 //! User routes take [`AuthUser`]. Every `/admin/**` route, the reward-rule
 //! routes included, takes [`AdminUser`]. A request without a valid token
 //! (missing, malformed, badly signed, expired, or with a `usr_type` other than
-//! `A` or `U`) is 401, and a valid token whose `usr_type` is not `A` is 403 on
-//! `/admin/**`.
+//! `A` or `U`) is 401, as is a valid token whose `sub` names no stored user,
+//! and a valid token whose `usr_type` is not `A` is 403 on `/admin/**`.
 
 pub mod extract;
 pub mod jwt;

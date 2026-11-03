@@ -18,7 +18,9 @@
 //! three files under `CARDDEMO_STATEMENT_DIR`
 //! (`Settings::statement_dir`, default `./var/statements/`): `STATEMNT.PS` with the 80-byte
 //! `STMTFILE` records, `STATEMNT.HTML` with the 100-byte `HTMLFILE` records, each record followed
-//! by `LF`, and `STATEMNT.PS.PDF` with one text line per `STMTFILE` record. The deletion of the
+//! by `LF`, and `STATEMNT.PS.PDF` with one text line per `STMTFILE` record, dated with the job
+//! clock (`CARDDEMO_CLOCK_OVERRIDE` when set), so a rerun over the same records at the same
+//! instant writes all three files with the same bytes. The deletion of the
 //! previous files, the record encoding, the PDF rendering and the writes run on Tokio's blocking
 //! pool ([`blocking`]), inside the job span; only the database reads run on the job's task.
 //!
@@ -61,6 +63,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use carddemo_domain::clock::Clock;
 use carddemo_domain::entities::{Account, CardXref, Customer, Transaction};
 use carddemo_domain::numeric::{AccountId, CustomerId};
 use carddemo_domain::ports::{
@@ -68,9 +71,11 @@ use carddemo_domain::ports::{
 };
 use carddemo_domain::rules::statement::{self, StatementError, StatementOutput};
 use carddemo_persistence::{Db, PgStore, UnitOfWork};
+use chrono::{DateTime, Utc};
+use printpdf::lopdf;
 use tracing::Span;
 
-use super::{JobContext, setup_failure};
+use super::{JobContext, JobCounts, count_of, setup_failure};
 use crate::exit::ExitStatus;
 use crate::generations::{LockFile, blocking, encode_fixed_lines, write_replacing};
 use crate::pdf::render_statement;
@@ -99,6 +104,13 @@ const HTML_LRECL: usize = 100;
 
 /// The cross-reference records one `XrefReader::xrefs_after` page reads.
 const XREF_PAGE: u16 = 500;
+
+/// The PDF date string (ISO 32000-1, 7.9.4) of a UTC instant, in the form printpdf writes:
+/// `D:YYYYMMDDHHmmSS+00'00'`.
+const PDF_DATE_FORMAT: &str = "D:%Y%m%d%H%M%S+00'00'";
+
+/// The entries of the PDF document information dictionary that hold a date.
+const PDF_DATE_ENTRIES: [&str; 2] = ["CreationDate", "ModDate"];
 
 /// The three statement files under `CARDDEMO_STATEMENT_DIR`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,8 +154,9 @@ struct PreparedFiles {
 /// files. All reads run in one unit of work, which is rolled back because the job writes nothing
 /// to the database.
 ///
-/// Records `read` (the live transactions read) and `written` (the `STMTFILE` records) on the job
-/// span, and ends with one event naming the statement count and the three files.
+/// Sets `read` (the live transactions read) in the job's counts, whose `posted` and `rejected`
+/// stay 0, records `written` (the `STMTFILE` records) on the job span, and ends with one event
+/// naming the statement count and the three files.
 ///
 /// Normal completion is CBSTM03A 9999-GOBACK — P-CBSTM03A-1264 [app/cbl/CBSTM03A.CBL:L341-342]:
 /// neither CBSTM03A nor CBSTM03B sets `RETURN-CODE`, so the step condition code is 0 and the job
@@ -187,14 +200,15 @@ async fn create_statement_files(ctx: &JobContext, db: &Db) -> Result<(), ExitSta
 /// `STEP030`, `STEP040`, the rollback, [`prepare`] and [`write_files`].
 ///
 /// `STEP030` and the preparation and writing of the statement files run on Tokio's blocking
-/// pool, inside the job span.
+/// pool, inside the job span. The job clock is read once, before the preparation, for the dates
+/// of `STATEMNT.PS.PDF` ([`prepare`]).
 async fn write_statement_files(ctx: &JobContext, db: &Db) -> Result<(), ExitStatus> {
     let files = StatementFiles::under(&ctx.settings.statement_dir);
     let mut uow = db
         .begin()
         .await
         .map_err(|err| setup_failure("statement read unit of work could not begin", err))?;
-    let transactions = step010_sort(&mut uow).await?;
+    let transactions = step010_sort(&mut uow, &ctx.counts).await?;
     let previous = files.clone();
     blocking(move || step030_delete(&previous))
         .await
@@ -211,14 +225,17 @@ async fn write_statement_files(ctx: &JobContext, db: &Db) -> Result<(), ExitStat
     let stmt_records = output.stmt_lines.len();
     let html_records = output.html_lines.len();
     let targets = files.clone();
-    blocking(move || prepare(&output).and_then(|prepared| write_files(&targets, &prepared)))
-        .await
-        .unwrap_or_else(|cancelled| {
-            Err(setup_failure(
-                "statement file preparation and write did not complete",
-                cancelled,
-            ))
-        })?;
+    let created = ctx.clock.now();
+    blocking(move || {
+        prepare(&output, created).and_then(|prepared| write_files(&targets, &prepared))
+    })
+    .await
+    .unwrap_or_else(|cancelled| {
+        Err(setup_failure(
+            "statement file preparation and write did not complete",
+            cancelled,
+        ))
+    })?;
     Span::current().record("written", stmt_records);
     tracing::info!(
         cards,
@@ -240,19 +257,24 @@ async fn write_statement_files(ctx: &JobContext, db: &Db) -> Result<(), ExitStat
 /// At most [`statement::TRNXFILE_READ_LIMIT`] records are read, one past the slots of the
 /// CBSTM03A 8500-READTRNX-READ tables (P-CBSTM03A-004): the load over them is the load over the
 /// whole file, and a file of more records ends in the capacity stop (P-CBSTM03A-1256, E-33), so
-/// no more of the master is held in memory. The records read are counted in `read` on the job
-/// span.
+/// no more of the master is held in memory. The records read are set in `read` in `counts`,
+/// whose `posted` and `rejected` stay 0: CBSTM03A writes no file record back and turns no
+/// transaction away.
 ///
 /// A failed read is reported as the `ERROR READING TRNXFILE` abend the statement rule defines for
-/// it (P-CBSTM03A-003). It ends the job before `STEP030`, as a failed `STEP010` bypasses the
-/// later steps under `COND=(0,NE)`, so the statement files of the previous run stay.
-async fn step010_sort(uow: &mut UnitOfWork) -> Result<Vec<Transaction>, ExitStatus> {
+/// it (P-CBSTM03A-003), with `read` left 0. It ends the job before `STEP030`, as a failed
+/// `STEP010` bypasses the later steps under `COND=(0,NE)`, so the statement files of the previous
+/// run stay.
+async fn step010_sort(
+    uow: &mut UnitOfWork,
+    counts: &JobCounts,
+) -> Result<Vec<Transaction>, ExitStatus> {
     let transactions = uow
         .store()
         .transactions_by_card(statement::TRNXFILE_READ_LIMIT)
         .await
         .map_err(|err| statement_failure(&StatementError::trnxfile_read_failed(&err)))?;
-    Span::current().record("read", transactions.len());
+    counts.set_read(count_of(transactions.len()));
     tracing::info!(
         records = transactions.len(),
         "STEP010 live transactions read by card number then TRAN-ID"
@@ -450,23 +472,54 @@ fn statement_failure(err: &StatementError) -> ExitStatus {
 
 /// Builds the bytes of the three statement files: the `STMTFILE` records at `LRECL=80` and the
 /// `HTMLFILE` records at `LRECL=100`, each followed by `LF`, and the PDF of the `STMTFILE`
-/// records, which `crate::pdf` writes one text object per record with every character kept.
+/// records, which `crate::pdf` writes one text object per record with every character kept,
+/// dated `created` ([`date_pdf`]).
 ///
 /// Nothing is written until all three are built, so a failure here leaves no statement file.
 ///
 /// # Errors
 ///
 /// A setup failure when a record does not have its file's record length or holds a line break,
-/// or when the PDF cannot be rendered. `CBSTM03A` tests no status on either file
+/// or when the PDF cannot be rendered or dated. `CBSTM03A` tests no status on either file
 /// (P-CBSTM03A-1263), so the audit records no COBOL outcome for these.
-fn prepare(output: &StatementOutput) -> Result<PreparedFiles, ExitStatus> {
+fn prepare(output: &StatementOutput, created: DateTime<Utc>) -> Result<PreparedFiles, ExitStatus> {
     let stmt = encode_fixed_lines(&output.stmt_lines, STMT_LRECL)
         .map_err(|err| setup_failure("STMTFILE record does not fit LRECL=80", err))?;
     let html = encode_fixed_lines(&output.html_lines, HTML_LRECL)
         .map_err(|err| setup_failure("HTMLFILE record does not fit LRECL=100", err))?;
-    let pdf = render_statement(&output.stmt_lines)
+    let rendered = render_statement(&output.stmt_lines)
         .map_err(|err| setup_failure("STATEMNT.PS.PDF could not be rendered", err))?;
+    let pdf = date_pdf(&rendered, created)
+        .map_err(|err| setup_failure("STATEMNT.PS.PDF could not be dated", err))?;
     Ok(PreparedFiles { stmt, html, pdf })
+}
+
+/// The rendered statement PDF `pdf` with the `/CreationDate` and `/ModDate` of its document
+/// information dictionary set to `created`, the job clock's instant, as a PDF date in UTC
+/// ([`PDF_DATE_FORMAT`]).
+///
+/// printpdf dates a document with the host clock when it builds it, and `crate::pdf` receives
+/// the text lines alone, so the job sets the dates here from its clock, which
+/// `CARDDEMO_CLOCK_OVERRIDE` fixes: a rerun at the same instant over the same records writes the
+/// same bytes. printpdf writes no XMP metadata stream for the document `crate::pdf` builds, so
+/// these two entries are its only dates. Only the dictionary changes; the pages, and with them
+/// the extracted text, stay as rendered.
+///
+/// # Errors
+///
+/// The lopdf error when `pdf` cannot be parsed, holds no information dictionary, or cannot be
+/// serialized again.
+fn date_pdf(pdf: &[u8], created: DateTime<Utc>) -> Result<Vec<u8>, lopdf::Error> {
+    let mut doc = lopdf::Document::load_mem(pdf)?;
+    let info = doc.trailer.get(b"Info")?.as_reference()?;
+    let date = created.format(PDF_DATE_FORMAT).to_string();
+    let entries = doc.get_dictionary_mut(info)?;
+    for entry in PDF_DATE_ENTRIES {
+        entries.set(entry, lopdf::Object::string_literal(date.as_str()));
+    }
+    let mut out = Vec::new();
+    doc.save_to(&mut out)?;
+    Ok(out)
 }
 
 /// CREASTMT STEP040 — P-CREASTMT-005: writes the three statement files, each replaced as a
@@ -574,12 +627,76 @@ mod tests {
     use carddemo_domain::numeric::{AccountId, CardNumber, CustomerId};
     use carddemo_domain::ports::{PortError, PortResult, XrefReader};
     use carddemo_domain::rules::statement::{CAPACITY_ESCALATION, StatementError, StatementOutput};
+    use chrono::{DateTime, Utc};
 
     use super::{
-        LOCK_FILE, StatementFiles, XREF_PAGE, lock_statement_dir, prepare, read_xref_file,
-        remove_if_present, statement_failure, step030_delete, write_files,
+        LOCK_FILE, StatementFiles, XREF_PAGE, date_pdf, lock_statement_dir, prepare,
+        read_xref_file, remove_if_present, statement_failure, step030_delete, write_files,
     };
     use crate::exit::ExitStatus;
+    use crate::pdf::render_statement;
+
+    /// The `CARDDEMO_CLOCK_OVERRIDE` instant of the statement tests.
+    const CLOCK: &str = "2022-07-01T12:00:00Z";
+
+    /// The RFC 3339 instant `text`.
+    fn at(text: &str) -> DateTime<Utc> {
+        text.parse()
+            .unwrap_or_else(|e| panic!("{text} is an RFC 3339 instant: {e}"))
+    }
+
+    /// The `/CreationDate` and `/ModDate` of the information dictionary of `pdf`, the catalog's
+    /// `/Metadata` entry if it has one, and the text lines `lopdf` extracts from every page.
+    fn pdf_dates_and_text(pdf: &[u8]) -> ([Vec<u8>; 2], bool, Vec<String>) {
+        let doc = lopdf::Document::load_mem(pdf).expect("the statement PDF parses");
+        let info = doc
+            .trailer
+            .get(b"Info")
+            .and_then(lopdf::Object::as_reference)
+            .and_then(|id| doc.get_dictionary(id))
+            .expect("the statement PDF has an information dictionary");
+        let date = |entry: &[u8]| {
+            info.get(entry).and_then(lopdf::Object::as_str).map_or_else(
+                |e| panic!("{}: {e}", String::from_utf8_lossy(entry)),
+                <[u8]>::to_vec,
+            )
+        };
+        let metadata = doc
+            .catalog()
+            .expect("the statement PDF has a catalog")
+            .has(b"Metadata");
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text = doc
+            .extract_text(&pages)
+            .expect("the statement PDF text extracts");
+        (
+            [date(b"CreationDate"), date(b"ModDate")],
+            metadata,
+            text.lines().map(str::to_owned).collect(),
+        )
+    }
+
+    /// `pdf` without the trailer `/ID`, saved again.
+    fn without_id(pdf: &[u8]) -> Vec<u8> {
+        let mut doc = lopdf::Document::load_mem(pdf).expect("the statement PDF parses");
+        doc.trailer.remove(b"ID");
+        let mut out = Vec::new();
+        doc.save_to(&mut out).expect("the statement PDF saves");
+        out
+    }
+
+    /// `bytes` with every `from` replaced by `to`.
+    fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut rest = bytes;
+        while let Some(at) = rest.windows(from.len()).position(|window| window == from) {
+            out.extend_from_slice(&rest[..at]);
+            out.extend_from_slice(to);
+            rest = &rest[at + from.len()..];
+        }
+        out.extend_from_slice(rest);
+        out
+    }
 
     /// A fresh directory of its own for the test `name`.
     fn scratch_dir(name: &str) -> PathBuf {
@@ -753,7 +870,7 @@ mod tests {
     #[test]
     fn prepare_encodes_both_record_files_and_the_pdf() {
         let out = output(2, 3);
-        let prepared = prepare(&out).expect("records of the right widths");
+        let prepared = prepare(&out, at(CLOCK)).expect("records of the right widths");
         assert_eq!(prepared.stmt.len(), 2 * 81);
         assert_eq!(prepared.html.len(), 3 * 101);
         assert_eq!(&prepared.stmt[..81], format!("{:<80}\n", 0).as_bytes());
@@ -777,16 +894,69 @@ mod tests {
             },
         ];
         for out in cases {
-            let status = prepare(&out).expect_err("a record off its LRECL");
+            let status = prepare(&out, at(CLOCK)).expect_err("a record off its LRECL");
             assert!(matches!(status, ExitStatus::SetupFailure(_)), "{status:?}");
         }
+    }
+
+    #[test]
+    fn the_statement_pdf_is_dated_with_the_job_clock() {
+        let out = output(3, 1);
+        let cases = [
+            (CLOCK, "D:20220701120000+00'00'"),
+            ("1999-12-31T23:59:59.999999Z", "D:19991231235959+00'00'"),
+        ];
+        for (instant, expected) in cases {
+            let prepared = prepare(&out, at(instant)).expect("records of the right widths");
+
+            let (dates, metadata, text) = pdf_dates_and_text(&prepared.pdf);
+
+            let expected = expected.as_bytes().to_vec();
+            assert_eq!(dates, [expected.clone(), expected], "{instant}");
+            assert!(
+                !metadata,
+                "{instant}: no XMP metadata stream holds other dates"
+            );
+            assert_eq!(text, out.stmt_lines, "{instant}: the text is as rendered");
+            let (_, _, rendered) = pdf_dates_and_text(
+                &render_statement(&out.stmt_lines).expect("the statement PDF renders"),
+            );
+            assert_eq!(text, rendered, "{instant}");
+        }
+    }
+
+    #[test]
+    fn the_statement_pdf_bytes_follow_the_records_and_the_instant_only() {
+        let out = output(2, 0);
+        let rendered = render_statement(&out.stmt_lines).expect("the statement PDF renders");
+        let first = date_pdf(&rendered, at(CLOCK)).expect("the statement PDF is dated");
+        let again = date_pdf(&rendered, at(CLOCK)).expect("the statement PDF is dated");
+        let later = date_pdf(&rendered, at("2022-07-01T12:00:01Z")).expect("is dated");
+
+        assert_eq!(first, again, "the same instant gives the same bytes");
+        assert_ne!(first, later, "another instant gives other dates");
+        assert_eq!(
+            replaced(&first, b"D:20220701120000", b"D:20220701120001"),
+            later,
+            "the dates are the only bytes the instant changes"
+        );
+        // printpdf numbers the trailer /ID of each document a process builds from a
+        // process-wide counter, so two renders in this test process differ there; one
+        // `batch creastmt` run renders one document, so its reruns write the same /ID too.
+        let one = prepare(&out, at(CLOCK)).expect("records of the right widths");
+        let other = prepare(&out, at(CLOCK)).expect("records of the right widths");
+        assert_eq!(
+            without_id(&one.pdf),
+            without_id(&other.pdf),
+            "no host-clock value is left in the document"
+        );
     }
 
     #[test]
     fn write_files_writes_the_three_files() {
         let dir = scratch_dir("write");
         let files = StatementFiles::under(&dir.join("statements"));
-        let prepared = prepare(&output(1, 1)).expect("records of the right widths");
+        let prepared = prepare(&output(1, 1), at(CLOCK)).expect("records of the right widths");
 
         let written = write_files(&files, &prepared);
         let contents: Vec<Vec<u8>> = files
@@ -807,7 +977,7 @@ mod tests {
         let blocker = dir.join("not-a-directory");
         fs::write(&blocker, b"").expect("write the blocking file");
         files.html = blocker.join(super::HTML_FILE);
-        let prepared = prepare(&output(1, 1)).expect("records of the right widths");
+        let prepared = prepare(&output(1, 1), at(CLOCK)).expect("records of the right widths");
 
         let written = write_files(&files, &prepared);
         let left = present(&files);

@@ -28,7 +28,7 @@
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
-use super::{Backup, JobContext, backup_live_master_in, setup_failure};
+use super::{Backup, JobContext, backup_live_master_in, count_of, setup_failure};
 use crate::exit::ExitStatus;
 
 /// The highest condition code of the earlier steps at which `STEP10` still runs: `COND=(4,LT)`
@@ -99,12 +99,18 @@ async fn begin_excluding_writers(db: &Db) -> Result<UnitOfWork, ExitStatus> {
 /// Returns the cataloged backup. Its [`Backup::status`] is the step's condition code: 0, or 12
 /// when the live transaction master was empty and the backup was cataloged empty (E-37).
 ///
+/// Once the backup is cataloged, `read` in the job's counts is set to the live records `REPRO`
+/// read, as many as it wrote (`written`, recorded on the job span by the shared REPROC step).
+/// `posted` and `rejected` stay 0: TRANBKP loads no record and turns none away. A backup that
+/// fails is discarded uncataloged and leaves `read` 0: no live record was backed up.
+///
 /// # Errors
 ///
 /// The setup failure (exit 16) of [`backup_live_master_in`] when the live transaction master
 /// cannot be read or the generation cannot be allocated, written or cataloged.
 async fn step05r_backup(ctx: &JobContext, uow: &mut UnitOfWork) -> Result<Backup, ExitStatus> {
     let backup = backup_live_master_in(ctx, uow).await?;
+    ctx.counts.set_read(count_of(backup.records));
     tracing::info!(
         step = "STEP05R",
         generation = %backup.generation,

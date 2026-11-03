@@ -25,11 +25,13 @@
 //! `carddemo_domain::rewards::validate_rule`, which the handler calls with the
 //! draft, so each keeps its one message.
 
+use std::ops::RangeInclusive;
+
 use carddemo_domain::clock::parse_instant;
 use carddemo_domain::entities::RewardRule;
 use carddemo_domain::numeric::{Money, TranCategoryCode, TranTypeCode};
 use carddemo_domain::rewards::RuleDraft;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -48,6 +50,16 @@ const NOT_A_DECIMAL: &str = "value is not a decimal number";
 /// The rejection reason of a type code holding `U+0000`, which the
 /// `reward_rules.transaction_type_cd` text column cannot store.
 const HAS_NUL: &str = "value has a NUL character (U+0000)";
+
+/// The years an RFC 3339 date-time can write: `date-fullyear` is exactly four
+/// digits.
+const RFC_3339_YEARS: RangeInclusive<i32> = 0..=9999;
+
+/// The rejection reason of an instant whose UTC year is outside
+/// [`RFC_3339_YEARS`], which a response could not write back as RFC 3339.
+const OUTSIDE_RFC_3339_YEARS: &str = "value is outside 0000-01-01T00:00:00Z to \
+    9999-12-31T23:59:59.999999Z once converted to UTC, which an RFC 3339 date-time \
+    cannot write";
 
 /// The body of `POST /admin/reward-rules` and `PUT /admin/reward-rules/{id}`:
 /// one reward rule as the administrator entered it.
@@ -85,7 +97,10 @@ pub struct RewardRuleRequest {
     /// date-time of at most microsecond precision, converted to UTC: a
     /// fraction digit after the 6th must be `0`, and second `60` (a leap
     /// second) is refused, because the stored timestamp keeps whole
-    /// microseconds and no leap second. The day must exist in its month.
+    /// microseconds and no leap second. The day must exist in its month, and
+    /// the instant converted to UTC must lie in years 0000 to 9999, the
+    /// four-digit years an RFC 3339 date-time writes, so that the rule is
+    /// returned in a form this endpoint accepts back.
     // The pattern is `carddemo_domain::clock::INSTANT_PATTERN`, the shape
     // `instant` accepts; the attribute takes only a literal.
     #[schema(
@@ -95,9 +110,9 @@ pub struct RewardRuleRequest {
     )]
     pub active_from: String,
     /// The end of the active window, exclusive, as an RFC 3339 date-time of
-    /// at most microsecond precision, converted to UTC, held to the same
-    /// constraints as `active_from`. Absent or `null` leaves the rule
-    /// open-ended.
+    /// at most microsecond precision, converted to UTC, which must lie in
+    /// years 0000 to 9999, held to the same constraints as `active_from`.
+    /// Absent or `null` leaves the rule open-ended.
     #[serde(default)]
     #[schema(
         format = DateTime,
@@ -130,8 +145,11 @@ impl RewardRuleRequest {
     /// - `min_transaction_amount`, `max_transaction_amount`: not
     ///   `-?[0-9]+(.[0-9]{1,2})?`, or a magnitude of 10^9 or more.
     /// - `active_from`, `active_to`: not an RFC 3339 date-time; a fraction
-    ///   digit after the 6th that is not `0`, finer than a microsecond; or
-    ///   second `60`, a leap second. None of them is narrowed to fit.
+    ///   digit after the 6th that is not `0`, finer than a microsecond;
+    ///   second `60`, a leap second; or, checked after those, an instant
+    ///   whose UTC conversion is outside years 0000 to 9999, which the
+    ///   response could not write as RFC 3339. None of them is narrowed to
+    ///   fit.
     pub fn into_draft(self) -> Result<RuleDraft, ApiError> {
         let Self {
             transaction_type_cd,
@@ -204,10 +222,11 @@ pub struct RewardRuleResponse {
     #[serde(with = "rust_decimal::serde::str_option")]
     #[schema(required = true, example = "500.00")]
     pub max_transaction_amount: Option<Decimal>,
-    /// The first instant the rule is active, inclusive, in RFC 3339 UTC.
+    /// The first instant the rule is active, inclusive, in RFC 3339 UTC, in
+    /// years 0000 to 9999 as the request requires.
     pub active_from: DateTime<Utc>,
-    /// The end of the active window, exclusive, in RFC 3339 UTC; `null` for an
-    /// open-ended rule.
+    /// The end of the active window, exclusive, in RFC 3339 UTC, in years 0000
+    /// to 9999 as the request requires; `null` for an open-ended rule.
     #[schema(required = true)]
     pub active_to: Option<DateTime<Utc>>,
 }
@@ -340,8 +359,20 @@ fn optional_amount(field: &str, text: Option<&str>) -> Result<Option<Money<9>>, 
 /// through [`parse_instant`]: an instant finer than a microsecond or on a leap
 /// second, which `reward_rules` would not store as written, is rejected rather
 /// than narrowed.
+///
+/// So is an instant whose UTC year, once the offset is applied, is outside
+/// years 0000 to 9999, such as `9999-12-31T23:59:59-05:00` or
+/// `0000-01-01T00:00:00+01:00`. Its text has the four-digit year the
+/// published pattern allows, but the response would write the stored instant
+/// as `+10000-01-01T04:59:59Z` or `-0001-12-31T23:00:00Z`, which is not
+/// RFC 3339 and which this function would refuse when the rule is sent back.
+/// The range is checked after [`parse_instant`]'s own refusals.
 fn instant(field: &str, text: &str) -> Result<DateTime<Utc>, ApiError> {
-    parse_instant(text).map_err(|err| rejected(field, err))
+    let instant = parse_instant(text).map_err(|err| rejected(field, err))?;
+    if !RFC_3339_YEARS.contains(&instant.year()) {
+        return Err(rejected(field, OUTSIDE_RFC_3339_YEARS));
+    }
+    Ok(instant)
 }
 
 #[cfg(test)]
@@ -641,6 +672,89 @@ mod tests {
                 .starts_with("active_from: value is not an RFC 3339 date-time: "),
             "a date alone is not an instant"
         );
+    }
+
+    #[test]
+    fn instants_whose_utc_year_is_outside_0000_to_9999_are_rejected() {
+        let outside = "value is outside 0000-01-01T00:00:00Z to 9999-12-31T23:59:59.999999Z \
+            once converted to UTC, which an RFC 3339 date-time cannot write";
+        let finer = "value is finer than a microsecond: a fraction digit after the 6th is not 0";
+        let leap = "value is a leap second (second 60), which a timestamp cannot hold";
+        let cases = [
+            ("9999-12-31T23:59:59-05:00", outside),
+            ("9999-12-31T23:59:59.999999-00:01", outside),
+            ("0000-01-01T00:00:00+01:00", outside),
+            ("0000-01-01T00:59:59.999999+01:00", outside),
+            // `parse_instant`'s own refusals are answered before the range.
+            ("9999-12-31T23:59:59.0000001-05:00", finer),
+            ("9999-12-31T23:59:60-05:00", leap),
+        ];
+        for field in ["active_from", "active_to"] {
+            for (text, reason) in cases {
+                let error = rejection(body_with(field, json!(text)));
+                assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{field} {text}");
+                assert_eq!(
+                    error.body().code,
+                    ErrorKind::Invalid.code(),
+                    "{field} {text}"
+                );
+                assert_eq!(error.body().message, format!("{field}: {reason}"));
+                assert!(error.body().fields.is_empty(), "{field} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn instants_at_the_utc_year_bounds_convert_and_echo_back() {
+        let last = Utc
+            .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+            .single()
+            .expect("a valid UTC instant")
+            + TimeDelta::microseconds(999_999);
+        let first = instant(0, 1, 1, 0);
+        let cases = [
+            (
+                "9999-12-31T23:59:59.999999Z",
+                last,
+                "9999-12-31T23:59:59.999999Z",
+            ),
+            (
+                "9999-12-31T18:59:59.999999-05:00",
+                last,
+                "9999-12-31T23:59:59.999999Z",
+            ),
+            ("0000-01-01T00:00:00Z", first, "0000-01-01T00:00:00Z"),
+            ("0000-01-01T01:00:00+01:00", first, "0000-01-01T00:00:00Z"),
+        ];
+        for (text, expected, written) in cases {
+            let mut body = body_with("active_from", json!(text));
+            body["active_to"] = json!(text);
+            let draft = request(body)
+                .into_draft()
+                .unwrap_or_else(|error| panic!("{text}: {}", error.body().message));
+            assert_eq!(draft.active_from, expected, "active_from {text}");
+            assert_eq!(draft.active_to, Some(expected), "active_to {text}");
+
+            // The GET → PUT echo: the rule as the response writes it is
+            // accepted back as the same instants.
+            let rule = RewardRule {
+                active_from: draft.active_from,
+                active_to: draft.active_to,
+                ..retail_rule()
+            };
+            let response =
+                serde_json::to_value(RewardRuleResponse::from(&rule)).expect("serializes");
+            let mut echo = retail_body();
+            for field in ["active_from", "active_to"] {
+                assert_eq!(response[field], json!(written), "{field} {text}");
+                echo[field] = response[field].clone();
+            }
+            let echoed = request(echo)
+                .into_draft()
+                .unwrap_or_else(|error| panic!("echo of {text}: {}", error.body().message));
+            assert_eq!(echoed.active_from, expected, "echoed active_from {text}");
+            assert_eq!(echoed.active_to, Some(expected), "echoed active_to {text}");
+        }
     }
 
     #[test]

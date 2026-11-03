@@ -18,9 +18,13 @@
 //! cannot be opened the request answers 500 with
 //! ` System error while scheduling PSB: Code:` and the status E-44 proposes,
 //! on the program's cursor field (V-COPAUS0C-010, V-COPAUS1C-002). The key
-//! edits read no store and run first, as `PROCESS-ENTER-KEY` runs before the
-//! PSB is scheduled, so a rejected key keeps its own answer when no
-//! connection can be had (V-COPAUS0C-001, V-COPAUS0C-002, V-COPAUS1C-001).
+//! edits read no store and run before that unit of work, as
+//! `PROCESS-ENTER-KEY` runs before the PSB is scheduled, so a rejected key
+//! keeps its own answer rather than the scheduling failure (V-COPAUS0C-001,
+//! V-COPAUS0C-002, V-COPAUS1C-001). A request reaches its handler only once
+//! [`AuthUser`] has read the signed-on user from `USRSEC`, so when the
+//! database cannot be reached the request answers 500 from that read before
+//! any key edit runs.
 //!
 //! - The read paths write nothing and lock nothing; their `TAKE-SYNCPOINT`
 //!   and the `SYNCPOINT` of `SEND-PAULST-SCREEN` commit nothing, so the unit
@@ -178,9 +182,11 @@ async fn summary_page(
 /// `PROCESS-ENTER-KEY` edits `ACCTIDI` before `GET-AUTH-SUMMARY` schedules
 /// the PSB. The length check, the browse position and
 /// [`auth_summary::edit_account_id`] read no store, so their rejections come
-/// before the scheduling failure (V-COPAUS0C-010) even when no connection can
-/// be had. The input keeps the account as entered, and the rule edits it
-/// again with the same answer.
+/// before the scheduling failure (V-COPAUS0C-010). The request reaches the
+/// handler only once [`AuthUser`] has read the signed-on user from `USRSEC`,
+/// so when the database cannot be reached the request answers 500 from that
+/// read before these edits run. The input keeps the account as entered, and
+/// the rule edits it again with the same answer.
 ///
 /// # Errors
 ///
@@ -446,8 +452,11 @@ async fn fraud_customer<S: XrefReader>(
 /// PSB, when no key is selected. A path that is not a decimal integer keeps
 /// the [`parse_auth_id`] answer, and a non-positive one gets the
 /// [`auth_detail::edit_auth_id`] answer, the same body. Neither reads a
-/// store, so both come before the scheduling failure (V-COPAUS1C-002) even
-/// when no connection can be had; the rule's read repeats the edit.
+/// store, so both come before the scheduling failure (V-COPAUS1C-002); the
+/// rule's read repeats the edit. The request reaches the handler only once
+/// [`AuthUser`] has read the signed-on user from `USRSEC`, so when the
+/// database cannot be reached the request answers 500 from that read before
+/// this edit runs.
 ///
 /// # Errors
 ///
@@ -699,7 +708,8 @@ mod tests {
     #[test]
     fn a_store_that_cannot_be_opened_is_the_psb_scheduling_text_of_each_program() {
         // V-COPAUS0C-010 on ACCTID, V-COPAUS1C-002 on CARDNUM; E-44 status AO.
-        let expected = " System error while scheduling PSB: Code:AO";
+        let expected =
+            messages::ims_status_message(messages::SYSTEM_ERROR_WHILE_SCHEDULING_PSB, "AO");
         let cases = [
             (auth_summary::schedule_psb_failure(), "ACCTID"),
             (schedule_psb_failure(), auth_detail::CARD_NUM_FIELD),

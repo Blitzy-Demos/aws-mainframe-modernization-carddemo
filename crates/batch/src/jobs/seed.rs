@@ -21,13 +21,16 @@ use carddemo_persistence::seed::{self, SeedReport, SeedSources};
 use carddemo_runtime::config::Settings;
 use tracing::Span;
 
-use super::{JobContext, setup_failure};
+use super::{JobContext, count_of, setup_failure};
 use crate::cli::SeedArgs;
 use crate::exit::ExitStatus;
 use crate::generations::blocking;
 
 /// Runs the seed `args` selects against `db` and records the rows it wrote in `written` on
-/// the job span.
+/// the job span, and sets them in `read` and `posted` in the job's counts too, since every row
+/// read from a source is loaded. `rejected` stays 0, since a source that does not decode fails
+/// the run rather than leaving a row out, and a run that fails writes no row and leaves every
+/// count 0.
 ///
 /// The sources resolve against the current directory, the repository root the runbook runs
 /// every command from: the fixture directory is `CARDDEMO_FIXTURE_DIR` (default
@@ -59,8 +62,11 @@ pub(crate) async fn run(ctx: &JobContext, db: &Db, args: &SeedArgs) -> ExitStatu
         Ok(report) => {
             // `seed::run` already emits the per-table counts and the refreshed,
             // masters-loaded and skipped flags as one event inside this span, so the job adds
-            // only the span's `written` total rather than a second event with the same counts.
-            Span::current().record("written", rows_written(&report));
+            // only the span's totals rather than a second event with the same counts.
+            let rows = rows_written(&report);
+            ctx.counts.set_read(count_of(rows));
+            ctx.counts.set_posted(count_of(rows));
+            Span::current().record("written", rows);
             ExitStatus::Success
         }
         Err(err) => setup_failure("seed failed", err),

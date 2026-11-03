@@ -58,8 +58,8 @@ use tracing::{Instrument, Span};
 use crate::auth::AdminUser;
 use crate::dto::BmsField;
 use crate::dto::admin_users::{
-    UserAddField, UserAddRequest, UserDeleteField, UserListField, UserListQuery,
-    UserMessageResponse, UserSummary, UserUpdateField, UserUpdateRequest, check_user_id_key,
+    UserAddField, UserAddRequest, UserDeleteField, UserListQuery, UserMessageResponse, UserSummary,
+    UserUpdateField, UserUpdateRequest, check_user_id_key, check_user_list_start_key,
 };
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
 use crate::pagination::{Page, PageQuery};
@@ -115,8 +115,9 @@ fn list_span(admin: &AdminUser) -> Span {
     )
 }
 
-/// Records on `span` the user ID key `key`, which [`check_user_id_key`]
-/// answered `checked` for. A key that passed is recorded under `field` as
+/// Records on `span` the user ID key `key`, which [`check_user_id_key`] (or,
+/// for the CU00 start key, [`check_user_list_start_key`]) answered `checked`
+/// for. A key that passed is recorded under `field` as
 /// entered, at most `PIC X(8)`. Of a rejected key only the error's `code`
 /// (`key_rejected`) and the key's length in characters (`key_len`) are
 /// recorded, never its text: a rejected key can be as long as the request
@@ -145,6 +146,19 @@ fn checked_key(
 ) -> Result<(), ApiError> {
     let checked = check_user_id_key(key, bms_field);
     record_key(span, field, key, &checked);
+    checked
+}
+
+/// [`check_user_list_start_key`] of the CU00 start key `key`, the check that
+/// decides the list request, with its result recorded on `span` under
+/// `start_key` by [`record_key`].
+///
+/// # Errors
+///
+/// The check's 400 `INVALID`, unchanged.
+fn checked_start_key(span: &Span, key: &str) -> Result<(), ApiError> {
+    let checked = check_user_list_start_key(key);
+    record_key(span, START_KEY, key, &checked);
     checked
 }
 
@@ -227,8 +241,9 @@ async fn roll_back(uow: UnitOfWork) {
 ///
 /// # Errors
 ///
-/// - 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`
-///   or holding a character outside ASCII, and for a query that does not
+/// - 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`,
+///   holding a character outside ASCII, or holding a NUL character without
+///   being the 8 of `LOW-VALUES` (E-49), and for a query that does not
 ///   deserialize (a `page_size` outside 1 to 100, an unknown `direction`).
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
@@ -242,7 +257,7 @@ async fn roll_back(uow: UnitOfWork) {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The page of users, with the page-boundary text COUSR00C shows, if any", body = Page<UserSummary>),
-        (status = 400, description = "A start key longer than 8 characters or not ASCII, or a malformed query", body = ErrorBody),
+        (status = 400, description = "A start key longer than 8 characters, not ASCII, or holding a NUL character other than the 8 of LOW-VALUES, or a malformed query", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 500, description = "The user browse failed", body = ErrorBody),
@@ -257,8 +272,8 @@ pub async fn list_users(
     traced(&span, list(&state, &span, query)).await
 }
 
-/// The CU00 browse: the start-key width and ASCII check, recorded on `span`,
-/// then
+/// The CU00 browse: the start-key width, ASCII and NUL check, recorded on
+/// `span`, then
 /// `user_list::list` in a unit of work that is rolled back, since the list
 /// writes nothing.
 async fn list(
@@ -267,7 +282,7 @@ async fn list(
     query: UserListQuery,
 ) -> Result<(Json<Page<UserSummary>>, &'static str), ApiError> {
     if let Some(key) = query.start_key.as_deref() {
-        checked_key(span, START_KEY, key, UserListField::UsrIdIn)?;
+        checked_start_key(span, key)?;
     }
     let (start_key, direction, page_size) = PageQuery::from(query).resolve(user_list::SCREEN_ROWS);
     let input = UserListInput {
@@ -637,17 +652,21 @@ mod tests {
     use utoipa_axum::routes;
 
     use super::{
-        CU00, CU01, CU02, CU03, START_KEY, TARGET_USER_ID, checked_key, list_span,
-        record_new_user_id, user_span,
+        CU00, CU01, CU02, CU03, START_KEY, TARGET_USER_ID, checked_key, checked_start_key,
+        list_span, record_new_user_id, user_span,
     };
     use crate::auth::{AdminUser, AuthUser, UserType};
-    use crate::dto::admin_users::{UserDeleteField, UserListField, UserUpdateField};
+    use crate::dto::admin_users::{UserDeleteField, UserUpdateField};
     use crate::error::ApiError;
     use crate::pagination::PageQuery;
     use crate::state::AppState;
 
     /// The ASCII pattern of every user key.
     const ASCII: &str = "^[\\x00-\\x7F]*$";
+
+    /// The pattern of the CU00 start key: ASCII, with NUL characters only as
+    /// the 8 of `LOW-VALUES`.
+    const LIST_START_KEY: &str = "^(?:\\x00{8}|[\\x01-\\x7F]*)$";
 
     /// The `OpenAPI` document of the five operations, registered as the route
     /// registry registers them: one `routes!` per path.
@@ -708,7 +727,7 @@ mod tests {
         assert_eq!(list[0]["required"], json!(false));
         assert_eq!(list[0]["schema"]["type"], json!("string"));
         assert_eq!(list[0]["schema"]["maxLength"], json!(8));
-        assert_eq!(list[0]["schema"]["pattern"], json!(ASCII));
+        assert_eq!(list[0]["schema"]["pattern"], json!(LIST_START_KEY));
         // The shared paging parameters keep the schemas `PageQuery` gives them.
         let shared = serde_json::to_value(PageQuery::into_params(|| None)).expect("serializes");
         let shared = &shared.as_array().expect("an array")[1..];
@@ -741,13 +760,14 @@ mod tests {
             self.lock().clone()
         }
 
-        /// The last value recorded under `field`, if any.
-        fn value(&self, field: &str) -> Option<String> {
+        /// Every value recorded under `field`, in the order it was recorded,
+        /// so a field recorded twice shows twice.
+        fn values_of(&self, field: &str) -> Vec<String> {
             self.lock()
                 .iter()
-                .rev()
-                .find(|(name, _)| *name == field)
+                .filter(|(name, _)| *name == field)
                 .map(|(_, value)| value.clone())
+                .collect()
         }
     }
 
@@ -812,7 +832,7 @@ mod tests {
                 transaction: CU00,
                 span: list_span,
                 field: START_KEY,
-                step: |span, key| checked_key(span, START_KEY, key, UserListField::UsrIdIn),
+                step: checked_start_key,
                 gates: true,
             },
             Site {
@@ -883,23 +903,25 @@ mod tests {
                     (site.step)(&span, key)
                 });
                 let case = format!("{} with {key:?}", site.route);
+                // Each field holds exactly the values recorded under it, so a
+                // second recording of any of them fails the case.
                 assert_eq!(
-                    capture.value("transaction").as_deref(),
-                    Some(site.transaction),
+                    capture.values_of("transaction"),
+                    [site.transaction],
+                    "{case}"
+                );
+                assert_eq!(capture.values_of("user_id"), ["ADMIN001"], "{case}");
+                assert_eq!(capture.values_of(site.field), recorded.as_slice(), "{case}");
+                assert_eq!(
+                    capture.values_of("key_rejected"),
+                    rejected_len.map(|_| "INVALID").as_slice(),
                     "{case}"
                 );
                 assert_eq!(
-                    capture.value("user_id").as_deref(),
-                    Some("ADMIN001"),
+                    capture.values_of("key_len"),
+                    rejected_len.as_slice(),
                     "{case}"
                 );
-                assert_eq!(capture.value(site.field).as_deref(), recorded, "{case}");
-                assert_eq!(
-                    capture.value("key_rejected").as_deref(),
-                    rejected_len.map(|_| "INVALID"),
-                    "{case}"
-                );
-                assert_eq!(capture.value("key_len").as_deref(), rejected_len, "{case}");
                 assert!(
                     capture
                         .values()
@@ -927,8 +949,8 @@ mod tests {
             record_new_user_id(&user_span(CU01, &admin()), None);
         });
         for field in [TARGET_USER_ID, "key_rejected", "key_len"] {
-            assert_eq!(capture.value(field), None, "{field}");
+            assert_eq!(capture.values_of(field), Vec::<String>::new(), "{field}");
         }
-        assert_eq!(capture.value("transaction").as_deref(), Some(CU01));
+        assert_eq!(capture.values_of("transaction"), [CU01]);
     }
 }

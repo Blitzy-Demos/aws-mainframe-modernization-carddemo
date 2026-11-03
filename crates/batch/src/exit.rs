@@ -236,7 +236,7 @@ fn text_lines(text: &impl fmt::Display) -> Vec<String> {
 
 /// `text` with its line breaks replaced by spaces, so a message composed into one report line
 /// stays one stderr line.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.replace(['\r', '\n'], " ")
 }
 

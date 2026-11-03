@@ -2,8 +2,11 @@
 //! rules and commits; [`PgStore`], the single port adapter bound to it; and
 //! the savepoint around each statement of a store.
 //!
-//! No other module begins, commits or rolls back a transaction or a
-//! savepoint. `carddemo-api`, `carddemo-batch` and `carddemo-messaging` open a
+//! No other module commits a transaction or begins or rolls back a savepoint,
+//! and only the seed run in [`crate::seed`] begins and rolls back a
+//! transaction of its own, which it commits through the crate-internal
+//! `commit_transaction`, as [`UnitOfWork::commit`] does. `carddemo-api`,
+//! `carddemo-batch` and `carddemo-messaging` open a
 //! [`UnitOfWork`] with `Db::begin`, pass [`UnitOfWork::store`] to the rules and
 //! finish with [`UnitOfWork::commit`]. A reader whose statements must all see
 //! one state, the CR00 report and the TRANREPT backup, opens it with
@@ -147,7 +150,8 @@
 //! through `crate::port_error_at`: one `database statement failed` event with
 //! the SQLSTATE, the outcome, the sanitized error text, the table and
 //! constraint names, and the code location of the store method that ran the
-//! statement (`code.filepath`, `code.lineno`). `NotFound` is not logged. A
+//! statement (`code.filepath`, relative to the workspace root, and
+//! `code.lineno`). `NotFound` is not logged. A
 //! call refused on an unusable transaction is one `warn` event,
 //! `database statement refused`, at the same location; the error an abandoned
 //! statement left, read before the next use, is a `debug` event.
@@ -158,7 +162,8 @@ use std::panic::Location;
 
 use carddemo_domain::numeric::{AccountId, TranId};
 use carddemo_domain::ports::{PortError, PortResult};
-use sqlx::{PgConnection, Postgres, Transaction};
+use sqlx::postgres::PgTransactionManager;
+use sqlx::{PgConnection, Postgres, Transaction, TransactionManager};
 
 use crate::{PersistenceError, port_error_at};
 
@@ -271,13 +276,23 @@ impl UnitOfWork {
     /// exactly the statements reported done. An unusable unit of work is
     /// rolled back instead of committed.
     ///
+    /// A `COMMIT` the server fails, on a deferred constraint or trigger or a
+    /// serialization failure, has already ended the transaction as a
+    /// rollback, so no `ROLLBACK` is sent after it: it would only draw the
+    /// warning `25P01`, "there is no transaction in progress". sqlx still
+    /// counts the transaction open, so a `BEGIN` and the `ROLLBACK` of that
+    /// empty transaction bring the connection back in step with it before it
+    /// returns to the pool. A failure of either is logged at `debug`, and the
+    /// `COMMIT` error is returned.
+    ///
     /// # Errors
     ///
     /// - [`PersistenceError::Port`] with `PortError::Unavailable` when the
     ///   unit of work is unusable, or what an abandoned store call left cannot
     ///   be settled; nothing is committed.
     /// - [`PersistenceError::Sqlx`] when the `COMMIT` fails, for example on a
-    ///   serialization failure or a lost connection.
+    ///   deferred constraint or trigger, a serialization failure or a lost
+    ///   connection.
     pub async fn commit(mut self) -> Result<(), PersistenceError> {
         let location = Location::caller();
         if let Err(refused) = recover(&mut self.tx, &mut self.statement, location).await {
@@ -286,7 +301,7 @@ impl UnitOfWork {
             }
             return Err(refused.into());
         }
-        self.tx.commit().await?;
+        commit_transaction(&mut self.tx).await?;
         tracing::debug!("unit of work committed");
         Ok(())
     }
@@ -714,6 +729,61 @@ async fn discard_pending(conn: &mut PgConnection) {
     }
 }
 
+/// Commits `tx`, the transaction of a [`UnitOfWork`] or of a seed run, and
+/// sends no `ROLLBACK` after a `COMMIT` the server fails.
+///
+/// A failed `COMMIT` has already ended the transaction as a rollback, so a
+/// `ROLLBACK` after it would only draw the warning `25P01`, "there is no
+/// transaction in progress". sqlx still counts the transaction open, so a
+/// `BEGIN` and the `ROLLBACK` of that empty transaction bring the connection
+/// back in step with it before it returns to the pool. A failure of either is
+/// logged at `debug`. Once the `COMMIT`, or that `BEGIN` and `ROLLBACK`,
+/// succeeded, dropping `tx` sends nothing.
+///
+/// # Errors
+///
+/// The error of the `COMMIT`, for example on a deferred constraint or
+/// trigger, a serialization failure or a lost connection.
+pub(crate) async fn commit_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
+    // Committed through the transaction manager, so the caller keeps the
+    // transaction whatever the outcome. sqlx 0.8.6's `Transaction::commit`
+    // consumes it, and a failed `COMMIT` leaves its depth at 1, so the dropped
+    // transaction queues a `ROLLBACK` the pool sends when it takes the
+    // connection back. A successful `COMMIT` brings the depth to 0, and
+    // dropping the transaction then sends nothing.
+    match <PgTransactionManager as TransactionManager>::commit(tx).await {
+        Ok(()) => Ok(()),
+        // `PostgreSQL` ends a transaction whose `COMMIT` fails as a rollback,
+        // and the session is idle. The `BEGIN` opens an empty transaction for
+        // sqlx's own `ROLLBACK` to end, which brings its depth to 0 without a
+        // `ROLLBACK` outside a transaction.
+        Err(error @ sqlx::Error::Database(_)) => {
+            match sqlx::query!("BEGIN").execute(&mut **tx).await {
+                Ok(_) => {
+                    if let Err(rollback) =
+                        <PgTransactionManager as TransactionManager>::rollback(tx).await
+                    {
+                        tracing::debug!(
+                            error = %rollback,
+                            "rollback after a failed commit failed"
+                        );
+                    }
+                }
+                Err(begin) => {
+                    tracing::debug!(error = %begin, "begin after a failed commit failed");
+                }
+            }
+            Err(error)
+        }
+        // Any other failure, a lost connection in practice, leaves the
+        // connection to the pool, which closes it once its check on return
+        // fails.
+        Err(error) => Err(error),
+    }
+}
+
 /// The text of a call refused on an unusable transaction.
 const UNUSABLE: &str = "the unit of work is unusable: a savepoint statement, a statement \
                         outside a savepoint or the connection failed earlier";
@@ -724,7 +794,7 @@ fn unusable(location: &'static Location<'static>) -> PortError {
     tracing::warn!(
         outcome = crate::OUTCOME_UNAVAILABLE,
         error = UNUSABLE,
-        code.filepath = location.file(),
+        code.filepath = crate::code_filepath(location),
         code.lineno = location.line(),
         "database statement refused"
     );

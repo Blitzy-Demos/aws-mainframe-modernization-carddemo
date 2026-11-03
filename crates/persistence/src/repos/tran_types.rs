@@ -62,7 +62,7 @@
 //! (`crate::tx::savepoint` and `crate::tx::settle`), and each read runs under
 //! its own savepoint too, so a failed statement leaves the caller's
 //! transaction usable for its error path and the Db2 `SYNCPOINT` or
-//! `ROLLBACK` decision to the adapter. `crate::port_error`
+//! `ROLLBACK` decision to the adapter. `crate::port_error_at`
 //! maps the failure onto the outcome the Db2 programs branch on: SQLSTATE
 //! `23505` is [`PortError::Duplicate`] (`SQLCODE` -803), `23503`
 //! [`PortError::Restricted`] (-532), and `40001`, `40P01` and `55P03`

@@ -935,18 +935,18 @@
           "admin-users"
         ],
         "summary": "CU00: one page of the user list, in user-ID order.",
-        "description": "COUSR00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,\nPROCESS-PAGE-FORWARD, PROCESS-PAGE-BACKWARD — P-COUSR00C-003 to\nP-COUSR00C-011; V-COUSR00C-002 to V-COUSR00C-009 (E-54, E-71).\nCOUSR00C SEND-USRLST-SCREEN — P-COUSR00C-013: the 200 page, its\n`message` included, replaces the `COUSR0A` map.\n\n`start_key` is the `USRIDIN` search field and the page keys a previous\npage returned; `direction=forward` is ENTER and PF8, `direction=backward`\nPF7; `page_size` defaults to the 10 rows of the `COUSR0A` screen. A\npage-boundary text, which `COUSR00C` shows without its error flag, comes\nback in `message` of the 200 page, and a start key with no user at or\nafter it is an empty page with `You are at the top of the page...`. Each\nrow is the user's ID, names and type; `SEC-USR-PWD` is never listed.\n\n# Errors\n\n- 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`\n  or holding a character outside ASCII, and for a query that does not\n  deserialize (a `page_size` outside 1 to 100, an unknown `direction`).\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 500 `Unable to lookup User...`, field `USRIDIN`, when the user browse\n  fails (V-COUSR00C-004, V-COUSR00C-006, V-COUSR00C-009).",
+        "description": "COUSR00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,\nPROCESS-PAGE-FORWARD, PROCESS-PAGE-BACKWARD — P-COUSR00C-003 to\nP-COUSR00C-011; V-COUSR00C-002 to V-COUSR00C-009 (E-54, E-71).\nCOUSR00C SEND-USRLST-SCREEN — P-COUSR00C-013: the 200 page, its\n`message` included, replaces the `COUSR0A` map.\n\n`start_key` is the `USRIDIN` search field and the page keys a previous\npage returned; `direction=forward` is ENTER and PF8, `direction=backward`\nPF7; `page_size` defaults to the 10 rows of the `COUSR0A` screen. A\npage-boundary text, which `COUSR00C` shows without its error flag, comes\nback in `message` of the 200 page, and a start key with no user at or\nafter it is an empty page with `You are at the top of the page...`. Each\nrow is the user's ID, names and type; `SEC-USR-PWD` is never listed.\n\n# Errors\n\n- 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`,\n  holding a character outside ASCII, or holding a NUL character without\n  being the 8 of `LOW-VALUES` (E-49), and for a query that does not\n  deserialize (a `page_size` outside 1 to 100, an unknown `direction`).\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 500 `Unable to lookup User...`, field `USRIDIN`, when the user browse\n  fails (V-COUSR00C-004, V-COUSR00C-006, V-COUSR00C-009).",
         "operationId": "list_users",
         "parameters": [
           {
             "name": "start_key",
             "in": "query",
-            "description": "The user ID the page starts from, `USRIDINI` `X(8)` in ASCII, case\nkept: the search field, or a key a page returned. Forward, the page\nstarts at the first user ID at or after it; backward, it holds the\nusers before that one. Absent, empty, all spaces or all low-values is\nthe top of the file: the first page forward, and backward an empty\npage with `You are already at the top of the page...`.",
+            "description": "The user ID the page starts from, `USRIDINI` `X(8)` in ASCII without\nNUL characters, case kept, or exactly 8 NUL characters, the\n`LOW-VALUES` of the top of the file: the search field, or a key a page\nreturned. Forward, the page starts at the first user ID at or after\nit; backward, it holds the users before that one. Absent, empty, all\nspaces or the 8 low-values is the top of the file: the first page\nforward, and backward an empty page with\n`You are already at the top of the page...`.",
             "required": false,
             "schema": {
               "type": "string",
               "maxLength": 8,
-              "pattern": "^[\\x00-\\x7F]*$"
+              "pattern": "^(?:\\x00{8}|[\\x01-\\x7F]*)$"
             }
           },
           {
@@ -988,7 +988,7 @@
             }
           },
           "400": {
-            "description": "A start key longer than 8 characters or not ASCII, or a malformed query",
+            "description": "A start key longer than 8 characters, not ASCII, or holding a NUL character other than the 8 of LOW-VALUES, or a malformed query",
             "content": {
               "application/json": {
                 "schema": {
@@ -1758,7 +1758,7 @@
           "cards"
         ],
         "summary": "COCRDLIC 0000-MAIN, 2200-EDIT-INPUTS, 9000-READ-FORWARD,\n9100-READ-BACKWARDS, 9500-FILTER-RECORDS, 1000-SEND-MAP,\n1400-SETUP-MESSAGE, 1500-SEND-SCREEN — P-COCRDLIC-003 to P-COCRDLIC-006,\nP-COCRDLIC-011 to P-COCRDLIC-015, P-COCRDLIC-017, P-COCRDLIC-020,\nP-COCRDLIC-021, P-COCRDLIC-023, V-COCRDLIC-001, V-COCRDLIC-002,\nV-COCRDLIC-005 to V-COCRDLIC-010",
-        "description": "One page of the card list in `CARDDAT` key order: forward (ENTER, PF8)\nfrom `start_key` inclusively, or backward (PF7) from the first card of the\npage shown, `WS-MAX-SCREEN-LINES` (7) rows unless `page_size` says\notherwise. Without `start_key` both directions read the first page from\nthe lowest card number: backward is PF7 on the first entry, which re-reads\nthat page with 'NO PREVIOUS PAGES TO DISPLAY'\n[app/cbl/COCRDLIC.cbl:L439-454]. The `account_id` and `card_number`\nfilters reach the rule as entered, so a filter that is neither blank nor a\nnumber of its width is answered with the `2210-EDIT-ACCOUNT` or\n`2220-EDIT-CARD` text. An empty page is a page: 200 with `items: []` and\nthe text the COBOL shows with it.\n\n# Errors\n\n- 400 with an empty `message` when a filter is longer than its map field.\n- 400 with 'ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER' at\n  `ACCTSID` or 'CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER' at\n  `CARDSID` (V-COCRDLIC-001, V-COCRDLIC-002).\n- 400 with code `INVALID` when the page parameters do not deserialize,\n  and with code `INVALID`, an empty `message` and no field when\n  `start_key` holds a NUL character, which no card number holds; no card\n  is read.\n- 401 without a valid bearer token.\n- 500 with the `CARDDAT` file-error text at `ACCTSID` when a card read\n  fails (V-COCRDLIC-008, V-COCRDLIC-010), or 'Unexpected error' when the\n  database cannot be reached.",
+        "description": "One page of the card list in `CARDDAT` key order: forward (ENTER, PF8)\nfrom `start_key` inclusively, or backward (PF7) from the first card of the\npage shown, `WS-MAX-SCREEN-LINES` (7) rows unless `page_size` says\notherwise. Without `start_key` both directions read the first page from\nthe lowest card number: backward is PF7 on the first entry, which re-reads\nthat page with 'NO PREVIOUS PAGES TO DISPLAY'\n[app/cbl/COCRDLIC.cbl:L439-454]. Because PF7 stays live on the first\npage, every non-empty page, the first included, carries its first card as\n`prev_key`, and the backward request from the first page's `prev_key`\nanswers as that PF7 does (E-54); an empty page read from a `start_key`\ncarries that key. The `account_id` and `card_number` filters reach the\nrule as entered, so a filter that is neither blank nor a number of its\nwidth is answered with the `2210-EDIT-ACCOUNT` or `2220-EDIT-CARD` text.\nAn empty page is a page: 200 with `items: []` and the text the COBOL shows\nwith it.\n\n# Errors\n\n- 400 with an empty `message` when a filter is longer than its map field.\n- 400 with 'ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER' at\n  `ACCTSID` or 'CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER' at\n  `CARDSID` (V-COCRDLIC-001, V-COCRDLIC-002).\n- 400 with code `INVALID` when the page parameters do not deserialize,\n  and with code `INVALID`, an empty `message` and no field when\n  `start_key` is longer than the 16 characters of a card number, holds a\n  character outside ASCII or holds a NUL character, none of which a card\n  number holds; no card is read.\n- 401 without a valid bearer token.\n- 500 with the `CARDDAT` file-error text at `ACCTSID` when a card read\n  fails (V-COCRDLIC-008, V-COCRDLIC-010), or 'Unexpected error' when the\n  database cannot be reached.",
         "operationId": "list_cards",
         "parameters": [
           {
@@ -1784,16 +1784,18 @@
           {
             "name": "start_key",
             "in": "query",
-            "description": "The key the page starts at, as the list shows it. Absent for the first\npage forward; what an absent key reads backward is the list's own, as\nits operation states.",
+            "description": "The card number the page starts from, `CARD-NUM` `X(16)` in ASCII\nwithout NUL characters: a previous page's `next_key` or `prev_key`.\nForward (ENTER, PF8), the page starts at that card, inclusive;\nbackward (PF7), it holds the cards before it. Absent, both directions\nread the first page.",
             "required": false,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 16,
+              "pattern": "^[\\x01-\\x7F]*$"
             }
           },
           {
             "name": "direction",
             "in": "query",
-            "description": "`forward` (next page, the default) or `backward` (previous page).",
+            "description": "`forward` (ENTER and PF8, the default) or `backward` (PF7).",
             "required": false,
             "schema": {
               "type": "string",
@@ -1807,7 +1809,7 @@
           {
             "name": "page_size",
             "in": "query",
-            "description": "Rows on the page, from 1 to 100. Defaults to the rows of the list's\nscreen.",
+            "description": "Rows on the page, from 1 to 100. Defaults to 7, the rows of the\n`COCRDLI` screen.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -1829,7 +1831,7 @@
             }
           },
           "400": {
-            "description": "A filter or page parameter the COBOL edits reject, or a start key holding a NUL character",
+            "description": "A filter or page parameter the COBOL edits reject, or a start key longer than 16 characters, not ASCII or holding a NUL character",
             "content": {
               "application/json": {
                 "schema": {
@@ -2153,7 +2155,7 @@
           "reports"
         ],
         "summary": "CORPT00C PROCESS-ENTER-KEY / SUBMIT-JOB-TO-INTRDR — P-CORPT00C-002 to\nP-CORPT00C-012, P-CORPT00C-014, P-CORPT00C-017, V-CORPT00C-001 to\nV-CORPT00C-018; CBTRN03C 1000-TRANFILE-GET-NEXT /\n1100-WRITE-TRANSACTION-REPORT — P-CBTRN03C-002 to P-CBTRN03C-015,\nP-TRANREPT-002, P-TRANREPT-003",
-        "description": "Prints the transaction report of the requested range: the current month\n(`monthly`), the current year (`yearly`) or `start_date` to `end_date`\n(`custom`), once `confirm` is `Y`. The answer carries the `CVTRA07Y` report\nrecords `CBTRN03C` writes for that range, untrimmed and in order, and the\n`<name> report submitted for printing ...` message.\n\n# Errors\n\n- 400 with the audited `CORPT00C` message and its BMS field when an edit\n  fails or the request is not confirmed: no report type, an empty or\n  invalid custom date part, a date `CSUTLDTC` rejects, a blank, `N` or\n  other confirmation (V-CORPT00C-001 to V-CORPT00C-018); also a query\n  value longer than its field.\n- 401 without a valid bearer token.\n- 500 `Unexpected error` when the database fails, when a report record's\n  cross-reference, type or category is missing from `card_xref`,\n  `trantype_file` or `trancatg_file` (the `CBTRN03C` abend, P-CBTRN03C-005),\n  or when the outcome is one the audit holds at halt.",
+        "description": "Prints the transaction report of the requested range: the current month\n(`monthly`), the current year (`yearly`) or `start_date` to `end_date`\n(`custom`), once `confirm` is `Y`. The answer carries the `CVTRA07Y` report\nrecords `CBTRN03C` writes for that range, untrimmed and in order, and the\n`<name> report submitted for printing ...` message.\n\n# Errors\n\n- 400 with the audited `CORPT00C` message and its BMS field when an edit\n  fails or the request is not confirmed: no report type, an empty or\n  invalid custom date part, a date `CSUTLDTC` rejects, a blank, `N` or\n  other confirmation (V-CORPT00C-001 to V-CORPT00C-018).\n- 400 with no message, before those edits, when a query value is longer\n  than its field (on `SDTYYYY`, `EDTYYYY` or `CONFIRM`) or the confirmation\n  holds a character above `U+007F` (on `CONFIRM`).\n- 401 without a valid bearer token.\n- 500 `Unexpected error` when the database fails, when a report record's\n  cross-reference, type or category is missing from `card_xref`,\n  `trantype_file` or `trancatg_file` (the `CBTRN03C` abend, P-CBTRN03C-005),\n  or when the outcome is one the audit holds at halt.",
         "operationId": "transaction_report",
         "parameters": [
           {
@@ -2194,11 +2196,12 @@
           {
             "name": "confirm",
             "in": "query",
-            "description": "`CONFIRM X(1)`: `Y` or `y` runs the report, which the SPA confirmation\ndialog sends; absent or blank asks for confirmation (V-CORPT00C-016),\n`N` or `n` clears the form (V-CORPT00C-017), any other value is\nrejected (V-CORPT00C-018).",
+            "description": "`CONFIRM X(1)` in ASCII: `Y` or `y` runs the report, which the SPA\nconfirmation dialog sends; absent or blank asks for confirmation\n(V-CORPT00C-016), `N` or `n` clears the form (V-CORPT00C-017), any\nother value is rejected and quoted back (V-CORPT00C-018). A character\nabove `U+007F` is rejected before those edits, with no message (E-49).",
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 1
+              "maxLength": 1,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           }
         ],
@@ -3933,7 +3936,7 @@
       },
       "Page_CardSummary": {
         "type": "object",
-        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the neighbouring pages, as the rule's page\ngives them: zero-padded or space-trimmed key text that a following request\npasses back unchanged as `start_key`.",
+        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the forward (PF8) and backward (PF7)\nrequests from this page, as the rule's page gives them: zero-padded or\nspace-trimmed key text that a following request passes back unchanged as\n`start_key`.",
         "required": [
           "items",
           "next_key",
@@ -3986,13 +3989,13 @@
               "string",
               "null"
             ],
-            "description": "The `start_key` of the previous page, read with `direction=backward`;\n`null` when no page precedes it."
+            "description": "The `start_key` of the backward (PF7) request from this page, read\nwith `direction=backward`; `null` when the list offers no backward\nrequest from the page. A key does not promise rows before the page:\nwhere the program's PF7 stays live on its first page (`GET /cards`,\n`GET /admin/users`), the first page carries its first key, and the\nbackward request from it answers with the program's no-previous-page\ntext in `message` (E-54). The other lists give `null` on the first page\nread without a `start_key`."
           }
         }
       },
       "Page_RewardAccrualResponse": {
         "type": "object",
-        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the neighbouring pages, as the rule's page\ngives them: zero-padded or space-trimmed key text that a following request\npasses back unchanged as `start_key`.",
+        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the forward (PF8) and backward (PF7)\nrequests from this page, as the rule's page gives them: zero-padded or\nspace-trimmed key text that a following request passes back unchanged as\n`start_key`.",
         "required": [
           "items",
           "next_key",
@@ -4071,13 +4074,13 @@
               "string",
               "null"
             ],
-            "description": "The `start_key` of the previous page, read with `direction=backward`;\n`null` when no page precedes it."
+            "description": "The `start_key` of the backward (PF7) request from this page, read\nwith `direction=backward`; `null` when the list offers no backward\nrequest from the page. A key does not promise rows before the page:\nwhere the program's PF7 stays live on its first page (`GET /cards`,\n`GET /admin/users`), the first page carries its first key, and the\nbackward request from it answers with the program's no-previous-page\ntext in `message` (E-54). The other lists give `null` on the first page\nread without a `start_key`."
           }
         }
       },
       "Page_TranTypeResponse": {
         "type": "object",
-        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the neighbouring pages, as the rule's page\ngives them: zero-padded or space-trimmed key text that a following request\npasses back unchanged as `start_key`.",
+        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the forward (PF8) and backward (PF7)\nrequests from this page, as the rule's page gives them: zero-padded or\nspace-trimmed key text that a following request passes back unchanged as\n`start_key`.",
         "required": [
           "items",
           "next_key",
@@ -4125,13 +4128,13 @@
               "string",
               "null"
             ],
-            "description": "The `start_key` of the previous page, read with `direction=backward`;\n`null` when no page precedes it."
+            "description": "The `start_key` of the backward (PF7) request from this page, read\nwith `direction=backward`; `null` when the list offers no backward\nrequest from the page. A key does not promise rows before the page:\nwhere the program's PF7 stays live on its first page (`GET /cards`,\n`GET /admin/users`), the first page carries its first key, and the\nbackward request from it answers with the program's no-previous-page\ntext in `message` (E-54). The other lists give `null` on the first page\nread without a `start_key`."
           }
         }
       },
       "Page_TransactionResponse": {
         "type": "object",
-        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the neighbouring pages, as the rule's page\ngives them: zero-padded or space-trimmed key text that a following request\npasses back unchanged as `start_key`.",
+        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the forward (PF8) and backward (PF7)\nrequests from this page, as the rule's page gives them: zero-padded or\nspace-trimmed key text that a following request passes back unchanged as\n`start_key`.",
         "required": [
           "items",
           "next_key",
@@ -4234,13 +4237,13 @@
               "string",
               "null"
             ],
-            "description": "The `start_key` of the previous page, read with `direction=backward`;\n`null` when no page precedes it."
+            "description": "The `start_key` of the backward (PF7) request from this page, read\nwith `direction=backward`; `null` when the list offers no backward\nrequest from the page. A key does not promise rows before the page:\nwhere the program's PF7 stays live on its first page (`GET /cards`,\n`GET /admin/users`), the first page carries its first key, and the\nbackward request from it answers with the program's no-previous-page\ntext in `message` (E-54). The other lists give `null` on the first page\nread without a `start_key`."
           }
         }
       },
       "Page_UserSummary": {
         "type": "object",
-        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the neighbouring pages, as the rule's page\ngives them: zero-padded or space-trimmed key text that a following request\npasses back unchanged as `start_key`.",
+        "description": "One page of a list: `{items, next_key, prev_key, message?}`.\n\nThe keys are the start keys of the forward (PF8) and backward (PF7)\nrequests from this page, as the rule's page gives them: zero-padded or\nspace-trimmed key text that a following request passes back unchanged as\n`start_key`.",
         "required": [
           "items",
           "next_key",
@@ -4302,7 +4305,7 @@
               "string",
               "null"
             ],
-            "description": "The `start_key` of the previous page, read with `direction=backward`;\n`null` when no page precedes it."
+            "description": "The `start_key` of the backward (PF7) request from this page, read\nwith `direction=backward`; `null` when the list offers no backward\nrequest from the page. A key does not promise rows before the page:\nwhere the program's PF7 stays live on its first page (`GET /cards`,\n`GET /admin/users`), the first page carries its first key, and the\nbackward request from it answers with the program's no-previous-page\ntext in `message` (E-54). The other lists give `null` on the first page\nread without a `start_key`."
           }
         }
       },
@@ -4512,7 +4515,7 @@
           "active_from": {
             "type": "string",
             "format": "date-time",
-            "description": "The first instant the rule is active, inclusive, as an RFC 3339\ndate-time of at most microsecond precision, converted to UTC: a\nfraction digit after the 6th must be `0`, and second `60` (a leap\nsecond) is refused, because the stored timestamp keeps whole\nmicroseconds and no leap second. The day must exist in its month.",
+            "description": "The first instant the rule is active, inclusive, as an RFC 3339\ndate-time of at most microsecond precision, converted to UTC: a\nfraction digit after the 6th must be `0`, and second `60` (a leap\nsecond) is refused, because the stored timestamp keeps whole\nmicroseconds and no leap second. The day must exist in its month, and\nthe instant converted to UTC must lie in years 0000 to 9999, the\nfour-digit years an RFC 3339 date-time writes, so that the rule is\nreturned in a form this endpoint accepts back.",
             "example": "2022-01-01T00:00:00Z",
             "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt ]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,6}0*)?([Zz]|[+\\-\\u2212]([01][0-9]|2[0-3]):[0-5][0-9])$"
           },
@@ -4522,7 +4525,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "The end of the active window, exclusive, as an RFC 3339 date-time of\nat most microsecond precision, converted to UTC, held to the same\nconstraints as `active_from`. Absent or `null` leaves the rule\nopen-ended.",
+            "description": "The end of the active window, exclusive, as an RFC 3339 date-time of\nat most microsecond precision, converted to UTC, which must lie in\nyears 0000 to 9999, held to the same constraints as `active_from`.\nAbsent or `null` leaves the rule open-ended.",
             "example": "2030-01-01T00:00:00Z",
             "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt ]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,6}0*)?([Zz]|[+\\-\\u2212]([01][0-9]|2[0-3]):[0-5][0-9])$"
           },
@@ -4582,7 +4585,7 @@
           "active_from": {
             "type": "string",
             "format": "date-time",
-            "description": "The first instant the rule is active, inclusive, in RFC 3339 UTC."
+            "description": "The first instant the rule is active, inclusive, in RFC 3339 UTC, in\nyears 0000 to 9999 as the request requires."
           },
           "active_to": {
             "type": [
@@ -4590,7 +4593,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "The end of the active window, exclusive, in RFC 3339 UTC; `null` for an\nopen-ended rule."
+            "description": "The end of the active window, exclusive, in RFC 3339 UTC, in years 0000\nto 9999 as the request requires; `null` for an open-ended rule."
           },
           "max_transaction_amount": {
             "type": [

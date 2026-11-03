@@ -5,10 +5,11 @@
 //!
 //! The COBTUPDT paragraphs fall through in their source order, and the job keeps it:
 //!
-//! 1. `0001-OPEN-FILES`: [`load_records`] reads the whole input and frames its 53-byte
-//!    records on Tokio's blocking pool, inside the job span. A file that cannot be read, or
-//!    whose records do not fit `WS-INPUT-REC`, ends the job with exit 16 before any change
-//!    (P-COBTUPDT-011, E-36).
+//! 1. `0001-OPEN-FILES`: [`load_records`] reads the input one line at a time, never holding
+//!    more than [`LINE_LIMIT`] bytes of a line, and frames every 53-byte record on Tokio's
+//!    blocking pool, inside the job span, before any change. A file that cannot be read, or
+//!    whose records do not fit `WS-INPUT-REC`, ends the job with exit 16 at the first such
+//!    record (P-COBTUPDT-011, E-36), so an endless input such as `/dev/zero` fails at once.
 //! 2. `1001-READ-NEXT-RECORDS` and `1002-READ-RECORDS`: every record, in file order, is shown
 //!    with its `PROCESSING` display (P-COBTUPDT-005).
 //! 3. `1003-TREAT-RECORD` and the statement it performs: [`treat_record`] hands the record to
@@ -23,18 +24,20 @@
 //! in the persistence adapter, so a failed statement changes nothing and leaves the others in
 //! place, as Db2 does for a statement that ends with a negative `SQLCODE`. Each `DISPLAY`
 //! becomes one `tracing` event inside the job span: `info` for the `PROCESSING` line and the
-//! success displays, `warn` for the `9999-ABEND` display. The job span receives `read` and
+//! success displays, `warn` for the `9999-ABEND` display. The job's counts receive `read` and
 //! `rejected` (failed records) once every record is treated, before the `STOP RUN` commit, and
-//! then `written` (inserts and updates) and `deleted` as the commit leaves the master: the
-//! statements' counts when it commits, 0 when it fails and every statement is undone, the
-//! undone counts then going to one `warn` event.
+//! then `posted` (inserts, updates and deletes), and the job span `written` (inserts and
+//! updates) and `deleted`, as the commit leaves the master: the statements' counts when it
+//! commits, 0 when it fails and every statement is undone, the undone counts then going to one
+//! `warn` event. A run that ends before its records are treated leaves every count 0.
 
 use std::fmt;
-use std::fs;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 use carddemo_codec::CodecError;
-use carddemo_codec::framing::{pad, split_ascii};
+use carddemo_codec::framing::pad;
 use carddemo_domain::messages::OPEN_FILE_NOT_OK;
 use carddemo_domain::rules::tran_type_batch::{
     self, INPUT_REC_LEN, MaintRecord, MaintRun, RecordOutcome,
@@ -42,7 +45,7 @@ use carddemo_domain::rules::tran_type_batch::{
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
-use super::{JobContext, setup_failure};
+use super::{JobContext, count_of, setup_failure};
 use crate::cli::Mnttrdb2Args;
 use crate::exit::ExitStatus;
 use crate::generations::blocking;
@@ -51,25 +54,58 @@ use crate::generations::blocking;
 /// `WS-INPUT-REC` it does not fit.
 const INPUT_LAYOUT: &str = "COBTUPDT";
 
+/// The most bytes [`parse_input`] reads of one `INPFILE` line: the 53 bytes of `WS-INPUT-REC`,
+/// the two of a `CR LF` line end, and one more. A line read whole within them has its length
+/// measured; a line with no `LF` among them is longer than the record whatever follows, so it is
+/// refused without reading any more of it.
+const LINE_LIMIT: usize = INPUT_REC_LEN + b"\r\n".len() + 1;
+
+/// Why the records of an `INPFILE` cannot be loaded. The text follows `INPFILE <path>: ` in the
+/// setup failure.
+#[derive(Debug, thiserror::Error)]
+enum InputError {
+    /// The file cannot be read: the operating-system error, as the open reports it.
+    #[error(transparent)]
+    Read(#[from] io::Error),
+    /// A line read whole whose body is longer than `WS-INPUT-REC`: the codec error with the
+    /// measured length, located at its 1-based record number.
+    #[error(transparent)]
+    Record(#[from] CodecError),
+    /// A line with no `LF` within its first [`LINE_LIMIT`] bytes, at the 1-based record
+    /// number `record`. Only those bytes were read, so the text gives no length.
+    #[error(
+        "{layout} record {record}: line longer than the {len}-byte record length, with no line \
+         end within its first {limit} bytes",
+        layout = INPUT_LAYOUT,
+        len = INPUT_REC_LEN,
+        limit = LINE_LIMIT
+    )]
+    Unbounded {
+        /// The 1-based record number of the line.
+        record: usize,
+    },
+}
+
 /// COBTUPDT 0001-OPEN-FILES through STOP RUN — P-COBTUPDT-004 to P-COBTUPDT-012, E-36.
 ///
 /// Runs MNTTRDB2 over `args.input`: loads every record, applies each to the Db2 transaction
 /// type master in file order inside one unit of work, commits it, and returns
 /// [`ExitStatus::ReturnCode`] with 4 when any record failed, else 0.
 ///
-/// The job reads no setting, clock or generation, so the context is unused. [`load_records`]
-/// runs on Tokio's blocking pool, inside the job span, before the unit of work begins.
+/// The job reads no setting, clock or generation; of the context it uses only the job's counts.
+/// [`load_records`] runs on Tokio's blocking pool, inside the job span, before the unit of work
+/// begins.
 ///
 /// Each of these ends the job with a setup failure (exit 16):
 ///
 /// - the input cannot be read or framed (P-COBTUPDT-011, E-36), or the runtime shuts down
-///   before it is read, before any change;
-/// - the unit of work cannot begin, before any change;
-/// - the commit at `STOP RUN` fails, which leaves every statement of the run undone. The job
-///   span keeps the `read` and `rejected` counts recorded before the commit and records
-///   `written` and `deleted` as 0, and one `warn` event carries the inserts, updates and
-///   deletes undone.
-pub(super) async fn run(_ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> ExitStatus {
+///   before it is read, before any change and with every count 0;
+/// - the unit of work cannot begin, before any change and with every count 0;
+/// - the commit at `STOP RUN` fails, which leaves every statement of the run undone. The job's
+///   counts keep the `read` and `rejected` set before the commit and `posted` stays 0, the job
+///   span records `written` and `deleted` as 0, and one `warn` event carries the inserts,
+///   updates and deletes undone.
+pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> ExitStatus {
     let input = args.input.clone();
     let records = match blocking(move || load_records(&input)).await {
         Ok(Ok(records)) => records,
@@ -86,9 +122,9 @@ pub(super) async fn run(_ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> Exit
         let outcome = treat_record(&mut uow, &mut run, index + 1, record).await;
         counts.add(&outcome);
     }
+    ctx.counts.set_read(count_of(counts.read));
+    ctx.counts.set_rejected(count_of(counts.failed));
     let span = Span::current();
-    span.record("read", counts.read);
-    span.record("rejected", counts.failed);
     if let Err(err) = uow.commit().await {
         let status = setup_failure("MNTTRDB2 STOP RUN commit failed", err);
         span.record("written", 0_usize);
@@ -102,6 +138,7 @@ pub(super) async fn run(_ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> Exit
         );
         return status;
     }
+    ctx.counts.set_posted(count_of(counts.applied()));
     span.record("written", counts.written);
     span.record("deleted", counts.deleted);
     ExitStatus::ReturnCode(run.return_code())
@@ -125,13 +162,18 @@ pub(super) async fn run(_ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> Exit
 /// longer record cannot occur in the dataset the step opens; input holding one is a file
 /// COBTUPDT cannot open as its FD declares, not a record to cut to 53 bytes.
 ///
+/// The file is read through a [`BufReader`] one line at a time by [`parse_input`], as COBTUPDT
+/// reads one record at a time, so memory holds the framed records and never more than
+/// [`LINE_LIMIT`] bytes of the line being read: a device or a file without line ends, such as
+/// `/dev/zero`, fails at its first record instead of being read whole.
+///
 /// # Errors
 ///
-/// The setup failure (exit 16) of a file that cannot be read or holds a record longer than
-/// 53 bytes, logged under [`OPEN_FILE_NOT_OK`] with the path and the cause.
+/// The setup failure (exit 16) of a file that cannot be opened or read or holds a record longer
+/// than 53 bytes, logged under [`OPEN_FILE_NOT_OK`] with the path and the cause.
 fn load_records(path: &Path) -> Result<Vec<MaintRecord>, ExitStatus> {
-    let bytes = fs::read(path).map_err(|err| open_failure(path, &err))?;
-    let records = parse_input(&bytes).map_err(|err| open_failure(path, &err))?;
+    let file = File::open(path).map_err(|err| open_failure(path, &err))?;
+    let records = parse_input(BufReader::new(file)).map_err(|err| open_failure(path, &err))?;
     tracing::info!(
         input = %path.display(),
         records = records.len(),
@@ -151,25 +193,43 @@ fn open_failure(path: &Path, err: &impl fmt::Display) -> ExitStatus {
 
 /// COBTUPDT 1002-READ-RECORDS — P-COBTUPDT-001 to P-COBTUPDT-003, P-COBTUPDT-005.
 ///
-/// Splits `bytes` into its lines (`LF`, `CR LF`, or none after the last), pads each body
-/// with spaces to the 53 bytes of `WS-INPUT-REC` and parses it. An empty line is a record of
-/// spaces, which `1003-TREAT-RECORD` rejects as an invalid type; nothing after the last line
-/// end is no record, so an empty file has none and the run ends at once with return code 0.
+/// Reads `reader` line by line, each line through a [`LINE_LIMIT`]-byte window, pads each body
+/// with spaces to the 53 bytes of `WS-INPUT-REC` and parses it. The lines are framed as
+/// `carddemo_codec::framing::split_ascii` frames a whole file: a line ends at `LF`; a `CR`
+/// directly before that `LF` belongs to the line end and any other `CR` is record data; a final
+/// line without `LF` is a record; nothing after the last `LF` is no record, so an empty file has
+/// none and the run ends at once with return code 0. An empty line is a record of spaces, which
+/// `1003-TREAT-RECORD` rejects as an invalid type. Every byte of a body is kept as read.
 ///
 /// # Errors
 ///
-/// The [`CodecError`] of the first record longer than 53 bytes, located at its 1-based
-/// record number.
-fn parse_input(bytes: &[u8]) -> Result<Vec<MaintRecord>, CodecError> {
-    split_ascii(bytes)
-        .into_iter()
-        .enumerate()
-        .map(|(index, (_frame, body))| {
-            pad(INPUT_LAYOUT, body, INPUT_REC_LEN)
-                .map(|padded| tran_type_batch::parse_record(&padded))
-                .map_err(|err| err.at_record(index + 1))
-        })
-        .collect()
+/// For the first line that cannot be a record, located at its 1-based record number, nothing
+/// after it being read:
+///
+/// - [`InputError::Record`], the [`CodecError`] with the measured length, for a body longer than
+///   53 bytes whose line ended within [`LINE_LIMIT`] bytes;
+/// - [`InputError::Unbounded`] for a line with no `LF` within [`LINE_LIMIT`] bytes;
+/// - [`InputError::Read`] when `reader` fails.
+fn parse_input<R: BufRead>(mut reader: R) -> Result<Vec<MaintRecord>, InputError> {
+    // A usize of at most 56 always fits the u64 that `Read::take` counts in.
+    let window = LINE_LIMIT as u64;
+    let mut records = Vec::new();
+    let mut line = Vec::with_capacity(LINE_LIMIT);
+    loop {
+        line.clear();
+        let read = reader.by_ref().take(window).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(records);
+        }
+        let number = records.len() + 1;
+        let body = match line.strip_suffix(b"\n") {
+            Some(ended) => ended.strip_suffix(b"\r").unwrap_or(ended),
+            None if read == LINE_LIMIT => return Err(InputError::Unbounded { record: number }),
+            None => line.as_slice(),
+        };
+        let padded = pad(INPUT_LAYOUT, body, INPUT_REC_LEN).map_err(|err| err.at_record(number))?;
+        records.push(tran_type_batch::parse_record(&padded));
+    }
 }
 
 /// COBTUPDT 1002-READ-RECORDS, 1003-TREAT-RECORD, 9999-ABEND — P-COBTUPDT-005 to
@@ -206,7 +266,8 @@ async fn treat_record(
     outcome
 }
 
-/// The record counts the job span receives.
+/// The record counts the job reports: `read`, `failed` (as `rejected`) and [`Counts::applied`]
+/// (as `posted`) in the job's counts, `written` and `deleted` on the job span.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Counts {
     /// Records read, comments and failed records included.
@@ -220,6 +281,11 @@ struct Counts {
 }
 
 impl Counts {
+    /// The records whose statement changed the master: the types inserted, updated or deleted.
+    const fn applied(&self) -> usize {
+        self.written + self.deleted
+    }
+
     /// Counts one record with its `outcome`.
     fn add(&mut self, outcome: &RecordOutcome) {
         self.read += 1;
@@ -234,13 +300,18 @@ impl Counts {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::io::{self, BufReader, Read};
+    use std::path::{Path, PathBuf};
 
-    use carddemo_codec::CodecErrorKind;
+    use carddemo_codec::CodecError;
+    use carddemo_codec::framing::{pad, split_ascii};
     use carddemo_domain::messages::{NO_RECORDS_FOUND, PROCESSING};
-    use carddemo_domain::rules::tran_type_batch::{MaintRecord, RecordOutcome, parse_record};
+    use carddemo_domain::rules::tran_type_batch::{
+        INPUT_REC_LEN, MaintRecord, RecordOutcome, parse_record,
+    };
 
-    use super::{Counts, load_records, parse_input};
+    use super::{Counts, INPUT_LAYOUT, InputError, LINE_LIMIT, load_records, parse_input};
     use crate::exit::ExitStatus;
 
     /// The MNTTRDB2 fixture input, 53-byte records each followed by `LF`.
@@ -295,28 +366,178 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_record_longer_than_ws_input_rec_is_located_and_refused() {
-        let full = format!("{:<53}", "A10FITS EXACTLY");
-        let long = format!("{full}X");
-        let input = format!("{full}\n{long}\nD10\n");
-        let err = parse_input(input.as_bytes()).expect_err("a 54-byte record must be refused");
-        assert_eq!(err.layout, "COBTUPDT");
-        assert_eq!(err.record, Some(2));
-        assert_eq!(err.kind, CodecErrorKind::RecordTooLong { stored_len: 54 });
+    /// The records `split_ascii` frames in the whole of `bytes`, each padded and parsed: the
+    /// framing [`parse_input`] keeps while it reads line by line.
+    fn split_ascii_records(bytes: &[u8]) -> Result<Vec<MaintRecord>, CodecError> {
+        split_ascii(bytes)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_frame, body))| {
+                pad(INPUT_LAYOUT, body, INPUT_REC_LEN)
+                    .map(|padded| parse_record(&padded))
+                    .map_err(|err| err.at_record(index + 1))
+            })
+            .collect()
+    }
+
+    /// A line of `len` bytes: `A10` followed by spaces.
+    fn line_of(len: usize) -> String {
+        format!("{:<len$}", "A10")
     }
 
     #[test]
-    fn an_unreadable_input_is_a_setup_failure_naming_the_file() {
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mnttrdb2_input.absent");
-        let status = load_records(&path).expect_err("a missing INPFILE must end the job");
-        assert_eq!(status.code(), 16);
-        let ExitStatus::SetupFailure(text) = status else {
-            panic!("a missing INPFILE is a setup failure: {status:?}");
+    fn line_by_line_framing_is_the_split_ascii_framing() {
+        let inputs: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"\n\n".to_vec(),
+            b"\r\n".to_vec(),
+            b"\r".to_vec(),
+            b"A01\r".to_vec(),
+            b"A01\rX\n".to_vec(),
+            b"A01\r\r\n".to_vec(),
+            b"U01PURCHASE\r\nD02".to_vec(),
+            b"*\n\nD04\n".to_vec(),
+            // Bytes outside ASCII are record data, kept byte for byte.
+            b"A0\xC3\xA9 CAF\xC3\x89 \xFF\x00\n".to_vec(),
+            format!("{}\n", line_of(53)).into_bytes(),
+            format!("{}\r\n", line_of(53)).into_bytes(),
+            line_of(53).into_bytes(),
+            format!("{}\n{}\nD10\n", line_of(53), line_of(54)).into_bytes(),
+            FIXTURE.to_vec(),
+        ];
+        for input in &inputs {
+            let read = match parse_input(input.as_slice()) {
+                Ok(records) => Ok(records),
+                Err(InputError::Record(err)) => Err(err),
+                Err(other) => panic!("{:?}: {other}", String::from_utf8_lossy(input)),
+            };
+            assert_eq!(
+                read,
+                split_ascii_records(input),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_longer_than_ws_input_rec_is_located_and_refused() {
+        let unbounded = |record: usize| {
+            format!(
+                "COBTUPDT record {record}: line longer than the 53-byte record length, with no \
+                 line end within its first 56 bytes"
+            )
         };
-        assert!(text.starts_with("INPFILE "), "{text}");
-        assert!(text.contains("mnttrdb2_input.absent"), "{text}");
+        let measured = |record: usize, len: usize| {
+            format!("COBTUPDT record {record}: stored length {len} exceeds the record length")
+        };
+        // A line read whole within the 56-byte window reports its length; a longer one does not.
+        let cases = [
+            (
+                format!("{}\n{}\nD10\n", line_of(53), line_of(54)),
+                measured(2, 54),
+            ),
+            (format!("{}\r\n", line_of(54)), measured(1, 54)),
+            (format!("{}\n", line_of(55)), measured(1, 55)),
+            (line_of(54), measured(1, 54)),
+            (line_of(55), measured(1, 55)),
+            // A CR that no LF follows is record data.
+            (format!("{}\r", line_of(53)), measured(1, 54)),
+            (format!("{}\r\n", line_of(55)), unbounded(1)),
+            (format!("{}\n", line_of(56)), unbounded(1)),
+            (line_of(56), unbounded(1)),
+            (format!("D01\n{}\nD02\n", line_of(1_000)), unbounded(2)),
+        ];
+        for (input, expected) in cases {
+            let err = parse_input(input.as_bytes())
+                .err()
+                .unwrap_or_else(|| panic!("{input:?} must be refused"));
+            assert_eq!(err.to_string(), expected, "{input:?}");
+        }
+    }
+
+    /// A reader that adds every byte `inner` hands out to `bytes`.
+    struct Counted<'a, R> {
+        inner: R,
+        bytes: &'a mut usize,
+    }
+
+    impl<R: Read> Read for Counted<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            *self.bytes += read;
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn an_endless_line_is_refused_after_one_window() {
+        // (records before the endless line, the byte it repeats, its record number)
+        let cases: [(&[u8], u8, usize); 3] =
+            [(b"", 0, 1), (b"D01\n", b'X', 2), (b"*\r\n", b'\r', 2)];
+        for (before, byte, record) in cases {
+            let mut bytes = 0;
+            let reader = Counted {
+                inner: before.chain(io::repeat(byte)),
+                bytes: &mut bytes,
+            };
+            let refused = parse_input(BufReader::with_capacity(LINE_LIMIT, reader));
+            assert!(
+                matches!(refused, Err(InputError::Unbounded { record: at }) if at == record),
+                "{before:?} then {byte:#04X} forever: {refused:?}"
+            );
+            assert!(
+                bytes <= before.len() + LINE_LIMIT,
+                "{before:?} then {byte:#04X} forever: {bytes} bytes read"
+            );
+        }
+    }
+
+    #[test]
+    fn inputs_that_cannot_be_framed_are_setup_failures_naming_the_file() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let absent = fixtures.join("mnttrdb2_input.absent");
+        let os_error = |path: &Path| {
+            fs::read(path)
+                .err()
+                .unwrap_or_else(|| panic!("{} must not be readable", path.display()))
+                .to_string()
+        };
+        let cases = [
+            (absent.clone(), os_error(&absent)),
+            (fixtures.clone(), os_error(&fixtures)),
+            (
+                PathBuf::from("/dev/zero"),
+                "COBTUPDT record 1: line longer than the 53-byte record length, with no line end \
+                 within its first 56 bytes"
+                    .to_owned(),
+            ),
+        ];
+        for (path, cause) in cases {
+            let status = load_records(&path).err();
+            assert_eq!(
+                status,
+                Some(ExitStatus::SetupFailure(format!(
+                    "INPFILE {}: {cause}",
+                    path.display()
+                ))),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn readable_inputs_load_their_records() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mnttrdb2_input.txt");
+        let cases = [(fixture, 10), (PathBuf::from("/dev/null"), 0)];
+        for (path, count) in cases {
+            let loaded = load_records(&path)
+                .unwrap_or_else(|status| panic!("{}: {status:?}", path.display()));
+            assert_eq!(loaded.len(), count, "{}", path.display());
+        }
     }
 
     #[test]

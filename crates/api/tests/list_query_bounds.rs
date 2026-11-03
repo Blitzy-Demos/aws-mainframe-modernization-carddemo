@@ -1,6 +1,6 @@
 //! Contract bounds of the list query parameters, proved through the HTTP
-//! layer: the CT00 account filter of `GET /transactions` and the CCLI start
-//! key of `GET /cards`.
+//! layer: the CT00 account filter of `GET /transactions`, the CCLI start
+//! key of `GET /cards` and the CU00 start key of `GET /admin/users`.
 //!
 //! Every case is a real request through the router, so it crosses the
 //! extractors, the bearer token, the status mapping and the
@@ -12,10 +12,21 @@
 //!   (E-17). A longer filter is refused whatever it holds, blank ones
 //!   included: V-COTRN00C-001 sets no message (E-49), so the answer is 400
 //!   `INVALID` with an empty message and no field.
-//! - A card `start_key` holding a NUL names no card and cannot be bound as the
-//!   text of the `CARDDAT` key (E-07). It is refused with the same no-message
-//!   answer before any browse, rather than failing the browse as a `CARDDAT`
-//!   file error (500).
+//! - A card `start_key` is published with `maxLength` 16, the `X(16)` of
+//!   `CARD-NUM`, and a NUL-free ASCII pattern. A key holding a NUL names no
+//!   card and cannot be bound as the text of the `CARDDAT` key (E-07); a
+//!   longer key would be cut to another card and a non-ASCII one moved in as
+//!   its UTF-8 bytes, echoed back as other characters in `prev_key`. Each is
+//!   refused with the same no-message answer before any browse, rather than
+//!   failing the browse as a `CARDDAT` file error (500) or paging from a key
+//!   the caller did not send.
+//! - A user `start_key` holding a NUL is browsed as entered unless it is the 8
+//!   NULs `COUSR00C` reads as `LOW-VALUES` once the key fills its `X(8)`
+//!   field, and the `USRSEC` key cannot hold NUL as text (E-07). It is refused
+//!   before any browse as an over-length or non-ASCII key is, 400 `INVALID`
+//!   with an empty message on `USRIDIN` (E-49), rather than failing the browse
+//!   with the `USRSEC` browse-failure text (500). The 8 NULs list the first
+//!   page.
 //!
 //! The file is kept apart from the per-transaction suites, which follow the
 //! audited COBOL paths of one program each. These bounds belong to the REST
@@ -29,6 +40,7 @@
 
 pub mod common;
 
+use carddemo_api::dto::admin_users::UserListField;
 use carddemo_domain::error::ErrorKind;
 use reqwest::StatusCode;
 use serde_json::json;
@@ -58,7 +70,7 @@ const CARDS: &str = "/cards";
 /// lowest key of the card browse.
 const FIRST_CARD: &str = "0500024453765740";
 
-/// Both list resources hold their query bounds on one seeded database, so the
+/// The list resources hold their query bounds on one seeded database, so the
 /// file starts a single container.
 #[test]
 fn list_query_parameters_hold_their_contract_bounds() {
@@ -67,6 +79,7 @@ fn list_query_parameters_hold_their_contract_bounds() {
         let token = app.user_token().await;
         ct00_account_filter_bounds(&app, &token).await;
         ccli_start_key_bounds(&app, &token).await;
+        cu00_start_key_bounds(&app).await;
     });
 }
 
@@ -111,10 +124,19 @@ async fn ct00_account_filter_bounds(app: &TestApp, token: &str) {
     }
 }
 
-/// CCLI: a `start_key` holding a NUL is refused before the browse; the same
-/// key without it pages from a stored card.
+/// CCLI: a `start_key` holding a NUL, a character outside ASCII or more than
+/// the 16 characters of a card number is refused before the browse; a stored
+/// card number pages from that card and comes back unchanged as `prev_key`.
 async fn ccli_start_key_bounds(app: &TestApp, token: &str) {
-    for start_key in ["%00".to_owned(), format!("{FIRST_CARD}%00")] {
+    let refused = [
+        "%00".to_owned(),
+        format!("{FIRST_CARD}%00"),
+        "%C3%A9%C3%A9%C3%A9".to_owned(),
+        "%E2%80%99%20OR".to_owned(),
+        format!("{FIRST_CARD}0"),
+        "A".repeat(20_000),
+    ];
+    for start_key in refused {
         let path = format!("{CARDS}?start_key={start_key}");
         let resp = app.get(&path, Some(token)).await;
         assert_rejected_without_message(&resp, StatusCode::BAD_REQUEST, &path);
@@ -128,6 +150,63 @@ async fn ccli_start_key_bounds(app: &TestApp, token: &str) {
             .as_array()
             .is_some_and(|items| !items.is_empty()),
         "GET {path} pages from a stored card: {raw}"
+    );
+    assert_eq!(
+        body["prev_key"], FIRST_CARD,
+        "GET {path} echoes its key: {raw}"
+    );
+}
+
+/// The CU00 list route.
+const ADMIN_USERS: &str = "/admin/users";
+
+/// The width of the CU00 start key, `USRIDINI PIC X(8)`
+/// [app/cpy-bms/COUSR00.CPY:L66]: the number of NULs `COUSR00C` reads as
+/// `LOW-VALUES`.
+const USER_ID_WIDTH: usize = 8;
+
+/// `SEC-USR-ID` of the first seeded user [app/jcl/DUSRSECJ.jcl:L35], the
+/// lowest key of the user browse.
+const FIRST_USER: &str = "ADMIN001";
+
+/// CU00: a `start_key` holding a NUL, in either direction, is refused on
+/// `USRIDIN` before the browse unless it is the 8 NULs of `LOW-VALUES`, which
+/// list the first page as no start key does.
+async fn cu00_start_key_bounds(app: &TestApp) {
+    let token = app.admin_token().await;
+    let refused = json!({
+        "code": ErrorKind::Invalid.code(),
+        "message": NO_MESSAGE,
+        "fields": [{ "field": UserListField::UsrIdIn.as_str(), "message": NO_MESSAGE }],
+    });
+    for query in [
+        "start_key=%00",
+        "start_key=A%00",
+        "start_key=%00&direction=backward",
+    ] {
+        let path = format!("{ADMIN_USERS}?{query}");
+        let (status, body, raw) = app.get(&path, Some(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "status of GET {path}: {raw}"
+        );
+        assert_eq!(body, refused, "body of GET {path}: {raw}");
+    }
+
+    let (status, first_page, raw) = app.get(ADMIN_USERS, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "status of GET {ADMIN_USERS}: {raw}");
+    let path = format!("{ADMIN_USERS}?start_key={}", "%00".repeat(USER_ID_WIDTH));
+    let (status, body, raw) = app.get(&path, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "status of GET {path}: {raw}");
+    assert_eq!(
+        body["items"][0]["user_id"],
+        json!(FIRST_USER),
+        "GET {path} starts at the first user: {raw}"
+    );
+    assert_eq!(
+        body, first_page,
+        "GET {path} lists as GET {ADMIN_USERS} does: {raw}"
     );
 }
 

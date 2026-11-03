@@ -1,10 +1,10 @@
 // Client edits of user administration, CU00 to CU03: the COUSR00C list start key, the
 // COUSR01C add form, the COUSR02C edit form and the COUSR03C delete key. They mirror the
 // width of each BMS field, the ASCII text the API requires of every member and key (with
-// NUL characters in a name or new user ID only as LOW-VALUES), and the empty-field edits
-// of the validation audit so a form never submits what the API rejects first; the API
-// stays authoritative. Its record-state
-// and I/O texts ('User ID already exist...', 'User ID NOT found...', 'Unable to ...') and
+// NUL characters in a name, a new user ID or the list start key only as LOW-VALUES), and
+// the empty-field edits of the validation audit so a form never submits what the API
+// rejects first; the API stays authoritative. Its record-state and I/O texts
+// ('User ID already exist...', 'User ID NOT found...', 'Unable to ...') and
 // 'Please modify to update ...', which needs the stored user and argon2 verification
 // (E-21), come from the server only.
 //
@@ -52,9 +52,9 @@ const WIDTH = {
   userType: 1,
 } as const;
 
-// ASCII text, the OpenAPI `pattern` of the password and user type members, the {id} path
-// segment and the start_key parameter. The COUSR0nC programs move each value byte for byte
-// into its PIC X(n) field of SEC-USER-DATA, and a 3270 field holds one byte per character,
+// ASCII text, the OpenAPI `pattern` of the password and user type members and the {id} path
+// segment. The COUSR0nC programs move each value byte for byte into its PIC X(n) field of
+// SEC-USER-DATA, and a 3270 field holds one byte per character,
 // so the API refuses a character above U+007F with no message, as it refuses an
 // over-length value: the issue keeps zod's default regex text. Spaces and NUL characters
 // are ASCII, so a blank field still gets its empty-field text.
@@ -66,8 +66,10 @@ const ASCII_TEXT = /^[\x00-\x7F]*$/;
 // LOW-VALUES its empty-field edit answers. COUSR02C reads NUL characters alone as blank,
 // whatever their number; COUSR01C first moves the entry into its PIC X(n) field, padded
 // with spaces, so only exactly n of them stay LOW-VALUES (WIDTH.firstName and
-// WIDTH.lastName 20, WIDTH.userId 8). The password keeps ASCII_TEXT: it is stored as its
-// argon2id hash, never as text.
+// WIDTH.lastName 20, WIDTH.userId 8). STORABLE_ADD_USER_ID is also the pattern of the
+// start_key parameter: COUSR00C reads its NUL characters as LOW-VALUES only when they fill
+// its X(8) field, and browses by any other key as entered, which the USRSEC key cannot hold
+// as text. The password keeps ASCII_TEXT: it is stored as its argon2id hash, never as text.
 const STORABLE_TEXT = /^(?:\x00+|[\x01-\x7F]*)$/;
 const STORABLE_ADD_NAME = /^(?:\x00{20}|[\x01-\x7F]*)$/;
 const STORABLE_ADD_USER_ID = /^(?:\x00{8}|[\x01-\x7F]*)$/;
@@ -102,13 +104,14 @@ function rejectBlank<K extends string>(
 
 // COUSR00C has no edit of USRIDIN: it is the key the browse starts at, and a blank key
 // starts at the top of the file. Every COUSR00C text (V-COUSR00C-001 to V-COUSR00C-009) is
-// a page-boundary or browse outcome the API returns.
+// a page-boundary or browse outcome the API returns. The API refuses a key holding NUL
+// characters other than the 8 of LOW-VALUES with no message (E-49), as this regex does.
 export const userListFilterSchema = z.object({
   // An empty search field is no start key, so the first page is requested.
   start_key: z
     .string()
     .max(WIDTH.userId)
-    .regex(ASCII_TEXT)
+    .regex(STORABLE_ADD_USER_ID)
     .optional()
     .transform((key) => (key === "" ? undefined : key)),
 }) satisfies z.ZodType<

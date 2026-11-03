@@ -21,22 +21,24 @@
 //! document in memory and fails on any byte difference from the committed
 //! file, so both commands run after every handler or DTO change.
 //!
-//! The only accepted arguments are `--out` followed by one non-empty path.
+//! The only accepted arguments are `--out` followed by one non-empty path, and
+//! `--help` or `-h` alone, which prints the `HELP` text.
 //!
 //! # Output and exit status
 //!
-//! Nothing is written to standard output. Failures are one line on standard
-//! error.
+//! Standard output carries only the help text; writing the document prints
+//! nothing there. Failures are one line on standard error.
 //!
 //! | Status | Meaning |
 //! |---|---|
-//! | 0 | The document was written |
-//! | 1 | A parent directory could not be created, or the file could not be written |
-//! | 2 | Usage error: any arguments other than `--out <path>` |
+//! | 0 | The document was written, or the help text was printed |
+//! | 1 | A parent directory could not be created, the file could not be written, or the help text could not be printed |
+//! | 2 | Usage error: any arguments other than `--out <path>` or a lone `--help` or `-h` |
 
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -46,12 +48,56 @@ const USAGE: &str = "usage: openapi --out <path>";
 /// The exit status of a usage error, distinct from an I/O failure's 1.
 const USAGE_STATUS: u8 = 2;
 
+/// The standard-output text of `--help` and `-h`.
+const HELP: &str = "\
+openapi: writes the OpenAPI 3.1 document of the CardDemo REST API to a file.
+
+The document is carddemo_api::spec_json(), written unchanged and ending
+with one newline. It is the input of the SPA's type generator, run as
+pnpm --dir web gen:api.
+
+usage: openapi --out <path>
+       openapi --help
+
+Options:
+  --out <path>  The file to write. Missing parent directories are created;
+                an existing file is replaced.
+  -h, --help    Print this help.
+
+No environment variable is read, and no database or broker is needed.
+Writing the document prints nothing on standard output; a failure is one
+line on standard error.
+
+Exit status:
+  0  The document was written, or this help was printed.
+  1  A parent directory could not be created, the file could not be written,
+     or this help could not be printed.
+  2  Usage error: any other arguments.
+
+Example, from the repository root, after a handler or DTO change:
+  cargo run -p carddemo-api --bin openapi -- --out web/openapi/openapi.json
+  pnpm --dir web gen:api
+";
+
+/// What a well-formed command line asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum Request {
+    /// `--out <path>`: write the document to the path.
+    Write(PathBuf),
+    /// `--help` or `-h`: print [`HELP`] to standard output.
+    Help,
+}
+
 fn main() -> ExitCode {
-    let Some(path) = parse_out(env::args_os().skip(1)) else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(USAGE_STATUS);
+    let result = match parse_args(env::args_os().skip(1)) {
+        Some(Request::Write(path)) => write_document(&path, &carddemo_api::spec_json()),
+        Some(Request::Help) => write_help(&mut io::stdout().lock()),
+        None => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(USAGE_STATUS);
+        }
     };
-    match write_document(&path, &carddemo_api::spec_json()) {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("{message}");
@@ -60,19 +106,36 @@ fn main() -> ExitCode {
     }
 }
 
-/// The output path of `args`, the command line without the program name, when
-/// it is exactly `--out` followed by one path; `None` for anything else,
-/// including the `--out=<path>` form.
+/// The request `args`, the command line without the program name, makes:
+/// [`Request::Help`] when it is exactly `--help` or `-h`, [`Request::Write`]
+/// when it is exactly `--out` followed by one path, and `None` for anything
+/// else, including the `--out=<path>` form and a help flag beside any other
+/// argument.
 ///
 /// An empty path is rejected here as a missing value, so it is reported as a
-/// usage error rather than as a failure to write a file named "".
-fn parse_out(mut args: impl Iterator<Item = OsString>) -> Option<PathBuf> {
+/// usage error rather than as a failure to write a file named "". The value
+/// after `--out` is always a path, so `--out --help` writes a file named
+/// `--help`.
+fn parse_args(mut args: impl Iterator<Item = OsString>) -> Option<Request> {
     match (args.next(), args.next(), args.next()) {
+        (Some(flag), None, None) if flag == "--help" || flag == "-h" => Some(Request::Help),
         (Some(flag), Some(path), None) if flag == "--out" && !path.is_empty() => {
-            Some(PathBuf::from(path))
+            Some(Request::Write(PathBuf::from(path)))
         }
         _ => None,
     }
+}
+
+/// Writes [`HELP`] to `out` and flushes it.
+///
+/// # Errors
+///
+/// The standard-error line naming the help text, with the I/O error, for
+/// example when standard output is a full device or a closed pipe.
+fn write_help(out: &mut impl Write) -> Result<(), String> {
+    out.write_all(HELP.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|err| format!("openapi: cannot write the help text: {err}"))
 }
 
 /// Writes `document` to `path`, first creating its missing parent directories.
@@ -100,13 +163,27 @@ fn write_document(path: &Path, document: &str) -> Result<(), String> {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
+    use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::process;
 
-    use super::{parse_out, write_document};
+    use super::{HELP, Request, USAGE, parse_args, write_document, write_help};
 
-    fn parse(args: &[&str]) -> Option<PathBuf> {
-        parse_out(args.iter().map(OsString::from))
+    fn parse(args: &[&str]) -> Option<Request> {
+        parse_args(args.iter().map(OsString::from))
+    }
+
+    /// A writer that refuses every byte, as a full device does.
+    struct Full;
+
+    impl Write for Full {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     /// A directory of its own under the system temporary directory, removed
@@ -158,23 +235,48 @@ mod tests {
             ),
             (["--out", "openapi.json"], "openapi.json"),
             (["--out", "/abs/dir/openapi.json"], "/abs/dir/openapi.json"),
+            (["--out", "--help"], "--help"),
+            (["--out", "-h"], "-h"),
         ] {
-            assert_eq!(parse(&args), Some(PathBuf::from(expected)), "{args:?}");
+            assert_eq!(
+                parse(&args),
+                Some(Request::Write(PathBuf::from(expected))),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_help_flag_alone_asks_for_the_help_text() {
+        for flag in ["--help", "-h"] {
+            assert_eq!(parse(&[flag]), Some(Request::Help), "{flag}");
         }
     }
 
     #[test]
     fn any_other_command_line_is_a_usage_error() {
-        let cases: [&[&str]; 9] = [
+        let cases: [&[&str]; 21] = [
             &[],
             &["--out"],
             &["--out", ""],
             &["--out", "a", "b"],
+            &["--out", "a", "--out", "b"],
             &["--out=web/openapi/openapi.json"],
             &["--output", "openapi.json"],
             &["openapi.json"],
             &["openapi.json", "--out"],
             &["-o", "openapi.json"],
+            &["--version"],
+            &["-V"],
+            &["help"],
+            &["-help"],
+            &["--HELP"],
+            &["--help=yes"],
+            &["--help", "-h"],
+            &["--help", "openapi.json"],
+            &["-h", "--out", "openapi.json"],
+            &["--out", "openapi.json", "--help"],
+            &["--out", "openapi.json", "-h"],
         ];
         for args in cases {
             assert_eq!(parse(args), None, "{args:?}");
@@ -188,7 +290,49 @@ mod tests {
 
         let path = OsString::from_vec(b"spec-\xff.json".to_vec());
         let args = [OsString::from("--out"), path.clone()];
-        assert_eq!(parse_out(args.into_iter()), Some(PathBuf::from(path)));
+        assert_eq!(
+            parse_args(args.into_iter()),
+            Some(Request::Write(PathBuf::from(path)))
+        );
+    }
+
+    #[test]
+    fn the_help_text_names_the_usage_the_help_flag_the_statuses_and_the_example() {
+        for needle in [
+            "cargo run -p carddemo-api --bin openapi -- --out web/openapi/openapi.json\n",
+            "pnpm --dir web gen:api\n",
+            USAGE,
+            "-h, --help",
+            "openapi --help",
+            "\n  0  ",
+            "\n  1  ",
+            "\n  2  ",
+        ] {
+            assert!(HELP.contains(needle), "{needle:?} is missing from:\n{HELP}");
+        }
+        assert!(
+            HELP.ends_with('\n') && !HELP.ends_with("\n\n"),
+            "the help text ends with one newline"
+        );
+        for line in HELP.lines() {
+            assert!(line.len() <= 80, "{line:?} is wider than 80 columns");
+        }
+    }
+
+    #[test]
+    fn the_help_text_is_written_whole_or_its_failure_is_one_line() {
+        let mut out = Vec::new();
+        write_help(&mut out).expect("the help text is written to memory");
+        assert_eq!(out, HELP.as_bytes());
+
+        let message = write_help(&mut Full).expect_err("a full device refuses the help text");
+        assert_eq!(
+            message,
+            format!(
+                "openapi: cannot write the help text: {}",
+                io::Error::from(io::ErrorKind::StorageFull)
+            )
+        );
     }
 
     #[test]

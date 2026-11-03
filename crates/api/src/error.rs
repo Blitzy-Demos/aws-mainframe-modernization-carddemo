@@ -26,6 +26,11 @@
 //! `NOT_FOUND`, and a method a routed path does not serve is 405 with code
 //! `METHOD_NOT_ALLOWED`, beside the `Allow` header axum sets.
 //!
+//! Every 401, the `UNAUTHENTICATED` answer and the `SignonFailed` kind alike,
+//! carries the challenge `WWW-Authenticate: Bearer` (RFC 9110 §15.5.2); no
+//! other status carries a `WWW-Authenticate` header. The body is the same with
+//! or without it.
+//!
 //! The table is the "Status mapping" of `docs/parity/validation-audit.md`, and
 //! every row's `Status` column follows from the row's kind through it. Where a
 //! row and its kind disagree, the rule's kind is corrected in
@@ -37,7 +42,9 @@
 //! COBOL text, trailing spaces included, never trimmed. A 500 carries the COBOL
 //! message the program shows for that failure when the rule supplies one, else
 //! [`messages::UNEXPECTED_ERROR`]. The detail of a database, port or reward
-//! store failure goes to the log through `tracing`, never to the body.
+//! store failure goes to the log through `tracing`, never to the body, and a
+//! rule's `Unexpected` error is logged at ERROR with its code, message and
+//! fields in the span of the handler answering it.
 //!
 //! # Extractors
 //!
@@ -45,14 +52,30 @@
 //! plain-text body. [`ApiJson`], [`ApiQuery`] and [`ApiPath`] wrap them and
 //! answer with the error body instead: status 400, code `INVALID`, and the
 //! rejection's text as `message`. That text describes the malformed input and
-//! holds no server detail. A JSON body that parses but does not fit the
-//! request DTO is the one rejection whose text serde words after a Rust type
-//! (`expected struct LoginRequest`): its `message` keeps the JSON path, the
-//! value received and the line and column, and names the JSON that type
-//! accepts in place of the type (`expected a JSON object`, `expected a JSON
-//! array of 7 elements`). Handlers declare their request body and parameters
-//! explicitly in `#[utoipa::path(request_body = .., params(..))]`, so the
+//! holds no server detail. A request body must be a JSON object, the
+//! `type: object` every request DTO's schema declares: [`ApiJson`] rejects any
+//! other JSON value, an array included, with 400 `INVALID`
+//! (`invalid type: sequence, expected a JSON object at line 1 column 0`), so
+//! no field is ever bound by position. A JSON body that parses but does not
+//! fit its type is the one rejection whose text serde may word after a Rust
+//! type (`expected struct <Name>`, `expected tuple struct <Name> with 2
+//! elements`): its `message` keeps the JSON path, the value received and the
+//! line and column, and names the JSON that type accepts in place of the type
+//! (`expected a JSON object`, `expected a JSON array of 2 elements`). Handlers
+//! declare their request body and parameters explicitly in
+//! `#[utoipa::path(request_body = .., params(..))]`, so the
 //! wrappers leave the `OpenAPI` document unchanged.
+//!
+//! A refused request never reaches its handler, so no handler span opens for
+//! it. Each wrapper therefore records the refusal on the request span through
+//! `crate::record_refusal`: the `transaction` of the operation the request
+//! asks for, `outcome` `rejected`, and the `user_id` of the user an earlier
+//! [`AuthUser`](crate::auth::AuthUser) or [`AdminUser`](crate::auth::AdminUser)
+//! extractor verified and kept in the request's extensions. A request whose
+//! token did not verify never reaches these wrappers, and a request to the
+//! public `POST /auth/login` has no verified user, so neither records one.
+//! The rejection's text is neither recorded nor logged, because it can quote
+//! what the client wrote, such as a body value.
 //!
 //! # Success statuses
 //!
@@ -61,20 +84,27 @@
 //! chooses no status itself. Handlers still declare the 201 in
 //! `#[utoipa::path(responses(..))]`.
 
+use std::fmt;
+use std::marker::PhantomData;
+
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
-use axum::http::StatusCode;
+use axum::http::header::WWW_AUTHENTICATE;
 use axum::http::request::Parts;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use carddemo_domain::error::{DomainError, ErrorKind, FieldError};
 use carddemo_domain::messages;
 use carddemo_domain::ports::PortError;
 use carddemo_domain::rewards::RewardError;
 use carddemo_persistence::PersistenceError;
-use serde::de::DeserializeOwned;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{DeserializeOwned, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+
+use crate::auth::extract::verified_user;
 
 /// The `code` of a request without a valid bearer token.
 const AUTH_REQUIRED_CODE: &str = "UNAUTHENTICATED";
@@ -84,6 +114,10 @@ const FORBIDDEN_CODE: &str = "FORBIDDEN";
 
 /// The `code` of a method a routed path does not serve.
 const METHOD_NOT_ALLOWED_CODE: &str = "METHOD_NOT_ALLOWED";
+
+/// The `WWW-Authenticate` challenge of every 401: the `Bearer` scheme the API
+/// authenticates requests with (RFC 6750 §3), without parameters.
+const BEARER_CHALLENGE: &str = "Bearer";
 
 /// One field a failure concerns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -262,6 +296,17 @@ impl ApiError {
     }
 }
 
+/// A rule's error answered with its kind's status and code, and its message
+/// and fields unchanged.
+///
+/// An [`ErrorKind::Unexpected`] error is a failure the request's input did not
+/// cause, so, as the adapter failures below are, it is also logged at ERROR,
+/// inside the span of the handler converting it: `code`, `reason` (the message
+/// without its trailing padding) and `fields` (the BMS names of its fields,
+/// joined with commas). The message is a `carddemo_domain::messages` text the
+/// response body carries as well, never request input, so the event holds
+/// nothing the answer does not. Every other kind answers the request's own
+/// input and is not logged.
 impl From<DomainError> for ApiError {
     fn from(err: DomainError) -> Self {
         let DomainError {
@@ -270,6 +315,16 @@ impl From<DomainError> for ApiError {
             fields,
             ..
         } = err;
+        if kind == ErrorKind::Unexpected {
+            let field_names: Vec<&str> = fields.iter().map(|entry| entry.field).collect();
+            let field_names = field_names.join(",");
+            tracing::error!(
+                code = kind.code(),
+                reason = message.trim_end_matches(' '),
+                fields = field_names.as_str(),
+                "unexpected failure answered"
+            );
+        }
         // The code is taken from the kind, as the status is, so the two can
         // never disagree; `DomainError::code` holds the same text.
         Self::new(
@@ -460,8 +515,18 @@ impl From<PathRejection> for ApiError {
 }
 
 impl IntoResponse for ApiError {
+    /// The status and the JSON error body, plus the `WWW-Authenticate:
+    /// Bearer` challenge on a 401, which RFC 9110 §15.5.2 requires of every
+    /// 401 response.
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let Self { status, body } = self;
+        let mut response = (status, Json(body)).into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response
+                .headers_mut()
+                .insert(WWW_AUTHENTICATE, HeaderValue::from_static(BEARER_CHALLENGE));
+        }
+        response
     }
 }
 
@@ -479,7 +544,13 @@ impl<T: Serialize> IntoResponse for Created<T> {
 }
 
 /// A JSON request body, extracted as `axum::Json` does, whose rejection is the
-/// 400 error body.
+/// 400 error body, recorded first on the request span
+/// (`crate::record_refusal`).
+///
+/// The body must be a JSON object, the `type: object` every request DTO's
+/// schema declares. Any other JSON value, an array included, is rejected with
+/// 400 `INVALID` (`invalid type: sequence, expected a JSON object`), so a
+/// struct's fields are never bound by position.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApiJson<T>(pub T);
 
@@ -490,14 +561,56 @@ where
 {
     type Rejection = ApiError;
 
+    /// The request's operation and verified user are read before
+    /// `axum::Json` consumes the request, so a refusal can still name them.
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let Json(value) = Json::<T>::from_request(req, state).await?;
-        Ok(Self(value))
+        let transaction = crate::transaction_of(req.method(), req.uri(), req.extensions());
+        let user_id = verified_user(req.extensions()).map(|user| user.user_id.clone());
+        Json::<ObjectBody<T>>::from_request(req, state)
+            .await
+            .map(|Json(ObjectBody(value))| Self(value))
+            .map_err(|rejection| {
+                crate::record_refusal(transaction, user_id.as_deref());
+                rejection.into()
+            })
+    }
+}
+
+/// A `T` deserialized from a JSON object only.
+///
+/// serde's derive also accepts a struct as a sequence of its field values in
+/// declaration order. This wrapper asks the deserializer for a map, so any
+/// other JSON value fails as a data error that expects `a JSON object`, and a
+/// map is handed to `T` whole. The JSON path, value and position of an error
+/// inside the object are the ones `T` itself reports.
+struct ObjectBody<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectBody<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_map(ObjectVisitor(PhantomData))
+            .map(Self)
+    }
+}
+
+/// The visitor of [`ObjectBody`]: it accepts a map and nothing else.
+struct ObjectVisitor<T>(PhantomData<T>);
+
+impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+        T::deserialize(MapAccessDeserializer::new(map))
     }
 }
 
 /// A query string, extracted as `axum::extract::Query` does, whose rejection
-/// is the 400 error body.
+/// is the 400 error body, recorded first on the request span
+/// (`crate::record_refusal`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApiQuery<T>(pub T);
 
@@ -509,13 +622,22 @@ where
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Query(value) = Query::<T>::from_request_parts(parts, state).await?;
-        Ok(Self(value))
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(value)| Self(value))
+            .map_err(|rejection| {
+                crate::record_refusal(
+                    crate::transaction_of(&parts.method, &parts.uri, &parts.extensions),
+                    verified_user(&parts.extensions).map(|user| user.user_id.as_str()),
+                );
+                rejection.into()
+            })
     }
 }
 
 /// Path parameters, extracted as `axum::extract::Path` does, whose rejection
-/// is the 400 error body.
+/// is the 400 error body, recorded first on the request span
+/// (`crate::record_refusal`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApiPath<T>(pub T);
 
@@ -527,8 +649,16 @@ where
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Path(value) = Path::<T>::from_request_parts(parts, state).await?;
-        Ok(Self(value))
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| Self(value))
+            .map_err(|rejection| {
+                crate::record_refusal(
+                    crate::transaction_of(&parts.method, &parts.uri, &parts.extensions),
+                    verified_user(&parts.extensions).map(|user| user.user_id.as_str()),
+                );
+                rejection.into()
+            })
     }
 }
 
@@ -538,7 +668,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
     use axum::extract::{Json, Path, Query};
-    use axum::http::{Request, StatusCode, header};
+    use axum::http::{HeaderValue, Request, StatusCode, header};
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use carddemo_domain::error::{DomainError, ErrorKind};
@@ -754,6 +884,155 @@ mod tests {
         }
     }
 
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `error` converted inside a `CAUP` handler span under the API's
+    /// telemetry subscriber and its default filter `info`, with every JSON line
+    /// the subscriber wrote: the event lines and the span line.
+    fn converted_in_handler_span(error: DomainError) -> (ApiError, Vec<Value>) {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let (subscriber, guard) =
+            carddemo_runtime::telemetry::subscriber_with_writer("api", "info", move || {
+                sink.clone()
+            })
+            .expect("valid directives");
+        let converted = tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!(
+                "update_account",
+                transaction = "CAUP",
+                user_id = "ADMIN001",
+                account_id = "00000000001",
+            )
+            .in_scope(|| ApiError::from(error))
+        });
+        guard.shutdown().expect("the tracer provider shuts down");
+        let bytes = capture.0.lock().expect("capture buffer").clone();
+        let text = String::from_utf8(bytes).expect("JSON lines are UTF-8");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON line"))
+            .collect();
+        (converted, lines)
+    }
+
+    /// The lines of `lines` that are log events, not span lines.
+    fn events(lines: &[Value]) -> Vec<&Value> {
+        lines.iter().filter(|line| line["type"] != "span").collect()
+    }
+
+    /// The status the span line of `lines` carries.
+    fn span_status(lines: &[Value]) -> &Value {
+        let spans: Vec<&Value> = lines.iter().filter(|line| line["type"] == "span").collect();
+        let [span] = spans.as_slice() else {
+            panic!("one span line expected, got {lines:?}");
+        };
+        &span["status"]
+    }
+
+    #[test]
+    fn an_unexpected_domain_error_is_logged_at_error_in_its_handler_span_with_its_reason() {
+        // A read failure with its composed, padded file-error text on one
+        // field, a TRAN-ID failure on one field, and a halt answer (E-26)
+        // that names no field.
+        let file_error = messages::file_error_message("READ", "ACCTDAT", 13, 0);
+        let cases = [
+            (
+                DomainError::unexpected(file_error.clone()).with_field("ACCTSID"),
+                file_error.trim_end_matches(' ').to_owned(),
+                "ACCTSID",
+            ),
+            (
+                DomainError::unexpected(messages::UNABLE_TO_LOOKUP_TRANSACTION)
+                    .with_field("ACTIDIN")
+                    .with_field_message("CARDNIN", messages::UNEXPECTED_ERROR),
+                messages::UNABLE_TO_LOOKUP_TRANSACTION
+                    .trim_end_matches(' ')
+                    .to_owned(),
+                "ACTIDIN,CARDNIN",
+            ),
+            (
+                DomainError::unexpected(messages::UNEXPECTED_ERROR),
+                messages::UNEXPECTED_ERROR.to_owned(),
+                "",
+            ),
+        ];
+        for (error, reason, fields) in cases {
+            let expected = ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorKind::Unexpected.code(),
+                error.message.clone(),
+                error
+                    .fields
+                    .iter()
+                    .cloned()
+                    .map(ErrorFieldBody::from)
+                    .collect(),
+            );
+            let (converted, lines) = converted_in_handler_span(error);
+            assert_eq!(converted.status(), expected.status(), "{reason}");
+            assert_eq!(converted.body(), expected.body(), "{reason}");
+            let events = events(&lines);
+            let [event] = events.as_slice() else {
+                panic!("{reason}: one event expected, got {lines:?}");
+            };
+            assert_eq!(event["level"], "ERROR", "{reason}");
+            assert_eq!(event["target"], "carddemo_api::error", "{reason}");
+            assert_eq!(
+                event["fields"],
+                json!({
+                    "message": "unexpected failure answered",
+                    "code": "UNEXPECTED",
+                    "reason": reason,
+                    "fields": fields,
+                }),
+                "{reason}"
+            );
+            assert_eq!(
+                event["span"],
+                json!({
+                    "name": "update_account",
+                    "transaction": "CAUP",
+                    "user_id": "ADMIN001",
+                    "account_id": "00000000001",
+                }),
+                "{reason}"
+            );
+            assert_eq!(span_status(&lines)["code"], "error", "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_domain_error_of_any_other_kind_is_answered_without_a_log_event() {
+        for (kind, status) in KIND_STATUSES {
+            if kind == ErrorKind::Unexpected {
+                continue;
+            }
+            let error =
+                DomainError::new(kind, messages::CCDA_MSG_INVALID_KEY).with_field("ACCTSID");
+            let (converted, lines) = converted_in_handler_span(error);
+            assert_eq!(converted.status(), status, "{kind:?}");
+            assert!(events(&lines).is_empty(), "{kind:?}: {lines:?}");
+            assert_eq!(span_status(&lines)["code"], "unset", "{kind:?}");
+        }
+    }
+
     #[tokio::test]
     async fn into_response_writes_the_status_and_the_json_body() {
         let error = ApiError::from(
@@ -773,6 +1052,60 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_401_carries_the_bearer_challenge_beside_an_unchanged_body() {
+        let kinds = KIND_STATUSES.map(|(kind, status)| {
+            let error = ApiError::from(
+                DomainError::new(kind, messages::WRONG_PASSWORD_TRY_AGAIN).with_field("PASSWD"),
+            );
+            (format!("{kind:?}"), error, status)
+        });
+        // The request-written failures and the sign-on rejection's own
+        // constructor, named by their codes.
+        let named = [
+            (ApiError::unauthenticated(), StatusCode::UNAUTHORIZED),
+            (
+                ApiError::from(
+                    DomainError::signon_failed(messages::WRONG_PASSWORD_TRY_AGAIN)
+                        .with_field("PASSWD"),
+                ),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (ApiError::forbidden(), StatusCode::FORBIDDEN),
+            (ApiError::route_not_found(), StatusCode::NOT_FOUND),
+            (
+                ApiError::method_not_allowed(),
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (ApiError::unexpected(), StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                ApiError::rejection(DETAIL.to_owned()),
+                StatusCode::BAD_REQUEST,
+            ),
+        ]
+        .map(|(error, status)| (error.body().code.clone(), error, status));
+        for (case, error, status) in kinds.into_iter().chain(named) {
+            let body = serde_json::to_vec(error.body()).expect("the body serializes");
+            let response = error.into_response();
+            let challenges: Vec<&[u8]> = response
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .map(HeaderValue::as_bytes)
+                .collect();
+            let expected: &[&[u8]] = if status == StatusCode::UNAUTHORIZED {
+                &[b"Bearer"]
+            } else {
+                &[]
+            };
+            assert_eq!(challenges, expected, "{case}");
+            let (actual, content_type, bytes) = read_body(response).await;
+            assert_eq!(actual, status, "{case}");
+            assert_eq!(content_type.as_deref(), Some("application/json"), "{case}");
+            assert_eq!(bytes, body, "{case}: the body, byte for byte");
+        }
     }
 
     #[tokio::test]
@@ -908,6 +1241,14 @@ mod tests {
     /// fit its type.
     const DATA_ERROR: &str = "Failed to deserialize the JSON body into the target type: ";
 
+    /// The description of a JSON array given for a request DTO: the position
+    /// is the one before the `[`, which is never read.
+    const SEQUENCE: &str = "invalid type: sequence, expected a JSON object at line 1 column 0";
+
+    /// The smallest `RewardRuleRequest` object: its four fields without a
+    /// default.
+    const REWARD_RULE_OBJECT: &str = r#"{"transaction_type_cd":"01","transaction_category_cd":"0001","reward_rate":"1.0000","active_from":"2022-01-01T00:00:00Z"}"#;
+
     /// Answers 204 to a body that deserializes as `T`.
     async fn accept<T>(ApiJson(_): ApiJson<T>) -> StatusCode {
         StatusCode::NO_CONTENT
@@ -980,6 +1321,20 @@ mod tests {
         });
         for dto in &dtos {
             let (path, field) = (dto.path, dto.field);
+            // The smallest object the DTO accepts: every field has a default
+            // but the reward rule's type, category, rate and start.
+            let object = if dto.type_name == "RewardRuleRequest" {
+                REWARD_RULE_OBJECT
+            } else {
+                "{}"
+            };
+            let response = router
+                .clone()
+                .oneshot(request("POST", path, JSON, object))
+                .await
+                .expect("the router is infallible");
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{path} {object}");
+
             // `{"<field>":` ends at column field.len() + 4: a map value is
             // reported there, a number once it is read.
             let (map_column, number_column) = (field.len() + 4, field.len() + 5);
@@ -1004,10 +1359,14 @@ mod tests {
                     "null".to_owned(),
                     "invalid type: null, expected a JSON object at line 1 column 4".to_owned(),
                 ),
+                // An array is refused before its first element is read,
+                // whatever it holds, so no field is bound by position.
+                ("[]".to_owned(), SEQUENCE.to_owned()),
+                ("[1]".to_owned(), SEQUENCE.to_owned()),
+                (r#"["ADMIN001","PASSWORD"]"#.to_owned(), SEQUENCE.to_owned()),
                 (
-                    "[1]".to_owned(),
-                    "[0]: invalid type: integer `1`, expected a string at line 1 column 2"
-                        .to_owned(),
+                    r#"["01","0001","2.5",null,null,"2099-01-01T00:00:00Z",null]"#.to_owned(),
+                    SEQUENCE.to_owned(),
                 ),
                 (
                     format!(r#"{{"{field}":{{}}}}"#),
@@ -1024,13 +1383,8 @@ mod tests {
                 ),
             ];
             // Only the reward rule has fields without a default, so only it
-            // refuses an empty array or object.
+            // refuses an empty object.
             if dto.type_name == "RewardRuleRequest" {
-                cases.push((
-                    "[]".to_owned(),
-                    "invalid length 0, expected a JSON array of 7 elements at line 1 column 2"
-                        .to_owned(),
-                ));
                 cases.push((
                     "{}".to_owned(),
                     "missing field `transaction_type_cd` at line 1 column 2".to_owned(),
@@ -1053,6 +1407,11 @@ mod tests {
                         error.message
                     );
                 }
+                assert!(
+                    !error.message.contains("JSON array"),
+                    "{path} {body}: {}",
+                    error.message
+                );
                 assert_eq!(
                     error,
                     ErrorBody {

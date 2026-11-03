@@ -45,6 +45,8 @@ mod tranbkp;
 mod tranrept;
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
 use carddemo_domain::clock::AnyClock;
@@ -65,8 +67,13 @@ const EMPTY_INPUT_CONDITION: u8 = 12;
 /// once, not a COBOL value. `REPRO` copies one record at a time.
 const BACKUP_PAGE_SIZE: u16 = 500;
 
-/// What every job of one `batch` run shares: the settings, the processing clock and the
-/// generation catalog.
+/// The `input` of the jobs that read the live transaction master, `TRANSACT.VSAM.KSDS`: the
+/// view `transaction_master`, through which every read of it goes (E-09). TRANBKP and TRANREPT
+/// back it up (REPROC `FILEIN`), CREASTMT sorts it (`STEP010` `SORTIN`).
+const LIVE_MASTER: &str = "transaction_master";
+
+/// What every job of one `batch` run shares: the settings, the processing clock, the
+/// generation catalog and the job's counts.
 #[derive(Debug)]
 pub(crate) struct JobContext {
     /// The `CARDDEMO_*` settings of the run.
@@ -75,12 +82,16 @@ pub(crate) struct JobContext {
     pub(crate) clock: AnyClock,
     /// The GDGs under `CARDDEMO_BATCH_DIR`.
     pub(crate) generations: Generations,
+    /// The `read`, `posted` and `rejected` counts of the run's one job, all 0 until the job
+    /// sets them, which [`dispatch`] records on the job span once the job has returned. Shared,
+    /// so work the job runs on Tokio's blocking pool can own a handle and set them there.
+    pub(crate) counts: Arc<JobCounts>,
 }
 
 impl JobContext {
     /// The context of a run whose generations live under `settings.batch_dir`
-    /// (`CARDDEMO_BATCH_DIR`, default `./var/batch/`). Nothing is created until a job writes a
-    /// generation.
+    /// (`CARDDEMO_BATCH_DIR`, default `./var/batch/`), with every count 0. Nothing is created
+    /// until a job writes a generation.
     #[must_use]
     pub(crate) fn new(settings: Settings, clock: AnyClock) -> Self {
         let generations = Generations::new(settings.batch_dir.clone());
@@ -88,28 +99,115 @@ impl JobContext {
             settings,
             clock,
             generations,
+            counts: Arc::default(),
         }
     }
+}
+
+/// The `read`, `posted` and `rejected` counts of one job, each 0 until the job sets it. A job
+/// sets a count as its work completes, so a job that fails keeps the totals of the work it
+/// completed and 0 for what it never counted. [`dispatch`] records the three on the job span
+/// once, after the job returns, on every exit path ([`JobCounts::record_on`]).
+#[derive(Debug, Default)]
+pub(crate) struct JobCounts {
+    /// The records the job read.
+    read: AtomicU64,
+    /// The records the job posted: what the target keeps of its writes.
+    posted: AtomicU64,
+    /// The records the job turned away.
+    rejected: AtomicU64,
+}
+
+impl JobCounts {
+    /// Sets `read` to `records`.
+    pub(crate) fn set_read(&self, records: u64) {
+        self.read.store(records, Ordering::Relaxed);
+    }
+
+    /// Sets `posted` to `records`.
+    pub(crate) fn set_posted(&self, records: u64) {
+        self.posted.store(records, Ordering::Relaxed);
+    }
+
+    /// Sets `rejected` to `records`.
+    pub(crate) fn set_rejected(&self, records: u64) {
+        self.rejected.store(records, Ordering::Relaxed);
+    }
+
+    /// The `read` count.
+    #[must_use]
+    pub(crate) fn read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed)
+    }
+
+    /// The `posted` count.
+    #[must_use]
+    pub(crate) fn posted(&self) -> u64 {
+        self.posted.load(Ordering::Relaxed)
+    }
+
+    /// The `rejected` count.
+    #[must_use]
+    pub(crate) fn rejected(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
+    }
+
+    /// Records `read`, `posted` and `rejected` on `span`, each once. Every setter ran before the
+    /// job's future completed, and blocking work before the job awaited its result, so the
+    /// counts read here are the job's last.
+    fn record_on(&self, span: &Span) {
+        span.record("read", self.read());
+        span.record("posted", self.posted());
+        span.record("rejected", self.rejected());
+    }
+}
+
+/// `records`, a `usize` count, as the `u64` [`JobCounts`] holds. A `usize` never exceeds
+/// `u64::MAX` on the targets the workspace builds for; the conversion saturates rather than
+/// fail should one ever be wider.
+#[must_use]
+pub(super) fn count_of(records: usize) -> u64 {
+    u64::try_from(records).unwrap_or(u64::MAX)
 }
 
 /// Runs `command` inside its job span and returns how it ended.
 ///
 /// The span `job` is opened first and carries the subcommand name in `job` and the job's
-/// inputs (`input`, `parm_date`, `start_date`, `end_date`). The `cbpaup0j` card is not
-/// recorded whole: `sysin` holds the 17-byte `PRM-INFO` receiver it fills, `sysin_len` the
-/// card's length in bytes and `sysin_truncated` whether the receiver left any of the card out
-/// (`cbpaup0j::BoundedSysin`). Inside the span the database pool is opened and the job runs.
-/// Jobs record their counts on it with
-/// `tracing::Span::current().record("<field>", value)` for the fields `read`, `posted`,
-/// `rejected`, `written` and `deleted`. When the job returns, `exit_code` is recorded and one
-/// job-end event is emitted inside the span: `info` for exit 0, `warn` for 4, `error` for every
-/// other code. The database URL carries the password and is never a span field.
+/// inputs (`input`, `parm_date`, `start_date`, `end_date`): `input` is the `--input` file of
+/// `posttran` and `mnttrdb2`, and [`LIVE_MASTER`] for `tranbkp`, `creastmt` and `tranrept`,
+/// which read the live transaction master; `combtran` records its two SORTIN generations in
+/// `input` once it has resolved them. The `cbpaup0j` card is not recorded whole: `sysin` holds
+/// the 17-byte `PRM-INFO` receiver it fills, `sysin_len` the card's length in bytes and
+/// `sysin_truncated` whether the receiver left any of the card out (`cbpaup0j::BoundedSysin`).
+/// Inside the span the database pool is opened and the job runs. Jobs record `written` and
+/// `deleted` on it with `tracing::Span::current().record("<field>", value)`, and set `read`,
+/// `posted` and `rejected` in `ctx.counts` ([`JobCounts`]) as their work completes:
+///
+/// | Job | `read` | `posted` | `rejected` |
+/// |---|---|---|---|
+/// | `migrate` | 0 | 0 | 0 |
+/// | `seed` | the rows written | the rows written | 0 |
+/// | `posttran` | the daily records read | the records posted | the records rejected |
+/// | `intcalc` | the balance records read | the accounts updated, as committed | 0 |
+/// | `tranbkp` | the live records backed up | 0 | 0 |
+/// | `combtran` | the SORTIN records read | the records loaded, 0 when the load is not committed | the duplicate records |
+/// | `creastmt` | the live transactions read | 0 | 0 |
+/// | `tranrept` | the backup records the sort read | 0 | 0 |
+/// | `cbpaup0j` | the summaries and details read | 0 | 0 |
+/// | `mnttrdb2` | the records read | the types inserted, updated or deleted, 0 when the commit fails | the failed records |
+///
+/// When the job returns, on every exit path, a failure to open the pool included, the three
+/// counts are recorded on the span once each: the totals of the work the job completed, and 0
+/// for what it did not count. Then `exit_code` is recorded and one job-end event is emitted
+/// inside the span: `info` for exit 0, `warn` for 4, `error` for every other code. The database
+/// URL carries the password and is never a span field.
 ///
 /// The caller reports the returned status on stderr and exits with its code.
 pub(crate) async fn dispatch(command: Command, ctx: &JobContext) -> ExitStatus {
     let job = job_name(&command);
     let span = job_span(job, &command);
     let status = run(command, ctx).instrument(span.clone()).await;
+    ctx.counts.record_on(&span);
     let exit_code = status.code();
     span.record("exit_code", exit_code);
     span.in_scope(|| match exit_code {
@@ -137,7 +235,7 @@ const fn job_name(command: &Command) -> &'static str {
 }
 
 /// The span of one job run, with the inputs of `command` recorded and every count and the exit
-/// code still empty.
+/// code still empty, for the job and [`dispatch`] to record.
 fn job_span(job: &'static str, command: &Command) -> Span {
     let span = tracing::info_span!(
         "job",
@@ -167,8 +265,12 @@ fn job_span(job: &'static str, command: &Command) -> Span {
             span.record("parm_date", args.parm_date.as_str());
         }
         Command::Tranrept(args) => {
+            span.record("input", LIVE_MASTER);
             span.record("start_date", args.start_date.as_str());
             span.record("end_date", args.end_date.as_str());
+        }
+        Command::Tranbkp | Command::Creastmt => {
+            span.record("input", LIVE_MASTER);
         }
         Command::Cbpaup0j(args) => {
             let sysin = cbpaup0j::BoundedSysin::of(&args.sysin);
@@ -176,11 +278,7 @@ fn job_span(job: &'static str, command: &Command) -> Span {
             span.record("sysin_len", sysin.len);
             span.record("sysin_truncated", sysin.truncated);
         }
-        Command::Migrate
-        | Command::Seed(_)
-        | Command::Tranbkp
-        | Command::Combtran
-        | Command::Creastmt => {}
+        Command::Migrate | Command::Seed(_) | Command::Combtran => {}
     }
     span
 }
@@ -420,12 +518,170 @@ mod tests {
 
     use carddemo_domain::clock::{AnyClock, SystemClock};
     use carddemo_runtime::config::Settings;
+    use carddemo_runtime::telemetry::subscriber_with_writer;
     use clap::{CommandFactory, Parser};
 
-    use super::{Backup, JobContext, job_name};
-    use crate::cli::Cli;
+    use super::{Backup, JobContext, JobCounts, dispatch, job_name, job_span};
+    use crate::cli::{Cli, Command};
     use crate::exit::ExitStatus;
+    use crate::generations::tests::Capture;
     use crate::generations::{Dataset, Generation};
+
+    /// Runs `work` under the batch telemetry subscriber, installed as the default of this thread
+    /// only, and returns the JSON line of the job span that finished during it with what `work`
+    /// returned. Only span fields are read from the line: an event callsite shared with tests
+    /// that run without a subscriber can have its interest cached as `never`, while the span
+    /// callsite of [`job_span`] is reached only under a subscriber.
+    fn finished_job_span<T>(work: impl FnOnce() -> T) -> (String, T) {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let (subscriber, guard) = subscriber_with_writer("batch", "info", move || sink.clone())
+            .expect("valid directives");
+        let outcome = tracing::subscriber::with_default(subscriber, work);
+        guard.shutdown().expect("the tracer provider shuts down");
+        let lines = capture.lines();
+        let span = lines
+            .iter()
+            .find(|line| line.contains(r#""type":"span""#) && line.contains(r#""name":"job""#))
+            .unwrap_or_else(|| panic!("no job span line: {lines:?}"))
+            .clone();
+        (span, outcome)
+    }
+
+    /// Runs `work` inside the job span of `command`, then records `counts` on the span as
+    /// [`dispatch`] does once the job returns, and returns the JSON line of the finished span
+    /// with what `work` returned ([`finished_job_span`]).
+    pub(super) fn job_span_line<T>(
+        command: &Command,
+        counts: &JobCounts,
+        work: impl FnOnce() -> T,
+    ) -> (String, T) {
+        finished_job_span(|| {
+            let span = job_span(job_name(command), command);
+            let outcome = span.in_scope(work);
+            counts.record_on(&span);
+            outcome
+        })
+    }
+
+    /// The command line of every subcommand with the arguments it requires.
+    fn every_subcommand() -> Vec<Vec<String>> {
+        Cli::command()
+            .get_subcommands()
+            .map(|sub| {
+                let mut args = vec!["batch".to_owned(), sub.get_name().to_owned()];
+                if sub.get_name() == "mnttrdb2" {
+                    args.extend(["--input".to_owned(), "trantype.upd".to_owned()]);
+                }
+                args
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_job_that_ends_before_any_work_records_zero_counts_and_its_exit_code() {
+        // Neither reaches a server: nothing listens on port 1, so the connection is refused at
+        // once, and the second does not parse as a connection URL.
+        let urls = [
+            "postgres://carddemo@127.0.0.1:1/carddemo",
+            "not a connection URL",
+        ];
+        let commands = every_subcommand();
+        assert_eq!(commands.len(), 10, "{commands:?}");
+        for args in &commands {
+            for url in urls {
+                let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+                let settings = Settings {
+                    database_url: url.to_owned(),
+                    ..Settings::default()
+                };
+                let ctx = JobContext::new(settings, AnyClock::System(SystemClock));
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap_or_else(|e| panic!("Tokio runtime: {e}"));
+
+                let (span, status) =
+                    finished_job_span(|| runtime.block_on(dispatch(cli.command, &ctx)));
+
+                assert!(
+                    matches!(status, ExitStatus::SetupFailure(_)),
+                    "{args:?} on {url:?}: {status:?}"
+                );
+                // The exporter writes an unsigned count as a decimal string and the exit code
+                // as a number.
+                for fragment in [
+                    r#""read":"0""#,
+                    r#""posted":"0""#,
+                    r#""rejected":"0""#,
+                    r#""exit_code":16"#,
+                ] {
+                    assert!(
+                        span.contains(fragment),
+                        "{args:?} on {url:?}: {fragment} in {span}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn job_spans_record_the_inputs_of_the_job() {
+        let live_master = r#""input":"transaction_master""#;
+        // (command line, span fragments present, span fragments absent)
+        let cases: [(&[&str], &[&str], &[&str]); 9] = [
+            (
+                &["posttran", "--input", "daily.txt"],
+                &[r#""input":"daily.txt""#],
+                &[],
+            ),
+            (
+                &["mnttrdb2", "--input", "trantype.upd"],
+                &[r#""input":"trantype.upd""#],
+                &[],
+            ),
+            (&["tranbkp"], &[live_master], &[]),
+            (&["creastmt"], &[live_master], &[]),
+            (
+                &[
+                    "tranrept",
+                    "--start-date",
+                    "2022-01-01",
+                    "--end-date",
+                    "2022-07-06",
+                ],
+                &[
+                    live_master,
+                    r#""start_date":"2022-01-01""#,
+                    r#""end_date":"2022-07-06""#,
+                ],
+                &[],
+            ),
+            (
+                &["intcalc"],
+                &[r#""parm_date":"2022071800""#],
+                &[r#""input""#],
+            ),
+            // COMBTRAN records its SORTIN generations once it has resolved them.
+            (&["combtran"], &[r#""job":"combtran""#], &[r#""input""#]),
+            (&["migrate"], &[r#""job":"migrate""#], &[r#""input""#]),
+            (&["seed"], &[r#""job":"seed""#], &[r#""input""#]),
+        ];
+        for (args, present, absent) in cases {
+            let cli = Cli::try_parse_from(["batch"].iter().chain(args))
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let (span, ()) = job_span_line(&cli.command, &JobCounts::default(), || ());
+            for fragment in present {
+                assert!(span.contains(fragment), "{args:?}: {fragment} in {span}");
+            }
+            for fragment in absent {
+                assert!(
+                    !span.contains(fragment),
+                    "{args:?}: no {fragment} in {span}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn job_names_are_the_subcommand_names() {

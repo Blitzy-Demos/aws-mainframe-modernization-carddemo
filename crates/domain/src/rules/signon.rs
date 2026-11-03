@@ -19,19 +19,24 @@
 //! The rule runs in two steps, because argon2id verification is memory-hard
 //! and CPU-bound and never yields:
 //!
-//! 1. [`sign_on`], asynchronous: the blank edits, the upper-casing and the
-//!    `USRSEC` read. It does no argon2 work and answers with a
-//!    [`SignonCheck`] holding the record read and the password typed.
+//! 1. [`sign_on`], asynchronous: the blank edits of [`edit_blank_fields`],
+//!    the upper-casing and the `USRSEC` read. It does no argon2 work and
+//!    answers with a [`SignonCheck`] holding the record read and the password
+//!    typed.
 //! 2. [`SignonCheck::verify`], synchronous and pure: the password compare and
 //!    the outcome it selects.
 //!
-//! An adapter awaits [`sign_on`], ends its unit of work, then runs
-//! [`SignonCheck::verify`] where blocking work belongs. An asynchronous
-//! adapter runs it on a blocking thread pool, such as tokio's
-//! `spawn_blocking`, never inline on the executor, where one verification
-//! would hold a worker thread and delay every other task on it. The token
-//! needs a [`SignonOutcome`], which only [`SignonCheck::verify`] yields, so no
-//! sign-on succeeds without the second step.
+//! The blank edits read no store, as `PROCESS-ENTER-KEY` rejects a blank field
+//! before any `USRSEC` I/O [app/cbl/COSGN00C.cbl:L117-130]. An adapter runs
+//! [`edit_blank_fields`] before it opens its unit of work, so a blank field is
+//! answered whatever the state of the store, and [`sign_on`] repeats the edits
+//! with the same answer. The adapter then awaits [`sign_on`] in the unit of
+//! work, ends it, and runs [`SignonCheck::verify`] where blocking work
+//! belongs. An asynchronous adapter runs it on a blocking thread pool, such
+//! as tokio's `spawn_blocking`, never inline on the executor, where one
+//! verification would hold a worker thread and delay every other task on it.
+//! The token needs a [`SignonOutcome`], which only [`SignonCheck::verify`]
+//! yields, so no sign-on succeeds without the second step.
 //!
 //! `POST /auth/login` adapts the rule and issues the token; the token, the
 //! logout text (P-COSGN00C-003) and the 3270 screen mechanics (first entry,
@@ -198,7 +203,9 @@ impl SignonCheck {
 ///
 /// 1. A user ID of `SPACES OR LOW-VALUES` is rejected first, then a password of
 ///    `SPACES OR LOW-VALUES` [app/cbl/COSGN00C.cbl:L117-130]. Either rejection
-///    sends the screen and ends the task's work, so no record is read.
+///    sends the screen and ends the task's work, so no record is read. These
+///    are the edits of [`edit_blank_fields`], which an adapter runs before it
+///    opens the store; they are repeated here with the same answer.
 /// 2. The user ID is upper-cased and padded to 8, giving the `USRSEC` key
 ///    [app/cbl/COSGN00C.cbl:L132-134]; the password is upper-cased and padded
 ///    when it is verified [app/cbl/COSGN00C.cbl:L135-136] (E-20).
@@ -232,13 +239,8 @@ pub async fn sign_on<S: UserStore>(
     store: &mut S,
     input: SignonInput,
 ) -> Result<SignonCheck, DomainError> {
+    edit_blank_fields(&input)?;
     let SignonInput { user_id, password } = input;
-    if is_spaces_or_low_values(&user_id, USERIDI_LEN) {
-        return Err(DomainError::empty(PLEASE_ENTER_USER_ID).with_field(USERID));
-    }
-    if is_spaces_or_low_values(&password, PASSWDI_LEN) {
-        return Err(DomainError::empty(PLEASE_ENTER_PASSWORD).with_field(PASSWD));
-    }
     let key = UserId::move_from(&normalize_signon_user_id(&user_id));
     let user = read_user_sec_file(store, key).await?;
     Ok(SignonCheck {
@@ -246,6 +248,36 @@ pub async fn sign_on<S: UserStore>(
         user,
         password,
     })
+}
+
+/// COSGN00C PROCESS-ENTER-KEY — P-COSGN00C-005, P-COSGN00C-006,
+/// V-COSGN00C-001, V-COSGN00C-002.
+///
+/// The blank edits of the two map fields, in the order the `EVALUATE TRUE`
+/// tests them [app/cbl/COSGN00C.cbl:L117-130]: a user ID of
+/// `SPACES OR LOW-VALUES` first, then a password of `SPACES OR LOW-VALUES`.
+/// Either rejection sends the sign-on screen before any `USRSEC` I/O.
+///
+/// Synchronous and pure: it reads no store, so an adapter runs it before it
+/// opens its unit of work, and a blank field is answered even when no
+/// connection can be had. [`sign_on`] runs it first, with the same answer.
+///
+/// # Errors
+///
+/// A [`DomainError`] of kind `Empty` with one field, the first that fails:
+///
+/// - [`PLEASE_ENTER_USER_ID`], field `USERID`: the user ID is blank
+///   (V-COSGN00C-001, order 1).
+/// - [`PLEASE_ENTER_PASSWORD`], field `PASSWD`: the user ID is entered and
+///   the password is blank (V-COSGN00C-002, order 2).
+pub fn edit_blank_fields(input: &SignonInput) -> Result<(), DomainError> {
+    if is_spaces_or_low_values(&input.user_id, USERIDI_LEN) {
+        return Err(DomainError::empty(PLEASE_ENTER_USER_ID).with_field(USERID));
+    }
+    if is_spaces_or_low_values(&input.password, PASSWDI_LEN) {
+        return Err(DomainError::empty(PLEASE_ENTER_PASSWORD).with_field(PASSWD));
+    }
+    Ok(())
 }
 
 /// COSGN00C PROCESS-ENTER-KEY — P-COSGN00C-005, P-COSGN00C-006,
@@ -312,7 +344,7 @@ mod tests {
     use std::sync::OnceLock;
     use std::thread;
 
-    use super::{Landing, SignonCheck, SignonInput, SignonOutcome, sign_on};
+    use super::{Landing, SignonCheck, SignonInput, SignonOutcome, edit_blank_fields, sign_on};
     use crate::auth::hash_stored_password;
     use crate::entities::UserSecurity;
     use crate::error::{DomainError, ErrorKind, FieldError};
@@ -459,6 +491,39 @@ mod tests {
             let result = run(&mut store, typed_id, typed_password);
             assert_rejected(result, empty, message, field, &case);
             assert!(store.calls.is_empty(), "{case}");
+        }
+    }
+
+    #[test]
+    fn the_blank_edits_answer_in_cobol_order_without_a_store() {
+        // V-COSGN00C-001 (order 1) before V-COSGN00C-002 (order 2), with no
+        // store to read (P-COSGN00C-005, P-COSGN00C-006). Spaces mixed with
+        // LOW-VALUES are neither figurative constant, so they pass.
+        let no_id = Err(DomainError::empty(PLEASE_ENTER_USER_ID).with_field("USERID"));
+        let no_password = Err(DomainError::empty(PLEASE_ENTER_PASSWORD).with_field("PASSWD"));
+        let cases = [
+            ("", "PASSWORD", &no_id),
+            ("        ", "x", &no_id),
+            ("\0\0\0\0\0\0\0\0", "PASSWORD", &no_id),
+            ("\0", "WRONGPWD", &no_id),
+            ("", "", &no_id),
+            ("        ", "\0", &no_id),
+            ("ADMIN001", "", &no_password),
+            ("ADMIN001", "        ", &no_password),
+            ("ADMIN001", "\0\0\0", &no_password),
+            ("\0 ", "\0\0\0\0\0\0\0\0", &no_password),
+            ("\0 ", "PASSWORD", &Ok(())),
+            ("ADMIN001", " \0", &Ok(())),
+            ("ADMIN001", "PASSWORD", &Ok(())),
+            ("user0099", "x", &Ok(())),
+        ];
+        for (typed_id, typed_password, expected) in cases {
+            let input = SignonInput {
+                user_id: typed_id.to_owned(),
+                password: typed_password.to_owned(),
+            };
+            let case = format!("{typed_id:?} {typed_password:?}");
+            assert_eq!(edit_blank_fields(&input), *expected, "{case}");
         }
     }
 
