@@ -322,15 +322,16 @@ digit_id! {
 /// decides the type:
 ///
 /// - `NumericCode<6>`: `PA-PROCESSING-CODE` P-CIPAUDTY-013
-///   [app/app-authorization-ims-db2-mq/cpy/CIPAUDTY.cpy:L33] and the request's
-///   `PA-RQ-PROCESSING-CODE` P-CCPAURQY-008
-///   [app/app-authorization-ims-db2-mq/cpy/CCPAURQY.cpy:L26].
+///   [app/app-authorization-ims-db2-mq/cpy/CIPAUDTY.cpy:L33], read from the
+///   request's `Alnum<6>` receiver `PA-RQ-PROCESSING-CODE` P-CCPAURQY-008
+///   [app/app-authorization-ims-db2-mq/cpy/CCPAURQY.cpy:L26] when its six
+///   bytes are digits (E-47).
 /// - `NumericCode<2>`: `PA-POS-ENTRY-MODE` P-CIPAUDTY-018
-///   [app/app-authorization-ims-db2-mq/cpy/CIPAUDTY.cpy:L38], the request's
-///   `PA-RQ-POS-ENTRY-MODE` P-CCPAURQY-012
-///   [app/app-authorization-ims-db2-mq/cpy/CCPAURQY.cpy:L30], the Db2
-///   `POS_ENTRY_MODE SMALLINT` P-AUTHFRDS-015 and the MQ error record's
-///   `MQ-APPL-CONDITION-CODE` (P-COACCT01-005, P-CODATE01-005).
+///   [app/app-authorization-ims-db2-mq/cpy/CIPAUDTY.cpy:L38], read in the same
+///   way from the request's `Alnum<2>` receiver `PA-RQ-POS-ENTRY-MODE`
+///   P-CCPAURQY-012 [app/app-authorization-ims-db2-mq/cpy/CCPAURQY.cpy:L30];
+///   also the Db2 `POS_ENTRY_MODE SMALLINT` P-AUTHFRDS-015 and the MQ error
+///   record's `MQ-APPL-CONDITION-CODE` (P-COACCT01-005, P-CODATE01-005).
 /// - `NumericCode<4>`: the reject reason `WS-VALIDATION-FAIL-REASON`
 ///   P-CBTRN02C-002 [app/cbl/CBTRN02C.cbl:L181].
 /// - `NumericCode<5>`: the MQ error record's `MQ-APPL-REASON-CODE`

@@ -198,9 +198,8 @@ export interface paths {
          *     `start_key` in `direction` (CTLI ENTER, F8 and F7).
          * @description COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,
          *     8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,
-         *     P-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,
-         *     V-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,
-         *     V-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,
+         *     P-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-040, V-COTRTLIC-001,
+         *     V-COTRTLIC-002, V-COTRTLIC-004 to V-COTRTLIC-010, V-COTRTLIC-024 to
          *     V-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response
          *     replaces the 3270 send of the `CTRTLIA` map, a mandated deviation.
          *
@@ -223,10 +222,12 @@ export interface paths {
          *     - 404 when no type passes the filters (V-COTRTLIC-002), a description
          *       filter holding a character outside ASCII included, which is searched as
          *       entered.
-         *     - 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,
-         *       V-COTRTLIC-026), with the no-records text when the filter count fails
-         *       (V-COTRTLIC-028), and with `Unexpected error` when the database cannot
-         *       be reached.
+         *     - 500 with the Db2 text of the cursor step that failed when the read
+         *       fails: its `OPEN` (V-COTRTLIC-024, V-COTRTLIC-026), a `FETCH`
+         *       (V-COTRTLIC-006, V-COTRTLIC-007, V-COTRTLIC-010) or its `CLOSE`
+         *       (V-COTRTLIC-025, V-COTRTLIC-027); with the no-records text when the
+         *       filter count fails (V-COTRTLIC-028); and with `Unexpected error` when
+         *       the database cannot be reached.
          */
         get: operations["list_tran_types"];
         put?: never;
@@ -308,26 +309,38 @@ export interface paths {
         put: operations["update_tran_type"];
         post?: never;
         /**
-         * Deletes the listed type `{id}`: the `D` selector of the `COTRTLI` list,
-         *     confirmed with F10 (CTLI).
-         * @description COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007, P-COTRTLIC-008,
-         *     V-COTRTLIC-021 to V-COTRTLIC-023
+         * Deletes the type `{id}`: without `origin` the `D` selector of the
+         *     `COTRTLI` list, confirmed with F10 (CTLI); with `origin=form` the F4 of
+         *     the `COTRTUP` maintenance screen, confirmed with F4 (CTTU).
+         * @description Without `origin`: COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007,
+         *     P-COTRTLIC-008, V-COTRTLIC-021 to V-COTRTLIC-023. A deleted type is
+         *     committed and answered with `HIGHLIGHTED row deleted.Hit Enter to
+         *     continue` and no type.
          *
-         *     The confirmation is the dialog of the SPA. A deleted type is committed
-         *     and answered with `HIGHLIGHTED row deleted.Hit Enter to continue` and no
-         *     type.
+         *     With `origin=form`: COTRTUPC 1210-EDIT-TRANTYPE, 9000-READ-TRANTYPE,
+         *     9800-DELETE-PROCESSING — P-COTRTUPC-004, P-COTRTUPC-005, V-COTRTUPC-022
+         *     to V-COTRTUPC-028 (E-23). The key is edited and the type read before the
+         *     delete; a deleted type is committed and answered with `Delete
+         *     successful.` and the type as read, which the delete-done screen shows
+         *     (P-COTRTUPC-023).
+         *
+         *     Either confirmation is the dialog of the SPA.
          *
          *     # Errors
          *
-         *     - 400 for a key longer than the type code `X(2)` or holding a character
-         *       outside ASCII, or a malformed path.
+         *     - 400 for a key longer than the type code `X(2)`, a malformed path or
+         *       query, and, without `origin`, a key holding a character outside ASCII;
+         *       with `origin=form`, 400 for the key edits on `TRTYPCD`
+         *       (V-COTRTUPC-022 to V-COTRTUPC-024).
          *     - 401 without a valid token; 403 for a token that is not an admin's.
-         *     - 404 with the delete-failed Db2 text when no type has the code
-         *       (V-COTRTLIC-022).
-         *     - 409 with the child-records Db2 text when categories still reference the
-         *       type (SQLCODE -532, V-COTRTLIC-021); the type stays.
-         *     - 500 with the delete-failed Db2 text on any other failure
-         *       (V-COTRTLIC-023).
+         *     - 404 when no type has the code: with the delete-failed Db2 text without
+         *       `origin` (V-COTRTLIC-022), and with the not-found text on `TRTYPCD`
+         *       with `origin=form` (V-COTRTUPC-025).
+         *     - 409 with the child-records Db2 text of the program when categories
+         *       still reference the type (SQLCODE -532, V-COTRTLIC-021,
+         *       V-COTRTUPC-027); the type stays.
+         *     - 500 with the program's Db2 text when the read (`origin=form`,
+         *       V-COTRTUPC-026) or the delete fails (V-COTRTLIC-023, V-COTRTUPC-028).
          */
         delete: operations["delete_tran_type"];
         options?: never;
@@ -771,7 +784,9 @@ export interface paths {
          *     `2210-EDIT-ACCOUNT` and `2220-EDIT-CARD` edit them, an absent account
          *     being a blank one, and the card is then read by its number alone (E-55).
          *     The response carries the card's version token, which a following
-         *     `PUT /cards/{id}` sends back, and never the verification code.
+         *     `PUT /cards/{id}` sends back, never the verification code, and in
+         *     `message` the information line of a found card, '   Displaying requested
+         *     details' with its three leading spaces (P-COCRDSLC-010).
          *
          *     # Errors
          *
@@ -1607,6 +1622,23 @@ export interface components {
          * @enum {string}
          */
         CardViewField: "ACCTSID" | "CARDSID";
+        /**
+         * @description The answer to a successful `GET /cards/{id}`: the card as `COCRDSL` shows
+         *     it, with its token, and the information line `1200-SETUP-SCREEN-VARS`
+         *     moves to `INFOMSGO` for a found card.
+         *
+         *     The card's fields stay the top-level keys `CardResponse` names, so the
+         *     keys and token a `PUT /cards/{id}` repeats read as from the card itself;
+         *     `message` stands beside them.
+         */
+        CardViewResponse: components["schemas"]["CardResponse"] & {
+            /**
+             * @description `WS-INFO-MSG X(40)` once `9100-GETCARD-BYACCTCARD` sets
+             *     `FOUND-CARDS-FOR-ACCOUNT`: '   Displaying requested details', with
+             *     its three leading spaces (P-COCRDSLC-010).
+             */
+            message: string;
+        };
         /** @description The body of every error response: `{code, message, fields?}`. */
         ErrorBody: {
             /**
@@ -2337,8 +2369,10 @@ export interface components {
          *     The texts are the rules': `COTRTUPC` `Changes committed to database` or
          *     `No change detected with respect to values fetched.` (V-COTRTUPC-006),
          *     `COTRTLIC` `HIGHLIGHTED row was updated` or `No change detected with
-         *     respect to database values.` (V-COTRTLIC-012), and on a delete
-         *     `HIGHLIGHTED row deleted.Hit Enter to continue`, with no type.
+         *     respect to database values.` (V-COTRTLIC-012), on the `COTRTLIC` delete
+         *     `HIGHLIGHTED row deleted.Hit Enter to continue`, with no type, and on the
+         *     `COTRTUPC` delete `Delete successful.`, with the type as it was read
+         *     (P-COTRTUPC-004, P-COTRTUPC-023).
          *
          *     `info` is present only on `PUT` with `origin=list`. It is left out of every
          *     other answer rather than sent as `null`, so the schema declares it an
@@ -2352,7 +2386,7 @@ export interface components {
              *     sets once the inline update is stored (P-COTRTLIC-009). It comes with
              *     every `origin=list` update, beside the no-change `message` of a change
              *     of case alone (V-COTRTLIC-012). Absent on the `COTRTUPC` writes and on
-             *     the delete.
+             *     both deletes.
              */
             info?: string;
             /** @description The program's text, unchanged. */
@@ -2383,8 +2417,9 @@ export interface components {
             description?: string | null;
         };
         /**
-         * @description A BMS field of the `COTRTUP` map that a `POST /admin/transaction-types`
-         *     or `PUT /admin/transaction-types/{id}` error names, where
+         * @description A BMS field of the `COTRTUP` map that a `POST /admin/transaction-types`,
+         *     `PUT /admin/transaction-types/{id}` or
+         *     `DELETE /admin/transaction-types/{id}?origin=form` error names, where
          *     `3300-SETUP-SCREEN-ATTRS` places the cursor
          *     [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1303-1325].
          * @enum {string}
@@ -3337,7 +3372,13 @@ export interface operations {
     };
     delete_tran_type: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description `form` for the F4 delete of the maintenance screen (`COTRTUPC`);
+                 *     absent for the row delete of the type list (`COTRTLIC`).
+                 */
+                origin?: "form";
+            };
             header?: never;
             path: {
                 /** @description The type code, `TR_TYPE`: two ASCII characters */
@@ -3347,7 +3388,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The type was deleted; `message` is the COBOL text and `transaction_type` is null */
+            /** @description The type was deleted; `message` is the COBOL text, and `transaction_type` is null without `origin` and the deleted type with `origin=form` */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3356,7 +3397,7 @@ export interface operations {
                     "application/json": components["schemas"]["TranTypeMessageResponse"];
                 };
             };
-            /** @description The type code is longer than two characters or not ASCII */
+            /** @description The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form` */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3401,7 +3442,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description The Db2 master could not be updated */
+            /** @description The Db2 master could not be read or updated */
             500: {
                 headers: {
                     [name: string]: unknown;
@@ -4134,13 +4175,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The card with its version token */
+            /** @description The card with its version token and the COBOL information text */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CardResponse"];
+                    "application/json": components["schemas"]["CardViewResponse"];
                 };
             };
             /** @description A key the COBOL edits reject */

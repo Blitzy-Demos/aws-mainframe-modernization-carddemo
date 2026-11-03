@@ -37,9 +37,11 @@
 //! P-CBACT04C-003, P-CBACT04C-174). [`InterestRun::finish`] reproduces that: it
 //! reports the unposted total and writes nothing.
 //!
-//! Every read or write that ends with a status other than 00 abends with
-//! `CEE3ABD` code 999 after the paragraph's displays; [`InterestAbend`] holds
-//! those displays for the job's stderr (exit 16, P-CBACT04C-188).
+//! Every open, read, write or close that ends with a status other than 00
+//! abends with `CEE3ABD` code 999 after the paragraph's displays;
+//! [`InterestAbend`] holds those displays for the job's stderr (exit 16,
+//! P-CBACT04C-188). The job performs the opens and closes of the files
+//! ([`InterestFile`]) and the `SYSTRAN(+1)` I/O around the rule.
 
 use std::error::Error;
 use std::fmt;
@@ -47,7 +49,11 @@ use std::fmt;
 use crate::clock::{Clock, db2_timestamp};
 use crate::entities::{CardXref, DisclosureGroupKey, NewTransaction, TranCatBalance};
 use crate::messages::{
-    ABENDING_PROGRAM, ACCOUNT_NOT_FOUND_CBACT04C, ERROR_RE_WRITING_ACCOUNT_FILE,
+    ABENDING_PROGRAM, ACCOUNT_NOT_FOUND_CBACT04C, ERROR_CLOSING_ACCOUNT_FILE,
+    ERROR_CLOSING_CROSS_REF_FILE, ERROR_CLOSING_DISCLOSURE_GROUP_FILE,
+    ERROR_CLOSING_TRANSACTION_BALANCE_FILE, ERROR_OPENING_ACCOUNT_MASTER_FILE,
+    ERROR_OPENING_CROSS_REF_FILE, ERROR_OPENING_DALY_REJECTS_FILE,
+    ERROR_OPENING_TRANSACTION_CATEGORY_BALANCE, ERROR_RE_WRITING_ACCOUNT_FILE,
     ERROR_READING_ACCOUNT_FILE, ERROR_READING_DEFAULT_DISCLOSURE_GROUP,
     ERROR_READING_DISCLOSURE_GROUP_FILE, ERROR_READING_TRANSACTION_CATEGORY_FILE,
     ERROR_READING_XREF_FILE, ERROR_WRITING_TRANSACTION_RECORD, file_status_message,
@@ -105,6 +111,63 @@ fn vsam_status(cause: &PortError) -> [u8; 2] {
     }
 }
 
+/// CBACT04C 0000-TCATBALF-OPEN to 0300-ACCTFILE-OPEN and 9000-TCATBALF-CLOSE
+/// to 9300-ACCTFILE-CLOSE — P-CBACT04C-177 to P-CBACT04C-180, P-CBACT04C-183
+/// to P-CBACT04C-186: a KSDS file `CBACT04C` opens before its main loop and
+/// closes after it, in the order of [`InterestFile::ALL`]
+/// [app/cbl/CBACT04C.cbl:L182-185] [app/cbl/CBACT04C.cbl:L224-227].
+/// `batch intcalc` performs each open and
+/// close and reports a failed one with [`InterestAbend::FileOpen`] or
+/// [`InterestAbend::FileClose`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterestFile {
+    /// `TCATBAL-FILE`, DD `TCATBALF`: the category balances.
+    Tcatbal,
+    /// `XREF-FILE`, DD `XREFFILE`: the card cross-reference.
+    Xref,
+    /// `DISCGRP-FILE`, DD `DISCGRP`: the disclosure groups.
+    DisclosureGroup,
+    /// `ACCOUNT-FILE`, DD `ACCTFILE`: the accounts.
+    Account,
+}
+
+impl InterestFile {
+    /// The four files in the order `CBACT04C` opens them (`0000-TCATBALF-OPEN`
+    /// to `0300-ACCTFILE-OPEN`) and closes them (`9000-TCATBALF-CLOSE` to
+    /// `9300-ACCTFILE-CLOSE`); `TRANSACT-FILE`, opened and closed last, is the
+    /// job's `SYSTRAN(+1)`.
+    pub const ALL: [Self; 4] = [
+        Self::Tcatbal,
+        Self::Xref,
+        Self::DisclosureGroup,
+        Self::Account,
+    ];
+
+    /// CBACT04C 0000-TCATBALF-OPEN to 0300-ACCTFILE-OPEN — P-CBACT04C-177 to
+    /// P-CBACT04C-180: the text the failed open displays. The disclosure group
+    /// open displays the daily rejects text, as written (E-72,
+    /// P-CBACT04C-194) [app/cbl/CBACT04C.cbl:L281].
+    const fn open_text(self) -> &'static str {
+        match self {
+            Self::Tcatbal => ERROR_OPENING_TRANSACTION_CATEGORY_BALANCE,
+            Self::Xref => ERROR_OPENING_CROSS_REF_FILE,
+            Self::DisclosureGroup => ERROR_OPENING_DALY_REJECTS_FILE,
+            Self::Account => ERROR_OPENING_ACCOUNT_MASTER_FILE,
+        }
+    }
+
+    /// CBACT04C 9000-TCATBALF-CLOSE to 9300-ACCTFILE-CLOSE — P-CBACT04C-183 to
+    /// P-CBACT04C-186: the text the failed close displays.
+    const fn close_text(self) -> &'static str {
+        match self {
+            Self::Tcatbal => ERROR_CLOSING_TRANSACTION_BALANCE_FILE,
+            Self::Xref => ERROR_CLOSING_CROSS_REF_FILE,
+            Self::DisclosureGroup => ERROR_CLOSING_DISCLOSURE_GROUP_FILE,
+            Self::Account => ERROR_CLOSING_ACCOUNT_FILE,
+        }
+    }
+}
+
 /// A `CBACT04C` abend: an I/O statement ended with a status other than 00, and
 /// the program displays its error text, `FILE STATUS IS: NNNN` with the status
 /// and `ABENDING PROGRAM`, then calls `CEE3ABD` with code [`Self::ABCODE`]
@@ -117,6 +180,27 @@ fn vsam_status(cause: &PortError) -> [u8; 2] {
 /// belongs in logs only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterestAbend {
+    /// CBACT04C 0000-TCATBALF-OPEN, 0100-XREFFILE-OPEN, 0200-DISCGRP-OPEN and
+    /// 0300-ACCTFILE-OPEN — P-CBACT04C-177 to P-CBACT04C-180, P-CBACT04C-194:
+    /// the `OPEN` of `file` ended with a status other than 00, before any
+    /// record is read. The job performs the open and reports it with this
+    /// variant.
+    FileOpen {
+        /// The file whose open failed.
+        file: InterestFile,
+        /// Why the open failed.
+        cause: PortError,
+    },
+    /// CBACT04C 9000-TCATBALF-CLOSE, 9100-XREFFILE-CLOSE, 9200-DISCGRP-CLOSE
+    /// and 9300-ACCTFILE-CLOSE — P-CBACT04C-183 to P-CBACT04C-186: the `CLOSE`
+    /// of `file` after the main loop ended with a status other than 00. The
+    /// job performs the close and reports it with this variant.
+    FileClose {
+        /// The file whose close failed.
+        file: InterestFile,
+        /// Why the close failed.
+        cause: PortError,
+    },
     /// CBACT04C 1000-TCATBALF-GET-NEXT — P-CBACT04C-182: the sequential read
     /// of `TCATBALF` failed. The job performs this read and reports it with
     /// this variant.
@@ -186,7 +270,9 @@ impl InterestAbend {
     #[must_use]
     pub fn file_status(&self) -> [u8; 2] {
         match self {
-            Self::TcatbalRead { cause }
+            Self::FileOpen { cause, .. }
+            | Self::FileClose { cause, .. }
+            | Self::TcatbalRead { cause }
             | Self::AccountRead { cause, .. }
             | Self::XrefRead { cause, .. }
             | Self::DisclosureGroupRead { cause, .. }
@@ -200,6 +286,10 @@ impl InterestAbend {
     /// of a missing account or cross-reference, the paragraph's error text,
     /// `FILE STATUS IS: NNNN` with the status, and `ABENDING PROGRAM`
     /// [app/cbl/CBACT04C.cbl:L372-413] [app/cbl/CBACT04C.cbl:L628-648].
+    ///
+    /// `0100-XREFFILE-OPEN` displays `XREFFILE-STATUS` right after its text,
+    /// in the same `DISPLAY` (P-CBACT04C-178) [app/cbl/CBACT04C.cbl:L263], so
+    /// that line ends with the two status bytes.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let invalid_key = match self {
@@ -213,11 +303,20 @@ impl InterestAbend {
             } => Some(format!("{ACCOUNT_NOT_FOUND_CBACT04C}{acct_id}")),
             _ => None,
         };
+        let status = self.file_status();
+        let mut error_line = self.error_text().to_owned();
+        if let Self::FileOpen {
+            file: InterestFile::Xref,
+            ..
+        } = self
+        {
+            error_line.extend(status.iter().copied().map(char::from));
+        }
         invalid_key
             .into_iter()
             .chain([
-                self.error_text().to_owned(),
-                file_status_message(self.file_status()),
+                error_line,
+                file_status_message(status),
                 ABENDING_PROGRAM.to_owned(),
             ])
             .collect()
@@ -226,6 +325,8 @@ impl InterestAbend {
     /// The error text the failing paragraph displays before its status.
     fn error_text(&self) -> &'static str {
         match self {
+            Self::FileOpen { file, .. } => file.open_text(),
+            Self::FileClose { file, .. } => file.close_text(),
             Self::TcatbalRead { .. } => ERROR_READING_TRANSACTION_CATEGORY_FILE,
             Self::AccountRead { .. } => ERROR_READING_ACCOUNT_FILE,
             Self::XrefRead { .. } => ERROR_READING_XREF_FILE,
@@ -248,7 +349,9 @@ impl fmt::Display for InterestAbend {
 impl Error for InterestAbend {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::TcatbalRead { cause }
+            Self::FileOpen { cause, .. }
+            | Self::FileClose { cause, .. }
+            | Self::TcatbalRead { cause }
             | Self::AccountRead { cause, .. }
             | Self::XrefRead { cause, .. }
             | Self::DisclosureGroupRead { cause, .. }
@@ -625,17 +728,23 @@ mod tests {
 
     use chrono::NaiveDate;
 
-    use super::{InterestAbend, InterestRun, InterestSummary, UnpostedInterest, monthly_interest};
+    use super::{
+        InterestAbend, InterestFile, InterestRun, InterestSummary, UnpostedInterest,
+        monthly_interest,
+    };
     use crate::clock::FixedClock;
     use crate::entities::{
         Account, CardXref, DisclosureGroup, DisclosureGroupKey, NewTransaction, TranCatBalance,
         TranCatBalanceKey,
     };
     use crate::messages::{
-        ABENDING_PROGRAM, ERROR_RE_WRITING_ACCOUNT_FILE, ERROR_READING_ACCOUNT_FILE,
-        ERROR_READING_DEFAULT_DISCLOSURE_GROUP, ERROR_READING_DISCLOSURE_GROUP_FILE,
-        ERROR_READING_TRANSACTION_CATEGORY_FILE, ERROR_READING_XREF_FILE,
-        ERROR_WRITING_TRANSACTION_RECORD,
+        ABENDING_PROGRAM, ERROR_CLOSING_ACCOUNT_FILE, ERROR_CLOSING_CROSS_REF_FILE,
+        ERROR_CLOSING_DISCLOSURE_GROUP_FILE, ERROR_CLOSING_TRANSACTION_BALANCE_FILE,
+        ERROR_OPENING_ACCOUNT_MASTER_FILE, ERROR_OPENING_DALY_REJECTS_FILE,
+        ERROR_OPENING_TRANSACTION_CATEGORY_BALANCE, ERROR_RE_WRITING_ACCOUNT_FILE,
+        ERROR_READING_ACCOUNT_FILE, ERROR_READING_DEFAULT_DISCLOSURE_GROUP,
+        ERROR_READING_DISCLOSURE_GROUP_FILE, ERROR_READING_TRANSACTION_CATEGORY_FILE,
+        ERROR_READING_XREF_FILE, ERROR_WRITING_TRANSACTION_RECORD,
     };
     use crate::numeric::{
         AccountGroupId, AccountId, Alnum, CardNumber, CustomerId, InterestRate, Money,
@@ -1147,13 +1256,23 @@ mod tests {
 
     #[test]
     fn job_side_abends_render_their_paragraph_texts() {
+        let unavailable = || PortError::Unavailable("relation does not exist".to_owned());
+        let open = |file| InterestAbend::FileOpen {
+            file,
+            cause: unavailable(),
+        };
+        let close = |file| InterestAbend::FileClose {
+            file,
+            cause: unavailable(),
+        };
+        let status_30 = "FILE STATUS IS: NNNN0030";
         let cases = [
             (
                 InterestAbend::TcatbalRead {
                     cause: PortError::Unavailable("timeout".to_owned()),
                 },
                 ERROR_READING_TRANSACTION_CATEGORY_FILE,
-                "FILE STATUS IS: NNNN0030",
+                status_30,
                 true,
             ),
             (
@@ -1161,6 +1280,57 @@ mod tests {
                 ERROR_WRITING_TRANSACTION_RECORD,
                 "FILE STATUS IS: NNNN0034",
                 false,
+            ),
+            // The opens, in their COBOL order: the cross-reference text carries
+            // XREFFILE-STATUS, and the disclosure group text is the daily
+            // rejects one (E-72).
+            (
+                open(InterestFile::Tcatbal),
+                ERROR_OPENING_TRANSACTION_CATEGORY_BALANCE,
+                status_30,
+                true,
+            ),
+            (
+                open(InterestFile::Xref),
+                "ERROR OPENING CROSS REF FILE30",
+                status_30,
+                true,
+            ),
+            (
+                open(InterestFile::DisclosureGroup),
+                ERROR_OPENING_DALY_REJECTS_FILE,
+                status_30,
+                true,
+            ),
+            (
+                open(InterestFile::Account),
+                ERROR_OPENING_ACCOUNT_MASTER_FILE,
+                status_30,
+                true,
+            ),
+            (
+                close(InterestFile::Tcatbal),
+                ERROR_CLOSING_TRANSACTION_BALANCE_FILE,
+                status_30,
+                true,
+            ),
+            (
+                close(InterestFile::Xref),
+                ERROR_CLOSING_CROSS_REF_FILE,
+                status_30,
+                true,
+            ),
+            (
+                close(InterestFile::DisclosureGroup),
+                ERROR_CLOSING_DISCLOSURE_GROUP_FILE,
+                status_30,
+                true,
+            ),
+            (
+                close(InterestFile::Account),
+                ERROR_CLOSING_ACCOUNT_FILE,
+                status_30,
+                true,
             ),
         ];
         for (abend, text, status, has_source) in cases {

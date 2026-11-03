@@ -124,8 +124,9 @@ const ALL_SPACES = /^ *$/;
 
 /**
  * ASCII text, the OpenAPI `pattern` of the `{id}` path segment, which the
- * server checks for `origin=list` and `DELETE`: the issue keeps zod's
- * default regex text, as the server's answer has no message.
+ * server checks for `PUT` with `origin=list` and `DELETE` without `origin`:
+ * the issue keeps zod's default regex text, as the server's answer has no
+ * message.
  */
 const ASCII_TEXT = /^[\x00-\x7F]*$/;
 

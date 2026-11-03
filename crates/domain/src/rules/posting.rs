@@ -39,7 +39,9 @@ use crate::entities::{
 };
 use crate::messages::{
     ABENDING_PROGRAM, ACCOUNT_RECORD_NOT_FOUND, ERROR_CLOSING_DAILY_REJECTS_FILE,
-    ERROR_OPENING_DALY_REJECTS_FILE, ERROR_OPENING_DALYTRAN, ERROR_OPENING_TRANSACTION_FILE,
+    ERROR_OPENING_ACCOUNT_MASTER_FILE, ERROR_OPENING_CROSS_REF_FILE,
+    ERROR_OPENING_DALY_REJECTS_FILE, ERROR_OPENING_DALYTRAN,
+    ERROR_OPENING_TRANSACTION_BALANCE_FILE, ERROR_OPENING_TRANSACTION_FILE,
     ERROR_READING_DALYTRAN_FILE, ERROR_READING_TRANSACTION_BALANCE_FILE,
     ERROR_REWRITING_TRANSACTION_BALANCE_FILE, ERROR_WRITING_TO_REJECTS_FILE,
     ERROR_WRITING_TO_TRANSACTION_FILE, ERROR_WRITING_TRANSACTION_BALANCE_FILE,
@@ -115,7 +117,10 @@ const STATUS_XREF_CLOSED: [u8; 2] = *b"00";
 
 const DALYTRAN_OPEN: &str = "0000-DALYTRAN-OPEN";
 const TRANFILE_OPEN: &str = "0100-TRANFILE-OPEN";
+const XREFFILE_OPEN: &str = "0200-XREFFILE-OPEN";
 const DALYREJS_OPEN: &str = "0300-DALYREJS-OPEN";
+const ACCTFILE_OPEN: &str = "0400-ACCTFILE-OPEN";
+const TCATBALF_OPEN: &str = "0500-TCATBALF-OPEN";
 const DALYTRAN_GET_NEXT: &str = "1000-DALYTRAN-GET-NEXT";
 const LOOKUP_XREF: &str = "1500-A-LOOKUP-XREF";
 const LOOKUP_ACCT: &str = "1500-B-LOOKUP-ACCT";
@@ -197,8 +202,9 @@ impl PostingCounts {
 ///
 /// The job-level open, read and write errors of `DALYTRAN` and `DALYREJS`
 /// carry the status the batch adapter derives from the operating-system
-/// error, because the COBOL performs `9910-DISPLAY-IO-STATUS` on each of
-/// those paths. [`PostingAbend::dalyrejs_close`] carries the `00` of
+/// error, and the failed opens of `TRANSACT`, `XREFFILE`, `ACCTFILE` and
+/// `TCATBALF` the status it derives from the store failure, because the COBOL
+/// performs `9910-DISPLAY-IO-STATUS` on each of those paths. [`PostingAbend::dalyrejs_close`] carries the `00` of
 /// `XREFFILE-STATUS`, the field that paragraph displays. A store failure that
 /// has no VSAM counterpart (a lost connection, a lock timeout) carries none,
 /// and no status is made up for it, so its abend shows the text and
@@ -213,8 +219,8 @@ pub struct PostingAbend {
     /// for a missing key, `22` for a duplicate key, `37` for the non-empty
     /// transaction master, `00` for `9300-DALYREJS-CLOSE`, and for any other
     /// job-level file error the status the batch adapter derives from the
-    /// operating-system error. `None` for a store failure with no VSAM
-    /// counterpart.
+    /// operating-system error or the failed open. `None` for a store failure
+    /// with no VSAM counterpart.
     pub file_status: Option<[u8; 2]>,
     /// The port failure behind the abend, for the job's log event. Its text is
     /// adapter detail and is never part of the displayed lines.
@@ -244,6 +250,31 @@ impl PostingAbend {
         )
     }
 
+    /// CBTRN02C 0100-TRANFILE-OPEN — P-CBTRN02C-004: the transaction master
+    /// cannot be opened for another reason than the records it holds
+    /// [app/cbl/CBTRN02C.cbl:L254-270]; the paragraph displays
+    /// `TRANFILE-STATUS`, here `file_status`.
+    #[must_use]
+    pub fn tranfile_open(file_status: [u8; 2]) -> Self {
+        Self::job_level(
+            TRANFILE_OPEN,
+            ERROR_OPENING_TRANSACTION_FILE,
+            Some(file_status),
+        )
+    }
+
+    /// CBTRN02C 0200-XREFFILE-OPEN — P-CBTRN02C-222: the cross-reference
+    /// cannot be opened [app/cbl/CBTRN02C.cbl:L273-289]; the paragraph
+    /// displays `XREFFILE-STATUS`, here `file_status`.
+    #[must_use]
+    pub fn xreffile_open(file_status: [u8; 2]) -> Self {
+        Self::job_level(
+            XREFFILE_OPEN,
+            ERROR_OPENING_CROSS_REF_FILE,
+            Some(file_status),
+        )
+    }
+
     /// CBTRN02C 0300-DALYREJS-OPEN — P-CBTRN02C-223: the new `DALYREJS`
     /// generation cannot be opened [app/cbl/CBTRN02C.cbl:L291-307]; the
     /// paragraph displays `DALYREJS-STATUS`, here `file_status`.
@@ -252,6 +283,30 @@ impl PostingAbend {
         Self::job_level(
             DALYREJS_OPEN,
             ERROR_OPENING_DALY_REJECTS_FILE,
+            Some(file_status),
+        )
+    }
+
+    /// CBTRN02C 0400-ACCTFILE-OPEN — P-CBTRN02C-224: the account master cannot
+    /// be opened [app/cbl/CBTRN02C.cbl:L309-325]; the paragraph displays
+    /// `ACCTFILE-STATUS`, here `file_status`.
+    #[must_use]
+    pub fn acctfile_open(file_status: [u8; 2]) -> Self {
+        Self::job_level(
+            ACCTFILE_OPEN,
+            ERROR_OPENING_ACCOUNT_MASTER_FILE,
+            Some(file_status),
+        )
+    }
+
+    /// CBTRN02C 0500-TCATBALF-OPEN — P-CBTRN02C-225: the category balances
+    /// cannot be opened [app/cbl/CBTRN02C.cbl:L327-343]; the paragraph
+    /// displays `TCATBALF-STATUS`, here `file_status`.
+    #[must_use]
+    pub fn tcatbalf_open(file_status: [u8; 2]) -> Self {
+        Self::job_level(
+            TCATBALF_OPEN,
+            ERROR_OPENING_TRANSACTION_BALANCE_FILE,
             Some(file_status),
         )
     }
@@ -641,7 +696,9 @@ mod tests {
     };
     use crate::messages::{
         ABENDING_PROGRAM, ACCOUNT_RECORD_NOT_FOUND, ERROR_CLOSING_DAILY_REJECTS_FILE,
-        ERROR_OPENING_DALY_REJECTS_FILE, ERROR_OPENING_DALYTRAN, ERROR_OPENING_TRANSACTION_FILE,
+        ERROR_OPENING_ACCOUNT_MASTER_FILE, ERROR_OPENING_CROSS_REF_FILE,
+        ERROR_OPENING_DALY_REJECTS_FILE, ERROR_OPENING_DALYTRAN,
+        ERROR_OPENING_TRANSACTION_BALANCE_FILE, ERROR_OPENING_TRANSACTION_FILE,
         ERROR_READING_DALYTRAN_FILE, ERROR_READING_TRANSACTION_BALANCE_FILE,
         ERROR_REWRITING_TRANSACTION_BALANCE_FILE, ERROR_WRITING_TO_REJECTS_FILE,
         ERROR_WRITING_TO_TRANSACTION_FILE, ERROR_WRITING_TRANSACTION_BALANCE_FILE,
@@ -1363,11 +1420,11 @@ mod tests {
         assert_eq!(PostingCounts::default().return_code(), 0);
     }
 
-    /// P-CBTRN02C-005, P-CBTRN02C-007, P-CBTRN02C-012, P-CBTRN02C-020,
-    /// P-CBTRN02C-021, P-CBTRN02C-221, P-CBTRN02C-223: the job-level abends
-    /// display their text, the status line of the status they carry, then
-    /// `ABENDING PROGRAM`; `9300-DALYREJS-CLOSE` carries the `00` of
-    /// `XREFFILE-STATUS`.
+    /// P-CBTRN02C-004, P-CBTRN02C-005, P-CBTRN02C-007, P-CBTRN02C-012,
+    /// P-CBTRN02C-020, P-CBTRN02C-021, P-CBTRN02C-221 to P-CBTRN02C-225: the
+    /// job-level abends display their text, the status line of the status
+    /// they carry, then `ABENDING PROGRAM`; `9300-DALYREJS-CLOSE` carries the
+    /// `00` of `XREFFILE-STATUS`.
     #[test]
     fn job_level_abends_display_their_lines_in_the_cobol_order() {
         let cases = [
@@ -1390,10 +1447,46 @@ mod tests {
                 ],
             ),
             (
+                PostingAbend::tranfile_open(*b"30"),
+                "0100-TRANFILE-OPEN",
+                vec![
+                    ERROR_OPENING_TRANSACTION_FILE,
+                    "FILE STATUS IS: NNNN0030",
+                    ABENDING_PROGRAM,
+                ],
+            ),
+            (
+                PostingAbend::xreffile_open(*b"30"),
+                "0200-XREFFILE-OPEN",
+                vec![
+                    ERROR_OPENING_CROSS_REF_FILE,
+                    "FILE STATUS IS: NNNN0030",
+                    ABENDING_PROGRAM,
+                ],
+            ),
+            (
                 PostingAbend::dalyrejs_open(*b"30"),
                 "0300-DALYREJS-OPEN",
                 vec![
                     ERROR_OPENING_DALY_REJECTS_FILE,
+                    "FILE STATUS IS: NNNN0030",
+                    ABENDING_PROGRAM,
+                ],
+            ),
+            (
+                PostingAbend::acctfile_open(*b"30"),
+                "0400-ACCTFILE-OPEN",
+                vec![
+                    ERROR_OPENING_ACCOUNT_MASTER_FILE,
+                    "FILE STATUS IS: NNNN0030",
+                    ABENDING_PROGRAM,
+                ],
+            ),
+            (
+                PostingAbend::tcatbalf_open(*b"30"),
+                "0500-TCATBALF-OPEN",
+                vec![
+                    ERROR_OPENING_TRANSACTION_BALANCE_FILE,
                     "FILE STATUS IS: NNNN0030",
                     ABENDING_PROGRAM,
                 ],

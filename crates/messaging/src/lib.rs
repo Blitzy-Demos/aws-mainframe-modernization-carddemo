@@ -58,11 +58,13 @@
 //! - The tasks get a bounded time to end, derived from the flows' own limits:
 //!   the longest delivery, CP00's, with every database call within its
 //!   30-second deadline and every publish within
-//!   [`connection::BROKER_TIMEOUT`], plus one broker timeout, 320 seconds in
-//!   all. One still running then is aborted and logged at ERROR, since the
-//!   CP00 writes it has not committed are lost.
-//! - The connection is closed, and the broker redelivers every request not yet
-//!   acknowledged or rejected, a case single-delivery parity excludes.
+//!   [`connection::BROKER_TIMEOUT`], plus the consumer's closing
+//!   `channel.close` and one broker timeout more, 330 seconds in all. One
+//!   still running then is aborted and logged at ERROR, since the CP00 writes
+//!   it has not committed are lost.
+//! - Each consumer channel still open is closed, then the connection, and the
+//!   broker redelivers every request not yet acknowledged or rejected, a case
+//!   single-delivery parity excludes.
 //!
 //! [`run`] is [`start`] then [`Running::wait`], as the `mq` binary uses it.
 //! The spawned tasks carry the caller's tracing dispatcher, so a subscriber
@@ -142,7 +144,7 @@ pub enum MessagingError {
     #[error("broker did not answer {operation} within {timeout:?}")]
     BrokerTimeout {
         /// The unanswered request: `connection handshake`, `channel.open`,
-        /// `confirm.select`, `basic.qos`, `basic.consume` or
+        /// `confirm.select`, `basic.qos`, `basic.consume`, `channel.close` or
         /// `connection.close`.
         operation: &'static str,
         /// How long the request was waited for.
@@ -151,8 +153,9 @@ pub enum MessagingError {
 }
 
 /// How long [`Running::shutdown`] waits for the consumers to end once their
-/// intake is stopped: the longest a delivery in flight can still need, plus
-/// one [`connection::BROKER_TIMEOUT`].
+/// intake is stopped: the longest a delivery in flight can still need, the
+/// consumer's closing `channel.close`, and one [`connection::BROKER_TIMEOUT`]
+/// more.
 ///
 /// A delivery can be anywhere in its handling when the intake stops, so the
 /// wait covers a whole delivery of the slowest flow, each database call and
@@ -160,16 +163,18 @@ pub enum MessagingError {
 /// post-acknowledgement unit of work (`flows::cp00::DELIVERY_BUDGET`, 310
 /// seconds), ahead of CDRA's 110 seconds and CDRD's 20. Each budget counts
 /// the calls its flow makes; settling an abandoned database call runs inside
-/// the next call's deadline, so the counts are complete. The broker timeout
-/// added covers the steps no limit bounds, the acknowledgement and the work
-/// between the calls, and the timers' lateness. The drain is therefore 320
-/// seconds, and a consumer still running at its end is one whose
-/// acknowledgement the broker held back longer than that allowance.
+/// the next call's deadline, so the counts are complete. A stopped consumer
+/// then closes its channel within one broker timeout ([`consumer::run_until`]).
+/// The broker timeout added last covers the steps no limit bounds, the
+/// acknowledgement and the work between the calls, and the timers' lateness.
+/// The drain is therefore 330 seconds, and a consumer still running at its
+/// end is one whose acknowledgement the broker held back longer than that
+/// allowance.
 const DRAIN_TIMEOUT: Duration = longer(
     flows::cp00::DELIVERY_BUDGET,
     longer(flows::cdra::DELIVERY_BUDGET, flows::cdrd::DELIVERY_BUDGET),
 )
-.saturating_add(connection::BROKER_TIMEOUT);
+.saturating_add(connection::BROKER_TIMEOUT.saturating_mul(2));
 
 /// The longer of two budgets.
 const fn longer(first: Duration, second: Duration) -> Duration {
@@ -192,11 +197,12 @@ struct ConsumerTask {
     stop: AbortHandle,
 }
 
-/// The started consumers: the broker connection and one task per flow.
+/// The started consumers: the broker connection, its consumer channels and one
+/// task per flow.
 ///
 /// [`Running::wait`] and [`Running::shutdown`] stop the consumers' intake, let
-/// each finish the delivery it is settling, and close the connection, waiting
-/// for the broker's reply. Dropping `Running` instead aborts the tasks at once,
+/// each finish the delivery it is settling, and close the channels and then the
+/// connection, waiting for the broker's replies. Dropping `Running` instead aborts the tasks at once,
 /// cancelling CP00's writes after an acknowledgement as well, and lapin then
 /// closes the connection without waiting for the broker.
 #[derive(Debug)]
@@ -204,6 +210,12 @@ struct ConsumerTask {
 pub struct Running {
     /// The connection every consumer channel is opened on.
     connection: Connection,
+    /// A handle on each consumer channel. Holding it keeps a consumer task's
+    /// end from dropping the channel's last handle, whose queued close lapin
+    /// refuses once the connection close has begun, failing that close
+    /// ([`connection::close_channel`]); [`Running::shutdown`] closes each one
+    /// first.
+    channels: Vec<Channel>,
     /// One task per flow, each running `consumer::run_until` until it fails
     /// or its intake is stopped.
     tasks: JoinSet<Result<(), MessagingError>>,
@@ -247,14 +259,16 @@ impl Running {
     /// Stops every consumer and closes the broker connection.
     ///
     /// Each consumer's intake is stopped first, so it ends after the delivery
-    /// it is settling, and the tasks get 320 seconds (`DRAIN_TIMEOUT`) to end:
-    /// a whole delivery of the slowest flow, CP00, with every database call
-    /// and publish within its limit, and one broker timeout more. The work in
-    /// flight ends in one of two ways:
+    /// it is settling and closes its channel, and the tasks get 330 seconds
+    /// (`DRAIN_TIMEOUT`) to end: a whole delivery of the slowest flow, CP00,
+    /// with every database call and publish within its limit, the channel
+    /// close, and one broker timeout more. The connection is closed only after
+    /// the tasks end, so no channel close is still pending when it begins. The
+    /// work in flight ends in one of two ways:
     ///
     /// - A request that is stopped before it is acknowledged or rejected,
     ///   because it was never handled or its settlement failed, stays
-    ///   unsettled, and the broker redelivers it after the connection closes.
+    ///   unsettled, and the broker redelivers it once its channel closes.
     ///   Redelivery after a lost connection is outside single-delivery parity.
     /// - The work a flow runs after acknowledging its request, CP00's
     ///   pending-authorization writes, cannot be redelivered, so it is waited
@@ -264,14 +278,16 @@ impl Running {
     ///   flows. That takes a step without a limit, the acknowledgement held
     ///   back by the broker, outlasting the broker timeout the drain adds.
     ///
-    /// The close waits for the broker's reply for at most
-    /// [`connection::BROKER_TIMEOUT`].
+    /// Then each consumer channel still open is closed, and the connection
+    /// after them ([`connection::close_channel`]); each close waits for the
+    /// broker's reply for at most [`connection::BROKER_TIMEOUT`]. A channel
+    /// close that fails is logged, and the connection close ends the channel.
     ///
     /// # Errors
     ///
     /// Returns [`MessagingError::Amqp`] when the connection is no longer open
-    /// or the broker refuses the close, and [`MessagingError::BrokerTimeout`]
-    /// when the broker does not confirm the close in time.
+    /// or the broker refuses its close, and [`MessagingError::BrokerTimeout`]
+    /// when the broker does not confirm the connection close in time.
     pub async fn shutdown(mut self) -> Result<(), MessagingError> {
         for consumer in &self.consumers {
             consumer.stop.abort();
@@ -295,6 +311,15 @@ impl Running {
             );
             self.tasks.abort_all();
             self.drain().await;
+        }
+        for channel in &self.channels {
+            if let Err(error) = connection::close_channel(channel).await {
+                tracing::warn!(
+                    channel = channel.id(),
+                    error = %error,
+                    "consumer channel close failed; the connection close ends it"
+                );
+            }
         }
         connection::close(&self.connection).await
     }
@@ -347,6 +372,11 @@ pub async fn start(
     // closes it.
     let [date_channel, acct_channel, pauth_channel] = open_channels(&connection).await?;
 
+    let channels = vec![
+        date_channel.clone(),
+        acct_channel.clone(),
+        pauth_channel.clone(),
+    ];
     let mut tasks = JoinSet::new();
     let consumers = vec![
         spawn_consumer(
@@ -370,6 +400,7 @@ pub async fn start(
     ];
     Ok(Running {
         connection,
+        channels,
         tasks,
         consumers,
     })
@@ -500,10 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn the_drain_outlasts_every_delivery_by_one_broker_timeout() {
+    fn the_drain_outlasts_every_delivery_and_its_channel_close_by_one_broker_timeout() {
         // CP00: 6 read-unit calls and 4 post-acknowledgement calls of 30 s, and
         // the reply's 10 s; CDRA: 3 calls of 30 s and 2 publishes of 10 s;
-        // CDRD: 2 publishes of 10 s.
+        // CDRD: 2 publishes of 10 s. Each consumer then closes its channel
+        // within one broker timeout.
         let budgets = [
             ("CP00 writes", flows::cp00::POST_ACK_BUDGET, 120),
             ("CP00", flows::cp00::DELIVERY_BUDGET, 310),
@@ -513,10 +545,10 @@ mod tests {
         for (flow, budget, seconds) in budgets {
             assert_eq!(budget, Duration::from_secs(seconds), "{flow}");
             assert!(
-                DRAIN_TIMEOUT >= budget + connection::BROKER_TIMEOUT,
-                "{flow}: {budget:?} and the allowance outlast the drain"
+                DRAIN_TIMEOUT >= budget + connection::BROKER_TIMEOUT * 2,
+                "{flow}: {budget:?}, the channel close and the allowance outlast the drain"
             );
         }
-        assert_eq!(DRAIN_TIMEOUT, Duration::from_secs(320));
+        assert_eq!(DRAIN_TIMEOUT, Duration::from_secs(330));
     }
 }

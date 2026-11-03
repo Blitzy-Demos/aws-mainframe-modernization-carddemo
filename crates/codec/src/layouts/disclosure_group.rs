@@ -35,9 +35,9 @@
 //! corpus is decoded as its own bytes, never reconciled. The `S9(04)V99`
 //! clause puts the implied point before the last two of the six digits, so
 //! the EBCDIC value is 15.00 (1 500 hundredths), the same rate as the `00150{`
-//! of record 1. Where P-CVTRA02Y-007 or E-05 give that EBCDIC rate as 1.50,
-//! the bytes do not spell it; the decoder follows the PIC clause ("PIC clauses
-//! are authoritative").
+//! of record 1. P-CVTRA02Y-007 records the two rates as 0.00 and 15.00
+//! (E-79, which corrects the EBCDIC 1.50 that E-05 states); the decoder reads
+//! each as its `S9(04)V99` bytes spell it ("PIC clauses are authoritative").
 
 use carddemo_domain::entities::{DisclosureGroup, DisclosureGroupKey};
 use carddemo_domain::numeric::{

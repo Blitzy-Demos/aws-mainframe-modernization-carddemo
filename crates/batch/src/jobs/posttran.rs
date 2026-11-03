@@ -9,15 +9,22 @@
 //! 1. `0000-DALYTRAN-OPEN`: the `--input` file, DD `DALYTRAN`, is opened.
 //! 2. `0100-TRANFILE-OPEN`: `OPEN OUTPUT` of the transaction master, which fails when the live
 //!    master already holds records (E-32).
-//! 3. `0300-DALYREJS-OPEN`: `DALYREJS(+1)` is allocated, DD `DALYREJS` with
+//! 3. `0200-XREFFILE-OPEN`: the cross-reference is opened.
+//! 4. `0300-DALYREJS-OPEN`: `DALYREJS(+1)` is allocated, DD `DALYREJS` with
 //!    `DISP=(NEW,CATLG,DELETE)` and `LRECL=430` [app/jcl/POSTTRAN.jcl:L34-38].
-//! 4. The main loop over the records in file order, numbered from 1 (P-CBTRN02C-006).
-//! 5. `9300-DALYREJS-CLOSE` catalogs `DALYREJS(+1)`, empty after a run without rejects, and the
+//! 5. `0400-ACCTFILE-OPEN` and `0500-TCATBALF-OPEN`: the accounts and the category balances are
+//!    opened.
+//! 6. The main loop over the records in file order, numbered from 1 (P-CBTRN02C-006).
+//! 7. `9300-DALYREJS-CLOSE` catalogs `DALYREJS(+1)`, empty after a run without rejects, and the
 //!    run counts and `RETURN-CODE` follow (P-CBTRN02C-020).
 //!
-//! `0200-XREFFILE-OPEN`, `0400-ACCTFILE-OPEN` and `0500-TCATBALF-OPEN` (P-CBTRN02C-222,
-//! P-CBTRN02C-224, P-CBTRN02C-225) have no step of their own: those files are tables reached
-//! through the pool `jobs::dispatch` opened, and a failure to open it is a setup failure.
+//! The transaction master, `XREFFILE`, `ACCTFILE` and `TCATBALF` are tables reached through the
+//! pool `jobs::dispatch` opened, and a failure to open the pool is a setup failure. Each `OPEN`
+//! is a check that its table answers: one statement on it, in a unit of work of its own that
+//! writes nothing (`open_tranfile`, `open_table`). A table that does not answer, for example
+//! one that is missing, is the open that ends with a status other than 00 (P-CBTRN02C-004,
+//! P-CBTRN02C-222, P-CBTRN02C-224, P-CBTRN02C-225): the paragraph's text, status 30
+//! ([`PERMANENT_ERROR_STATUS`]) and `ABEND 999`, before any record is read.
 //!
 //! The file work of these paragraphs runs on Tokio's blocking pool, inside the job span, in the
 //! order above: the open and the whole-file read and decode of `DALYTRAN`, and the allocation,
@@ -56,10 +63,11 @@
 //!
 //! An open, read or write failure of `DALYTRAN` or `DALYREJS(+1)` displays its
 //! `9910-DISPLAY-IO-STATUS` line with the status the job derives from the operating-system error:
-//! 35 for a missing `--input` file, else 30. When a held allocation lock refuses `DALYREJS(+1)`,
-//! one line naming the lock file comes before the `DISPLAY` lines (`open_rejects`). A failed
-//! catalog of `DALYREJS(+1)` displays status 00, whatever the operating-system error: the
-//! `XREFFILE-STATUS` that `9300-DALYREJS-CLOSE` shows (`close_rejects`).
+//! 35 for a missing `--input` file, else 30. A failed open of a table displays 30. When a held
+//! allocation lock refuses `DALYREJS(+1)`, one line naming the lock file comes before the
+//! `DISPLAY` lines (`open_rejects`). A failed catalog of `DALYREJS(+1)` displays status 00,
+//! whatever the operating-system error: the `XREFFILE-STATUS` that `9300-DALYREJS-CLOSE` shows
+//! (`close_rejects`).
 
 use std::fmt;
 use std::fs::File;
@@ -75,7 +83,9 @@ use carddemo_domain::messages::{
     ACCOUNT_RECORD_NOT_FOUND, transactions_processed_message, transactions_rejected_message,
 };
 use carddemo_domain::numeric::{AccountId, Alnum, CardNumber, NumericCode};
-use carddemo_domain::ports::{AccountReader, PortResult, TransactionReader, XrefReader};
+use carddemo_domain::ports::{
+    AccountReader, PortError, PortResult, TranCatBalanceStore, TransactionReader, XrefReader,
+};
 use carddemo_domain::rewards::{AccrualInput, RewardEngine, RewardError};
 use carddemo_domain::rules::posting::{self, PostingAbend, PostingCounts, Validation};
 use carddemo_persistence::{Db, UnitOfWork};
@@ -97,8 +107,16 @@ const MISSING_FILE_STATUS: [u8; 2] = *b"35";
 /// The `DALYTRAN-STATUS` or `DALYREJS-STATUS` shown for every other file-system failure of
 /// `DALYTRAN` or `DALYREJS(+1)`: 30, a permanent error with no further information. A
 /// file-system error has no QSAM status of its own; `intcalc` and `tranrept` show their
-/// generation-file failures with the same status.
+/// generation-file failures with the same status. A table that does not answer its open shows
+/// it too: a store failure has no VSAM status of its own either.
 const PERMANENT_ERROR_STATUS: [u8; 2] = *b"30";
+
+/// The account key the open check of `ACCTFILE` reads (`open_table`): 0, an `ACCT-ID` no
+/// fixture account holds. A record and status 23 both show that the table answers.
+const CHECK_ACCOUNT: AccountId = match AccountId::new(0) {
+    Ok(id) => id,
+    Err(_) => panic!("0 fits the eleven digits of ACCT-ID"),
+};
 
 /// Runs POSTTRAN `STEP15` over the `--input` file and returns how it ended (see the module
 /// documentation).
@@ -119,7 +137,14 @@ async fn post_daily_file(
 ) -> Result<ExitStatus, ExitStatus> {
     let file = open_daily(input).await?;
     open_tranfile(db).await?;
+    open_table(db, Table::Xref).await?;
     let mut rejects = open_rejects(ctx).await?;
+    for table in [Table::Account, Table::Tcatbal] {
+        if let Err(status) = open_table(db, table).await {
+            rejects.discard_async().await;
+            return Err(status);
+        }
+    }
     let records = match read_daily(file, input).await {
         Ok(records) => records,
         Err(status) => {
@@ -164,22 +189,27 @@ async fn open_daily(input: &Path) -> Result<File, ExitStatus> {
     })
 }
 
-/// CBTRN02C 0100-TRANFILE-OPEN — P-CBTRN02C-005, P-CBTRN02C-219
+/// CBTRN02C 0100-TRANFILE-OPEN — P-CBTRN02C-004, P-CBTRN02C-005, P-CBTRN02C-219
 /// [app/cbl/CBTRN02C.cbl:L254-270]: `OPEN OUTPUT` of a transaction master defined without
 /// `REUSE` fails with status 37 when it already holds records. The run then abends before
 /// anything is read or written, so a `posttran` without a `tranbkp` before it changes nothing
 /// (E-32).
 ///
-/// The live master is probed with one read in a unit of work that writes nothing. A database
-/// failure there has no COBOL counterpart and is a setup failure.
+/// The live master is probed with one read in a unit of work that writes nothing. A probe that
+/// fails is an open that fails: the paragraph's abend, with status 30
+/// ([`PERMANENT_ERROR_STATUS`]); the store failure is logged. A unit of work that cannot begin
+/// or end is a setup failure.
 async fn open_tranfile(db: &Db) -> Result<(), ExitStatus> {
     const WHAT: &str = "live transaction master read failed";
     let mut uow = db.begin().await.map_err(|err| setup_failure(WHAT, err))?;
-    let highest = uow
-        .store()
-        .highest_transaction()
-        .await
-        .map_err(|err| setup_failure(WHAT, err))?;
+    let highest = match uow.store().highest_transaction().await {
+        Ok(highest) => highest,
+        // The unit of work wrote nothing; dropping it rolls it back.
+        Err(cause) => {
+            let abend = PostingAbend::tranfile_open(PERMANENT_ERROR_STATUS);
+            return Err(abend_status(&abend, None, Some(&cause)));
+        }
+    };
     uow.rollback()
         .await
         .map_err(|err| setup_failure(WHAT, err))?;
@@ -190,6 +220,75 @@ async fn open_tranfile(db: &Db) -> Result<(), ExitStatus> {
             None,
             None,
         )),
+    }
+}
+
+/// CBTRN02C 0200-XREFFILE-OPEN, 0400-ACCTFILE-OPEN and 0500-TCATBALF-OPEN — P-CBTRN02C-222,
+/// P-CBTRN02C-224, P-CBTRN02C-225: a KSDS of CBTRN02C, other than the transaction master, that
+/// is a table here.
+#[derive(Debug, Clone, Copy)]
+enum Table {
+    /// `XREF-FILE`, DD `XREFFILE`, opened `INPUT` by `0200-XREFFILE-OPEN`.
+    Xref,
+    /// `ACCOUNT-FILE`, DD `ACCTFILE`, opened `I-O` by `0400-ACCTFILE-OPEN`.
+    Account,
+    /// `TCATBAL-FILE`, DD `TCATBALF`, opened `I-O` by `0500-TCATBALF-OPEN`.
+    Tcatbal,
+}
+
+impl Table {
+    /// The abend of the table's failed open, with status 30 ([`PERMANENT_ERROR_STATUS`]).
+    fn open_abend(self) -> PostingAbend {
+        match self {
+            Self::Xref => PostingAbend::xreffile_open(PERMANENT_ERROR_STATUS),
+            Self::Account => PostingAbend::acctfile_open(PERMANENT_ERROR_STATUS),
+            Self::Tcatbal => PostingAbend::tcatbalf_open(PERMANENT_ERROR_STATUS),
+        }
+    }
+}
+
+/// CBTRN02C 0200-XREFFILE-OPEN, 0400-ACCTFILE-OPEN and 0500-TCATBALF-OPEN — P-CBTRN02C-222,
+/// P-CBTRN02C-224, P-CBTRN02C-225 [app/cbl/CBTRN02C.cbl:L273-343]: the `OPEN` of `table`, whose
+/// table must answer one statement in a unit of work of its own that writes nothing and is
+/// rolled back ([`table_answers`]). Nothing is read or written before the opens.
+///
+/// # Errors
+///
+/// - The paragraph's abend, with status 30, when the table does not answer; the store failure
+///   is logged.
+/// - A setup failure when the unit of work cannot begin or end.
+async fn open_table(db: &Db, table: Table) -> Result<(), ExitStatus> {
+    const WHAT: &str = "file open check failed";
+    let mut uow = db.begin().await.map_err(|err| setup_failure(WHAT, err))?;
+    match table_answers(&mut uow.store(), table).await {
+        Ok(()) => uow.rollback().await.map_err(|err| setup_failure(WHAT, err)),
+        // The unit of work wrote nothing; dropping it rolls it back.
+        Err(cause) => Err(abend_status(&table.open_abend(), None, Some(&cause))),
+    }
+}
+
+/// CBTRN02C 0200-XREFFILE-OPEN, 0400-ACCTFILE-OPEN and 0500-TCATBALF-OPEN — P-CBTRN02C-222,
+/// P-CBTRN02C-224, P-CBTRN02C-225: whether the table of `table` answers one statement of
+/// `store`: for `XREFFILE` and `TCATBALF` a sequential read of no records, for `ACCTFILE` a
+/// keyed read of
+/// [`CHECK_ACCOUNT`], where a record and status 23 both count as an answer. The outcome is
+/// discarded.
+///
+/// # Errors
+///
+/// The port failure of the statement, other than [`PortError::NotFound`].
+async fn table_answers<S>(store: &mut S, table: Table) -> PortResult<()>
+where
+    S: XrefReader + AccountReader + TranCatBalanceStore,
+{
+    let answered = match table {
+        Table::Xref => store.xrefs_after(None, 0).await.map(|_| ()),
+        Table::Account => store.read_account(CHECK_ACCOUNT).await.map(|_| ()),
+        Table::Tcatbal => store.tcatbals_after(None, 0).await.map(|_| ()),
+    };
+    match answered {
+        Ok(()) | Err(PortError::NotFound) => Ok(()),
+        Err(cause) => Err(cause),
     }
 }
 

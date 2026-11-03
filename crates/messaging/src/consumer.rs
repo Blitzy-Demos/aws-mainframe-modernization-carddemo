@@ -86,6 +86,7 @@ use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions, BasicRejectOptions,
 };
+use lapin::protocol::constants::REPLY_SUCCESS;
 use lapin::publisher_confirm::Confirmation;
 use lapin::types::{FieldTable, ShortString};
 use lapin::{BasicProperties, Channel};
@@ -457,8 +458,8 @@ pub async fn run<F: Flow>(channel: Channel, queue: &str, flow: F) -> Result<(), 
 /// aborted, the delivery being settled still finishes, its publishes, its
 /// acknowledgement or rejection and [`Flow::after_ack`] included, and no other
 /// delivery is handled: one the broker has already sent stays unsettled, and
-/// the broker redelivers it once the channel closes. Then `run_until` returns
-/// `Ok(())`.
+/// the broker redelivers it once the channel closes. Then `run_until` closes
+/// the channel and returns `Ok(())`.
 ///
 /// A request whose settlement fails is left unsettled; the broker redelivers it
 /// once the channel closes.
@@ -466,9 +467,10 @@ pub async fn run<F: Flow>(channel: Channel, queue: &str, flow: F) -> Result<(), 
 /// # Errors
 ///
 /// Returns [`MessagingError::Amqp`] when `basic.qos`, `basic.consume`, an
-/// acknowledgement, a rejection or the delivery stream fails,
-/// [`MessagingError::BrokerTimeout`] when the broker does not answer
-/// `basic.qos` or `basic.consume` within [`connection::BROKER_TIMEOUT`], and
+/// acknowledgement, a rejection, the delivery stream or the closing
+/// `channel.close` fails, [`MessagingError::BrokerTimeout`] when the broker
+/// does not answer `basic.qos`, `basic.consume` or that `channel.close` within
+/// [`connection::BROKER_TIMEOUT`], and
 /// [`MessagingError::ConsumerStopped`] when the broker ends the delivery stream
 /// before `stop` is signalled, for example because the queue was deleted.
 pub async fn run_until<F: Flow>(
@@ -528,11 +530,21 @@ impl<F: Flow> Session<F> {
             let delivery = item.map_err(MessagingError::Amqp)?;
             self.settle(delivery).await?;
         }
-        if deliveries.is_aborted() {
-            Ok(())
-        } else {
-            Err(MessagingError::ConsumerStopped { flow: F::NAME })
+        if !deliveries.is_aborted() {
+            return Err(MessagingError::ConsumerStopped { flow: F::NAME });
         }
+        // Closed here, while `deliveries` still holds the consumer, and not by
+        // dropping the handles: lapin runs a dropped channel's close in the
+        // background, and one that runs after `Running::shutdown` has begun the
+        // connection close fails and turns into a connection error, which fails
+        // that close. The closed channel cancels the consumer, so dropping
+        // `deliveries` afterwards sends nothing.
+        connection::bounded(
+            "channel.close",
+            connection::BROKER_TIMEOUT,
+            self.channel.close(REPLY_SUCCESS, "consumer stopped"),
+        )
+        .await
     }
 
     /// Handles one delivery inside its message span and settles it with the

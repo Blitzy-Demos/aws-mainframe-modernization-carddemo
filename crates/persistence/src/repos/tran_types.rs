@@ -104,13 +104,15 @@
 //! reported as [`PortError::Unavailable`]; this file never trims it.
 
 use std::borrow::Cow;
+use std::future::poll_fn;
 use std::iter;
+use std::task::{Context, Poll};
 
 use carddemo_domain::entities::{TranCategoryRecord, TranTypeMaster, TranTypeRecord};
 use carddemo_domain::numeric::{TranCategoryCode, TranTypeCode};
 use carddemo_domain::ports::{
-    Browse, Direction, PortError, PortResult, TranTypeFileReader, TranTypeFilter,
-    TranTypeMasterStore,
+    Browse, CursorError, CursorPhase, CursorResult, Direction, PortError, PortResult,
+    TranTypeFileReader, TranTypeFilter, TranTypeMasterStore,
 };
 
 use super::{alnum, expect_affected, limit_i64, tran_category_code, tran_type_code};
@@ -164,11 +166,47 @@ impl MasterRow {
 }
 
 /// The masters of a cursor's rows, in the order fetched.
-fn masters(rows: Vec<MasterRow>) -> PortResult<Vec<TranTypeMaster>> {
-    rows.into_iter()
-        .map(MasterRow::into_master)
-        .collect::<Result<_, _>>()
-        .map_err(PortError::from)
+///
+/// # Errors
+///
+/// A [`CursorPhase::Fetch`] failure at the first row that no
+/// [`TranTypeMaster`] can carry, with the masters of the rows before it: the
+/// `FETCH` into `DCLTRANSACTION-TYPE` of that row fails.
+fn masters(rows: Vec<MasterRow>) -> CursorResult<TranTypeMaster> {
+    let mut fetched = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row.into_master() {
+            Ok(master) => fetched.push(master),
+            Err(err) => {
+                return Err(CursorError {
+                    phase: CursorPhase::Fetch,
+                    fetched,
+                    error: PortError::from(err),
+                });
+            }
+        }
+    }
+    Ok(fetched)
+}
+
+/// The rows a cursor statement returned, in fetch order, and the error that
+/// ended it, when it failed.
+type Fetched = (Vec<MasterRow>, Option<sqlx::Error>);
+
+/// Receives the rows of one cursor statement through `next_row`, the poll of
+/// its row stream, one row at a time until the stream ends or fails, as the
+/// program's `FETCH` loop receives them: a failure keeps the rows before it.
+async fn fetch_each(
+    mut next_row: impl FnMut(&mut Context<'_>) -> Poll<Option<Result<MasterRow, sqlx::Error>>>,
+) -> Fetched {
+    let mut rows = Vec::new();
+    loop {
+        match poll_fn(&mut next_row).await {
+            Some(Ok(row)) => rows.push(row),
+            Some(Err(err)) => return (rows, Some(err)),
+            None => return (rows, None),
+        }
+    }
 }
 
 /// Whether `code` holds a NUL byte, and so names no stored type.
@@ -269,11 +307,21 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// row: the page is empty, without a query. A start key holding a NUL byte
     /// binds as the NUL-free key that bounds the cursor at exactly the same
     /// codes (`start_bound`).
+    ///
+    /// The rows are received one at a time, as the program's `FETCH` loop
+    /// receives them, so a failure names the cursor step it stopped
+    /// ([`CursorError::after`]) and keeps the rows fetched before it: before
+    /// any row, the `OPEN` (P-COTRTLIC-037, P-COTRTLIC-039), a savepoint that
+    /// cannot be opened included; after some rows, the `FETCH` of the
+    /// next one (P-COTRTLIC-031, P-COTRTLIC-032, P-COTRTLIC-034); after every
+    /// row asked for, as the statement completes, the `CLOSE`
+    /// (P-COTRTLIC-038, P-COTRTLIC-040). A row the master holds that no
+    /// [`TranTypeMaster`] can carry fails the `FETCH` of that row.
     async fn browse_tran_types(
         &mut self,
         browse: Browse<TranTypeCode>,
         filter: TranTypeFilter,
-    ) -> PortResult<Vec<TranTypeMaster>> {
+    ) -> CursorResult<TranTypeMaster> {
         if matches_nothing(&filter) {
             return Ok(Vec::new());
         }
@@ -283,11 +331,16 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
         let limit = limit_i64(browse.limit)?;
         let (type_code, start) = (type_code.as_deref(), start.as_deref());
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
-        let result = match browse.direction {
+        let (rows, failure) = match browse.direction {
             Direction::Forward => types_forward(&mut sp, type_code, start, pattern, limit).await,
             Direction::Backward => types_backward(&mut sp, type_code, start, pattern, limit).await,
         };
-        masters(settle(sp, result).await?)
+        let settled = settle(sp, failure.map_or(Ok(()), Err)).await;
+        let fetched = masters(rows)?;
+        match settled {
+            Ok(()) => Ok(fetched),
+            Err(error) => Err(CursorError::after(fetched, browse.limit, error)),
+        }
     }
 
     /// `COTRTLIC` `9100-CHECK-FILTERS` — P-COTRTLIC-036
@@ -417,66 +470,59 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
 /// `8000-READ-FORWARD` (P-COTRTLIC-030), with the filters of P-COTRTLIC-020.
 /// Up to `limit` types in ascending byte order of the code padded to its
 /// `X(2)` bytes, from `start` inclusive, or from the first type, read on
-/// `conn` by the static statement of the keys present. `type_code` and
-/// `start` are right-trimmed codes, `start` made NUL-free by `start_bound`;
-/// each bound pads `start` back with `rpad`.
+/// `conn` by the static statement of the keys present and received one row at
+/// a time ([`fetch_each`]). `type_code` and `start` are right-trimmed codes,
+/// `start` made NUL-free by `start_bound`; each bound pads `start` back with
+/// `rpad`.
 async fn types_forward(
     conn: &mut sqlx::PgConnection,
     type_code: Option<&str>,
     start: Option<&str>,
     pattern: Option<&str>,
     limit: i64,
-) -> Result<Vec<MasterRow>, sqlx::Error> {
-    match (type_code, start) {
-        (Some(code), start) => {
-            sqlx::query_as!(
-                MasterRow,
-                r#"SELECT tr_type, tr_description
+) -> Fetched {
+    let mut rows = match (type_code, start) {
+        (Some(code), start) => sqlx::query_as!(
+            MasterRow,
+            r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE tr_type = $1::text
                       AND ($2::text IS NULL OR rpad(tr_type, 2) COLLATE "C" >= rpad($2::text, 2))
                       AND ($3::text IS NULL OR tr_description LIKE $3::text ESCAPE '')
                     ORDER BY rpad(tr_type, 2) COLLATE "C"
                     LIMIT $4"#,
-                code,
-                start,
-                pattern,
-                limit,
-            )
-            .fetch_all(&mut *conn)
-            .await
-        }
-        (None, Some(start)) => {
-            sqlx::query_as!(
-                MasterRow,
-                r#"SELECT tr_type, tr_description
+            code,
+            start,
+            pattern,
+            limit,
+        )
+        .fetch(&mut *conn),
+        (None, Some(start)) => sqlx::query_as!(
+            MasterRow,
+            r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE rpad(tr_type, 2) COLLATE "C" >= rpad($1::text, 2)
                       AND ($2::text IS NULL OR tr_description LIKE $2::text ESCAPE '')
                     ORDER BY rpad(tr_type, 2) COLLATE "C"
                     LIMIT $3"#,
-                start,
-                pattern,
-                limit,
-            )
-            .fetch_all(&mut *conn)
-            .await
-        }
-        (None, None) => {
-            sqlx::query_as!(
-                MasterRow,
-                r#"SELECT tr_type, tr_description
+            start,
+            pattern,
+            limit,
+        )
+        .fetch(&mut *conn),
+        (None, None) => sqlx::query_as!(
+            MasterRow,
+            r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')
                     ORDER BY rpad(tr_type, 2) COLLATE "C"
                     LIMIT $2"#,
-                pattern,
-                limit,
-            )
-            .fetch_all(&mut *conn)
-            .await
-        }
-    }
+            pattern,
+            limit,
+        )
+        .fetch(&mut *conn),
+    };
+    fetch_each(|cx| rows.as_mut().poll_next(cx)).await
 }
 
 /// The rows of a [`Direction::Backward`]
@@ -486,66 +532,59 @@ async fn types_forward(
 /// `8100-READ-BACKWARDS` (P-COTRTLIC-033), with the filters of
 /// P-COTRTLIC-020. Up to `limit` types in descending byte order of the code
 /// padded to its `X(2)` bytes, strictly below `start`, or from the last type,
-/// read on `conn` by the static statement of the keys present. `type_code`
-/// and `start` are right-trimmed codes, `start` made NUL-free by
-/// `start_bound`; each bound pads `start` back with `rpad`.
+/// read on `conn` by the static statement of the keys present and received
+/// one row at a time ([`fetch_each`]). `type_code` and `start` are
+/// right-trimmed codes, `start` made NUL-free by `start_bound`; each bound
+/// pads `start` back with `rpad`.
 async fn types_backward(
     conn: &mut sqlx::PgConnection,
     type_code: Option<&str>,
     start: Option<&str>,
     pattern: Option<&str>,
     limit: i64,
-) -> Result<Vec<MasterRow>, sqlx::Error> {
-    match (type_code, start) {
-        (Some(code), start) => {
-            sqlx::query_as!(
-                MasterRow,
-                r#"SELECT tr_type, tr_description
+) -> Fetched {
+    let mut rows = match (type_code, start) {
+        (Some(code), start) => sqlx::query_as!(
+            MasterRow,
+            r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE tr_type = $1::text
                       AND ($2::text IS NULL OR rpad(tr_type, 2) COLLATE "C" < rpad($2::text, 2))
                       AND ($3::text IS NULL OR tr_description LIKE $3::text ESCAPE '')
                     ORDER BY rpad(tr_type, 2) COLLATE "C" DESC
                     LIMIT $4"#,
-                code,
-                start,
-                pattern,
-                limit,
-            )
-            .fetch_all(&mut *conn)
-            .await
-        }
-        (None, Some(start)) => {
-            sqlx::query_as!(
-                MasterRow,
-                r#"SELECT tr_type, tr_description
+            code,
+            start,
+            pattern,
+            limit,
+        )
+        .fetch(&mut *conn),
+        (None, Some(start)) => sqlx::query_as!(
+            MasterRow,
+            r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE rpad(tr_type, 2) COLLATE "C" < rpad($1::text, 2)
                       AND ($2::text IS NULL OR tr_description LIKE $2::text ESCAPE '')
                     ORDER BY rpad(tr_type, 2) COLLATE "C" DESC
                     LIMIT $3"#,
-                start,
-                pattern,
-                limit,
-            )
-            .fetch_all(&mut *conn)
-            .await
-        }
-        (None, None) => {
-            sqlx::query_as!(
-                MasterRow,
-                r#"SELECT tr_type, tr_description
+            start,
+            pattern,
+            limit,
+        )
+        .fetch(&mut *conn),
+        (None, None) => sqlx::query_as!(
+            MasterRow,
+            r#"SELECT tr_type, tr_description
                      FROM transaction_types
                     WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')
                     ORDER BY rpad(tr_type, 2) COLLATE "C" DESC
                     LIMIT $2"#,
-                pattern,
-                limit,
-            )
-            .fetch_all(&mut *conn)
-            .await
-        }
-    }
+            pattern,
+            limit,
+        )
+        .fetch(&mut *conn),
+    };
+    fetch_each(|cx| rows.as_mut().poll_next(cx)).await
 }
 
 impl TranTypeFileReader for PgStore<'_, '_> {

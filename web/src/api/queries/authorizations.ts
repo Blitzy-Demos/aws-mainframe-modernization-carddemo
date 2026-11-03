@@ -1,0 +1,163 @@
+/**
+ * Server state of the pending-authorization screens:
+ * - CPVS, the authorization summary of one account (COPAUS0C, map COPAU00):
+ *   `GET /authorizations?account_id=`, five rows a page.
+ * - CPVD, one authorization (COPAUS1C, map COPAU01): `GET /authorizations/{id}`
+ *   with the PF8 neighbour as `next_id`, and PF5, the fraud mark through
+ *   COPAUS2C: `PUT /authorizations/{id}`.
+ *
+ * The CP00 consumer writes these records; the browser reads them only through
+ * these endpoints. A non-2xx answer rejects with the client's ApiError,
+ * unchanged, which the pages show through lib/api-errors.ts. The COBOL texts
+ * that are not errors (the page-boundary line, `Already at the last
+ * Authorization...`, the fraud-mark result) arrive as `message` in the data.
+ */
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseMutationResult,
+  type UseQueryResult,
+} from "@tanstack/react-query";
+
+import { api, unwrap } from "@/api/client";
+import type { components, paths } from "@/api/schema";
+
+type AuthSummaryQuery = NonNullable<
+  paths["/authorizations"]["get"]["parameters"]["query"]
+>;
+
+/**
+ * The CPVS request: the account ID as entered (`ACCTIDI PIC X(11)`) and the
+ * page position.
+ * - `account_id` is optional on the server, which edits an absent account as
+ *   blank, but the screen always sends what was typed, so the hook requires
+ *   it. An empty value sends nothing (see useAuthorizationSummary).
+ * - `start_key` is a previous page's `next_key` with `direction: "forward"`
+ *   (PF8) or its `prev_key` with `direction: "backward"` (PF7).
+ * - Without `page_size` the page holds the 5 rows of the COPAU00 list.
+ */
+export type AuthSummaryParams = AuthSummaryQuery &
+  Required<Pick<AuthSummaryQuery, "account_id">>;
+
+/** The COPAU00 header (customer, account, summary segment) with one page of authorizations. */
+export type AuthSummary = components["schemas"]["AuthSummaryResponse"];
+
+/** The COPAU01 screen of one authorization, with `next_id`, the one PF8 shows. */
+export type AuthDetail = components["schemas"]["AuthDetailResponse"];
+
+/** The PF5 answer: the replaced detail and `AUTH MARKED FRAUD...` or `AUTH FRAUD REMOVED...`. */
+export type FraudToggleResult = components["schemas"]["FraudToggleResponse"];
+
+const all = ["authorizations"] as const;
+
+/** Query keys: a prefix invalidates every key below it. */
+export const authorizationKeys = {
+  all,
+  summaries: () => [...all, "summary"] as const,
+  summary: (params: AuthSummaryParams) => [...all, "summary", params] as const,
+  details: () => [...all, "detail"] as const,
+  detail: (authId: string) => [...all, "detail", authId] as const,
+} as const;
+
+/**
+ * COPAUS0C ENTER, PF7 and PF8: the summary of `params.account_id` and one page
+ * of its authorizations, newest first, returned whole: the header fields come
+ * with `items`, `next_key`, `prev_key` and `message`.
+ *
+ * Nothing is requested while the account ID is empty; the page's form edits
+ * the field first (schemas/authorizations.ts). The previous page stays shown
+ * while the next one loads.
+ */
+export function useAuthorizationSummary(
+  params: AuthSummaryParams,
+): UseQueryResult<AuthSummary> {
+  return useQuery({
+    queryKey: authorizationKeys.summary(params),
+    queryFn: async ({ signal }) =>
+      unwrap(
+        await api.GET("/authorizations", {
+          params: { query: params },
+          signal,
+        }),
+      ),
+    enabled: params.account_id !== "",
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * COPAUS1C ENTER: the authorization `authId` names, the `auth_id` of a
+ * summary row. `next_id` is the next older authorization under the same
+ * summary, `null` at the last one, where `message` carries
+ * `Already at the last Authorization...`.
+ */
+export function useAuthorizationDetail(
+  authId: string,
+): UseQueryResult<AuthDetail> {
+  return useQuery({
+    queryKey: authorizationKeys.detail(authId),
+    queryFn: async ({ signal }) =>
+      unwrap(
+        await api.GET("/authorizations/{id}", {
+          params: { path: { id: authId } },
+          signal,
+        }),
+      ),
+    enabled: authId !== "",
+  });
+}
+
+/**
+ * COPAUS1C PF5, MARK-AUTH-FRAUD with COPAUS2C: toggles the fraud mark of
+ * `authId`. The request has no body, because PF5 acts on the record shown.
+ * The result carries `message`, the success text the page shows.
+ *
+ * On success the shown detail becomes the replaced one, and every summary is
+ * marked stale, so CPVS reads the account again after the write, as PF3 back
+ * to COPAUS0C does. On failure the server has rolled both writes back
+ * (ROLL-BACK), so the cache is left alone and the ApiError reaches the page.
+ */
+export function useFraudToggleMutation(
+  authId: string,
+): UseMutationResult<FraudToggleResult, Error, void> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () =>
+      unwrap(
+        await api.PUT("/authorizations/{id}", {
+          params: { path: { id: authId } },
+        }),
+      ),
+    onSuccess: async (data) => {
+      const detailKey = authorizationKeys.detail(authId);
+      // A read of the detail still in flight may have been served before the
+      // mark committed, so it is stopped rather than allowed to overwrite the
+      // replaced detail with the old flag.
+      await queryClient.cancelQueries({ queryKey: detailKey });
+      const shown = queryClient.getQueryData<AuthDetail>(detailKey);
+      const summaries = queryClient.invalidateQueries({
+        queryKey: authorizationKeys.summaries(),
+      });
+      if (shown === undefined) {
+        // No detail to keep a PF8 neighbour from: read it afresh.
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: detailKey }),
+          summaries,
+        ]);
+        return;
+      }
+      // The PUT reads no PF8 neighbour, so its detail has `next_id` null.
+      // COPAUS1C keeps the selected key after PF5 and PF8 still reads on from
+      // it, so the neighbour already shown is kept. The record's own message
+      // is the PUT's (none): the fraud text replaces the last-authorization
+      // line, as on the screen.
+      queryClient.setQueryData<AuthDetail>(detailKey, {
+        ...data.detail,
+        next_id: data.detail.next_id ?? shown.next_id,
+      });
+      await summaries;
+    },
+  });
+}

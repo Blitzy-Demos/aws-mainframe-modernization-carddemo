@@ -16,7 +16,10 @@
 //!   key, `GTEQ` by default, then `READNEXT` (P-COTRN00C-005, P-COTRN00C-006).
 //!   `next_key` is the record the look-ahead `READNEXT` found, the first row of
 //!   the next page, so a forward request from it shows what PF8 shows after
-//!   discarding the last key shown. `None` is `NEXT-PAGE-NO`.
+//!   discarding the last key shown. `None` is `NEXT-PAGE-NO`. A forward
+//!   request from the last TRAN-ID stands for the PF8 without a next page
+//!   (V-COTRN00C-003, E-54): that one record with
+//!   `"You are already at the bottom of the page..."`.
 //! - A backward request is PF7 with `start_key` as the first key shown:
 //!   `STARTBR` at the key, one `READPREV` discarded, then `READPREV` up to a
 //!   page, shown in ascending order (P-COTRN00C-007). `prev_key` is the first
@@ -138,8 +141,8 @@ pub fn edit_start_key(raw: Option<&str>) -> Result<Option<TranId>, DomainError> 
 }
 
 /// COTRN00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY —
-/// P-COTRN00C-005 to P-COTRN00C-007, P-COTRN00C-009, P-COTRN00C-011 to
-/// P-COTRN00C-016, V-COTRN00C-004 to V-COTRN00C-013
+/// P-COTRN00C-005 to P-COTRN00C-007, P-COTRN00C-009 to P-COTRN00C-016,
+/// V-COTRN00C-003 to V-COTRN00C-013
 /// [app/cbl/COTRN00C.cbl:L146-380]: one page of the transaction list.
 ///
 /// The start key is edited first, so a rejected key reads nothing. A forward
@@ -197,10 +200,11 @@ async fn browse<S: TransactionReader>(
         .map_err(|_| lookup_failed())
 }
 
-/// COTRN00C PROCESS-PAGE-FORWARD — P-COTRN00C-006, P-COTRN00C-011,
-/// P-COTRN00C-013, V-COTRN00C-005, V-COTRN00C-007
-/// [app/cbl/COTRN00C.cbl:L279-328]: ENTER from `start` (`LOW-VALUES` when
-/// `None`), up to `rows` `READNEXT`s and the look-ahead one.
+/// COTRN00C PROCESS-PAGE-FORWARD, PROCESS-PF8-KEY — P-COTRN00C-006,
+/// P-COTRN00C-010, P-COTRN00C-011, P-COTRN00C-013, V-COTRN00C-003,
+/// V-COTRN00C-005, V-COTRN00C-007 [app/cbl/COTRN00C.cbl:L257-328]: ENTER
+/// from `start` (`LOW-VALUES` when `None`), up to `rows` `READNEXT`s and the
+/// look-ahead one; from the last TRAN-ID, the PF8 without a next page.
 async fn page_forward<S: TransactionReader>(
     store: &mut S,
     start: Option<TranId>,
@@ -217,15 +221,26 @@ async fn page_forward<S: TransactionReader>(
             messages::YOU_ARE_AT_THE_TOP_OF_THE_PAGE,
         ));
     }
+    let from_last_key = matches!(items.as_slice(), [only] if start == Some(only.tran_id));
+    if from_last_key {
+        // V-COTRN00C-003 and E-54 map the PF8 without a next page onto a
+        // forward request from the last TRAN-ID, answered with its text; the
+        // COBOL browses nothing there and leaves the rows it showed on screen.
+        // The page keeps that one record instead of coming back empty,
+        // because a forward request from the last TRAN-ID is also how a
+        // client follows `next_key` to a final page holding only that record,
+        // which must stay listable. `COUSR00C` answers the same way
+        // (`user_list`, V-COUSR00C-002).
+        return Ok(TransactionListPage {
+            items,
+            next_key: None,
+            prev_key: start,
+            message: Some(messages::YOU_ARE_ALREADY_AT_THE_BOTTOM_OF_THE_PAGE),
+        });
+    }
     let page_len = usize::from(rows);
     let next_key = items.get(page_len).map(|tran| tran.tran_id);
     items.truncate(page_len);
-    // A start key equal to the highest TRAN-ID is ENTER with that key: it
-    // shows the record and the end-of-file text. The PF8-without-next-page
-    // text ("You are already at the bottom of the page...", V-COTRN00C-003)
-    // is not substituted here, because a client following `next_key` to a
-    // final page of one record sends this same request and must see it;
-    // `next_key: None` is how a page says that no further page exists.
     let message = next_key
         .is_none()
         .then_some(messages::YOU_HAVE_REACHED_THE_BOTTOM_OF_THE_PAGE);
@@ -520,16 +535,20 @@ mod tests {
     fn forward_pages_cover_the_file_once_and_end_at_the_bottom() {
         // P-COTRN00C-006, P-COTRN00C-013, V-COTRN00C-007: a short last page
         // ends in the READNEXT loop, a full one at the look-ahead READNEXT;
-        // both carry the ENDFILE text. A last page of one record (21) is
-        // reached through the previous page's next_key (V-COTRN00C-003 is not
-        // substituted for it).
-        for (count, page_size, page_count) in [
-            (23, SCREEN_ROWS, 3),
-            (20, SCREEN_ROWS, 2),
-            (21, SCREEN_ROWS, 3),
-            (7, SCREEN_ROWS, 1),
-            (5, 2, 3),
-            (3, 0, 3),
+        // both carry the ENDFILE text. A last page of one record reached
+        // through the previous page's next_key is the forward request from the
+        // last TRAN-ID, so it keeps that record and carries the PF8
+        // without-next-page text instead (P-COTRN00C-010, V-COTRN00C-003).
+        let reached = messages::YOU_HAVE_REACHED_THE_BOTTOM_OF_THE_PAGE;
+        let already = messages::YOU_ARE_ALREADY_AT_THE_BOTTOM_OF_THE_PAGE;
+        for (count, page_size, page_count, last_message) in [
+            (23, SCREEN_ROWS, 3, reached),
+            (20, SCREEN_ROWS, 2, reached),
+            (21, SCREEN_ROWS, 3, already),
+            (7, SCREEN_ROWS, 1, reached),
+            (1, SCREEN_ROWS, 1, reached),
+            (5, 2, 3, already),
+            (3, 0, 3, already),
         ] {
             let mut store = store(count);
             let pages = forward_pages(&mut store, page_size);
@@ -539,7 +558,8 @@ mod tests {
             let (last, earlier) = pages.split_last().expect("at least one page");
             assert_eq!(
                 last.message,
-                Some(messages::YOU_HAVE_REACHED_THE_BOTTOM_OF_THE_PAGE)
+                Some(last_message),
+                "{count} rows by {page_size}"
             );
             assert_eq!(last.next_key, None);
             for earlier in earlier {
@@ -553,19 +573,26 @@ mod tests {
 
     #[test]
     fn forward_from_a_key_starts_at_the_first_key_at_or_after_it() {
-        // P-COTRN00C-006: STARTBR GTEQ. The highest key is shown with the
-        // ENDFILE text, as ENTER with that key shows it.
+        // P-COTRN00C-006: STARTBR GTEQ. The highest key is the PF8 without a
+        // next page (P-COTRN00C-010, V-COTRN00C-003): its record, with the
+        // already-at-the-bottom text.
         let mut store = store(23);
         let cases = [
-            (key(5), keys(5..=14), Some(key(15))),
+            (key(5), keys(5..=14), Some(key(15)), None),
             (
                 TranId::move_from("0000000000000000"),
                 keys(1..=10),
                 Some(key(11)),
+                None,
             ),
-            (key(23), keys(23..=23), None),
+            (
+                key(23),
+                keys(23..=23),
+                None,
+                Some(messages::YOU_ARE_ALREADY_AT_THE_BOTTOM_OF_THE_PAGE),
+            ),
         ];
-        for (start, expected, next_key) in cases {
+        for (start, expected, next_key, message) in cases {
             let shown = page(
                 &mut store,
                 input(Some(start), Direction::Forward, SCREEN_ROWS),
@@ -573,6 +600,7 @@ mod tests {
             assert_eq!(item_keys(&shown), expected, "{start}");
             assert_eq!(shown.next_key, next_key, "{start}");
             assert_eq!(shown.prev_key, expected.first().copied(), "{start}");
+            assert_eq!(shown.message, message, "{start}");
         }
         let mut gaps = FakeStore::default()
             .with_transaction(new_tran(10, CARD_A))

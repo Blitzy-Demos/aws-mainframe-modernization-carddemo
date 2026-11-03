@@ -70,8 +70,8 @@ use tracing::field::Empty;
 
 use crate::auth::AuthUser;
 use crate::dto::cards::{
-    CardListPageQuery, CardListQuery, CardResponse, CardSummary, CardUpdateRequest,
-    CardUpdateResponse, CardViewQuery,
+    CardListPageQuery, CardListQuery, CardSummary, CardUpdateRequest, CardUpdateResponse,
+    CardViewQuery, CardViewResponse,
 };
 use crate::dto::id_string;
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
@@ -258,7 +258,9 @@ pub async fn list_cards(
 /// `2210-EDIT-ACCOUNT` and `2220-EDIT-CARD` edit them, an absent account
 /// being a blank one, and the card is then read by its number alone (E-55).
 /// The response carries the card's version token, which a following
-/// `PUT /cards/{id}` sends back, and never the verification code.
+/// `PUT /cards/{id}` sends back, never the verification code, and in
+/// `message` the information line of a found card, '   Displaying requested
+/// details' with its three leading spaces (P-COCRDSLC-010).
 ///
 /// # Errors
 ///
@@ -282,7 +284,7 @@ pub async fn list_cards(
         CardViewQuery,
     ),
     responses(
-        (status = 200, description = "The card with its version token", body = CardResponse),
+        (status = 200, description = "The card with its version token and the COBOL information text", body = CardViewResponse),
         (status = 400, description = "A key the COBOL edits reject", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 404, description = "No card has the number", body = ErrorBody),
@@ -309,7 +311,7 @@ pub async fn get_card(
     State(state): State<AppState>,
     ApiPath(card_number): ApiPath<String>,
     ApiQuery(query): ApiQuery<CardViewQuery>,
-) -> Result<Json<CardResponse>, ApiError> {
+) -> Result<Json<CardViewResponse>, ApiError> {
     finish(
         crate::cancellable(Span::current(), view(&state, card_number, query)).await,
         OUTCOME_OK,
@@ -432,14 +434,14 @@ async fn view(
     state: &AppState,
     card_number: String,
     query: CardViewQuery,
-) -> Result<CardResponse, ApiError> {
+) -> Result<CardViewResponse, ApiError> {
     record_keys(entered_keys(query.account_id.as_deref(), &card_number));
     query.check()?;
     let input = query.into_input(card_number);
     let mut uow = state.db().begin().await?;
     let viewed = card_view::view(&mut uow.store(), state.version_key(), input).await;
     release(uow).await;
-    Ok(CardResponse::from_view(&viewed?))
+    Ok(CardViewResponse::from_view(&viewed?))
 }
 
 /// The `PUT /cards/{id}` answer for `card_number` and `body`: the whole

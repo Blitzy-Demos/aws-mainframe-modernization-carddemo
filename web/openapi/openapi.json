@@ -501,7 +501,7 @@
           "admin-transaction-types"
         ],
         "summary": "Lists the transaction types that pass the filters: one page from\n`start_key` in `direction` (CTLI ENTER, F8 and F7).",
-        "description": "COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,\n8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,\nP-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,\nV-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,\nV-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,\nV-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response\nreplaces the 3270 send of the `CTRTLIA` map, a mandated deviation.\n\nA page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,\nin ascending type code order. Without `start_key` both directions read\nthe first page from the start of the table: backward is F7 on the first\npage, which re-reads that page with `No previous pages to display`\n(P-COTRTLIC-004, V-COTRTLIC-009). An empty result and a page boundary are\n200 with the COBOL text in `message` (E-54).\n\n# Errors\n\n- 400 with an empty message for a filter longer than its BMS field, on\n  `TRTYPE` or `TRDESC`, and for a `start_key` longer than two characters\n  or not in ASCII, on no field; 400 for a malformed query; and 400 for a\n  type code filter that is not two digits, on `TRTYPE` (V-COTRTLIC-001).\n  The filters are checked first, then the start key, before the master\n  is read.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type passes the filters (V-COTRTLIC-002), a description\n  filter holding a character outside ASCII included, which is searched as\n  entered.\n- 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,\n  V-COTRTLIC-026), with the no-records text when the filter count fails\n  (V-COTRTLIC-028), and with `Unexpected error` when the database cannot\n  be reached.",
+        "description": "COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,\n8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,\nP-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-040, V-COTRTLIC-001,\nV-COTRTLIC-002, V-COTRTLIC-004 to V-COTRTLIC-010, V-COTRTLIC-024 to\nV-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response\nreplaces the 3270 send of the `CTRTLIA` map, a mandated deviation.\n\nA page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,\nin ascending type code order. Without `start_key` both directions read\nthe first page from the start of the table: backward is F7 on the first\npage, which re-reads that page with `No previous pages to display`\n(P-COTRTLIC-004, V-COTRTLIC-009). An empty result and a page boundary are\n200 with the COBOL text in `message` (E-54).\n\n# Errors\n\n- 400 with an empty message for a filter longer than its BMS field, on\n  `TRTYPE` or `TRDESC`, and for a `start_key` longer than two characters\n  or not in ASCII, on no field; 400 for a malformed query; and 400 for a\n  type code filter that is not two digits, on `TRTYPE` (V-COTRTLIC-001).\n  The filters are checked first, then the start key, before the master\n  is read.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type passes the filters (V-COTRTLIC-002), a description\n  filter holding a character outside ASCII included, which is searched as\n  entered.\n- 500 with the Db2 text of the cursor step that failed when the read\n  fails: its `OPEN` (V-COTRTLIC-024, V-COTRTLIC-026), a `FETCH`\n  (V-COTRTLIC-006, V-COTRTLIC-007, V-COTRTLIC-010) or its `CLOSE`\n  (V-COTRTLIC-025, V-COTRTLIC-027); with the no-records text when the\n  filter count fails (V-COTRTLIC-028); and with `Unexpected error` when\n  the database cannot be reached.",
         "operationId": "list_tran_types",
         "parameters": [
           {
@@ -833,8 +833,8 @@
         "tags": [
           "admin-transaction-types"
         ],
-        "summary": "Deletes the listed type `{id}`: the `D` selector of the `COTRTLI` list,\nconfirmed with F10 (CTLI).",
-        "description": "COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007, P-COTRTLIC-008,\nV-COTRTLIC-021 to V-COTRTLIC-023\n\nThe confirmation is the dialog of the SPA. A deleted type is committed\nand answered with `HIGHLIGHTED row deleted.Hit Enter to continue` and no\ntype.\n\n# Errors\n\n- 400 for a key longer than the type code `X(2)` or holding a character\n  outside ASCII, or a malformed path.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 with the delete-failed Db2 text when no type has the code\n  (V-COTRTLIC-022).\n- 409 with the child-records Db2 text when categories still reference the\n  type (SQLCODE -532, V-COTRTLIC-021); the type stays.\n- 500 with the delete-failed Db2 text on any other failure\n  (V-COTRTLIC-023).",
+        "summary": "Deletes the type `{id}`: without `origin` the `D` selector of the\n`COTRTLI` list, confirmed with F10 (CTLI); with `origin=form` the F4 of\nthe `COTRTUP` maintenance screen, confirmed with F4 (CTTU).",
+        "description": "Without `origin`: COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007,\nP-COTRTLIC-008, V-COTRTLIC-021 to V-COTRTLIC-023. A deleted type is\ncommitted and answered with `HIGHLIGHTED row deleted.Hit Enter to\ncontinue` and no type.\n\nWith `origin=form`: COTRTUPC 1210-EDIT-TRANTYPE, 9000-READ-TRANTYPE,\n9800-DELETE-PROCESSING — P-COTRTUPC-004, P-COTRTUPC-005, V-COTRTUPC-022\nto V-COTRTUPC-028 (E-23). The key is edited and the type read before the\ndelete; a deleted type is committed and answered with `Delete\nsuccessful.` and the type as read, which the delete-done screen shows\n(P-COTRTUPC-023).\n\nEither confirmation is the dialog of the SPA.\n\n# Errors\n\n- 400 for a key longer than the type code `X(2)`, a malformed path or\n  query, and, without `origin`, a key holding a character outside ASCII;\n  with `origin=form`, 400 for the key edits on `TRTYPCD`\n  (V-COTRTUPC-022 to V-COTRTUPC-024).\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code: with the delete-failed Db2 text without\n  `origin` (V-COTRTLIC-022), and with the not-found text on `TRTYPCD`\n  with `origin=form` (V-COTRTUPC-025).\n- 409 with the child-records Db2 text of the program when categories\n  still reference the type (SQLCODE -532, V-COTRTLIC-021,\n  V-COTRTUPC-027); the type stays.\n- 500 with the program's Db2 text when the read (`origin=form`,\n  V-COTRTUPC-026) or the delete fails (V-COTRTLIC-023, V-COTRTUPC-028).",
         "operationId": "delete_tran_type",
         "parameters": [
           {
@@ -847,11 +847,24 @@
               "maxLength": 2,
               "pattern": "^[\\x00-\\x7F]*$"
             }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "description": "`form` for the F4 delete of the maintenance screen (`COTRTUPC`);\nabsent for the row delete of the type list (`COTRTLIC`).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "The program whose edits and texts `DELETE /admin/transaction-types/{id}`\napplies when the request names one.",
+              "enum": [
+                "form"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "The type was deleted; `message` is the COBOL text and `transaction_type` is null",
+            "description": "The type was deleted; `message` is the COBOL text, and `transaction_type` is null without `origin` and the deleted type with `origin=form`",
             "content": {
               "application/json": {
                 "schema": {
@@ -861,7 +874,7 @@
             }
           },
           "400": {
-            "description": "The type code is longer than two characters or not ASCII",
+            "description": "The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form`",
             "content": {
               "application/json": {
                 "schema": {
@@ -911,7 +924,7 @@
             }
           },
           "500": {
-            "description": "The Db2 master could not be updated",
+            "description": "The Db2 master could not be read or updated",
             "content": {
               "application/json": {
                 "schema": {
@@ -1873,7 +1886,7 @@
           "cards"
         ],
         "summary": "COCRDSLC 2000-PROCESS-INPUTS, 9000-READ-DATA, 1200-SETUP-SCREEN-VARS,\n1400-SEND-SCREEN, COMMON-RETURN — P-COCRDSLC-002 to P-COCRDSLC-007,\nP-COCRDSLC-010, P-COCRDSLC-012 to P-COCRDSLC-016, V-COCRDSLC-001 to\nV-COCRDSLC-007",
-        "description": "The card whose number is the `{id}` path segment, with the account number\nof the `account_id` query parameter: both keys are edited as\n`2210-EDIT-ACCOUNT` and `2220-EDIT-CARD` edit them, an absent account\nbeing a blank one, and the card is then read by its number alone (E-55).\nThe response carries the card's version token, which a following\n`PUT /cards/{id}` sends back, and never the verification code.\n\n# Errors\n\n- 400 with an empty `message` when `account_id` is longer than 11\n  characters.\n- 400 with 'Account number not provided', 'Card number not provided',\n  'No input received', or the account or card not-numeric text, at\n  `ACCTSID` or `CARDSID` (V-COCRDSLC-001 to V-COCRDSLC-005).\n- 401 without a valid bearer token.\n- 404 with 'Did not find cards for this search condition' at `ACCTSID`\n  when no card has the number (V-COCRDSLC-006).\n- 500 with the `CARDDAT` file-error text at `ACCTSID` when the read fails\n  (V-COCRDSLC-007), or 'Unexpected error' when the database cannot be\n  reached.",
+        "description": "The card whose number is the `{id}` path segment, with the account number\nof the `account_id` query parameter: both keys are edited as\n`2210-EDIT-ACCOUNT` and `2220-EDIT-CARD` edit them, an absent account\nbeing a blank one, and the card is then read by its number alone (E-55).\nThe response carries the card's version token, which a following\n`PUT /cards/{id}` sends back, never the verification code, and in\n`message` the information line of a found card, '   Displaying requested\ndetails' with its three leading spaces (P-COCRDSLC-010).\n\n# Errors\n\n- 400 with an empty `message` when `account_id` is longer than 11\n  characters.\n- 400 with 'Account number not provided', 'Card number not provided',\n  'No input received', or the account or card not-numeric text, at\n  `ACCTSID` or `CARDSID` (V-COCRDSLC-001 to V-COCRDSLC-005).\n- 401 without a valid bearer token.\n- 404 with 'Did not find cards for this search condition' at `ACCTSID`\n  when no card has the number (V-COCRDSLC-006).\n- 500 with the `CARDDAT` file-error text at `ACCTSID` when the read fails\n  (V-COCRDSLC-007), or 'Unexpected error' when the database cannot be\n  reached.",
         "operationId": "get_card",
         "parameters": [
           {
@@ -1898,11 +1911,11 @@
         ],
         "responses": {
           "200": {
-            "description": "The card with its version token",
+            "description": "The card with its version token and the COBOL information text",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CardResponse"
+                  "$ref": "#/components/schemas/CardViewResponse"
                 }
               }
             }
@@ -3794,6 +3807,27 @@
           "CARDSID"
         ]
       },
+      "CardViewResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CardResponse",
+            "description": "The card read by its number, with its token."
+          },
+          {
+            "type": "object",
+            "required": [
+              "message"
+            ],
+            "properties": {
+              "message": {
+                "type": "string",
+                "description": "`WS-INFO-MSG X(40)` once `9100-GETCARD-BYACCTCARD` sets\n`FOUND-CARDS-FOR-ACCOUNT`: '   Displaying requested details', with\nits three leading spaces (P-COCRDSLC-010)."
+              }
+            }
+          }
+        ],
+        "description": "The answer to a successful `GET /cards/{id}`: the card as `COCRDSL` shows\nit, with its token, and the information line `1200-SETUP-SCREEN-VARS`\nmoves to `INFOMSGO` for a found card.\n\nThe card's fields stay the top-level keys `CardResponse` names, so the\nkeys and token a `PUT /cards/{id}` repeats read as from the card itself;\n`message` stands beside them."
+      },
       "ErrorBody": {
         "type": "object",
         "description": "The body of every error response: `{code, message, fields?}`.",
@@ -4666,7 +4700,7 @@
       },
       "TranTypeMessageResponse": {
         "type": "object",
-        "description": "The answer of a successful write: the type as stored, the text the\nprogram shows, and the `COTRTLIC` info line of an inline update.\n\nThe texts are the rules': `COTRTUPC` `Changes committed to database` or\n`No change detected with respect to values fetched.` (V-COTRTUPC-006),\n`COTRTLIC` `HIGHLIGHTED row was updated` or `No change detected with\nrespect to database values.` (V-COTRTLIC-012), and on a delete\n`HIGHLIGHTED row deleted.Hit Enter to continue`, with no type.\n\n`info` is present only on `PUT` with `origin=list`. It is left out of every\nother answer rather than sent as `null`, so the schema declares it an\noptional, non-nullable string.",
+        "description": "The answer of a successful write: the type as stored, the text the\nprogram shows, and the `COTRTLIC` info line of an inline update.\n\nThe texts are the rules': `COTRTUPC` `Changes committed to database` or\n`No change detected with respect to values fetched.` (V-COTRTUPC-006),\n`COTRTLIC` `HIGHLIGHTED row was updated` or `No change detected with\nrespect to database values.` (V-COTRTLIC-012), on the `COTRTLIC` delete\n`HIGHLIGHTED row deleted.Hit Enter to continue`, with no type, and on the\n`COTRTUPC` delete `Delete successful.`, with the type as it was read\n(P-COTRTUPC-004, P-COTRTUPC-023).\n\n`info` is present only on `PUT` with `origin=list`. It is left out of every\nother answer rather than sent as `null`, so the schema declares it an\noptional, non-nullable string.",
         "required": [
           "transaction_type",
           "message"
@@ -4674,7 +4708,7 @@
         "properties": {
           "info": {
             "type": "string",
-            "description": "The `COTRTLI` info line `INFOMSG` `X(45)`\n[app/app-transaction-type-db2/cpy-bms/COTRTLI.cpy:L222], uncentred:\n`HIGHLIGHTED row was updated`, which `COTRTLIC` `9200-UPDATE-RECORD`\nsets once the inline update is stored (P-COTRTLIC-009). It comes with\nevery `origin=list` update, beside the no-change `message` of a change\nof case alone (V-COTRTLIC-012). Absent on the `COTRTUPC` writes and on\nthe delete."
+            "description": "The `COTRTLI` info line `INFOMSG` `X(45)`\n[app/app-transaction-type-db2/cpy-bms/COTRTLI.cpy:L222], uncentred:\n`HIGHLIGHTED row was updated`, which `COTRTLIC` `9200-UPDATE-RECORD`\nsets once the inline update is stored (P-COTRTLIC-009). It comes with\nevery `origin=list` update, beside the no-change `message` of a change\nof case alone (V-COTRTLIC-012). Absent on the `COTRTUPC` writes and on\nboth deletes."
           },
           "message": {
             "type": "string",
@@ -4687,7 +4721,7 @@
               },
               {
                 "$ref": "#/components/schemas/TranTypeResponse",
-                "description": "The type as stored after the write; `null` after a delete."
+                "description": "The type as stored after the write; `null` after the `COTRTLIC`\ndelete, and the deleted type as read after the `COTRTUPC` delete."
               }
             ]
           }
@@ -4727,7 +4761,7 @@
       },
       "TranTypeUpsertField": {
         "type": "string",
-        "description": "A BMS field of the `COTRTUP` map that a `POST /admin/transaction-types`\nor `PUT /admin/transaction-types/{id}` error names, where\n`3300-SETUP-SCREEN-ATTRS` places the cursor\n[app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1303-1325].",
+        "description": "A BMS field of the `COTRTUP` map that a `POST /admin/transaction-types`,\n`PUT /admin/transaction-types/{id}` or\n`DELETE /admin/transaction-types/{id}?origin=form` error names, where\n`3300-SETUP-SCREEN-ATTRS` places the cursor\n[app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1303-1325].",
         "enum": [
           "TRTYPCD",
           "TRTYDSC"

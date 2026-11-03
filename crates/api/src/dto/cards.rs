@@ -22,7 +22,8 @@
 //!
 //! Responses carry the `CVACT02Y` `CARD-RECORD` fields the maps show, under the
 //! copybook names (`card_expiraion_date`, spelling kept) and the request-fixed
-//! keys `card_number` and `account_id`. The verification code `CARD-CVV-CD` is
+//! keys `card_number` and `account_id`, and the information text the program
+//! shows with the card in `message`. The verification code `CARD-CVV-CD` is
 //! never shown by `COCRDSL` or `COCRDUP` [app/cbl/COCRDSLC.cbl:L463-484]
 //! [app/cbl/COCRDUPC.cbl:L1088-1117] and has no field in any type here.
 //!
@@ -523,14 +524,6 @@ impl fmt::Debug for CardResponse {
 }
 
 impl CardResponse {
-    /// COCRDSLC 1200-SETUP-SCREEN-VARS — P-COCRDSLC-006
-    ///
-    /// The card a successful `GET /cards/{id}` shows, with its token.
-    #[must_use]
-    pub fn from_view(view: &card_view::CardView) -> Self {
-        Self::from_card(&view.card, &view.version)
-    }
-
     /// COCRDUPC 3200-SETUP-SCREEN-VARS — P-COCRDUPC-019
     ///
     /// `card` with `version`, its token: the card a successful
@@ -545,6 +538,38 @@ impl CardResponse {
             card_expiraion_date: text(&card.card_expiraion_date),
             card_active_status: text(&card.card_active_status),
             version: version.as_str().to_owned(),
+        }
+    }
+}
+
+/// The answer to a successful `GET /cards/{id}`: the card as `COCRDSL` shows
+/// it, with its token, and the information line `1200-SETUP-SCREEN-VARS`
+/// moves to `INFOMSGO` for a found card.
+///
+/// The card's fields stay the top-level keys `CardResponse` names, so the
+/// keys and token a `PUT /cards/{id}` repeats read as from the card itself;
+/// `message` stands beside them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct CardViewResponse {
+    /// The card read by its number, with its token.
+    #[serde(flatten)]
+    pub card: CardResponse,
+    /// `WS-INFO-MSG X(40)` once `9100-GETCARD-BYACCTCARD` sets
+    /// `FOUND-CARDS-FOR-ACCOUNT`: '   Displaying requested details', with
+    /// its three leading spaces (P-COCRDSLC-010).
+    pub message: String,
+}
+
+impl CardViewResponse {
+    /// COCRDSLC 1200-SETUP-SCREEN-VARS — P-COCRDSLC-006, P-COCRDSLC-010
+    ///
+    /// The card a successful `GET /cards/{id}` shows, with its token and the
+    /// information line the rule returned with it.
+    #[must_use]
+    pub fn from_view(view: &card_view::CardView) -> Self {
+        Self {
+            card: CardResponse::from_card(&view.card, &view.version),
+            message: view.message.to_owned(),
         }
     }
 }
@@ -700,6 +725,7 @@ mod tests {
     use super::{
         CardListField, CardListPageQuery, CardListQuery, CardResponse, CardSummary,
         CardUpdateField, CardUpdateRequest, CardUpdateResponse, CardViewField, CardViewQuery,
+        CardViewResponse,
     };
     use crate::dto::BmsField;
     use crate::error::ApiError;
@@ -780,13 +806,38 @@ mod tests {
         let text = json.to_string();
         assert!(!text.contains("cvv"), "{text}");
         assert!(!text.contains(&CVV.to_string()), "{text}");
+        Ok(())
+    }
 
+    #[test]
+    fn view_response_carries_the_card_keys_and_the_rule_text_beside_them()
+    -> Result<(), NumericError> {
+        let card = fixture_card()?;
         let view = CardView {
             card: card.clone(),
             version: token(),
             message: messages::DISPLAYING_REQUESTED_DETAILS,
         };
-        assert_eq!(CardResponse::from_view(&view), response);
+        let response = CardViewResponse::from_view(&view);
+        assert_eq!(response.card, CardResponse::from_card(&card, &token()));
+        assert_eq!(response.message, messages::DISPLAYING_REQUESTED_DETAILS);
+        let mut expected = serde_json::to_value(&response.card).expect("serializes");
+        expected.as_object_mut().expect("an object").insert(
+            "message".to_owned(),
+            json!(messages::DISPLAYING_REQUESTED_DETAILS),
+        );
+        assert_eq!(
+            serde_json::to_value(&response).expect("serializes"),
+            expected
+        );
+
+        // The published schema: the card's schema with a required `message`.
+        let schema = schema_of::<CardViewResponse>();
+        let parts = schema["allOf"].as_array().expect("allOf");
+        assert_eq!(parts.len(), 2, "{schema}");
+        assert_eq!(parts[0]["$ref"], "#/components/schemas/CardResponse");
+        assert_eq!(parts[1]["required"], json!(["message"]), "{schema}");
+        assert_eq!(parts[1]["properties"]["message"]["type"], "string");
         Ok(())
     }
 
@@ -829,6 +880,14 @@ mod tests {
             format!("{page:?}"),
             format!("{:?}", CardSummary::from(&card)),
             format!("{:?}", CardResponse::from_card(&card, &token())),
+            format!(
+                "{:?}",
+                CardViewResponse::from_view(&CardView {
+                    card: card.clone(),
+                    version: token(),
+                    message: messages::DISPLAYING_REQUESTED_DETAILS,
+                })
+            ),
             format!(
                 "{:?}",
                 CardUpdateResponse::from_updated(

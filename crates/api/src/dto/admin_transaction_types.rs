@@ -9,6 +9,7 @@
 //! | `PUT /admin/transaction-types/{id}` | `COTRTUPC`, `COTRTUP` | [`TranTypeUpdateRequest`] | [`TranTypeUpsertField`] |
 //! | `PUT /admin/transaction-types/{id}?origin=list` | `COTRTLIC`, `COTRTLI` | [`TranTypeUpdateRequest`] | none |
 //! | `DELETE /admin/transaction-types/{id}` | `COTRTLIC`, `COTRTLI` | the path only | none |
+//! | `DELETE /admin/transaction-types/{id}?origin=form` | `COTRTUPC`, `COTRTUP` | the path and [`TranTypeDeleteQuery`] | [`TranTypeUpsertField`] |
 //!
 //! Every write reaches the Db2 master only. The reports read the processing
 //! copy `trantype_file`, which shows an edit made here only after
@@ -28,16 +29,19 @@
 //! [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L1336-1370], so no single
 //! field exists for an error to name, and their errors carry none.
 //!
-//! The delete is `COTRTLIC`'s `9300-DELETE-RECORD` (V-COTRTLIC-021 to
-//! V-COTRTLIC-023), whose rows name no field either; the same `DELETE`
-//! serves the `COTRTUP` F4 delete, with these `COTRTLIC` texts
-//! (P-COTRTUPC-028). [`TranTypeCreateRequest`], the `POST` body, is the
-//! `COTRTUPC` add: F5 on a key not found. The map's `F6=Add` legend has no
-//! executable path, as it stays dark and F6 is never accepted
-//! (P-COTRTUPC-001, P-COTRTUPC-026). Only the alternate `COTRTUPC` delete
-//! message set, `Delete successful.` (P-COTRTUPC-004) and its failure texts
-//! (P-COTRTUPC-005), stays unexposed: E-23 leaves its selection open, so no
-//! type here carries it and no second delete endpoint exists.
+//! # One delete, two programs
+//!
+//! CTLI and CTTU share `DELETE /admin/transaction-types/{id}`, the plan's
+//! CTLI resource. [`TranTypeDeleteQuery::origin`] selects the program, as
+//! the update's `origin` does: absent, it is `COTRTLIC`'s
+//! `9300-DELETE-RECORD` (V-COTRTLIC-021 to V-COTRTLIC-023), whose rows name
+//! no field either; `form`, the `COTRTUP` F4 delete of `COTRTUPC`, with its
+//! key edits, its read, `Delete successful.` and its own Db2 texts
+//! (P-COTRTUPC-004, P-COTRTUPC-005, V-COTRTUPC-022 to V-COTRTUPC-028), on
+//! `TRTYPCD` (E-23, P-COTRTUPC-028). [`TranTypeCreateRequest`], the `POST`
+//! body, is the `COTRTUPC` add: F5 on a key not found. The map's `F6=Add`
+//! legend has no executable path, as it stays dark and F6 is never accepted
+//! (P-COTRTUPC-001, P-COTRTUPC-026).
 //!
 //! # Lengths
 //!
@@ -62,23 +66,25 @@
 //! precedes it; where neither holds, the value is held to ASCII
 //! ([`crate::dto::ascii_text`]) and answered as an over-length one:
 //!
-//! - `COTRTUPC` (`POST`, and `PUT` without `origin`): the type code, from the
-//!   body or the `{id}` segment, goes to `1245-EDIT-NUM-REQD`, and the
-//!   description to `1230-EDIT-ALPHANUM-REQD`. A non-ASCII character leaves
-//!   a byte of `0x80` or more within the two or fifty bytes kept, which is no
-//!   `NUMVAL` argument and no letter, digit or space, so the key is refused
-//!   `must be numeric.` (V-COTRTUPC-002, V-COTRTUPC-013) and the description
-//!   `can have numbers or alphabets only.` (V-COTRTUPC-008, V-COTRTUPC-018)
-//!   before anything is read or written. No ASCII check is added.
-//! - `COTRTLIC` (`PUT` with `origin=list`, and `DELETE`): the `{id}` segment
-//!   is the listed row's `TRTTYPn` and has no edit, so a non-ASCII segment
-//!   would address the type its first two bytes spell; it is held to ASCII,
-//!   on no field, as the rows name none. The row description goes to
-//!   `1240-EDIT-ALPHANUM-REQD`. The rule receives it into `X(50)`
-//!   (`1100-RECEIVE-SCREEN`) keeping whole a character that byte 50 splits,
-//!   which stands for the lead bytes the COBOL field keeps, so the edit reads
-//!   every non-ASCII character of a description within the length and
-//!   refuses it `can have numbers or alphabets only.` (V-COTRTLIC-014)
+//! - `COTRTUPC` (`POST`, `PUT` without `origin`, and `DELETE` with
+//!   `origin=form`): the type code, from the body or the `{id}` segment, goes
+//!   to `1245-EDIT-NUM-REQD`, and the description to
+//!   `1230-EDIT-ALPHANUM-REQD`. A non-ASCII character leaves a byte of `0x80`
+//!   or more within the two or fifty bytes kept, which is no `NUMVAL`
+//!   argument and no letter, digit or space, so the key is refused `must be
+//!   numeric.` (V-COTRTUPC-002, V-COTRTUPC-013, V-COTRTUPC-023) and the
+//!   description `can have numbers or alphabets only.` (V-COTRTUPC-008,
+//!   V-COTRTUPC-018) before anything is read or written. No ASCII check is
+//!   added.
+//! - `COTRTLIC` (`PUT` with `origin=list`, and `DELETE` without `origin`):
+//!   the `{id}` segment is the listed row's `TRTTYPn` and has no edit, so a
+//!   non-ASCII segment would address the type its first two bytes spell; it
+//!   is held to ASCII, on no field, as the rows name none. The row
+//!   description goes to `1240-EDIT-ALPHANUM-REQD`. The rule receives it
+//!   into `X(50)` (`1100-RECEIVE-SCREEN`) keeping whole a character that byte
+//!   50 splits, which stands for the lead bytes the COBOL field keeps, so the
+//!   edit reads every non-ASCII character of a description within the length
+//!   and refuses it `can have numbers or alphabets only.` (V-COTRTLIC-014)
 //!   before anything is written. No ASCII check is added.
 //! - `COTRTLIC` list (`GET`): the type code filter goes to
 //!   `1220-EDIT-TYPECD`, whose `IS NUMERIC` refuses a byte of `0x80` or more
@@ -102,7 +108,8 @@ use carddemo_domain::rules::tran_type_list::{
     TranTypeDeleted, TranTypeListInput, TranTypePage, TranTypeUpdated,
 };
 use carddemo_domain::rules::tran_type_update::{
-    FIELD_DESCRIPTION, FIELD_TYPE_CODE, TranTypeSaved, TranTypeUpsertInput, TranTypeUpsertOutcome,
+    self, FIELD_DESCRIPTION, FIELD_TYPE_CODE, TranTypeSaved, TranTypeUpsertInput,
+    TranTypeUpsertOutcome,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -190,20 +197,23 @@ impl BmsField for TranTypeListField {
     }
 }
 
-/// A BMS field of the `COTRTUP` map that a `POST /admin/transaction-types`
-/// or `PUT /admin/transaction-types/{id}` error names, where
+/// A BMS field of the `COTRTUP` map that a `POST /admin/transaction-types`,
+/// `PUT /admin/transaction-types/{id}` or
+/// `DELETE /admin/transaction-types/{id}?origin=form` error names, where
 /// `3300-SETUP-SCREEN-ATTRS` places the cursor
 /// [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1303-1325].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum TranTypeUpsertField {
-    /// The type code `TRTYPCD`, `X(2)`: the key edits, the read and every
-    /// write failure (V-COTRTUPC-001 to V-COTRTUPC-005, V-COTRTUPC-009 to
-    /// V-COTRTUPC-016, V-COTRTUPC-019 to V-COTRTUPC-021).
+    /// The type code `TRTYPCD`, `X(2)`: the key edits, the read, every write
+    /// failure but the lock error (V-COTRTUPC-001 to V-COTRTUPC-005,
+    /// V-COTRTUPC-010 to V-COTRTUPC-016, V-COTRTUPC-020, V-COTRTUPC-021), and
+    /// every failure of the delete (V-COTRTUPC-022 to V-COTRTUPC-028).
     #[serde(rename = "TRTYPCD")]
     TrTypCd,
-    /// The description `TRTYDSC`, `X(50)`: the no-change compare and the
-    /// description edits (V-COTRTUPC-006 to V-COTRTUPC-008, V-COTRTUPC-017,
-    /// V-COTRTUPC-018).
+    /// The description `TRTYDSC`, `X(50)`: the no-change compare, the
+    /// description edits and the lock error, whose changes-made state puts
+    /// the cursor there (V-COTRTUPC-006 to V-COTRTUPC-009, V-COTRTUPC-017 to
+    /// V-COTRTUPC-019; P-COTRTUPC-025).
     #[serde(rename = "TRTYDSC")]
     TrTyDsc,
 }
@@ -511,6 +521,30 @@ pub struct TranTypeUpdateQuery {
     pub origin: Option<TranTypeOrigin>,
 }
 
+/// The program whose edits and texts `DELETE /admin/transaction-types/{id}`
+/// applies when the request names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TranTypeDeleteOrigin {
+    /// The F4 delete of the maintenance screen, `COTRTUPC` F4 confirmed.
+    Form,
+}
+
+/// The query of `DELETE /admin/transaction-types/{id}`.
+///
+/// A value of `origin` other than `form` does not deserialize, so the query
+/// extractor answers it 400.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TranTypeDeleteQuery {
+    /// `form` for the F4 delete of the maintenance screen (`COTRTUPC`);
+    /// absent for the row delete of the type list (`COTRTLIC`).
+    // Inlined, as `TranTypeUpdateQuery::origin` is.
+    #[serde(default)]
+    #[param(inline)]
+    pub origin: Option<TranTypeDeleteOrigin>,
+}
+
 /// The body of `PUT /admin/transaction-types/{id}`: the new description, as
 /// entered. The type code is the path segment.
 ///
@@ -600,8 +634,9 @@ impl TranTypeUpdateRequest {
 /// Rejects a `{id}` path segment longer than the type code `X(2)`: 400 with
 /// an empty message, on `TRTYPCD` without `origin`, and on no field with
 /// `origin=list`, the `COTRTLIC` row actions whose rows name none.
-/// `DELETE /admin/transaction-types/{id}` is the `COTRTLIC` delete, so it
-/// passes `Some(TranTypeOrigin::List)`.
+/// `DELETE /admin/transaction-types/{id}` without `origin` is the `COTRTLIC`
+/// delete, so it passes `Some(TranTypeOrigin::List)`; with `origin=form` it
+/// is the `COTRTUPC` delete, which passes `None`.
 ///
 /// The segment is the code a `COTRTUPC` key field or a listed row holds,
 /// never more than two characters. Moved into `X(2)`, a longer one would be
@@ -685,17 +720,20 @@ fn reject_list_row(errors: &ValidationErrors) -> ApiError {
 /// The texts are the rules': `COTRTUPC` `Changes committed to database` or
 /// `No change detected with respect to values fetched.` (V-COTRTUPC-006),
 /// `COTRTLIC` `HIGHLIGHTED row was updated` or `No change detected with
-/// respect to database values.` (V-COTRTLIC-012), and on a delete
-/// `HIGHLIGHTED row deleted.Hit Enter to continue`, with no type.
+/// respect to database values.` (V-COTRTLIC-012), on the `COTRTLIC` delete
+/// `HIGHLIGHTED row deleted.Hit Enter to continue`, with no type, and on the
+/// `COTRTUPC` delete `Delete successful.`, with the type as it was read
+/// (P-COTRTUPC-004, P-COTRTUPC-023).
 ///
 /// `info` is present only on `PUT` with `origin=list`. It is left out of every
 /// other answer rather than sent as `null`, so the schema declares it an
 /// optional, non-nullable string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TranTypeMessageResponse {
-    /// The type as stored after the write; `null` after a delete.
+    /// The type as stored after the write; `null` after the `COTRTLIC`
+    /// delete, and the deleted type as read after the `COTRTUPC` delete.
     // Required although nullable: the member is always serialized, as `null`
-    // after a delete, so the published schema says so.
+    // after the `COTRTLIC` delete, so the published schema says so.
     #[schema(required = true)]
     pub transaction_type: Option<TranTypeResponse>,
     /// The program's text, unchanged.
@@ -706,7 +744,7 @@ pub struct TranTypeMessageResponse {
     /// sets once the inline update is stored (P-COTRTLIC-009). It comes with
     /// every `origin=list` update, beside the no-change `message` of a change
     /// of case alone (V-COTRTLIC-012). Absent on the `COTRTUPC` writes and on
-    /// the delete.
+    /// both deletes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub info: Option<String>,
@@ -763,6 +801,19 @@ impl From<TranTypeDeleted> for TranTypeMessageResponse {
     }
 }
 
+/// The `COTRTUPC` F4 delete, `DELETE` with `origin=form` (P-COTRTUPC-004):
+/// the type as read before the delete, which the delete-done screen still
+/// shows (P-COTRTUPC-023), and `Delete successful.`.
+impl From<tran_type_update::TranTypeDeleted> for TranTypeMessageResponse {
+    fn from(deleted: tran_type_update::TranTypeDeleted) -> Self {
+        Self {
+            transaction_type: Some(TranTypeResponse::from(&deleted.master)),
+            message: deleted.message,
+            info: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::extract::Query;
@@ -787,10 +838,10 @@ mod tests {
     use utoipa::{IntoParams, PartialSchema};
 
     use super::{
-        DESCRIPTION_MAX_LEN, TYPE_CODE_MAX_LEN, TranTypeCreateRequest, TranTypeListField,
-        TranTypeListPageQuery, TranTypeListQuery, TranTypeListUpdate, TranTypeMessageResponse,
-        TranTypeOrigin, TranTypeResponse, TranTypeUpdateQuery, TranTypeUpdateRequest,
-        TranTypeUpsertField, check_type_code_key,
+        DESCRIPTION_MAX_LEN, TYPE_CODE_MAX_LEN, TranTypeCreateRequest, TranTypeDeleteOrigin,
+        TranTypeDeleteQuery, TranTypeListField, TranTypeListPageQuery, TranTypeListQuery,
+        TranTypeListUpdate, TranTypeMessageResponse, TranTypeOrigin, TranTypeResponse,
+        TranTypeUpdateQuery, TranTypeUpdateRequest, TranTypeUpsertField, check_type_code_key,
     };
     use crate::dto::BmsField;
     use crate::error::ApiError;
@@ -858,6 +909,26 @@ mod tests {
         }
         for text in ["origin=LIST", "origin=", "origin=cttu"] {
             let error = query::<TranTypeUpdateQuery>(text).expect_err("rejected");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{text}");
+            assert_eq!(error.body().code, ErrorKind::Invalid.code(), "{text}");
+        }
+    }
+
+    // E-23: `form` selects the COTRTUPC delete; absent, the COTRTLIC one.
+    #[test]
+    fn delete_origin_deserializes_from_the_query_string() {
+        // (query text, origin)
+        let cases = [
+            ("origin=form", Some(TranTypeDeleteOrigin::Form)),
+            ("", None),
+            ("other=1", None),
+        ];
+        for (text, origin) in cases {
+            let parsed: TranTypeDeleteQuery = query(text).expect("deserializes");
+            assert_eq!(parsed.origin, origin, "{text}");
+        }
+        for text in ["origin=FORM", "origin=", "origin=list"] {
+            let error = query::<TranTypeDeleteQuery>(text).expect_err("rejected");
             assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{text}");
             assert_eq!(error.body().code, ErrorKind::Invalid.code(), "{text}");
         }
@@ -1511,7 +1582,7 @@ mod tests {
                     message: messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_DATABASE_VALUES,
                     info: messages::HIGHLIGHTED_ROW_WAS_UPDATED,
                 }),
-                typed,
+                typed.clone(),
                 messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_DATABASE_VALUES,
                 Some(messages::HIGHLIGHTED_ROW_WAS_UPDATED),
             ),
@@ -1522,6 +1593,17 @@ mod tests {
                 }),
                 None,
                 messages::HIGHLIGHTED_ROW_DELETED_HIT_ENTER_TO_CONTINUE,
+                None,
+            ),
+            // The COTRTUPC F4 delete: the type as read, which the delete-done
+            // screen shows (P-COTRTUPC-004, P-COTRTUPC-023).
+            (
+                TranTypeMessageResponse::from(tran_type_update::TranTypeDeleted {
+                    master: stored,
+                    message: messages::DELETE_SUCCESSFUL.to_owned(),
+                }),
+                typed,
+                messages::DELETE_SUCCESSFUL,
                 None,
             ),
         ];
@@ -1590,6 +1672,16 @@ mod tests {
         assert_eq!(origin[0]["required"], json!(false));
         assert_eq!(origin[0]["schema"]["enum"], json!(["list"]));
         assert!(!origin.to_string().contains("$ref"), "{origin}");
+        let delete_origin =
+            serde_json::to_value(TranTypeDeleteQuery::into_params(|| None)).expect("serializes");
+        assert_eq!(delete_origin[0]["name"], json!("origin"));
+        assert_eq!(delete_origin[0]["in"], json!("query"));
+        assert_eq!(delete_origin[0]["required"], json!(false));
+        assert_eq!(delete_origin[0]["schema"]["enum"], json!(["form"]));
+        assert!(
+            !delete_origin.to_string().contains("$ref"),
+            "{delete_origin}"
+        );
 
         let create = serde_json::to_value(TranTypeCreateRequest::schema()).expect("serializes");
         assert_eq!(

@@ -34,6 +34,16 @@ const ASCII_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app/data/ASC
 /// The EBCDIC (CP037) counterpart corpus.
 const EBCDIC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app/data/EBCDIC");
 
+/// The parity audit, whose section E row [`RECORD_34_ROW`] states the rates of
+/// disclosure group record 34 in each corpus.
+const PARITY_AUDIT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/parity/parity-oracle-audit.md"
+);
+
+/// The audit row of the E-05 rate difference, as corrected by E-79.
+const RECORD_34_ROW: &str = "P-CVTRA02Y-007";
+
 /// The failure message of a cross-check whose differences are not exactly
 /// E-05's.
 const NOT_E05: &str = "ASCII/EBCDIC content differs outside E-05 (or an E-05 difference \
@@ -157,6 +167,66 @@ fn crosscheck<L: Layout>(ascii_file: &'static str, ebcdic_file: &str) -> Vec<Dif
     differences
 }
 
+/// The cells of the data row `id` of [`PARITY_AUDIT`]: the table line whose
+/// first cell is `id` and whose `Program` cell is the key of `id`, which
+/// passes over the review-log lines that also start with `id`.
+fn audit_cells(id: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(PARITY_AUDIT)
+        .unwrap_or_else(|error| panic!("cannot read {PARITY_AUDIT}: {error}"));
+    let key = id
+        .strip_prefix("P-")
+        .and_then(|rest| rest.rsplit_once('-'))
+        .map_or_else(|| panic!("{id} is not a P-ID"), |(key, _)| key);
+    text.lines()
+        .map(|line| {
+            line.trim()
+                .trim_matches('|')
+                .split(" | ")
+                .map(|cell| cell.trim().to_owned())
+                .collect::<Vec<String>>()
+        })
+        .find(|cells| {
+            cells.first().is_some_and(|first| first == id)
+                && cells.get(1).is_some_and(|program| program == key)
+        })
+        .unwrap_or_else(|| panic!("{PARITY_AUDIT} has no data row {id}"))
+}
+
+/// Cell `index` of the audit row `id`, whose cells are `cells`.
+fn cell<'c>(cells: &'c [String], index: usize, id: &str) -> &'c str {
+    cells
+        .get(index)
+        .map_or_else(|| panic!("{id} has no cell {index}"), String::as_str)
+}
+
+/// The exact texts of an audit cell: the double-quoted string of each code
+/// span.
+fn exact_texts(cell: &str) -> Vec<&str> {
+    cell.split('`')
+        .skip(1)
+        .step_by(2)
+        .map(|span| span.trim_matches('"'))
+        .collect()
+}
+
+/// The rate written after `label` in `text`, in hundredths: `15.00` is 1 500.
+fn rate_after(text: &str, label: &str) -> i32 {
+    let rate = text
+        .split_once(label)
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .map_or_else(|| panic!("{text:?} gives no {label:?}"), |word| word);
+    let (whole, cents) = rate
+        .split_once('.')
+        .filter(|(_, cents)| cents.len() == 2)
+        .unwrap_or_else(|| panic!("{rate:?} is not a rate with two decimals"));
+    let number = |digits: &str| -> i32 {
+        digits
+            .parse()
+            .unwrap_or_else(|error| panic!("{rate:?}: {error}"))
+    };
+    number(whole) * 100 + number(cents)
+}
+
 /// Record `number` (1-based) of a decoded file pair.
 fn record<R>(pairs: &[RecordPair<R>], number: usize) -> &RecordPair<R> {
     number
@@ -225,11 +295,43 @@ fn account_record_49_differs_only_in_its_zip() {
     assert_eq!(&aligned, ascii, "{NOT_E05}");
 }
 
+/// [`RECORD_34_ROW`] read from the audit: the record, key and field it names
+/// hold, in each corpus, the field bytes and the rate the row gives, and
+/// nothing else in the record differs.
 #[test]
 fn disclosure_group_record_34_differs_only_in_its_rate() {
+    let id = RECORD_34_ROW;
+    let cells = audit_cells(id);
+    let (number, row_key) = cell(&cells, 4, id)
+        .strip_prefix("record ")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|rest| rest.split_once(" ("))
+        .unwrap_or_else(|| panic!("{id}: the input condition names no record and key"));
+    let number: usize = number
+        .parse()
+        .unwrap_or_else(|error| panic!("{id}: record {number:?}: {error}"));
+    let row_key: Vec<&str> = row_key.split(", ").collect();
+    let field_name = cell(&cells, 3, id)
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("{id} names no field"));
+    let spec = DisclosureGroupLayout::FIELDS
+        .iter()
+        .find(|spec| spec.name == field_name)
+        .unwrap_or_else(|| panic!("{id}: DIS-GROUP-RECORD has no {field_name}"));
+    let disposition = cell(&cells, 5, id);
+    let texts = exact_texts(disposition);
+    let [ascii_bytes, ebcdic_bytes] = texts.as_slice() else {
+        panic!("{id}: {disposition:?} gives no ASCII and EBCDIC field bytes")
+    };
+
     let pairs: Vec<RecordPair<DisclosureGroupRecord>> =
         decode_pair::<DisclosureGroupLayout>("discgrp.txt", "AWS.M2.CARDDEMO.DISCGRP.PS");
-    let RecordPair { ascii, ebcdic, .. } = record(&pairs, 34);
+    let RecordPair {
+        ascii,
+        ebcdic,
+        ebcdic_internal,
+    } = record(&pairs, number);
 
     for (corpus, side) in [("ASCII", ascii), ("EBCDIC", ebcdic)] {
         let key = &side.group.key;
@@ -238,23 +340,35 @@ fn disclosure_group_record_34_differs_only_in_its_rate() {
             &DEFAULT_GROUP_ID,
             "{corpus} DIS-ACCT-GROUP-ID"
         );
-        assert_eq!(
-            key.dis_tran_type_cd.as_bytes(),
-            b"07",
-            "{corpus} DIS-TRAN-TYPE-CD"
-        );
-        assert_eq!(key.dis_tran_cat_cd.get(), 1, "{corpus} DIS-TRAN-CAT-CD");
+        let held = [
+            key.dis_acct_group_id.trimmed().into_owned(),
+            key.dis_tran_type_cd.trimmed().into_owned(),
+            key.dis_tran_cat_cd.to_string(),
+        ];
+        assert_eq!(held.as_slice(), row_key.as_slice(), "{id}: {corpus} key");
     }
 
-    assert_eq!(ascii.group.dis_int_rate.hundredths(), 0, "ASCII 0.00");
-    // `S9(04)V99` puts the implied point before the last two of the digits
-    // `001500`, so the EBCDIC rate is 15.00, as record 1's identical `00150{`
-    // is. E-05 and P-CVTRA02Y-007 state it as 1.50, which these bytes do not
-    // spell; the PIC clause decides ("PIC clauses are authoritative").
+    // The field's bytes as the row gives them, then the rates `S9(04)V99`
+    // reads from them: the implied point falls before the last two digits.
+    let window = spec.offset..spec.end();
+    let fields = (
+        latin1(&DisclosureGroupLayout::encode(ascii, Charset::Ascii)[window.clone()]),
+        latin1(&ebcdic_internal[window]),
+    );
+    assert_eq!(
+        (fields.0.as_str(), fields.1.as_str()),
+        (*ascii_bytes, *ebcdic_bytes),
+        "{id}: {field_name} bytes in ASCII and after CP037 translation"
+    );
+    assert_eq!(
+        ascii.group.dis_int_rate.hundredths(),
+        rate_after(disposition, "ASCII rate "),
+        "{id}: ASCII rate"
+    );
     assert_eq!(
         ebcdic.group.dis_int_rate.hundredths(),
-        1_500,
-        "EBCDIC 15.00"
+        rate_after(disposition, "EBCDIC rate "),
+        "{id}: EBCDIC rate"
     );
 
     let mut aligned = ebcdic.clone();

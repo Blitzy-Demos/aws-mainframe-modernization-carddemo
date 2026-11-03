@@ -63,12 +63,13 @@ pub struct AuthFraud {
     /// `TIMESTAMP(6)` column holds exactly. That conversion, including the
     /// century of the two-digit year, belongs to `rules::auth_detail`.
     //
-    // A timestamp, not the `Alnum<26>` the section A row labels the column
-    // with: 26 is the length of the string form of the same `TIMESTAMP(6)`
-    // value that the row's SQL type and migration 0004 store. Db2 compares the
-    // column only as a timestamp (the key, the descending `XAUTHFRD` order and
-    // `FRAUD-UPDATE`'s `WHERE AUTH_TS = TIMESTAMP_FORMAT(...)`, L227-228), and
-    // no program reads it back as text, so no COBOL text comparison needs it.
+    // A `NaiveDateTime`, as P-AUTHFRDS-002 types the column: the
+    // `TIMESTAMP(6)` value that migration 0004 stores, whose 26-character
+    // string form is what the host variable `AUTH-TS X(26)` holds. Db2
+    // compares the column only as a timestamp (the key, the descending
+    // `XAUTHFRD` order and `FRAUD-UPDATE`'s
+    // `WHERE AUTH_TS = TIMESTAMP_FORMAT(...)`, L227-228), and no program reads
+    // it back as text, so the field holds the timestamp, not its text.
     pub auth_ts: NaiveDateTime,
     /// `AUTH_TYPE CHAR(4)` (P-AUTHFRDS-003; DDL L4, host L58,
     /// `MOVE PA-AUTH-TYPE` L115).
@@ -158,10 +159,11 @@ pub struct AuthFraud {
     /// `PA-FRAUD-RPT-DATE`, the `MM/DD/YY` text that `COPAUS2C` builds from
     /// `FORMATTIME` (L91-101, P-COPAUS2C-006).
     //
-    // A date, not the `Alnum<10>` of the section A row, for the reason given
-    // at `auth_ts`: 10 is the length of the `DATE` string form, the column is
-    // `DATE` in the row and in migration 0004, and no program reads it back
-    // as text.
+    // A `NaiveDate`, as P-AUTHFRDS-024 types the column: the `DATE` value
+    // that migration 0004 stores, whose 10-character string form is what the
+    // host variable `FRAUD-RPT-DATE X(10)` holds. `COPAUS2C` sets it only to
+    // `CURRENT DATE` and no program reads it back as text, so the field holds
+    // the date, not its text, as `auth_ts` holds the timestamp.
     pub fraud_rpt_date: Option<NaiveDate>,
     /// `ACCT_ID DECIMAL(11)` (P-AUTHFRDS-025; DDL L26, host `S9(11)V COMP-3`
     /// L85, `MOVE WS-ACCT-ID` L138), moved from the unsigned commarea field

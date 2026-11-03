@@ -10,6 +10,7 @@
 //! | `PUT /admin/transaction-types/{id}` | CTTU | `COTRTUPC` | `tran_type_update::update` |
 //! | `PUT /admin/transaction-types/{id}?origin=list` | CTLI | `COTRTLIC` | `tran_type_list::update_description` |
 //! | `DELETE /admin/transaction-types/{id}` | CTLI | `COTRTLIC` | `tran_type_list::delete` |
+//! | `DELETE /admin/transaction-types/{id}?origin=form` | CTTU | `COTRTUPC` | `tran_type_update::delete` |
 //!
 //! # One update, two programs
 //!
@@ -20,17 +21,18 @@
 //! a listed row, the `U` selector and its F10 save in `COTRTLIC`
 //! (`1211-EDIT-ARRAY-DESC`, `9200-UPDATE-RECORD`), with that program's texts.
 //!
-//! # What these resources leave out
+//! # One delete, two programs
 //!
-//! They leave out only the alternate `COTRTUPC` delete message set:
-//! `Delete successful.` (P-COTRTUPC-004) and its failure texts
-//! (P-COTRTUPC-005). The `COTRTUP` F4 delete is served by the one `DELETE`,
-//! with the `COTRTLIC` `9300-DELETE-RECORD` texts (P-COTRTUPC-028); which set
-//! that `DELETE` answers with is the user's decision under E-23 (open), so no
-//! second delete endpoint exists here. The add is `POST`, which `COTRTUPC`
-//! reaches with F5 on a key not found. The map's `F6=Add` legend has no
-//! executable path: it stays dark and `0001-CHECK-PFKEYS` never accepts F6
-//! (P-COTRTUPC-001, P-COTRTUPC-026).
+//! CTLI and CTTU share `DELETE /admin/transaction-types/{id}`, the CTLI
+//! resource. Without `origin` it is the `D` selector of a listed row and its
+//! F10 confirmation, `COTRTLIC` `9300-DELETE-RECORD`, with that program's
+//! texts. With `origin=form` it is the confirmed F4 of the `COTRTUP`
+//! maintenance screen, `COTRTUPC` `9800-DELETE-PROCESSING`, with its key
+//! edits, its read and its texts: `Delete successful.` (P-COTRTUPC-004) and
+//! its failure texts (P-COTRTUPC-005), which E-23 carries to this `DELETE`.
+//! The add is `POST`, which `COTRTUPC` reaches with F5 on a key not found.
+//! The map's `F6=Add` legend has no executable path: it stays dark and
+//! `0001-CHECK-PFKEYS` never accepts F6 (P-COTRTUPC-001, P-COTRTUPC-026).
 //!
 //! # Units of work
 //!
@@ -52,13 +54,14 @@
 //! token 403, before any input is read. The COBOL kept users out of these
 //! programs only through the admin menu. The admin's ID from the verified
 //! token is used for telemetry only. Each request runs in a `handler` span
-//! with `transaction` (`CTLI` or `CTTU`), `user_id`, `type_code`, `origin`
-//! and, once the unit of work has ended, `outcome`: `ok`, or the error code
-//! of the response. A request dropped before its answer, its client gone,
-//! records `cancelled`: an open unit of work is rolled back as it is dropped,
-//! unless its commit had already reached the server. `type_code` is the path
-//! code, the code of an add's body or the type code filter of a list,
-//! recorded only once [`check_type_code_key`] has passed it, so it is at most
+//! with `transaction` (`CTLI` or `CTTU`), `user_id`, `type_code`, the
+//! `origin` of an update or a delete and, once the unit of work has ended,
+//! `outcome`: `ok`, or the error code of the response. A request dropped
+//! before its answer, its client gone, records `cancelled`: an open unit of
+//! work is rolled back as it is dropped, unless its commit had already
+//! reached the server. `type_code` is the path code, the code of an add's
+//! body or the type code filter of a list, recorded only once
+//! [`check_type_code_key`] has passed it, so it is at most
 //! `X(2)`. A code that check rejects is never recorded: `key_rejected` holds
 //! the error's code and `key_len` its length in characters instead.
 
@@ -73,9 +76,9 @@ use tracing::{Instrument, Span};
 
 use crate::auth::AdminUser;
 use crate::dto::admin_transaction_types::{
-    TranTypeCreateRequest, TranTypeListPageQuery, TranTypeListQuery, TranTypeMessageResponse,
-    TranTypeOrigin, TranTypeResponse, TranTypeUpdateQuery, TranTypeUpdateRequest,
-    check_type_code_key,
+    TranTypeCreateRequest, TranTypeDeleteOrigin, TranTypeDeleteQuery, TranTypeListPageQuery,
+    TranTypeListQuery, TranTypeMessageResponse, TranTypeOrigin, TranTypeResponse,
+    TranTypeUpdateQuery, TranTypeUpdateRequest, check_type_code_key,
 };
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
 use crate::pagination::{Page, PageQuery};
@@ -95,9 +98,8 @@ const OUTCOME_OK: &str = "ok";
 ///
 /// COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,
 /// 8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,
-/// P-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,
-/// V-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,
-/// V-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,
+/// P-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-040, V-COTRTLIC-001,
+/// V-COTRTLIC-002, V-COTRTLIC-004 to V-COTRTLIC-010, V-COTRTLIC-024 to
 /// V-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response
 /// replaces the 3270 send of the `CTRTLIA` map, a mandated deviation.
 ///
@@ -120,10 +122,12 @@ const OUTCOME_OK: &str = "ok";
 /// - 404 when no type passes the filters (V-COTRTLIC-002), a description
 ///   filter holding a character outside ASCII included, which is searched as
 ///   entered.
-/// - 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,
-///   V-COTRTLIC-026), with the no-records text when the filter count fails
-///   (V-COTRTLIC-028), and with `Unexpected error` when the database cannot
-///   be reached.
+/// - 500 with the Db2 text of the cursor step that failed when the read
+///   fails: its `OPEN` (V-COTRTLIC-024, V-COTRTLIC-026), a `FETCH`
+///   (V-COTRTLIC-006, V-COTRTLIC-007, V-COTRTLIC-010) or its `CLOSE`
+///   (V-COTRTLIC-025, V-COTRTLIC-027); with the no-records text when the
+///   filter count fails (V-COTRTLIC-028); and with `Unexpected error` when
+///   the database cannot be reached.
 #[utoipa::path(
     get,
     path = "/admin/transaction-types",
@@ -286,7 +290,7 @@ pub async fn update_tran_type(
         None => CTTU,
         Some(TranTypeOrigin::List) => CTLI,
     };
-    let span = handler_span(transaction, &admin, query.origin);
+    let span = handler_span(transaction, &admin, query.origin.map(origin_name));
     traced(span.clone(), async move {
         let response = match query.origin {
             None => update_via_cttu(&state, &span, id, body).await?,
@@ -341,42 +345,55 @@ async fn update_via_ctli(
     commit_or_roll_back(uow, result).await.map(Into::into)
 }
 
-/// Deletes the listed type `{id}`: the `D` selector of the `COTRTLI` list,
-/// confirmed with F10 (CTLI).
+/// Deletes the type `{id}`: without `origin` the `D` selector of the
+/// `COTRTLI` list, confirmed with F10 (CTLI); with `origin=form` the F4 of
+/// the `COTRTUP` maintenance screen, confirmed with F4 (CTTU).
 ///
-/// COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007, P-COTRTLIC-008,
-/// V-COTRTLIC-021 to V-COTRTLIC-023
+/// Without `origin`: COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007,
+/// P-COTRTLIC-008, V-COTRTLIC-021 to V-COTRTLIC-023. A deleted type is
+/// committed and answered with `HIGHLIGHTED row deleted.Hit Enter to
+/// continue` and no type.
 ///
-/// The confirmation is the dialog of the SPA. A deleted type is committed
-/// and answered with `HIGHLIGHTED row deleted.Hit Enter to continue` and no
-/// type.
+/// With `origin=form`: COTRTUPC 1210-EDIT-TRANTYPE, 9000-READ-TRANTYPE,
+/// 9800-DELETE-PROCESSING — P-COTRTUPC-004, P-COTRTUPC-005, V-COTRTUPC-022
+/// to V-COTRTUPC-028 (E-23). The key is edited and the type read before the
+/// delete; a deleted type is committed and answered with `Delete
+/// successful.` and the type as read, which the delete-done screen shows
+/// (P-COTRTUPC-023).
+///
+/// Either confirmation is the dialog of the SPA.
 ///
 /// # Errors
 ///
-/// - 400 for a key longer than the type code `X(2)` or holding a character
-///   outside ASCII, or a malformed path.
+/// - 400 for a key longer than the type code `X(2)`, a malformed path or
+///   query, and, without `origin`, a key holding a character outside ASCII;
+///   with `origin=form`, 400 for the key edits on `TRTYPCD`
+///   (V-COTRTUPC-022 to V-COTRTUPC-024).
 /// - 401 without a valid token; 403 for a token that is not an admin's.
-/// - 404 with the delete-failed Db2 text when no type has the code
-///   (V-COTRTLIC-022).
-/// - 409 with the child-records Db2 text when categories still reference the
-///   type (SQLCODE -532, V-COTRTLIC-021); the type stays.
-/// - 500 with the delete-failed Db2 text on any other failure
-///   (V-COTRTLIC-023).
+/// - 404 when no type has the code: with the delete-failed Db2 text without
+///   `origin` (V-COTRTLIC-022), and with the not-found text on `TRTYPCD`
+///   with `origin=form` (V-COTRTUPC-025).
+/// - 409 with the child-records Db2 text of the program when categories
+///   still reference the type (SQLCODE -532, V-COTRTLIC-021,
+///   V-COTRTUPC-027); the type stays.
+/// - 500 with the program's Db2 text when the read (`origin=form`,
+///   V-COTRTUPC-026) or the delete fails (V-COTRTLIC-023, V-COTRTUPC-028).
 #[utoipa::path(
     delete,
     path = "/admin/transaction-types/{id}",
     tag = "admin-transaction-types",
     params(
         ("id" = String, Path, description = "The type code, `TR_TYPE`: two ASCII characters", max_length = 2, pattern = "^[\\x00-\\x7F]*$"),
+        TranTypeDeleteQuery,
     ),
     responses(
-        (status = 200, description = "The type was deleted; `message` is the COBOL text and `transaction_type` is null", body = TranTypeMessageResponse),
-        (status = 400, description = "The type code is longer than two characters or not ASCII", body = ErrorBody),
+        (status = 200, description = "The type was deleted; `message` is the COBOL text, and `transaction_type` is null without `origin` and the deleted type with `origin=form`", body = TranTypeMessageResponse),
+        (status = 400, description = "The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form`", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an admin's", body = ErrorBody),
         (status = 404, description = "No transaction type has the code", body = ErrorBody),
         (status = 409, description = "Transaction categories still reference the type", body = ErrorBody),
-        (status = 500, description = "The Db2 master could not be updated", body = ErrorBody),
+        (status = 500, description = "The Db2 master could not be read or updated", body = ErrorBody),
     ),
     security(("bearer_auth" = []))
 )]
@@ -384,31 +401,66 @@ pub async fn delete_tran_type(
     State(state): State<AppState>,
     admin: AdminUser,
     ApiPath(id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<TranTypeDeleteQuery>,
 ) -> Result<Json<TranTypeMessageResponse>, ApiError> {
-    let span = handler_span(CTLI, &admin, None);
+    let transaction = match query.origin {
+        None => CTLI,
+        Some(TranTypeDeleteOrigin::Form) => CTTU,
+    };
+    let span = handler_span(transaction, &admin, query.origin.map(delete_origin_name));
     traced(span.clone(), async move {
-        checked_type_code(&span, &id, Some(TranTypeOrigin::List))?;
-        // The `COTRTLIC` delete, not the `COTRTUPC` F4 delete with its own
-        // texts: which of the two message sets this endpoint answers with is
-        // open for the user (E-23), and the list's delete is the one the
-        // CTLI resource carries.
-        let code = TranTypeCode::move_from(&id);
-        let mut uow = state.db().begin().await?;
-        let result = tran_type_list::delete(&mut uow.store(), code).await;
-        let deleted = commit_or_roll_back(uow, result).await?;
-        Ok(Json(deleted.into()))
+        let response = match query.origin {
+            None => delete_via_ctli(&state, &span, &id).await?,
+            Some(TranTypeDeleteOrigin::Form) => delete_via_cttu(&state, &span, &id).await?,
+        };
+        Ok(Json(response))
     })
     .await
 }
 
+/// `DELETE /admin/transaction-types/{id}` without `origin`: the `COTRTLIC`
+/// delete of the listed row `{id}`, the plan's CTLI resource.
+///
+/// COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007, P-COTRTLIC-008,
+/// V-COTRTLIC-021 to V-COTRTLIC-023
+async fn delete_via_ctli(
+    state: &AppState,
+    span: &Span,
+    id: &str,
+) -> Result<TranTypeMessageResponse, ApiError> {
+    checked_type_code(span, id, Some(TranTypeOrigin::List))?;
+    let code = TranTypeCode::move_from(id);
+    let mut uow = state.db().begin().await?;
+    let result = tran_type_list::delete(&mut uow.store(), code).await;
+    commit_or_roll_back(uow, result).await.map(Into::into)
+}
+
+/// `DELETE /admin/transaction-types/{id}?origin=form`: the `COTRTUPC` F4
+/// delete of the type `{id}`, confirmed, in one request.
+///
+/// COTRTUPC 1210-EDIT-TRANTYPE, 9000-READ-TRANTYPE, 9800-DELETE-PROCESSING —
+/// P-COTRTUPC-004, P-COTRTUPC-005, V-COTRTUPC-022 to V-COTRTUPC-028
+async fn delete_via_cttu(
+    state: &AppState,
+    span: &Span,
+    id: &str,
+) -> Result<TranTypeMessageResponse, ApiError> {
+    checked_type_code(span, id, None)?;
+    let mut uow = state.db().begin().await?;
+    // `delete` edits the key and reads the type before deleting it, in the
+    // order the audit ranks those rejections.
+    let result = tran_type_update::delete(&mut uow.store(), id).await;
+    commit_or_roll_back(uow, result).await.map(Into::into)
+}
+
 /// The span of one request: its CICS `transaction`, the admin's ID and the
-/// `origin` of an update. `type_code`, or `key_rejected` and `key_len` in
-/// its place, is recorded by [`record_type_code`], and `outcome` by
-/// [`traced`].
+/// `origin` of an update or a delete, as its query names it. `type_code`, or
+/// `key_rejected` and `key_len` in its place, is recorded by
+/// [`record_type_code`], and `outcome` by [`traced`].
 fn handler_span(
     transaction: &'static str,
     admin: &AdminUser,
-    origin: Option<TranTypeOrigin>,
+    origin: Option<&'static str>,
 ) -> Span {
     tracing::info_span!(
         "handler",
@@ -417,7 +469,7 @@ fn handler_span(
         type_code = tracing::field::Empty,
         key_rejected = tracing::field::Empty,
         key_len = tracing::field::Empty,
-        origin = origin.map(origin_name),
+        origin,
         outcome = tracing::field::Empty,
     )
 }
@@ -465,10 +517,17 @@ fn record_entered_type_code(span: &Span, code: Option<&str>) {
     }
 }
 
-/// The `origin` query value, as the span records it.
+/// The `origin` query value of an update, as the span records it.
 const fn origin_name(origin: TranTypeOrigin) -> &'static str {
     match origin {
         TranTypeOrigin::List => "list",
+    }
+}
+
+/// The `origin` query value of a delete, as the span records it.
+const fn delete_origin_name(origin: TranTypeDeleteOrigin) -> &'static str {
+    match origin {
+        TranTypeDeleteOrigin::Form => "form",
     }
 }
 
@@ -545,9 +604,12 @@ mod tests {
     use utoipa_axum::router::OpenApiRouter;
     use utoipa_axum::routes;
 
-    use super::{CTLI, CTTU, checked_type_code, handler_span, record_entered_type_code};
+    use super::{
+        CTLI, CTTU, checked_type_code, delete_origin_name, handler_span, origin_name,
+        record_entered_type_code,
+    };
     use crate::auth::{AdminUser, AuthUser, UserType};
-    use crate::dto::admin_transaction_types::TranTypeOrigin;
+    use crate::dto::admin_transaction_types::{TranTypeDeleteOrigin, TranTypeOrigin};
     use crate::error::ApiError;
     use crate::pagination::PageQuery;
     use crate::state::AppState;
@@ -730,7 +792,11 @@ mod tests {
         );
 
         let delete = operation(&document, "/admin/transaction-types/{id}", "delete");
-        assert_eq!(parameters(delete), [("id".to_owned(), "path".to_owned())]);
+        assert_eq!(
+            parameters(delete),
+            [("id", "path"), ("origin", "query")]
+                .map(|(name, place)| (name.to_owned(), place.to_owned()))
+        );
         // The {id} of both operations: two characters, in ASCII.
         for operation in [update, delete] {
             let id = &operation["parameters"][0];
@@ -830,7 +896,7 @@ mod tests {
         gates: bool,
     }
 
-    fn sites() -> [Site; 5] {
+    fn sites() -> [Site; 6] {
         [
             Site {
                 route: "GET /admin/transaction-types?type_code",
@@ -866,7 +932,7 @@ mod tests {
                 route: "PUT /admin/transaction-types/{id}?origin=list",
                 transaction: CTLI,
                 origin: Some("list"),
-                span: |admin| handler_span(CTLI, admin, Some(TranTypeOrigin::List)),
+                span: |admin| handler_span(CTLI, admin, Some(origin_name(TranTypeOrigin::List))),
                 step: |span, code| checked_type_code(span, code, Some(TranTypeOrigin::List)),
                 gates: true,
             },
@@ -876,6 +942,17 @@ mod tests {
                 origin: None,
                 span: |admin| handler_span(CTLI, admin, None),
                 step: |span, code| checked_type_code(span, code, Some(TranTypeOrigin::List)),
+                gates: true,
+            },
+            Site {
+                route: "DELETE /admin/transaction-types/{id}?origin=form",
+                transaction: CTTU,
+                origin: Some("form"),
+                span: |admin| {
+                    let origin = delete_origin_name(TranTypeDeleteOrigin::Form);
+                    handler_span(CTTU, admin, Some(origin))
+                },
+                step: |span, code| checked_type_code(span, code, None),
                 gates: true,
             },
         ]

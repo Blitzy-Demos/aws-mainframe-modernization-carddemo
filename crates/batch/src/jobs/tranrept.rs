@@ -33,17 +33,21 @@ use carddemo_domain::entities::Transaction;
 use carddemo_domain::format::REPORT_RECORD_LEN;
 use carddemo_domain::messages::{
     ABENDING_PROGRAM, END_OF_EXECUTION_OF_PROGRAM_CBTRN03C, ERROR_CLOSING_REPORT_FILE,
-    ERROR_OPENING_TRANFILE, ERROR_READING_TRANSACTION_FILE, ERROR_WRITING_REPTFILE,
-    file_status_message,
+    ERROR_OPENING_CROSS_REF_FILE, ERROR_OPENING_REPTFILE, ERROR_OPENING_TRANFILE,
+    ERROR_OPENING_TRANSACTION_CATG_FILE, ERROR_OPENING_TRANSACTION_TYPE_FILE,
+    ERROR_READING_TRANSACTION_FILE, ERROR_WRITING_REPTFILE, file_status_message,
 };
-use carddemo_domain::numeric::{Alnum, TransactionRowId};
+use carddemo_domain::numeric::{
+    Alnum, CardNumber, TranCategoryCode, TranTypeCode, TransactionRowId,
+};
+use carddemo_domain::ports::{PortError, PortResult, TranTypeFileReader, XrefReader};
 use carddemo_domain::rules::transaction_report::{self, ReportAbend, ReportRun, UnpinnedSortKey};
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
 use super::{JobContext, JobCounts, backup_live_master, count_of, setup_failure};
 use crate::cli::TranreptArgs;
-use crate::exit::ExitStatus;
+use crate::exit::{ExitStatus, one_line};
 use crate::generations::{
     Dataset, Generation, GenerationError, Generations, PendingGeneration, blocking, read_records,
     read_records_async,
@@ -63,6 +67,16 @@ const INVALID_KEY_STATUS: [u8; 2] = *b"23";
 /// information, as the CBACT04C rules show a database failure.
 const PERMANENT_ERROR_STATUS: [u8; 2] = *b"30";
 
+/// Category `0000`: with a type code of spaces, the key [`open_lookup_files`] opens `TRANCATG` by.
+const OPEN_CATEGORY: TranCategoryCode = match TranCategoryCode::new(0) {
+    Ok(category) => category,
+    Err(_) => panic!("0 fits the four digits of TRAN-CAT-CD"),
+};
+
+/// The records of `TRANFILE` that [`open_tranfile`] read, or the decoding error the first
+/// `READ` of `1000-TRANFILE-GET-NEXT` meets.
+type TranFile = Result<Vec<TransactionRecord>, GenerationError>;
+
 /// TRANREPT [app/jcl/TRANREPT.jcl] — P-TRANREPT-001 to P-TRANREPT-003: REPROC, SORT and
 /// CBTRN03C over the dates of `args`.
 ///
@@ -72,8 +86,9 @@ const PERMANENT_ERROR_STATUS: [u8; 2] = *b"30";
 /// report of zero totals. A failed step ends the job with its status and runs no later step:
 ///
 /// - REPROC and SORT: a generation or database failure, or a record the sort cannot place, exit 16.
-/// - CBTRN03C: an abend, exit 16 with its `DISPLAY` lines and `ABEND 999`, or a generation or
-///   database failure outside the program, exit 16.
+/// - CBTRN03C: an abend, exit 16 with its `DISPLAY` lines and `ABEND 999`, a failed open of a
+///   file included, or a database connection failure outside the program's file statements,
+///   exit 16.
 ///
 /// The SORT step runs on Tokio's blocking pool; a runtime that shuts down before it starts ends
 /// the job with a setup failure (exit 16) and allocates nothing.
@@ -205,20 +220,24 @@ fn unpinned_sort_key(err: &UnpinnedSortKey) -> ExitStatus {
 /// TRANREPT `STEP10R` `EXEC PGM=CBTRN03C` [app/jcl/TRANREPT.jcl:L59-80] — P-TRANREPT-003,
 /// P-CBTRN03C-001, P-CBTRN03C-002: the report of `daly` over `start` to `end`.
 ///
-/// Allocates `TRANREPT(+1)` (`LRECL=133`), writes the report into it ([`report_program`]), and
-/// catalogs it once the program has closed its files, so a failure while the files close leaves
-/// no report cataloged, as the abnormal end of the step deletes it.
+/// Opens the program's files in the order of its `PROCEDURE DIVISION`
+/// [app/cbl/CBTRN03C.cbl:L161-166]: `TRANFILE` ([`open_tranfile`]), then `TRANREPT(+1)`
+/// (`LRECL=133`, [`open_reptfile`]), then, in [`report_program`], the three lookup files. It
+/// writes the report into `TRANREPT(+1)` and catalogs it once the program has closed its files,
+/// so a failure while the files close leaves no report cataloged, as the abnormal end of the step
+/// deletes it.
 ///
-/// The allocation, the catalog and the deletion of an uncataloged `TRANREPT(+1)` run on Tokio's
-/// blocking pool, inside the job span, as do the reads and appends of [`report_program`].
+/// The reads, the allocation, the catalog and the deletion of an uncataloged `TRANREPT(+1)` run
+/// on Tokio's blocking pool, inside the job span, as do the appends of [`report_program`].
 ///
 /// # Errors
 ///
-/// - A CBTRN03C abend, exit 16 with `ABEND 999`: a failed lookup ([`lookup_abend`]), a
-///   `TRANFILE` that cannot be read ([`tranfile_abend`]), or a `TRANREPT(+1)` that cannot be
-///   written or closed ([`file_abend`]).
-/// - A failure to allocate `TRANREPT(+1)` or to begin or end the unit of work is a setup failure
-///   (exit 16): neither has a COBOL counterpart.
+/// - A CBTRN03C abend, exit 16 with `ABEND 999`: a file that cannot be opened
+///   ([`open_tranfile`], [`open_reptfile`], [`open_lookup_files`]), a failed lookup
+///   ([`lookup_abend`]), a `TRANFILE` record that cannot be read ([`tranfile_abend`]), or a
+///   `TRANREPT(+1)` that cannot be written or closed ([`file_abend`]).
+/// - A failure to begin or end the unit of work is a setup failure (exit 16): it is the database
+///   connection itself, which no COBOL file statement has.
 ///
 /// On every error `TRANREPT(+1)` is left uncataloged and deleted, with every line already written
 /// to it, since `DISP=(NEW,CATLG,DELETE)` [app/jcl/TRANREPT.jcl:L76-80] catalogs it only when the
@@ -232,12 +251,9 @@ async fn report_step(
     start: Alnum<10>,
     end: Alnum<10>,
 ) -> Result<(), ExitStatus> {
-    let mut reptfile = ctx
-        .generations
-        .begin_next_async(Dataset::TranRept)
-        .await
-        .map_err(|err| setup_failure("TRANREPT(+1) allocation failed", err))?;
-    let (records, lines) = match report_program(db, daly, start, end, &mut reptfile).await {
+    let tranfile = open_tranfile(daly).await?;
+    let mut reptfile = open_reptfile(ctx).await?;
+    let (records, lines) = match report_program(db, tranfile, start, end, &mut reptfile).await {
         Ok(counts) => counts,
         Err(status) => {
             reptfile.discard_async().await;
@@ -257,18 +273,127 @@ async fn report_step(
     Ok(())
 }
 
-/// CBTRN03C `PROCEDURE DIVISION` [app/cbl/CBTRN03C.cbl:L159-217] — P-CBTRN03C-001,
-/// P-CBTRN03C-002: the report of `daly` over `start` to `end`, written to `reptfile`, from the
-/// opens to the closes. Returns the number of `TRANFILE` records and of report lines written.
+/// CBTRN03C `0000-TRANFILE-OPEN` [app/cbl/CBTRN03C.cbl:L376-392] — P-CBTRN03C-468, the first of
+/// the six opens: `TRANSACT.DALY(+1)`, the program's `TRANFILE` and its only input of
+/// transactions, read whole on Tokio's blocking pool before any other file is opened.
 ///
-/// Reads the records of `daly`, the program's `TRANFILE` and its only input of transactions,
-/// opens a read-only unit of work for the `CARDXREF`, `TRANTYPE` and `TRANCATG` lookups, and
-/// starts the [`ReportRun`] with the `DATEPARM` dates (CBTRN03C `0550-DATEPARM-READ`
-/// [app/cbl/CBTRN03C.cbl:L220-243] — P-CBTRN03C-467). The repository holds no content for the
-/// `DATEPARM` dataset [app/jcl/TRANREPT.jcl:L73-74], so `start` and `end`, the job's
-/// `--start-date` and `--end-date`, stand in for its record: the same dates the `STEP05R` sort
-/// selects by, as the CR00 job writes them into both `SYMNAMES` and `DATEPARM` (E-34, resolved,
-/// whose disposition uses the start and end dates).
+/// A file that cannot be read fails the `OPEN`. A record that does not decode is instead the
+/// failure of a `READ` (`1000-TRANFILE-GET-NEXT`, P-CBTRN03C-474), which follows the other opens,
+/// so that error is returned in the [`TranFile`] for [`report_program`] to raise at the first
+/// read.
+///
+/// # Errors
+///
+/// The `ERROR OPENING TRANFILE` abend ([`tranfile_abend`]) when the file cannot be read.
+async fn open_tranfile(daly: &Generation) -> Result<TranFile, ExitStatus> {
+    match read_records_async::<TransactionLayout>(daly.path.clone()).await {
+        Err(err) if !matches!(err, GenerationError::Codec(_)) => Err(tranfile_abend(&err)),
+        read => Ok(read),
+    }
+}
+
+/// CBTRN03C `0100-REPTFILE-OPEN` [app/cbl/CBTRN03C.cbl:L394-410] — P-CBTRN03C-469: `OPEN OUTPUT`
+/// of DD `TRANREPT`, the new generation `TRANREPT(+1)` [app/jcl/TRANREPT.jcl:L76-80], allocated
+/// on Tokio's blocking pool.
+///
+/// Any failure to allocate it abends with `ERROR OPENING REPTFILE` and status 30
+/// ([`PERMANENT_ERROR_STATUS`]), as the POSTTRAN open of `DALYREJS(+1)` does: IBM's table gives
+/// `OPEN OUTPUT` no "file not present" status, and a file-system error has no QSAM status of its
+/// own. A held allocation lock ([`GenerationError::InUse`]) puts the error's text, one line
+/// naming the lock file and the process it records, before the `DISPLAY` lines, as the
+/// allocation message precedes the program's output in the job log.
+///
+/// # Errors
+///
+/// The `ERROR OPENING REPTFILE` abend when `TRANREPT(+1)` cannot be allocated.
+async fn open_reptfile(ctx: &JobContext) -> Result<PendingGeneration, ExitStatus> {
+    ctx.generations
+        .begin_next_async(Dataset::TranRept)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "TRANREPT(+1) allocation failed");
+            let cause =
+                matches!(err, GenerationError::InUse { .. }).then(|| one_line(&err.to_string()));
+            ExitStatus::Abend {
+                lines: cause
+                    .into_iter()
+                    .chain(abend_display(
+                        ERROR_OPENING_REPTFILE.to_owned(),
+                        PERMANENT_ERROR_STATUS,
+                    ))
+                    .collect(),
+                abcode: Some(ABCODE),
+            }
+        })
+}
+
+/// CBTRN03C `0200-CARDXREF-OPEN`, `0300-TRANTYPE-OPEN` and `0400-TRANCATG-OPEN`
+/// [app/cbl/CBTRN03C.cbl:L412-464] — P-CBTRN03C-470 to P-CBTRN03C-472: `OPEN INPUT` of the
+/// three lookup files, in that order, in the unit of work `uow`.
+///
+/// A table has no `OPEN` of its own, so each is opened by the random `READ` its lookup issues,
+/// for a key of spaces, outside the [`ReportRun`] and its memo: the table is open when the store
+/// answers with a record or with [`PortError::NotFound`]. Any other answer fails the `OPEN`, with
+/// the paragraph's `DISPLAY` and status 30, the database failure without further information, so
+/// a lookup table that cannot be read abends before any `TRANFILE` record is read.
+///
+/// `0500-DATEPARM-OPEN` [app/cbl/CBTRN03C.cbl:L466-482] — P-CBTRN03C-473, the last open, has no
+/// counterpart: the `DATEPARM` record is the job's `--start-date` and `--end-date` (E-34), which
+/// no file holds.
+///
+/// # Errors
+///
+/// The open abend of the first table that cannot be read.
+async fn open_lookup_files(uow: &mut UnitOfWork) -> Result<(), ExitStatus> {
+    let mut store = uow.store();
+    let blank_type = TranTypeCode::move_from("");
+    let xref = store.read_xref_by_card(CardNumber::move_from("")).await;
+    opened(xref, ERROR_OPENING_CROSS_REF_FILE, "CARDXREF open failed")?;
+    let tran_type = store.read_tran_type_file(blank_type).await;
+    opened(
+        tran_type,
+        ERROR_OPENING_TRANSACTION_TYPE_FILE,
+        "TRANTYPE open failed",
+    )?;
+    let category = store
+        .read_tran_category_file(blank_type, OPEN_CATEGORY)
+        .await;
+    opened(
+        category,
+        ERROR_OPENING_TRANSACTION_CATG_FILE,
+        "TRANCATG open failed",
+    )
+}
+
+/// The outcome of the `OPEN` that [`open_lookup_files`] made by the `READ` `read`: open on a
+/// record or [`PortError::NotFound`], otherwise the abend after `display` with status 30. The
+/// event logs `what` and the store's answer.
+fn opened<T>(
+    read: PortResult<T>,
+    display: &'static str,
+    what: &'static str,
+) -> Result<(), ExitStatus> {
+    match read {
+        Ok(_) | Err(PortError::NotFound) => Ok(()),
+        Err(err) => {
+            tracing::error!(error = %err, "{what}");
+            Err(program_abend(display.to_owned(), PERMANENT_ERROR_STATUS))
+        }
+    }
+}
+
+/// CBTRN03C `PROCEDURE DIVISION` [app/cbl/CBTRN03C.cbl:L159-217] — P-CBTRN03C-001,
+/// P-CBTRN03C-002: the report of `tranfile` over `start` to `end`, written to `reptfile`, from the
+/// lookup opens to the closes. Returns the number of `TRANFILE` records and of report lines
+/// written.
+///
+/// Opens a read-only unit of work for the `CARDXREF`, `TRANTYPE` and `TRANCATG` lookups, opens the
+/// three files in it ([`open_lookup_files`]), and starts the [`ReportRun`] with the `DATEPARM`
+/// dates (CBTRN03C `0550-DATEPARM-READ` [app/cbl/CBTRN03C.cbl:L220-243] — P-CBTRN03C-467). The
+/// repository holds no content for the `DATEPARM` dataset [app/jcl/TRANREPT.jcl:L73-74], so
+/// `start` and `end`, the job's `--start-date` and `--end-date`, stand in for its record: the same
+/// dates the `STEP05R` sort selects by, as the CR00 job writes them into both `SYMNAMES` and
+/// `DATEPARM` (E-34, resolved, whose disposition uses the start and end dates).
 ///
 /// [`report_records`] reports every record and [`ReportRun::finish`] adds the end-of-input
 /// totals. The unit of work is then rolled back, since it writes nothing, before the caller
@@ -276,27 +401,26 @@ async fn report_step(
 ///
 /// # Errors
 ///
-/// The errors [`report_step`] lists, except the allocation and the catalog of `TRANREPT(+1)`.
-/// `reptfile` is left to the caller, which discards it.
+/// The errors [`report_step`] lists, except the `TRANFILE` and `TRANREPT(+1)` opens and the
+/// catalog of `TRANREPT(+1)`. `reptfile` is left to the caller, which discards it.
 async fn report_program(
     db: &Db,
-    daly: &Generation,
+    tranfile: TranFile,
     start: Alnum<10>,
     end: Alnum<10>,
     reptfile: &mut PendingGeneration,
 ) -> Result<(usize, usize), ExitStatus> {
-    let tranfile = read_records_async::<TransactionLayout>(daly.path.clone())
-        .await
-        .map_err(|err| tranfile_abend(&err))?;
     let mut uow = db
         .begin()
         .await
         .map_err(|err| setup_failure("CARDXREF, TRANTYPE and TRANCATG open failed", err))?;
+    open_lookup_files(&mut uow).await?;
     tracing::info!(
         start_date = %start.as_text(),
         end_date = %end.as_text(),
         "report date range read"
     );
+    let tranfile = tranfile.map_err(|err| tranfile_abend(&err))?;
     let mut run = ReportRun::new(start, end);
     let records = tranfile.len();
     let mut lines = report_records(&mut run, &mut uow, tranfile, reptfile).await?;
@@ -421,13 +545,19 @@ fn file_abend(display: &'static str, what: &'static str, err: &GenerationError) 
 /// rule's error renders only its paragraph and literal.
 fn program_abend(display: String, status: [u8; 2]) -> ExitStatus {
     ExitStatus::Abend {
-        lines: vec![
-            display,
-            file_status_message(status),
-            ABENDING_PROGRAM.to_owned(),
-        ],
+        lines: abend_display(display, status),
         abcode: Some(ABCODE),
     }
+}
+
+/// The `DISPLAY` lines of a CBTRN03C abend: `display`, `FILE STATUS IS: NNNN` with `status`
+/// (`9910-DISPLAY-IO-STATUS`) and `ABENDING PROGRAM` (`9999-ABEND-PROGRAM`).
+fn abend_display(display: String, status: [u8; 2]) -> Vec<String> {
+    vec![
+        display,
+        file_status_message(status),
+        ABENDING_PROGRAM.to_owned(),
+    ]
 }
 
 #[cfg(test)]
@@ -439,14 +569,18 @@ mod tests {
     use carddemo_codec::{Charset, Layout};
     use carddemo_domain::format::REPORT_RECORD_LEN;
     use carddemo_domain::messages::{
-        ABENDING_PROGRAM, ERROR_OPENING_TRANFILE, ERROR_READING_TRANSACTION_FILE,
-        ERROR_WRITING_REPTFILE, FILE_STATUS_IS, INVALID_CARD_NUMBER, INVALID_TRANSACTION_TYPE,
+        ABENDING_PROGRAM, ERROR_OPENING_CROSS_REF_FILE, ERROR_OPENING_TRANFILE,
+        ERROR_OPENING_TRANSACTION_CATG_FILE, ERROR_OPENING_TRANSACTION_TYPE_FILE,
+        ERROR_READING_TRANSACTION_FILE, ERROR_WRITING_REPTFILE, FILE_STATUS_IS,
+        INVALID_CARD_NUMBER, INVALID_TRANSACTION_TYPE,
     };
     use carddemo_domain::numeric::{Alnum, CardNumber, TranId, TranTypeCode, TransactionRowId};
     use carddemo_domain::ports::PortError;
     use carddemo_domain::rules::transaction_report::{LookupKey, ReportAbend, UnpinnedSortKey};
 
-    use super::{file_abend, lookup_abend, record_numbers, select, tranfile_abend, write_lines};
+    use super::{
+        file_abend, lookup_abend, opened, record_numbers, select, tranfile_abend, write_lines,
+    };
     use crate::exit::ExitStatus;
     use crate::generations::{Dataset, GenerationError, Generations};
 
@@ -618,6 +752,31 @@ mod tests {
         for (status, expected) in cases {
             assert_eq!(status.code(), 16, "{expected:?}");
             assert_eq!(status.render(), expected);
+        }
+    }
+
+    #[test]
+    fn a_lookup_table_is_open_on_a_record_or_not_found_and_abends_on_any_other_answer() {
+        assert_eq!(opened(Ok(()), ERROR_OPENING_CROSS_REF_FILE, "open"), Ok(()));
+        assert_eq!(
+            opened::<()>(
+                Err(PortError::NotFound),
+                ERROR_OPENING_TRANSACTION_TYPE_FILE,
+                "open"
+            ),
+            Ok(())
+        );
+        let failures = [
+            PortError::Unavailable("relation \"trancatg_file\" does not exist".to_owned()),
+            PortError::Contention,
+        ];
+        for cause in failures {
+            let status = opened::<()>(Err(cause), ERROR_OPENING_TRANSACTION_CATG_FILE, "open")
+                .map_err(|status| (status.code(), status.render()));
+            assert_eq!(
+                status,
+                Err((16, abend_lines(ERROR_OPENING_TRANSACTION_CATG_FILE, "30")))
+            );
         }
     }
 

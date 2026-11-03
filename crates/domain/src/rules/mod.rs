@@ -414,9 +414,10 @@ pub(crate) mod test_support {
     };
     use crate::ports::{
         AccountReader, AccountWriter, AuthorizationStore, Browse, CardFilter, CardReader,
-        CardWriter, CustomerReader, CustomerWriter, Direction, DisclosureGroupReader, PortError,
-        PortResult, TranCatBalanceStore, TranTypeFileReader, TranTypeFilter, TranTypeMasterStore,
-        TransactionReader, TransactionWriter, UserStore, XrefReader,
+        CardWriter, CursorError, CursorResult, CustomerReader, CustomerWriter, Direction,
+        DisclosureGroupReader, PortError, PortResult, TranCatBalanceStore, TranTypeFileReader,
+        TranTypeFilter, TranTypeMasterStore, TransactionReader, TransactionWriter, UserStore,
+        XrefReader,
     };
 
     use super::VersionKey;
@@ -590,6 +591,9 @@ pub(crate) mod test_support {
         pub(crate) calls: Vec<&'static str>,
         /// Failures queued by [`FakeStore::fail_next`], consumed in order.
         failures: Vec<(&'static str, PortError)>,
+        /// Cursor failures queued by [`FakeStore::fail_tran_type_cursor`]: the
+        /// rows fetched before each and its outcome, consumed in order.
+        cursor_failures: Vec<(usize, PortError)>,
         /// The last transaction row identity assigned; the first is 1.
         last_transaction_row: i64,
         /// The last detail identity assigned; the first is 1.
@@ -728,6 +732,17 @@ pub(crate) mod test_support {
                 "no port method is named {method:?}"
             );
             self.failures.push((method, error));
+        }
+
+        /// Queues `error` as the outcome of the next `browse_tran_types` once
+        /// its cursor has fetched `fetched` rows of the page it reads, or all
+        /// of them when it reads fewer: the cursor's `FETCH` of the row after
+        /// them fails, or its `CLOSE` when they are every row the browse asked
+        /// for ([`CursorError::after`]). Failures are consumed in the order
+        /// queued; a call a [`FakeStore::fail_next`] failure fails consumes
+        /// none.
+        pub(crate) fn fail_tran_type_cursor(&mut self, fetched: usize, error: PortError) {
+            self.cursor_failures.push((fetched, error));
         }
 
         /// Records the call of `method`, waits once as a query does, and
@@ -1115,18 +1130,25 @@ pub(crate) mod test_support {
             found(self.tran_types.get(&code))
         }
 
+        /// A failure [`FakeStore::fail_next`] queued is the cursor's `OPEN`,
+        /// with no row; one [`FakeStore::fail_tran_type_cursor`] queued comes
+        /// after its rows are fetched, at the step [`CursorError::after`]
+        /// names.
         async fn browse_tran_types(
             &mut self,
             browse: Browse<TranTypeCode>,
             filter: TranTypeFilter,
-        ) -> PortResult<Vec<TranTypeMaster>> {
+        ) -> CursorResult<TranTypeMaster> {
             self.enter("browse_tran_types").await?;
-            Ok(page(
-                &self.tran_types,
-                &browse,
-                BackwardStart::Below,
-                |row| passes(&filter, row),
-            ))
+            let mut rows = page(&self.tran_types, &browse, BackwardStart::Below, |row| {
+                passes(&filter, row)
+            });
+            if self.cursor_failures.is_empty() {
+                return Ok(rows);
+            }
+            let (fetched, error) = self.cursor_failures.remove(0);
+            rows.truncate(fetched);
+            Err(CursorError::after(rows, browse.limit, error))
         }
 
         async fn count_tran_types(&mut self, filter: TranTypeFilter) -> PortResult<u64> {
@@ -1392,8 +1414,8 @@ mod tests {
     };
     use crate::ports::{
         AccountReader, AccountWriter, AuthorizationStore, Browse, CardFilter, CardReader,
-        CardWriter, CustomerReader, CustomerWriter, Direction, DisclosureGroupReader, PortError,
-        TranCatBalanceStore, TranTypeFileReader, TranTypeFilter, TranTypeMasterStore,
+        CardWriter, CursorPhase, CustomerReader, CustomerWriter, Direction, DisclosureGroupReader,
+        PortError, TranCatBalanceStore, TranTypeFileReader, TranTypeFilter, TranTypeMasterStore,
         TransactionReader, TransactionWriter, UserStore, XrefReader,
     };
 
@@ -2023,11 +2045,15 @@ mod tests {
         let admin = UserId::move_from("ADMIN001");
         let all_users = browse(None, Direction::Forward, 10);
         fails_as_injected!(store, "read_tran_type", store.read_tran_type(purchase));
-        fails_as_injected!(
-            store,
-            "browse_tran_types",
-            store.browse_tran_types(all_types, TranTypeFilter::default())
-        );
+        fails_as_injected!(store, "browse_tran_types", async {
+            let failure = store
+                .browse_tran_types(all_types, TranTypeFilter::default())
+                .await
+                .expect_err("the injected failure");
+            assert_eq!(failure.phase, CursorPhase::Open, "browse_tran_types");
+            assert!(failure.fetched.is_empty(), "an OPEN fetches nothing");
+            Err::<(), _>(failure.error)
+        });
         fails_as_injected!(
             store,
             "count_tran_types",

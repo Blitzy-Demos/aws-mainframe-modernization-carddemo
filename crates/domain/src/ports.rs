@@ -664,6 +664,83 @@ pub trait DisclosureGroupReader {
     ) -> impl Future<Output = PortResult<DisclosureGroup>> + Send + '_;
 }
 
+/// The step of a Db2 cursor read at which it failed: the `OPEN`, a `FETCH`
+/// or the `CLOSE` of the cursor a [`TranTypeMasterStore::browse_tran_types`]
+/// call stands for, judged by how many rows the read had returned.
+///
+/// The adapter reads the cursor's rows as one statement whose rows arrive one
+/// at a time, as the `FETCH` loop of the program receives them:
+///
+/// - the statement is planned, takes its locks and produces its first row
+///   before it returns any, so a failure before the first row is the
+///   `OPEN`'s, the step a Db2 cursor whose order needs a sort also evaluates
+///   its rows in;
+/// - a failure after some rows, fewer than the browse's limit, is the
+///   `FETCH` of the row after them, the one that would answer `SQLCODE`
+///   +100 when they are all the rows there are;
+/// - a failure once every row the browse asked for has arrived, as the
+///   statement completes, is the `CLOSE`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorPhase {
+    /// `OPEN CURSOR`: no row was returned.
+    Open,
+    /// `FETCH`: the row after [`CursorError::fetched`] could not be fetched.
+    Fetch,
+    /// `CLOSE CURSOR`: every row the browse asked for was returned.
+    Close,
+}
+
+/// A failed cursor read: the step it failed at, the rows it had returned
+/// before the failure, in fetch order, and the outcome the program branches
+/// on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorError<T> {
+    /// The cursor step that failed.
+    pub phase: CursorPhase,
+    /// The rows fetched before the failure, in fetch order; none for an
+    /// `OPEN` failure.
+    pub fetched: Vec<T>,
+    /// Why the step failed.
+    pub error: PortError,
+}
+
+impl<T> CursorError<T> {
+    /// The failure `error` of a cursor read of at most `limit` rows that had
+    /// returned `fetched` when it failed: [`CursorPhase::Open`] when it had
+    /// returned none, [`CursorPhase::Close`] when it had returned all
+    /// `limit`, and [`CursorPhase::Fetch`] in between.
+    #[must_use]
+    pub fn after(fetched: Vec<T>, limit: u16, error: PortError) -> Self {
+        let phase = if fetched.is_empty() {
+            CursorPhase::Open
+        } else if fetched.len() < usize::from(limit) {
+            CursorPhase::Fetch
+        } else {
+            CursorPhase::Close
+        };
+        Self {
+            phase,
+            fetched,
+            error,
+        }
+    }
+}
+
+/// A failure before the cursor returned any row, the statement never sent
+/// included: its `OPEN`.
+impl<T> From<PortError> for CursorError<T> {
+    fn from(error: PortError) -> Self {
+        Self {
+            phase: CursorPhase::Open,
+            fetched: Vec::new(),
+            error,
+        }
+    }
+}
+
+/// The result of a cursor read: its rows in fetch order, or its failure.
+pub type CursorResult<T> = Result<Vec<T>, CursorError<T>>;
+
 /// The Db2 transaction type master `CARDDEMO.TRANSACTION_TYPE`, table
 /// `transaction_types`.
 ///
@@ -705,13 +782,16 @@ pub trait TranTypeMasterStore {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; a cursor that fetches nothing
-    /// is `Ok` with no rows.
+    /// A [`CursorError`] naming the step that failed, with the rows fetched
+    /// before it (P-COTRTLIC-031, P-COTRTLIC-032, P-COTRTLIC-034,
+    /// P-COTRTLIC-037 to P-COTRTLIC-040): [`PortError::Contention`] on a lock
+    /// timeout or deadlock (`SQLCODE` -911), [`PortError::Unavailable`] on any
+    /// other failure. A cursor that fetches nothing is `Ok` with no rows.
     fn browse_tran_types(
         &mut self,
         browse: Browse<TranTypeCode>,
         filter: TranTypeFilter,
-    ) -> impl Future<Output = PortResult<Vec<TranTypeMaster>>> + Send + '_;
+    ) -> impl Future<Output = CursorResult<TranTypeMaster>> + Send + '_;
 
     /// `SELECT COUNT(1)` of the types that pass `filter`, with no start key:
     /// `COTRTLIC` `9100-CHECK-FILTERS` (P-COTRTLIC-036), whose zero count gives

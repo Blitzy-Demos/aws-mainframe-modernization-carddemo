@@ -41,14 +41,20 @@
 //! A failure without a Db2 code ([`PortError::Unavailable`]) answers the
 //! unexpected-error text, because its text is adapter detail that never
 //! reaches a response.
+//!
+//! A failed cursor read names the step of the cursor that failed, its `OPEN`,
+//! a `FETCH` or its `CLOSE` ([`CursorPhase`]), and the action text is that
+//! step's, as the program moves it.
 
 use std::iter::repeat_n;
 
 use crate::entities::TranTypeMaster;
 use crate::error::{DomainError, ErrorKind};
 use crate::messages::{
-    C_TR_TYPE_BACKWARD_OPEN, C_TR_TYPE_FORWARD_OPEN, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY,
-    DEADLOCK_SOMEONE_ELSE_UPDATING, DELETE_FAILED_WITH_MESSAGE, FIELD_TRANSACTION_DESC,
+    C_TR_TYPE_BACKWARD_CLOSE, C_TR_TYPE_BACKWARD_OPEN, C_TR_TYPE_FORWARD_CLOSE,
+    C_TR_TYPE_FORWARD_FETCH, C_TR_TYPE_FORWARD_OPEN, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY,
+    DEADLOCK_SOMEONE_ELSE_UPDATING, DELETE_FAILED_WITH_MESSAGE,
+    ERROR_ON_FETCH_CURSOR_C_TR_TYPE_BACKWARD, FIELD_TRANSACTION_DESC,
     HIGHLIGHTED_ROW_DELETED_HIT_ENTER_TO_CONTINUE, HIGHLIGHTED_ROW_WAS_UPDATED, MUST_BE_SUPPLIED,
     NO_CHANGE_DETECTED_WITH_RESPECT_TO_DATABASE_VALUES, NO_MORE_PAGES_FOR_THESE_SEARCH_CONDITIONS,
     NO_MORE_PAGES_TO_DISPLAY_COTRTLIC, NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC,
@@ -59,7 +65,10 @@ use crate::messages::{
     field_edit_message, tran_type_list_db2_message,
 };
 use crate::numeric::TranTypeCode;
-use crate::ports::{Browse, Direction, PortError, TranTypeFilter, TranTypeMasterStore};
+use crate::ports::{
+    Browse, CursorError, CursorPhase, CursorResult, Direction, PortError, TranTypeFilter,
+    TranTypeMasterStore,
+};
 
 use super::ReturnMsg;
 
@@ -186,7 +195,7 @@ pub struct TranTypeDeleted {
 ///   type condition; two digits give `TR_TYPE = code`; anything else gives
 ///   no condition and records [`TYPE_CODE_FILTER_IF_SUPPLIED_MUST_BE_2_DIGIT`]
 ///   on the type filter `TRTYPE`.
-/// - The description is moved into `X(50)` ([`receive_description`]).
+/// - The description is moved into `X(50)` (`receive_description`).
 ///   Low-values or spaces give no description condition; any other text
 ///   gives `TR_DESCRIPTION LIKE` the pattern `%`, the text without its
 ///   leading and trailing spaces, `%`. The text is not edited, so a `%` or
@@ -282,10 +291,9 @@ fn receive_description(entered: &str) -> String {
 /// COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,
 /// 8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,
 /// P-COTRTLIC-012, P-COTRTLIC-014, P-COTRTLIC-022, P-COTRTLIC-028,
-/// P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036, P-COTRTLIC-037,
-/// P-COTRTLIC-039, P-COTRTLIC-044, P-COTRTLIC-045, V-COTRTLIC-001,
-/// V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005, V-COTRTLIC-008,
-/// V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026, V-COTRTLIC-028
+/// P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036 to P-COTRTLIC-040,
+/// P-COTRTLIC-044, P-COTRTLIC-045, V-COTRTLIC-001, V-COTRTLIC-002,
+/// V-COTRTLIC-004 to V-COTRTLIC-010, V-COTRTLIC-024 to V-COTRTLIC-028
 ///
 /// The filters are edited first ([`edit_filters`]). When a valid filter is
 /// given, the types that pass it are counted (`9100-CHECK-FILTERS`, which
@@ -307,7 +315,8 @@ fn receive_description(entered: &str) -> String {
 ///   when the page reached is the first: with no type before the start key
 ///   the page read forward from it, else an empty page whose next key is the
 ///   start key, both with that message, which replaces the cursor's text
-///   (E-73);
+///   (E-73); a failure past the page's last row, at the look-behind row the
+///   program never fetches, answers the page as read;
 /// - backward without a start key, the F7 on the first page from the start
 ///   of the table.
 ///
@@ -321,13 +330,19 @@ fn receive_description(entered: &str) -> String {
 ///   program turns not OK, the type filter first.
 /// - [`ErrorKind::Invalid`] with the type code text on `TRTYPE`
 ///   (V-COTRTLIC-001).
-/// - [`ErrorKind::Unexpected`] on `TRTYPE` when the read of a forward request
-///   fails, with the [`C_TR_TYPE_FORWARD_OPEN`] Db2 text (V-COTRTLIC-024),
-///   and when the backward read fails and the page it reaches is not the
-///   first, or cannot be shown to be, with the [`C_TR_TYPE_BACKWARD_OPEN`]
-///   Db2 text (V-COTRTLIC-026); either is [`UNEXPECTED_ERROR`] for a failure
-///   without a Db2 code. A backward read failure that reaches the first page
-///   gives way to [`NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC`] (V-COTRTLIC-009).
+/// - [`ErrorKind::Unexpected`] on `TRTYPE` with the Db2 text of the cursor
+///   step that failed: for a forward request its `OPEN`
+///   ([`C_TR_TYPE_FORWARD_OPEN`], V-COTRTLIC-024), the `FETCH` of a row of
+///   the page ([`C_TR_TYPE_FORWARD_CLOSE`], V-COTRTLIC-007, E-73), the
+///   look-ahead `FETCH` ([`C_TR_TYPE_FORWARD_FETCH`], V-COTRTLIC-006) or its
+///   `CLOSE` ([`C_TR_TYPE_FORWARD_CLOSE`], V-COTRTLIC-025); for a backward
+///   read whose page reached is not the first, or cannot be shown to be, its
+///   `OPEN` ([`C_TR_TYPE_BACKWARD_OPEN`], V-COTRTLIC-026), a `FETCH`
+///   ([`ERROR_ON_FETCH_CURSOR_C_TR_TYPE_BACKWARD`], V-COTRTLIC-010) or its
+///   `CLOSE` ([`C_TR_TYPE_BACKWARD_CLOSE`], V-COTRTLIC-027). Each is
+///   [`UNEXPECTED_ERROR`] for a failure without a Db2 code. A backward read
+///   failure that reaches the first page gives way to
+///   [`NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC`] (V-COTRTLIC-009).
 pub async fn list<S: TranTypeMasterStore>(
     store: &mut S,
     input: TranTypeListInput,
@@ -390,7 +405,7 @@ async fn browse<S: TranTypeMasterStore>(
     start_key: Option<TranTypeCode>,
     direction: Direction,
     page_size: u16,
-) -> Result<Vec<TranTypeMaster>, PortError> {
+) -> CursorResult<TranTypeMaster> {
     let browse = Browse {
         start_key,
         direction,
@@ -417,7 +432,8 @@ fn forward_page(mut rows: Vec<TranTypeMaster>, page_size: u16) -> TranTypePage {
 /// V-COTRTLIC-004, V-COTRTLIC-005, V-COTRTLIC-008, V-COTRTLIC-024
 ///
 /// A request with a start key is F8, so the previous page exists and starts
-/// before the first code shown.
+/// before the first code shown. A failed read answers the text of the cursor
+/// step that failed ([`forward_cursor_error`]).
 async fn read_forward<S: TranTypeMasterStore>(
     store: &mut S,
     filter: TranTypeFilter,
@@ -426,7 +442,7 @@ async fn read_forward<S: TranTypeMasterStore>(
 ) -> Result<TranTypePage, DomainError> {
     let rows = browse(store, filter, start_key, Direction::Forward, page_size)
         .await
-        .map_err(|error| cursor_error(C_TR_TYPE_FORWARD_OPEN, &error))?;
+        .map_err(|failure| forward_cursor_error(&failure, page_size))?;
     let mut page = forward_page(rows, page_size);
     let first_shown = page.items.first().map(|row| row.tr_type);
     page.prev_key = start_key.and(first_shown);
@@ -442,31 +458,38 @@ async fn read_forward<S: TranTypeMasterStore>(
 }
 
 /// COTRTLIC 0000-MAIN F7 with CA-FIRST-PAGE, 8000-READ-FORWARD,
-/// 2500-SETUP-MESSAGE — P-COTRTLIC-004, P-COTRTLIC-028, V-COTRTLIC-009
+/// 9450-CLOSE-FORWARD-CURSOR, 2500-SETUP-MESSAGE — P-COTRTLIC-004,
+/// P-COTRTLIC-028, P-COTRTLIC-038, V-COTRTLIC-009, V-COTRTLIC-025
 ///
 /// The page is read forward from `start_key`, the first code shown, and
 /// [`NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC`] is moved over whatever the read
-/// set: a failed read leaves the page empty and still answers that text,
-/// because `WS-DB2-ERROR` is not tested after it (E-73).
+/// set, because `WS-DB2-ERROR` is not tested after it (E-73). A read whose
+/// `CLOSE` fails has fetched the page and its look-ahead row, which stay
+/// shown as after a whole read (P-COTRTLIC-038); any other failed read
+/// leaves the page empty.
 async fn reread_first_page<S: TranTypeMasterStore>(
     store: &mut S,
     filter: TranTypeFilter,
     start_key: Option<TranTypeCode>,
     page_size: u16,
 ) -> TranTypePage {
-    let mut page = browse(store, filter, start_key, Direction::Forward, page_size)
-        .await
-        .map_or_else(
-            |_| TranTypePage::default(),
-            |rows| forward_page(rows, page_size),
-        );
+    let read = browse(store, filter, start_key, Direction::Forward, page_size).await;
+    let mut page = match read {
+        Ok(rows) => forward_page(rows, page_size),
+        Err(failure) if failure.phase == CursorPhase::Close => {
+            forward_page(failure.fetched, page_size)
+        }
+        Err(_) => TranTypePage::default(),
+    };
     page.message = Some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC);
     page
 }
 
 /// COTRTLIC 8100-READ-BACKWARDS, 9500-OPEN-BACKWARD-CURSOR,
-/// 2500-SETUP-MESSAGE — P-COTRTLIC-028, P-COTRTLIC-033, P-COTRTLIC-034,
-/// P-COTRTLIC-039, P-COTRTLIC-044, V-COTRTLIC-009, V-COTRTLIC-026
+/// 9550-CLOSE-BACK-CURSOR, 2500-SETUP-MESSAGE — P-COTRTLIC-028,
+/// P-COTRTLIC-033, P-COTRTLIC-034, P-COTRTLIC-039, P-COTRTLIC-040,
+/// P-COTRTLIC-044, V-COTRTLIC-009, V-COTRTLIC-010, V-COTRTLIC-026,
+/// V-COTRTLIC-027
 ///
 /// The cursor reads the types below `first_shown` in descending order and
 /// the page shows them ascending; F8 from it starts at `first_shown` again.
@@ -483,7 +506,8 @@ async fn reread_first_page<S: TranTypeMasterStore>(
 /// A failed read tells nothing of the types before `first_shown`, so
 /// [`failed_backward_read`] counts them before the failure is answered: on
 /// a page-back that reaches the first page the first-page text replaces the
-/// cursor's text, as `2500-SETUP-MESSAGE` replaces it (E-73).
+/// cursor's text, as `2500-SETUP-MESSAGE` replaces it (E-73), and on any
+/// other the text of the cursor step that failed answers.
 async fn read_backwards<S: TranTypeMasterStore>(
     store: &mut S,
     filter: TranTypeFilter,
@@ -498,42 +522,63 @@ async fn read_backwards<S: TranTypeMasterStore>(
         page_size,
     )
     .await;
-    let mut rows = match backward {
+    let rows = match backward {
         Ok(rows) => rows,
-        Err(error) => {
-            return failed_backward_read(store, filter, first_shown, page_size, &error).await;
+        Err(failure) => {
+            return failed_backward_read(store, filter, first_shown, page_size, failure).await;
         }
     };
     if rows.is_empty() {
         return Ok(reread_first_page(store, filter, Some(first_shown), page_size).await);
     }
-    let shown = usize::from(page_size);
-    let reached_first = rows.len() <= shown;
-    rows.truncate(shown);
+    let reached_first = rows.len() <= usize::from(page_size);
+    Ok(backward_page(rows, first_shown, page_size, reached_first))
+}
+
+/// The page of a backward read from `first_shown`: the first `page_size` of
+/// `rows`, in the descending order the cursor fetched them, shown ascending,
+/// with F8 starting at `first_shown` again. The page that `reached_first`
+/// names the first has no previous key and the first-page text
+/// (V-COTRTLIC-009); any other page goes back from its first code.
+fn backward_page(
+    mut rows: Vec<TranTypeMaster>,
+    first_shown: TranTypeCode,
+    page_size: u16,
+    reached_first: bool,
+) -> TranTypePage {
+    rows.truncate(usize::from(page_size));
     rows.reverse();
     let prev_key = if reached_first {
         None
     } else {
         rows.first().map(|row| row.tr_type)
     };
-    Ok(TranTypePage {
+    TranTypePage {
         items: rows,
         next_key: Some(first_shown),
         prev_key,
         message: reached_first.then_some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC),
-    })
+    }
 }
 
-/// COTRTLIC 0000-MAIN F7, 8100-READ-BACKWARDS, 2500-SETUP-MESSAGE —
-/// P-COTRTLIC-039, P-COTRTLIC-044, V-COTRTLIC-009, V-COTRTLIC-026
+/// COTRTLIC 0000-MAIN F7, 8100-READ-BACKWARDS, 8100-READ-BACKWARDS-EXIT,
+/// 2500-SETUP-MESSAGE — P-COTRTLIC-033, P-COTRTLIC-034, P-COTRTLIC-035,
+/// P-COTRTLIC-039, P-COTRTLIC-040, P-COTRTLIC-044, V-COTRTLIC-009,
+/// V-COTRTLIC-010, V-COTRTLIC-026, V-COTRTLIC-027
 ///
 /// The outcome of a backward read from `first_shown` that failed with
-/// `error`. F7 subtracts 1 from the page number before `8100-READ-BACKWARDS`,
-/// and `2500-SETUP-MESSAGE` moves [`NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC`]
-/// over the cursor's text whenever the page reached is the first (E-73).
-/// The request carries no page number (E-54), so a forward read from the
-/// start of the table counts the types that pass the filters before
-/// `first_shown`, up to one more than a page:
+/// `failure`. The read asks for the page and one look-behind row beyond it
+/// ([`read_backwards`]); the program's loop ends at the page's last row and
+/// never fetches that one, so a failure of its `FETCH` leaves the program's
+/// read whole: the page is answered as read, and it is the first when the
+/// count below finds no more than a page of types before `first_shown`.
+///
+/// Any other failure is the program's. F7 subtracts 1 from the page number
+/// before `8100-READ-BACKWARDS`, and `2500-SETUP-MESSAGE` moves
+/// [`NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC`] over the cursor's text whenever
+/// the page reached is the first (E-73). The request carries no page number
+/// (E-54), so the types before `first_shown` are counted
+/// ([`types_before`]):
 ///
 /// - none precede it: the page shown is the first, and the program's F7 on
 ///   the first page applies, which re-reads the page forward from
@@ -541,36 +586,63 @@ async fn read_backwards<S: TranTypeMasterStore>(
 /// - a page or fewer precede it: the page reached is the first, and the
 ///   failed read leaves it empty (`8100-READ-BACKWARDS` cleared the rows);
 ///   F8 from it starts at `first_shown` again, as after any backward read;
-/// - more than a page precede it, or the forward read fails too: the page
-///   reached is not the first, or cannot be shown to be, and `error`
-///   answers the [`C_TR_TYPE_BACKWARD_OPEN`] text (V-COTRTLIC-026).
+/// - more than a page precede it, the failed `CLOSE` having fetched the
+///   look-behind row too, or the count fails: the page reached is not the
+///   first, or cannot be shown to be, and the text of the cursor step that
+///   failed answers ([`backward_cursor_error`]).
 async fn failed_backward_read<S: TranTypeMasterStore>(
     store: &mut S,
     filter: TranTypeFilter,
     first_shown: TranTypeCode,
     page_size: u16,
-    error: &PortError,
+    failure: CursorError<TranTypeMaster>,
 ) -> Result<TranTypePage, DomainError> {
-    let open_error = || cursor_error(C_TR_TYPE_BACKWARD_OPEN, error);
-    let from_start = browse(store, filter.clone(), None, Direction::Forward, page_size)
+    let shown = usize::from(page_size);
+    let preceding = match failure.phase {
+        CursorPhase::Open | CursorPhase::Fetch => {
+            types_before(store, filter.clone(), first_shown, page_size).await
+        }
+        CursorPhase::Close => None,
+    };
+    if failure.phase == CursorPhase::Fetch && failure.fetched.len() == shown {
+        let reached_first = preceding.is_some_and(|count| count <= shown);
+        return Ok(backward_page(
+            failure.fetched,
+            first_shown,
+            page_size,
+            reached_first,
+        ));
+    }
+    match preceding {
+        Some(0) => Ok(reread_first_page(store, filter, Some(first_shown), page_size).await),
+        Some(count) if count <= shown => Ok(TranTypePage {
+            items: Vec::new(),
+            next_key: Some(first_shown),
+            prev_key: None,
+            message: Some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC),
+        }),
+        _ => Err(backward_cursor_error(&failure)),
+    }
+}
+
+/// The types that pass `filter` before `first_shown`, counted up to one more
+/// than `page_size` by a forward read from the start of the table; `None`
+/// when that read fails.
+async fn types_before<S: TranTypeMasterStore>(
+    store: &mut S,
+    filter: TranTypeFilter,
+    first_shown: TranTypeCode,
+    page_size: u16,
+) -> Option<usize> {
+    let from_start = browse(store, filter, None, Direction::Forward, page_size)
         .await
-        .map_err(|_| open_error())?;
-    let preceding = from_start
-        .iter()
-        .take_while(|row| row.tr_type < first_shown)
-        .count();
-    if preceding == 0 {
-        return Ok(reread_first_page(store, filter, Some(first_shown), page_size).await);
-    }
-    if preceding > usize::from(page_size) {
-        return Err(open_error());
-    }
-    Ok(TranTypePage {
-        items: Vec::new(),
-        next_key: Some(first_shown),
-        prev_key: None,
-        message: Some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC),
-    })
+        .ok()?;
+    Some(
+        from_start
+            .iter()
+            .take_while(|row| row.tr_type < first_shown)
+            .count(),
+    )
 }
 
 /// Updates the description of the listed type `code` to `new_desc`, the row
@@ -779,14 +851,61 @@ fn delete_failure(error: &PortError) -> DomainError {
     db2_error(kind, action, error)
 }
 
-/// A failed cursor read of the list: the cursor's Db2 text on the type
-/// filter, where the program puts the cursor when no input is in error.
+/// COTRTLIC 8000-READ-FORWARD, 9400-OPEN-FORWARD-CURSOR,
+/// 9450-CLOSE-FORWARD-CURSOR — P-COTRTLIC-031, P-COTRTLIC-032,
+/// P-COTRTLIC-037, P-COTRTLIC-038, P-COTRTLIC-044, V-COTRTLIC-006,
+/// V-COTRTLIC-007, V-COTRTLIC-024, V-COTRTLIC-025
 ///
-/// The store answers the whole read in one call, so its failure cannot be
-/// told apart as the cursor's `OPEN`, `FETCH` or `CLOSE`. It takes the `OPEN`
-/// text (V-COTRTLIC-024, V-COTRTLIC-026), the failure before any row is read;
-/// the fetch and close texts of V-COTRTLIC-006, V-COTRTLIC-007, V-COTRTLIC-010,
-/// V-COTRTLIC-025 and V-COTRTLIC-027 have no separate store outcome.
+/// The error of a forward read of `page_size` rows and the look-ahead row
+/// that failed with `failure`, by the cursor step that failed:
+///
+/// - the `OPEN`: [`C_TR_TYPE_FORWARD_OPEN`] (V-COTRTLIC-024);
+/// - the `FETCH` of a row of the page: [`C_TR_TYPE_FORWARD_CLOSE`], the
+///   action text the loop moves although the `FETCH` failed (V-COTRTLIC-007,
+///   E-73);
+/// - the look-ahead `FETCH` after a full page: [`C_TR_TYPE_FORWARD_FETCH`]
+///   (V-COTRTLIC-006);
+/// - the `CLOSE` after the look-ahead row: [`C_TR_TYPE_FORWARD_CLOSE`]
+///   (V-COTRTLIC-025).
+///
+/// The texts are moved only while `WS-RETURN-MSG` is blank, and no list
+/// request reaches the read with a text set (V-COTRTLIC-024), so the first
+/// step that fails gives the text: the `CLOSE` after a failed `FETCH` keeps
+/// the `FETCH`'s.
+fn forward_cursor_error(failure: &CursorError<TranTypeMaster>, page_size: u16) -> DomainError {
+    let action = match failure.phase {
+        CursorPhase::Open => C_TR_TYPE_FORWARD_OPEN,
+        CursorPhase::Fetch if failure.fetched.len() >= usize::from(page_size) => {
+            C_TR_TYPE_FORWARD_FETCH
+        }
+        CursorPhase::Fetch | CursorPhase::Close => C_TR_TYPE_FORWARD_CLOSE,
+    };
+    cursor_error(action, &failure.error)
+}
+
+/// COTRTLIC 8100-READ-BACKWARDS, 8100-READ-BACKWARDS-EXIT,
+/// 9500-OPEN-BACKWARD-CURSOR, 9550-CLOSE-BACK-CURSOR — P-COTRTLIC-034,
+/// P-COTRTLIC-035, P-COTRTLIC-039, P-COTRTLIC-040, P-COTRTLIC-044,
+/// V-COTRTLIC-010, V-COTRTLIC-026, V-COTRTLIC-027
+///
+/// The error of a failed backward read on a page that is not the first, by
+/// the cursor step that failed: the `OPEN`, [`C_TR_TYPE_BACKWARD_OPEN`],
+/// which the `FETCH` and the `CLOSE` of the unopened cursor keep
+/// (V-COTRTLIC-026); a `FETCH`, [`ERROR_ON_FETCH_CURSOR_C_TR_TYPE_BACKWARD`]
+/// (V-COTRTLIC-010); the `CLOSE`, [`C_TR_TYPE_BACKWARD_CLOSE`]
+/// (V-COTRTLIC-027). As forward, the first step that fails gives the text.
+fn backward_cursor_error(failure: &CursorError<TranTypeMaster>) -> DomainError {
+    let action = match failure.phase {
+        CursorPhase::Open => C_TR_TYPE_BACKWARD_OPEN,
+        CursorPhase::Fetch => ERROR_ON_FETCH_CURSOR_C_TR_TYPE_BACKWARD,
+        CursorPhase::Close => C_TR_TYPE_BACKWARD_CLOSE,
+    };
+    cursor_error(action, &failure.error)
+}
+
+/// A failed cursor read of the list: the Db2 text of the cursor's `action`
+/// for `error`, on the type filter, where the program puts the cursor when
+/// no input is in error.
 fn cursor_error(action: &str, error: &PortError) -> DomainError {
     db2_error(ErrorKind::Unexpected, action, error).with_field(FIELD_TYPE_FILTER)
 }
@@ -817,8 +936,10 @@ mod tests {
     use crate::error::DomainError;
     use crate::format::edit_sqlcode;
     use crate::messages::{
-        C_TR_TYPE_BACKWARD_OPEN, C_TR_TYPE_FORWARD_OPEN, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY,
-        DEADLOCK_SOMEONE_ELSE_UPDATING, DELETE_FAILED_WITH_MESSAGE, FIELD_TRANSACTION_DESC,
+        C_TR_TYPE_BACKWARD_CLOSE, C_TR_TYPE_BACKWARD_OPEN, C_TR_TYPE_FORWARD_CLOSE,
+        C_TR_TYPE_FORWARD_FETCH, C_TR_TYPE_FORWARD_OPEN, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY,
+        DEADLOCK_SOMEONE_ELSE_UPDATING, DELETE_FAILED_WITH_MESSAGE,
+        ERROR_ON_FETCH_CURSOR_C_TR_TYPE_BACKWARD, FIELD_TRANSACTION_DESC,
         HIGHLIGHTED_ROW_DELETED_HIT_ENTER_TO_CONTINUE, HIGHLIGHTED_ROW_WAS_UPDATED,
         MUST_BE_SUPPLIED, NO_CHANGE_DETECTED_WITH_RESPECT_TO_DATABASE_VALUES,
         NO_MORE_PAGES_FOR_THESE_SEARCH_CONDITIONS, NO_MORE_PAGES_TO_DISPLAY_COTRTLIC,
@@ -1230,6 +1351,131 @@ mod tests {
                 assert_eq!(page.message, first, "{case}");
             }
         }
+    }
+
+    #[test]
+    fn a_failed_forward_read_answers_the_text_of_the_cursor_step_that_failed() {
+        // V-COTRTLIC-006, V-COTRTLIC-007, V-COTRTLIC-024, V-COTRTLIC-025,
+        // P-COTRTLIC-031, P-COTRTLIC-032, P-COTRTLIC-037, P-COTRTLIC-038,
+        // P-COTRTLIC-044 (E-73: a failed FETCH of the page names the close).
+        let (open, close) = (C_TR_TYPE_FORWARD_OPEN, C_TR_TYPE_FORWARD_CLOSE);
+        let fetch = C_TR_TYPE_FORWARD_FETCH;
+        // The rows fetched before the failure: none is the OPEN, fewer than
+        // the page's seven a FETCH of the page, seven the look-ahead FETCH,
+        // and the eight rows asked for the CLOSE.
+        let cases = [
+            (16, "", 0, open),
+            (16, "", 1, close),
+            (16, "", 6, close),
+            (16, "", 7, fetch),
+            (16, "", 8, close),
+            (16, "08", 3, close),
+            (16, "08", 7, fetch),
+            // The FETCH that would answer +100 after the last type fails: in
+            // the page after five types, as the look-ahead after seven.
+            (5, "", 5, close),
+            (7, "", 7, fetch),
+        ];
+        for (count, start, fetched, action) in cases {
+            let case = format!("{count} {start:?} {fetched}");
+            let mut store = numbered(count);
+            store.fail_tran_type_cursor(fetched, PortError::Contention);
+            let outcome = block_on(list(&mut store, browse(start, FORWARD)));
+            let expected =
+                DomainError::unexpected(db2_text(action, -911)).with_field(FIELD_TYPE_FILTER);
+            assert_eq!(outcome, Err(expected), "{case}");
+            assert_eq!(store.calls, ["browse_tran_types"], "{case}");
+
+            // A failure without a Db2 code answers the unexpected-error text.
+            let mut store = numbered(count);
+            let unavailable = PortError::Unavailable("connection reset".to_owned());
+            store.fail_tran_type_cursor(fetched, unavailable);
+            let outcome = block_on(list(&mut store, browse(start, FORWARD)));
+            let expected = DomainError::unexpected(UNEXPECTED_ERROR).with_field(FIELD_TYPE_FILTER);
+            assert_eq!(outcome, Err(expected), "{case}");
+
+            // F7 on the first page re-reads it forward, and the first-page
+            // text replaces whichever text the failed step gave. A failed
+            // CLOSE comes after the page and its look-ahead row, which stay
+            // shown (P-COTRTLIC-038); any earlier failure leaves no row.
+            let mut store = numbered(count);
+            store.fail_tran_type_cursor(fetched, PortError::Contention);
+            let page = block_on(list(&mut store, browse("", BACKWARD)))
+                .expect("the first-page text is not an error");
+            let expected = if fetched > usize::from(SCREEN_ROWS) {
+                let mut whole = block_on(list(&mut numbered(count), browse("", FORWARD)))
+                    .expect("the first page of a whole read");
+                whole.message = Some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC);
+                whole
+            } else {
+                empty_page(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC)
+            };
+            assert_eq!(page, expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_failed_backward_read_answers_the_text_of_the_cursor_step_that_failed() {
+        // V-COTRTLIC-010, V-COTRTLIC-026, V-COTRTLIC-027, P-COTRTLIC-034,
+        // P-COTRTLIC-035, P-COTRTLIC-039, P-COTRTLIC-040: backward from 15 of
+        // 16 types, whose fourteen predecessors put the page reached after
+        // the first. The OPEN and a FETCH leave the types before 15 to be
+        // counted; the CLOSE comes after the look-behind row, which tells
+        // that more than a page precede.
+        let fetch = ERROR_ON_FETCH_CURSOR_C_TR_TYPE_BACKWARD;
+        let cases = [
+            (0, C_TR_TYPE_BACKWARD_OPEN, 2),
+            (1, fetch, 2),
+            (6, fetch, 2),
+            (8, C_TR_TYPE_BACKWARD_CLOSE, 1),
+        ];
+        for (fetched, action, reads) in cases {
+            let mut store = numbered(16);
+            store.fail_tran_type_cursor(fetched, PortError::Contention);
+            let outcome = block_on(list(&mut store, browse("15", BACKWARD)));
+            let expected =
+                DomainError::unexpected(db2_text(action, -911)).with_field(FIELD_TYPE_FILTER);
+            assert_eq!(outcome, Err(expected), "{fetched}");
+            assert_eq!(store.calls, vec!["browse_tran_types"; reads], "{fetched}");
+        }
+
+        // A FETCH failure on a page-back that reaches the first page gives way
+        // to the first-page text, the page empty and F8 starting at 08 again.
+        let mut store = numbered(16);
+        store.fail_tran_type_cursor(3, PortError::Contention);
+        let page = block_on(list(&mut store, browse("08", BACKWARD))).expect("the first page");
+        let expected = TranTypePage {
+            next_key: key("08"),
+            ..empty_page(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC)
+        };
+        assert_eq!(page, expected);
+    }
+
+    #[test]
+    fn a_failure_at_the_look_behind_row_answers_the_page_as_read() {
+        // P-COTRTLIC-033: the program's backward loop ends at the page's
+        // seventh row and never fetches the look-behind row, so a failure there
+        // leaves its read whole. The count of the types before the start key
+        // tells whether the page reached is the first.
+        for start in ["15", "08"] {
+            let expected = block_on(list(&mut numbered(16), browse(start, BACKWARD)))
+                .expect("the page of a whole read");
+            let mut store = numbered(16);
+            store.fail_tran_type_cursor(SCREEN_ROWS.into(), PortError::Contention);
+            let page = block_on(list(&mut store, browse(start, BACKWARD))).expect("the page");
+            assert_eq!(page, expected, "{start}");
+            assert_eq!(store.calls, ["browse_tran_types", "browse_tran_types"]);
+        }
+
+        // The count fails too: the page is shown, not shown to be the first.
+        let mut store = numbered(16);
+        store.fail_tran_type_cursor(SCREEN_ROWS.into(), PortError::Contention);
+        store.fail_tran_type_cursor(0, PortError::Contention);
+        let page = block_on(list(&mut store, browse("08", BACKWARD))).expect("the page");
+        let first_seven = ["01", "02", "03", "04", "05", "06", "07"];
+        assert_eq!(codes(&page.items), first_seven);
+        assert_eq!((page.next_key, page.prev_key), (key("08"), key("01")));
+        assert_eq!(page.message, None);
     }
 
     #[test]

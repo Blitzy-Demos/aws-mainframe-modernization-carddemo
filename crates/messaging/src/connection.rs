@@ -33,7 +33,9 @@ use crate::MessagingError;
 /// The longest the consumers wait for the broker to answer one request: the
 /// connection handshake (TCP connect included, unless the broker URL sets its
 /// own `connection_timeout`), `channel.open`, `confirm.select`, `basic.qos`,
-/// `basic.consume` and `connection.close`.
+/// `basic.consume`, `channel.close` (a stopped consumer's own, and each
+/// consumer channel [`close_channel`] closes at shutdown) and
+/// `connection.close`.
 ///
 /// It is a fixed property of the adapter, not a deployment setting.
 pub const BROKER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -154,6 +156,34 @@ pub async fn open_channel(connection: &Connection) -> Result<Channel, MessagingE
     )
     .await?;
     Ok(channel)
+}
+
+/// Closes `channel` with reply code 200 and waits for the broker's
+/// `channel.close-ok`, for at most [`BROKER_TIMEOUT`]. A channel that is no
+/// longer open, closed by the broker or by an earlier close, is left as it is.
+///
+/// Dropping a channel's last handle closes it too, but through a close lapin
+/// queues and runs later. When [`close`] has marked the connection closing
+/// before that queued close runs, lapin refuses it as
+/// `InvalidChannelState(Closing)` and turns the refusal into a connection
+/// error, which fails the `connection.close` under way. Closing each channel
+/// here, before the connection, leaves no such close queued.
+///
+/// # Errors
+///
+/// Returns [`MessagingError::Amqp`] when the broker refuses the close, and
+/// [`MessagingError::BrokerTimeout`] when it has not confirmed the close
+/// within [`BROKER_TIMEOUT`].
+pub async fn close_channel(channel: &Channel) -> Result<(), MessagingError> {
+    if !channel.status().connected() {
+        return Ok(());
+    }
+    bounded(
+        "channel.close",
+        BROKER_TIMEOUT,
+        channel.close(REPLY_SUCCESS, "shutdown"),
+    )
+    .await
 }
 
 /// Closes `connection` with reply code 200 and waits for the broker's

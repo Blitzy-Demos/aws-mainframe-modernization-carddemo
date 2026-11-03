@@ -21,9 +21,8 @@
 //!   never updates a type the screen did not show (E-70, proposed).
 //! - [`delete`] is the F4 delete (V-COTRTUPC-022 to V-COTRTUPC-028). E-23
 //!   carries F4 as `DELETE /admin/transaction-types/{id}` with these `COTRTUPC`
-//!   texts. Which of the `COTRTUPC` and `COTRTLIC` message sets that endpoint
-//!   answers with is open for the user, so the handler chooses between this
-//!   function and `super::tran_type_list`.
+//!   texts: the handler runs this function for `origin=form`, and the
+//!   `COTRTLIC` delete of `super::tran_type_list` without `origin`.
 //!
 //! [`edit_type_code`], [`edit`] and [`upsert`] are the steps the three
 //! compose. Only the Db2 master is written; reports read the processing copy
@@ -33,7 +32,10 @@
 //! The 3270 state machine is not reproduced: the PF-key validity, the info
 //! line, the screen attributes and the abend of a data scenario no request
 //! reaches (P-COTRTUPC-001, P-COTRTUPC-010, P-COTRTUPC-011, P-COTRTUPC-019,
-//! P-COTRTUPC-022 to P-COTRTUPC-027; E-63, E-64, E-68, E-69).
+//! P-COTRTUPC-022 to P-COTRTUPC-027; E-63, E-64, E-68, E-69). Of the screen
+//! attributes only the cursor is kept: each error names the field
+//! `3300-SETUP-SCREEN-ATTRS` puts the cursor on in the state the failure
+//! leaves (P-COTRTUPC-025).
 //!
 //! # Stored description
 //!
@@ -74,12 +76,13 @@ use crate::ports::{PortError, TranTypeMasterStore};
 
 /// The BMS field of the type code, `TRTYPCD` of the `COTRTUP` map
 /// [app/app-transaction-type-db2/cpy-bms/COTRTUP.cpy:L60]: the field every key,
-/// read, write and delete failure marks.
+/// read, delete and write failure but the lock error marks.
 pub const FIELD_TYPE_CODE: &str = "TRTYPCD";
 
 /// The BMS field of the description, `TRTYDSC` of the `COTRTUP` map
 /// [app/app-transaction-type-db2/cpy-bms/COTRTUP.cpy:L66]: the field the
-/// description edits mark (V-COTRTUPC-007, V-COTRTUPC-008).
+/// description edits and the lock error mark (V-COTRTUPC-007,
+/// V-COTRTUPC-008, V-COTRTUPC-009).
 pub const FIELD_DESCRIPTION: &str = "TRTYDSC";
 
 /// `TRTYPCDI PIC X(2)` and `TTUP-NEW-TTYP-TYPE PIC X(02)`.
@@ -161,8 +164,10 @@ pub enum TranTypeUpsertOutcome {
 /// A delete that `9800-DELETE-PROCESSING` committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranTypeDeleted {
-    /// The code of the deleted type.
-    pub code: TranTypeCode,
+    /// The type as read before the delete: `3200-SETUP-SCREEN-VARS` shows
+    /// the old type and description in the delete-done state
+    /// (P-COTRTUPC-023).
+    pub master: TranTypeMaster,
     /// The info text the COBOL shows: [`DELETE_SUCCESSFUL`] (P-COTRTUPC-004).
     pub message: String,
 }
@@ -260,11 +265,16 @@ pub fn edit(
 ///
 /// # Errors
 ///
-/// [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with the field
-/// [`FIELD_TYPE_CODE`], and nothing written:
+/// [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected), and nothing
+/// written:
 ///
 /// - [`COULD_NOT_LOCK_RECORD_FOR_UPDATE`] when the UPDATE meets a lock
-///   (SQLCODE -911);
+///   (SQLCODE -911), with the field [`FIELD_DESCRIPTION`], where the cursor
+///   goes in the lock-error state (V-COTRTUPC-009, V-COTRTUPC-019);
+///
+/// and with the field [`FIELD_TYPE_CODE`], where the cursor goes in the
+/// update-done state the other failures leave:
+///
 /// - the [`TranTypeSqlFailure::Update`] text with the Db2 code for any other
 ///   UPDATE failure that has one, else [`UNEXPECTED_ERROR`];
 /// - the [`TranTypeSqlFailure::Insert`] text for any INSERT failure, its
@@ -276,9 +286,12 @@ pub async fn upsert<S: TranTypeMasterStore>(
     match store.update_tran_type(master.clone()).await {
         Ok(()) => Ok(committed(master, false)),
         Err(PortError::NotFound) => insert(store, master).await,
+        // The lock error leaves TTUP-CHANGES-OKAYED-LOCK-ERROR, one of the
+        // changes-made states, for which 3300-SETUP-SCREEN-ATTRS puts the
+        // cursor on the description (P-COTRTUPC-025).
         Err(PortError::Contention) => {
             Err(DomainError::unexpected(COULD_NOT_LOCK_RECORD_FOR_UPDATE)
-                .with_field(FIELD_TYPE_CODE))
+                .with_field(FIELD_DESCRIPTION))
         }
         Err(error) => Err(
             DomainError::unexpected(sql_message(TranTypeSqlFailure::Update, &error))
@@ -359,7 +372,9 @@ pub async fn add<S: TranTypeMasterStore>(
 ///
 /// The F4 delete, confirmed: the key is edited, the type read (F4 needs its
 /// details shown) and deleted by the code read. The confirmation is the
-/// dialog of the SPA, and the server keeps no delete state (E-63, E-69).
+/// dialog of the SPA, and the server keeps no delete state (E-63, E-69). A
+/// deleted type is answered as read, with [`DELETE_SUCCESSFUL`]: the
+/// delete-done screen shows the old values (P-COTRTUPC-023).
 ///
 /// # Errors
 ///
@@ -379,7 +394,7 @@ pub async fn delete<S: TranTypeMasterStore>(
     let current = fetch(store, code).await?.ok_or_else(record_not_found)?;
     match store.delete_tran_type(current.tr_type).await {
         Ok(()) => Ok(TranTypeDeleted {
-            code: current.tr_type,
+            master: current,
             message: DELETE_SUCCESSFUL.to_owned(),
         }),
         Err(error @ PortError::Restricted) => Err(DomainError::conflict(sql_message(
@@ -1011,7 +1026,8 @@ mod tests {
     }
 
     // V-COTRTUPC-009 to -011 (PUT), -019 to -021 (POST); P-COTRTUPC-008,
-    // P-COTRTUPC-009: the insert text keeps the UPDATE's +100 (E-51).
+    // P-COTRTUPC-009: the insert text keeps the UPDATE's +100 (E-51);
+    // P-COTRTUPC-025: the lock error marks the description.
     #[test]
     fn write_failures_answer_the_cobol_texts_and_change_nothing() {
         let lock = COULD_NOT_LOCK_RECORD_FOR_UPDATE.to_owned();
@@ -1081,9 +1097,16 @@ mod tests {
             for (method, error) in failures {
                 store.fail_next(method, error);
             }
+            // P-COTRTUPC-025: the cursor goes on the description in the
+            // lock-error state, on the key in the done state the others set.
+            let field = if message == COULD_NOT_LOCK_RECORD_FOR_UPDATE {
+                FIELD_DESCRIPTION
+            } else {
+                FIELD_TYPE_CODE
+            };
             assert_eq!(
                 perform(&mut store, operation, type_code, "NEW TYPE"),
-                Err(rejected(ErrorKind::Unexpected, &message, FIELD_TYPE_CODE)),
+                Err(rejected(ErrorKind::Unexpected, &message, field)),
                 "{operation:?} {message:?}"
             );
             assert_eq!(store.tran_types, seeded().tran_types, "{message:?}");
@@ -1116,14 +1139,15 @@ mod tests {
         }
     }
 
-    // P-COTRTUPC-004: the confirmed F4 deletes the type read.
+    // P-COTRTUPC-004, P-COTRTUPC-023: the confirmed F4 deletes the type read
+    // and answers it, as the delete-done screen shows it.
     #[test]
     fn delete_removes_the_type_it_read() {
         let mut store = seeded();
         assert_eq!(
             block_on(delete(&mut store, "3")),
             Ok(TranTypeDeleted {
-                code: code("03"),
+                master: master("03", "CREDIT"),
                 message: DELETE_SUCCESSFUL.to_owned(),
             })
         );

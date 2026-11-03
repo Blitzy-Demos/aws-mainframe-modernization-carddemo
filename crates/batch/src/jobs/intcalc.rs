@@ -7,12 +7,13 @@
 //! | CBACT04C | Audit rows | Here |
 //! |---|---|---|
 //! | `PROCEDURE DIVISION USING EXTERNAL-PARMS`, `PARM-DATE X(10)` | P-CBACT04C-001 | `parm_date` |
-//! | `0000-TCATBALF-OPEN` to `0300-ACCTFILE-OPEN` | P-CBACT04C-177 to P-CBACT04C-180 | the units of work, below |
+//! | `0000-TCATBALF-OPEN` to `0300-ACCTFILE-OPEN` | P-CBACT04C-177 to P-CBACT04C-180, P-CBACT04C-194 | `open_files` |
 //! | `0400-TRANFILE-OPEN`, `TRANSACT DD DSN=SYSTRAN(+1)` | P-CBACT04C-181 | `open_systran` |
 //! | `1000-TCATBALF-GET-NEXT` | P-CBACT04C-182 | `read_page` |
 //! | the loop body, `1050-UPDATE-ACCOUNT` to `1300-COMPUTE-INTEREST` | P-CBACT04C-002 to P-CBACT04C-010 | `InterestRun::process_record`, called by `IntcalcJob::process` |
 //! | `1300-B-WRITE-TX` `WRITE FD-TRANFILE-REC` | P-CBACT04C-008, P-CBACT04C-009 | `IntcalcJob::write_systran` |
 //! | end of file, the last account never updated (E-14) | P-CBACT04C-003, P-CBACT04C-174 | `InterestRun::finish`, called by `IntcalcJob::end_of_file` |
+//! | `9000-TCATBALF-CLOSE` to `9300-ACCTFILE-CLOSE` | P-CBACT04C-183 to P-CBACT04C-186 | `close_files` in `IntcalcJob::end_of_file` |
 //! | `9400-TRANFILE-CLOSE`, `DISP=(NEW,CATLG,DELETE)` | P-CBACT04C-187 | `PendingGeneration::catalog_async` in `IntcalcJob::end_of_file` |
 //! | `9999-ABEND-PROGRAM`, `9910-DISPLAY-IO-STATUS` | P-CBACT04C-188, P-CBACT04C-189 | `abend_status`, `systran_abend` |
 //!
@@ -20,11 +21,16 @@
 //!
 //! `TCATBALF`, `XREFFILE`, `DISCGRP` and `ACCTFILE` are tables of one database here. The job
 //! layer opened the pool before this job runs, and a failure to reach it is a setup failure
-//! (exit 16, as an abend). The four KSDS opens therefore have no outcome of their own: there is
-//! no per-table open that can fail while the others succeed, so the texts of P-CBACT04C-177 to
-//! P-CBACT04C-180, `"ERROR OPENING DALY REJECTS FILE"` of E-72 included, have no reachable
-//! counterpart, as the per-request queue opens of E-22 have none in the consumers. A unit of
-//! work that cannot begin is a setup failure too.
+//! (exit 16, as an abend). The `OPEN` and `CLOSE` of each of the four KSDS files become a check
+//! that its table answers (`check_file`): one statement on the table in a unit of work of its
+//! own that writes nothing, whose outcome is discarded. A table that does not answer, for
+//! example one that is missing, is the open or close that ends with a status other than 00: the
+//! paragraph's text, status 30 ([`NO_FURTHER_INFORMATION`]) and `ABEND 999`. The opens run in
+//! the COBOL order before `SYSTRAN(+1)` is allocated, so a failed one reads and writes nothing;
+//! the disclosure group open shows the daily rejects text, as written (E-72). The closes run in
+//! the COBOL order after the end of the file, before `9400-TRANFILE-CLOSE`; a failed one leaves
+//! the account rewrites committed and deletes the uncataloged `SYSTRAN(+1)`. A unit of work
+//! that cannot begin or end is a setup failure.
 //!
 //! The category balances are browsed in key order a page at a time, each page in a read-only
 //! unit of work. Every balance record is then processed in its own unit of work, committed once
@@ -71,12 +77,14 @@ use carddemo_domain::messages::{
     ABENDING_PROGRAM, END_OF_EXECUTION_OF_PROGRAM_CBACT04C, ERROR_CLOSING_TRANSACTION_FILE,
     ERROR_OPENING_TRANSACTION_FILE, file_status_message,
 };
-use carddemo_domain::numeric::{AccountId, Alnum, CardNumber};
+use carddemo_domain::numeric::{
+    AccountGroupId, AccountId, Alnum, CardNumber, TranCategoryCode, TranTypeCode,
+};
 use carddemo_domain::ports::{
     AccountReader, AccountWriter, DisclosureGroupReader, PortError, PortResult,
     TranCatBalanceStore, XrefReader,
 };
-use carddemo_domain::rules::interest::{InterestAbend, InterestRun};
+use carddemo_domain::rules::interest::{InterestAbend, InterestFile, InterestRun};
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
@@ -94,6 +102,25 @@ const PAGE_SIZE: u16 = 500;
 /// own, and `rules::interest` shows every database failure without one as 30 too.
 const NO_FURTHER_INFORMATION: [u8; 2] = *b"30";
 
+/// The account key the check of `ACCTFILE` reads (`check_file`): 0, an `ACCT-ID` no fixture
+/// account holds. A record and status 23 both show that the table answers.
+const CHECK_ACCOUNT: AccountId = match AccountId::new(0) {
+    Ok(id) => id,
+    Err(_) => panic!("0 fits the eleven digits of ACCT-ID"),
+};
+
+/// The key the check of `DISCGRP` reads (`check_file`): a blank group, a blank type and
+/// category 0, a key no fixture disclosure group holds. A record and status 23 both show that
+/// the table answers.
+const CHECK_GROUP: DisclosureGroupKey = DisclosureGroupKey {
+    dis_acct_group_id: AccountGroupId::from_alnum(Alnum::from_array(*b"          ")),
+    dis_tran_type_cd: TranTypeCode::from_alnum(Alnum::from_array(*b"  ")),
+    dis_tran_cat_cd: match TranCategoryCode::new(0) {
+        Ok(code) => code,
+        Err(_) => panic!("0 fits the four digits of DIS-TRAN-CAT-CD"),
+    },
+};
+
 /// Runs `batch intcalc` with `args` on `db`, and returns how CBACT04C ended: exit 0 at the end
 /// of the category balance file, 16 on an abend or a setup failure.
 ///
@@ -108,6 +135,9 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &IntcalcArgs) -> ExitSt
         Ok(parm) => parm,
         Err(status) => return status,
     };
+    if let Err(status) = open_files(db).await {
+        return status;
+    }
     let systran = match open_systran(ctx).await {
         Ok(pending) => pending,
         Err(status) => return status,
@@ -146,6 +176,95 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &IntcalcArgs) -> ExitSt
 fn parm_date(args: &IntcalcArgs) -> Result<Alnum<10>, ExitStatus> {
     Alnum::from_bytes(args.parm_date.as_bytes())
         .map_err(|err| setup_failure("PARM-DATE does not fill X(10)", err))
+}
+
+/// CBACT04C 0000-TCATBALF-OPEN, 0100-XREFFILE-OPEN, 0200-DISCGRP-OPEN and 0300-ACCTFILE-OPEN
+/// [app/cbl/CBACT04C.cbl:L182-185] [app/cbl/CBACT04C.cbl:L234-305] — P-CBACT04C-177 to
+/// P-CBACT04C-180, P-CBACT04C-194: `OPEN INPUT TCATBAL-FILE`, `XREF-FILE` and `DISCGRP-FILE` and
+/// `OPEN I-O ACCOUNT-FILE`, in that order, each a [`check_file`]. Nothing is read or written
+/// before them.
+///
+/// # Errors
+///
+/// - The abend of the first open whose table does not answer
+///   ([`InterestAbend::FileOpen`]); the later files are not opened.
+/// - A setup failure when a check's unit of work cannot begin or end.
+async fn open_files(db: &Db) -> Result<(), ExitStatus> {
+    for file in InterestFile::ALL {
+        if let Err(cause) = check_file(db, file).await? {
+            return Err(abend_status(&InterestAbend::FileOpen { file, cause }));
+        }
+    }
+    Ok(())
+}
+
+/// CBACT04C 9000-TCATBALF-CLOSE, 9100-XREFFILE-CLOSE, 9200-DISCGRP-CLOSE and
+/// 9300-ACCTFILE-CLOSE [app/cbl/CBACT04C.cbl:L224-227] [app/cbl/CBACT04C.cbl:L522-593] —
+/// P-CBACT04C-183 to P-CBACT04C-186: the `CLOSE` of each KSDS after the main loop, in that
+/// order, each a [`check_file`].
+///
+/// # Errors
+///
+/// - The abend of the first close whose table does not answer
+///   ([`InterestAbend::FileClose`]); the later files are not closed.
+/// - A setup failure when a check's unit of work cannot begin or end.
+async fn close_files(db: &Db) -> Result<(), ExitStatus> {
+    for file in InterestFile::ALL {
+        if let Err(cause) = check_file(db, file).await? {
+            return Err(abend_status(&InterestAbend::FileClose { file, cause }));
+        }
+    }
+    Ok(())
+}
+
+/// CBACT04C 0000-TCATBALF-OPEN to 0300-ACCTFILE-OPEN and 9000-TCATBALF-CLOSE to
+/// 9300-ACCTFILE-CLOSE — P-CBACT04C-177 to P-CBACT04C-180, P-CBACT04C-183 to P-CBACT04C-186:
+/// the `OPEN` or `CLOSE` of the KSDS `file`, whose table must answer: one statement on it, in a
+/// unit of work of its own that writes nothing and is rolled back, through
+/// [`table_answers`]. `Ok(Err(cause))` when the table does not answer.
+///
+/// # Errors
+///
+/// A setup failure when the unit of work cannot begin or end.
+async fn check_file(db: &Db, file: InterestFile) -> Result<PortResult<()>, ExitStatus> {
+    let mut uow = db
+        .begin()
+        .await
+        .map_err(|err| setup_failure("file open or close check could not begin", err))?;
+    let answered = table_answers(&mut uow.store(), file).await;
+    if answered.is_ok() {
+        uow.rollback()
+            .await
+            .map_err(|err| setup_failure("file open or close check could not end", err))?;
+    }
+    // A failed check wrote nothing; dropping its unit of work rolls it back.
+    Ok(answered)
+}
+
+/// CBACT04C `OPEN` and `CLOSE` of the four KSDS files — P-CBACT04C-177 to P-CBACT04C-180,
+/// P-CBACT04C-183 to P-CBACT04C-186: whether the table of `file` answers one statement of
+/// `store`: for `TCATBALF` and `XREFFILE` a sequential read of no records, for `DISCGRP` and
+/// `ACCTFILE` a keyed read of
+/// [`CHECK_GROUP`] or [`CHECK_ACCOUNT`], where a record and status 23 both count as an answer.
+/// The outcome is discarded.
+///
+/// # Errors
+///
+/// The port failure of the statement, other than [`PortError::NotFound`].
+async fn table_answers<S>(store: &mut S, file: InterestFile) -> PortResult<()>
+where
+    S: TranCatBalanceStore + XrefReader + DisclosureGroupReader + AccountReader,
+{
+    let answered = match file {
+        InterestFile::Tcatbal => store.tcatbals_after(None, 0).await.map(|_| ()),
+        InterestFile::Xref => store.xrefs_after(None, 0).await.map(|_| ()),
+        InterestFile::DisclosureGroup => store.read_disclosure_group(CHECK_GROUP).await.map(|_| ()),
+        InterestFile::Account => store.read_account(CHECK_ACCOUNT).await.map(|_| ()),
+    };
+    match answered {
+        Ok(()) | Err(PortError::NotFound) => Ok(()),
+        Err(cause) => Err(cause),
+    }
 }
 
 /// CBACT04C 0400-TRANFILE-OPEN [app/cbl/CBACT04C.cbl:L307-323] — P-CBACT04C-181:
@@ -446,18 +565,23 @@ impl IntcalcJob<'_> {
     }
 
     /// CBACT04C end of file and closes [app/cbl/CBACT04C.cbl:L188-230] — P-CBACT04C-003,
-    /// P-CBACT04C-174, P-CBACT04C-187, E-14: the run ends with the last account not updated,
-    /// and `9400-TRANFILE-CLOSE` catalogs `SYSTRAN(+1)` on the blocking pool.
+    /// P-CBACT04C-174, P-CBACT04C-183 to P-CBACT04C-187, E-14: the run ends with the last
+    /// account not updated, the four KSDS files are closed ([`close_files`]), and
+    /// `9400-TRANFILE-CLOSE` catalogs `SYSTRAN(+1)` on the blocking pool.
     ///
     /// The loop leaves before the `ELSE` that would perform `1050-UPDATE-ACCOUNT`, so the last
     /// account keeps its balance and cycle amounts while its interest records are written; the
-    /// rule reports its total and nothing updates it. The closes of the four KSDS files end
-    /// nothing here: each record's unit of work is already committed.
+    /// rule reports its total and nothing updates it. Each record's unit of work is already
+    /// committed, so a failed close leaves every account rewrite in place.
     ///
     /// # Errors
     ///
-    /// The 9400-TRANFILE-CLOSE abend when the generation cannot be cataloged; the catalog
-    /// error is logged and the account updates stay committed.
+    /// - The abend of the first KSDS close that fails, or a setup failure of its check;
+    ///   `SYSTRAN(+1)` is then deleted uncataloged, as `DISP=(NEW,CATLG,DELETE)` deletes it.
+    /// - The 9400-TRANFILE-CLOSE abend when the generation cannot be cataloged; the catalog
+    ///   error is logged.
+    ///
+    /// The account updates stay committed in both cases.
     async fn end_of_file(self) -> ExitStatus {
         let summary = self.interest.finish();
         if let Some(unposted) = summary.unposted {
@@ -466,6 +590,10 @@ impl IntcalcJob<'_> {
                 total_interest = %unposted.total_interest,
                 "last account of the category balance file not updated (E-14)"
             );
+        }
+        if let Err(status) = close_files(self.db).await {
+            self.systran.discard_async().await;
+            return status;
         }
         match self.systran.catalog_async().await {
             Ok(generation) => {

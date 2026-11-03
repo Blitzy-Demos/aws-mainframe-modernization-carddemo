@@ -220,10 +220,12 @@ pub struct Unproven {
 /// `PA-RQ-TRANSACTION-AMT`, which [`parse_amount`] computes from it.
 ///
 /// Each field holds its receiver's bytes. The two numeric receivers
-/// `PA-RQ-PROCESSING-CODE 9(06)` and `PA-RQ-POS-ENTRY-MODE 9(02)`, which
-/// section A types as `NumericCode` (P-CCPAURQY-008, P-CCPAURQY-012), keep
-/// their bytes as `Alnum` here because the request text may put non-digits in
-/// them; [`write_plan`] converts them where the detail stores them.
+/// `PA-RQ-PROCESSING-CODE 9(06)` and `PA-RQ-POS-ENTRY-MODE 9(02)` are
+/// `Alnum<6>` and `Alnum<2>`, as P-CCPAURQY-008 and P-CCPAURQY-012 type them,
+/// because the request text may put a non-digit in them, whose COBOL result is
+/// unpinned (E-47). [`write_plan`] reads them as the `NumericCode<6>` of
+/// `PA-PROCESSING-CODE` and the `NumericCode<2>` of `PA-POS-ENTRY-MODE` where
+/// the detail stores them, and reports [`Unproven`] when one holds a non-digit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthRequest {
     /// `PA-RQ-AUTH-DATE PIC X(06)` (P-CCPAURQY-001): the request date, `YYMMDD`.
