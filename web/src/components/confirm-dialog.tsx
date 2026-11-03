@@ -5,7 +5,8 @@
 // render this component and never compose AlertDialog themselves.
 //
 // The dialog is controlled and has no trigger: the page opens it from its own
-// Button, and focus returns to that button on close. The action only
+// Button, and focus returns to that button on close unless the page has
+// moved it while the dialog closed (an error's field, say). The action only
 // reports the choice through onConfirm, after which Radix closes the dialog
 // through onOpenChange(false); the page then sends its request (with
 // `confirm: "Y"` where the resource carries a confirmation) and shows the
@@ -90,6 +91,21 @@ export function ConfirmDialog({
         onCloseAutoFocus={(event) => {
           const opener = openerRef.current;
           openerRef.current = null;
+          // This runs once the close animation has removed the content. A
+          // request the action sent may have answered meanwhile, and the
+          // page may have moved focus itself: onto the field an error names
+          // (lib/api-errors) or the first field of a cleared form. That focus
+          // stands. Focus on the body was still in the removed dialog, and
+          // only then is the opener refocused.
+          const active = document.activeElement;
+          if (
+            active instanceof HTMLElement &&
+            active !== document.body &&
+            active.isConnected
+          ) {
+            event.preventDefault();
+            return;
+          }
           if (opener?.isConnected) {
             event.preventDefault();
             opener.focus({ preventScroll: true });
