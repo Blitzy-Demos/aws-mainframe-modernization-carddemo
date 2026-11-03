@@ -1,0 +1,438 @@
+// CU00 user list, COUSR00C on the COUSR00 map, and the CU03 user delete,
+// COUSR03C on the COUSR03 map, as one page at /admin/users (AAP 0.3.1). It is
+// the destination of COADM02Y options 1, 3 and 4 (web/src/nav/menu.ts, E-61).
+//
+// - ENTER=Continue is the Search form: USRIDIN is the start key of a forward
+//   browse, blank from the first user (F-COUSR00-001). F7=Backward and
+//   F8=Forward are the data table's Previous and Next (F-COUSR00-003,
+//   F-COUSR00-004), F3=Back the Back link to /admin (F-COUSR00-002).
+// - The row selectors become row actions (E-54): U is the Edit link to the
+//   CU02 route (F-COUSR00-005), D the Delete button (F-COUSR00-006).
+// - COUSR03 has no screen of its own (E-58). Delete reads the user, as
+//   COUSR03C's ENTER does on entry from the list (F-COUSR03-001), and the
+//   confirm dialog shows what the read returned. F5=Delete is the dialog's
+//   Confirm (F-COUSR03-004); F3, F4 and F12 are its Cancel (F-COUSR03-002,
+//   F-COUSR03-003, F-COUSR03-005). The dialog is bound to one row, so this page
+//   renders no COUSR03 key field, Fetch or Clear control: the function map
+//   places none, and a user ID reaches the delete only through its row.
+//
+// Every message comes from the API: page-boundary texts in the 200 page's
+// `message` (V-COUSR00C-001 to V-COUSR00C-009), errors as ApiError bodies,
+// and the delete's success text (P-COUSR03C-005).
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type JSX,
+} from "react";
+import { Link } from "react-router";
+import { Controller, useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import type { ColumnDef } from "@tanstack/react-table";
+import { ArrowLeftIcon } from "lucide-react";
+
+import {
+  useUser,
+  useUserDeleteMutation,
+  useUsers,
+  type User,
+  type UserListParams,
+} from "@/api/queries/admin-users";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { DataTable } from "@/components/data-table";
+import { PageHeader } from "@/components/page-header";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldLabel,
+} from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import {
+  applyApiError,
+  showApiError,
+  showMessage,
+  showSuccess,
+} from "@/lib/api-errors";
+import {
+  userListBmsFieldMap,
+  userListFilterSchema,
+  type UserListFilterValues,
+} from "@/schemas/admin-users";
+
+// USRIDINI PIC X(8) of COUSR0A [app/cpy-bms/COUSR00.CPY:L66].
+const USER_ID_WIDTH = 8;
+
+// The list this page is, the `from` the CU02 edit page returns to: COUSR02C
+// goes back to its calling program on PF3 (CDEMO-FROM-PROGRAM).
+const LIST_ROUTE = "/admin/users";
+
+// The admin menu, COADM01C, where PF3 leads [app/cbl/COUSR00C.cbl:L125-127].
+const ADMIN_ROUTE = "/admin";
+
+// One request of the browse: the key a page starts from and the direction.
+// No page size is sent, so every page holds the 10 rows of the COUSR0A screen.
+type Cursor = Pick<UserListParams, "start_key" | "direction">;
+
+// The USRIDIN entry an ENTER browses from, forward. A blank entry (the
+// schema's undefined) sends no start key, which starts at the top of the
+// file, as LOW-VALUES does [app/cbl/COUSR00C.cbl:L218-222].
+function searchCursor(startKey: string | undefined): Cursor {
+  return startKey === undefined ? {} : { start_key: startKey };
+}
+
+function sameCursor(a: Cursor, b: Cursor): boolean {
+  return a.start_key === b.start_key && a.direction === b.direction;
+}
+
+/** The fields COUSR03 shows before F5=Delete [app/bms/COUSR03.bms:L80-139]. */
+function UserToDelete({ user }: { user: User }): JSX.Element {
+  return (
+    <div className="flex flex-col gap-4">
+      <p>Confirm deletes this user. Cancel keeps it.</p>
+      <dl className="grid grid-cols-3 gap-x-4 gap-y-2">
+        <dt>User ID</dt>
+        <dd className="col-span-2 font-medium break-words text-foreground">
+          {user.user_id}
+        </dd>
+        <dt>First Name</dt>
+        <dd className="col-span-2 font-medium break-words text-foreground">
+          {user.first_name}
+        </dd>
+        <dt>Last Name</dt>
+        <dd className="col-span-2 font-medium break-words text-foreground">
+          {user.last_name}
+        </dd>
+        <dt>User Type</dt>
+        <dd className="col-span-2 flex flex-wrap items-center gap-2">
+          <span className="font-medium text-foreground">{user.usr_type}</span>
+          <span>(A=Admin, U=User)</span>
+        </dd>
+      </dl>
+    </div>
+  );
+}
+
+export default function UserListPage(): JSX.Element {
+  const baseId = useId();
+  const startKeyId = `${baseId}-start-key`;
+  const startKeyHintId = `${baseId}-start-key-hint`;
+  const startKeyErrorId = `${baseId}-start-key-error`;
+
+  // ---------------------------------------------------------------------
+  // CU00: the browse
+  // ---------------------------------------------------------------------
+
+  const filterForm = useForm<UserListFilterValues>({
+    resolver: zodResolver(userListFilterSchema),
+    defaultValues: { start_key: "" },
+  });
+
+  // On first entry COUSR00C browses from the top of the file
+  // [app/cbl/COUSR00C.cbl:L115-119].
+  const [cursor, setCursor] = useState<Cursor>({});
+  const usersQuery = useUsers(cursor);
+  const page = usersQuery.data;
+
+  // Counts the browses the user asked for (first entry, ENTER, PF7, PF8), so a
+  // page's text is shown for the answer to a browse and not again when the
+  // list is re-read after a delete.
+  const browseCount = useRef(1);
+
+  // ENTER re-reads the file whatever the screen shows, so a search from the
+  // key already shown is a new read, not the cached page.
+  const onSearch = (values: UserListFilterValues): void => {
+    browseCount.current += 1;
+    const next = searchCursor(values.start_key);
+    if (sameCursor(next, cursor)) {
+      void usersQuery.refetch();
+    } else {
+      setCursor(next);
+    }
+  };
+
+  // PF7 browses back from the first key shown, PF8 forward from the key the
+  // page found after its last row. The table calls these only while the key
+  // is present.
+  const onPrevious = (): void => {
+    if (page?.prev_key) {
+      browseCount.current += 1;
+      setCursor({ start_key: page.prev_key, direction: "backward" });
+    }
+  };
+  const onNext = (): void => {
+    if (page?.next_key) {
+      browseCount.current += 1;
+      setCursor({ start_key: page.next_key, direction: "forward" });
+    }
+  };
+
+  // A failed browse is shown once per error: toasted, set on USRIDIN, where
+  // every COUSR00C path puts the cursor, and kept in place of the rows, which
+  // the answer did not supply. The ref keeps StrictMode's repeated effect and
+  // re-renders from showing the same error twice. A layout effect, so the
+  // table never paints its no-records text for a failed read.
+  const listError = usersQuery.error;
+  const shownListError = useRef<unknown>(null);
+  const [listErrorText, setListErrorText] = useState<string | null>(null);
+  useLayoutEffect(() => {
+    if (listError === null || listError === shownListError.current) {
+      return;
+    }
+    shownListError.current = listError;
+    setListErrorText(
+      applyApiError(listError, filterForm, userListBmsFieldMap).message,
+    );
+  }, [listError, filterForm]);
+
+  // The page-boundary text of a page with rows (V-COUSR00C-005,
+  // V-COUSR00C-008) is toasted once per browse, when its answer arrives: a
+  // page kept on screen while the next one loads is not that answer, and a
+  // re-read the user did not ask for shows nothing. An empty page shows its
+  // text in place of the rows, and its status region announces it, so it is
+  // not toasted as well. dataUpdatedAt marks every answer, including a
+  // repeated search whose page equals the one shown.
+  const answeredBrowse = useRef(0);
+  const { dataUpdatedAt, isPlaceholderData } = usersQuery;
+  useEffect(() => {
+    if (
+      page === undefined ||
+      isPlaceholderData ||
+      answeredBrowse.current === browseCount.current
+    ) {
+      return;
+    }
+    answeredBrowse.current = browseCount.current;
+    if (page.items.length > 0) {
+      showMessage(page.message);
+    }
+  }, [page, dataUpdatedAt, isPlaceholderData]);
+
+  // ---------------------------------------------------------------------
+  // CU03: read the user, confirm, delete
+  // ---------------------------------------------------------------------
+
+  // The user ID a Delete is reading, "" when none is: COUSR03C's ENTER on
+  // entry from the list, READ-USER-SEC-FILE [app/cbl/COUSR03C.cbl:L95-104].
+  const [lookupId, setLookupId] = useState("");
+  const lookup = useUser(lookupId);
+  // The user the dialog shows, kept while it closes so its content does not
+  // empty during the exit animation.
+  const [dialogUser, setDialogUser] = useState<User | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const deleteMutation = useUserDeleteMutation();
+
+  // The dialog opens once the read has answered, with the fields it returned;
+  // a read that fails (V-COUSR03C-002, V-COUSR03C-003) is toasted and opens
+  // nothing. Cached data is not enough: the effect waits
+  // for the read the new key starts, so the dialog never shows a user the
+  // file no longer holds.
+  useEffect(() => {
+    if (lookupId === "" || lookup.isFetching) {
+      return;
+    }
+    if (lookup.isSuccess) {
+      setDialogUser(lookup.data);
+      setDialogOpen(true);
+    } else if (lookup.isError) {
+      showApiError(lookup.error);
+    } else {
+      return;
+    }
+    setLookupId("");
+  }, [
+    lookupId,
+    lookup.isFetching,
+    lookup.isSuccess,
+    lookup.isError,
+    lookup.data,
+    lookup.error,
+  ]);
+
+  // F5=Delete, DELETE-USER-INFO [app/cbl/COUSR03C.cbl:L174-196]. The delete
+  // hook refreshes the list, so the deleted row leaves the page it was on.
+  const onConfirmDelete = (): void => {
+    if (dialogUser === null) {
+      return;
+    }
+    setDialogOpen(false);
+    deleteMutation.mutate(dialogUser.user_id, {
+      onSuccess: (response) => {
+        showSuccess(response.message);
+      },
+      onError: (error) => {
+        showApiError(error);
+      },
+    });
+  };
+
+  // ---------------------------------------------------------------------
+  // The rows: USRIDnn, FNAMEnn, LNAMEnn and UTYPEnn under the COUSR00
+  // headings [app/bms/COUSR00.bms:L103-127], then the row actions.
+  // ---------------------------------------------------------------------
+
+  // Every row's Edit and Delete share their names, as the function map fixes
+  // them, so each is described by its row's user ID cell.
+  //
+  // The definitions must keep their identity across renders: flexRender
+  // renders each `cell` function as a component, so a new function remounts
+  // its cells, and the focused Edit or Delete would lose focus. They
+  // therefore depend on nothing but the stable id prefix and the stable state
+  // setter.
+  const columns = useMemo<ColumnDef<User>[]>(
+    () => [
+      {
+        accessorKey: "user_id",
+        header: "User ID",
+        cell: ({ row }) => (
+          <span id={`${baseId}-user-${row.index}`}>
+            {row.original.user_id}
+          </span>
+        ),
+      },
+      { accessorKey: "first_name", header: "First Name" },
+      { accessorKey: "last_name", header: "Last Name" },
+      {
+        accessorKey: "usr_type",
+        header: "Type",
+        cell: ({ row }) => (
+          <Badge variant="secondary">{row.original.usr_type}</Badge>
+        ),
+      },
+      {
+        id: "actions",
+        header: "Actions",
+        cell: ({ row }) => {
+          const user = row.original;
+          const describedBy = `${baseId}-user-${row.index}`;
+          return (
+            <div className="flex items-center gap-1">
+              <Button variant="link" size="sm" asChild>
+                <Link
+                  to={`${LIST_ROUTE}/${encodeURIComponent(user.user_id)}/edit`}
+                  state={{ from: LIST_ROUTE }}
+                  aria-describedby={describedBy}
+                >
+                  Edit
+                </Link>
+              </Button>
+              <Button
+                type="button"
+                variant="link"
+                size="sm"
+                aria-describedby={describedBy}
+                onClick={() => {
+                  setLookupId(user.user_id);
+                }}
+              >
+                Delete
+              </Button>
+            </div>
+          );
+        },
+      },
+    ],
+    [baseId],
+  );
+
+  return (
+    <div className="flex flex-col gap-6">
+      <PageHeader
+        actions={
+          <Button variant="outline" asChild>
+            <Link to={ADMIN_ROUTE}>
+              <ArrowLeftIcon aria-hidden="true" />
+              Back
+            </Link>
+          </Button>
+        }
+      />
+
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            <h2>Search User ID</h2>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <form
+            noValidate
+            className="flex flex-col gap-4"
+            onSubmit={filterForm.handleSubmit(onSearch)}
+          >
+            <Controller
+              name="start_key"
+              control={filterForm.control}
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid} className="max-w-sm">
+                  <FieldLabel htmlFor={startKeyId}>User ID</FieldLabel>
+                  <Input
+                    id={startKeyId}
+                    name={field.name}
+                    ref={field.ref}
+                    value={field.value ?? ""}
+                    onChange={field.onChange}
+                    onBlur={field.onBlur}
+                    maxLength={USER_ID_WIDTH}
+                    autoComplete="off"
+                    spellCheck={false}
+                    aria-invalid={fieldState.invalid}
+                    aria-describedby={
+                      fieldState.invalid
+                        ? `${startKeyHintId} ${startKeyErrorId}`
+                        : startKeyHintId
+                    }
+                  />
+                  <FieldDescription id={startKeyHintId}>
+                    The list starts at this user ID. Leave it blank to start at
+                    the first user.
+                  </FieldDescription>
+                  <FieldError id={startKeyErrorId} errors={[fieldState.error]} />
+                </Field>
+              )}
+            />
+            <div>
+              <Button type="submit">Search</Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+
+      <DataTable<User>
+        columns={columns}
+        data={page?.items ?? []}
+        prevKey={page?.prev_key}
+        nextKey={page?.next_key}
+        onPrevious={onPrevious}
+        onNext={onNext}
+        caption="Users, in user ID order"
+        emptyMessage={usersQuery.isError ? listErrorText : page?.message}
+        loading={usersQuery.isPending || isPlaceholderData}
+      />
+
+      {dialogUser === null ? null : (
+        <ConfirmDialog
+          open={dialogOpen}
+          onOpenChange={setDialogOpen}
+          title="Delete User"
+          description={<UserToDelete user={dialogUser} />}
+          confirmLabel="Confirm"
+          cancelLabel="Cancel"
+          onConfirm={onConfirmDelete}
+          pending={deleteMutation.isPending}
+        />
+      )}
+    </div>
+  );
+}
