@@ -42,9 +42,10 @@
 //! unexpected-error text, because its text is adapter detail that never
 //! reaches a response.
 
+use std::iter::repeat_n;
+
 use crate::entities::TranTypeMaster;
 use crate::error::{DomainError, ErrorKind};
-use crate::format::move_alnum;
 use crate::messages::{
     C_TR_TYPE_BACKWARD_OPEN, C_TR_TYPE_FORWARD_OPEN, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY,
     DEADLOCK_SOMEONE_ELSE_UPDATING, DELETE_FAILED_WITH_MESSAGE, FIELD_TRANSACTION_DESC,
@@ -185,10 +186,12 @@ pub struct TranTypeDeleted {
 ///   type condition; two digits give `TR_TYPE = code`; anything else gives
 ///   no condition and records [`TYPE_CODE_FILTER_IF_SUPPLIED_MUST_BE_2_DIGIT`]
 ///   on the type filter `TRTYPE`.
-/// - The description is moved into `X(50)`. Low-values or spaces give no
-///   description condition; any other text gives `TR_DESCRIPTION LIKE` the
-///   pattern `%`, the text without its leading and trailing spaces, `%`. The
-///   text is not edited, so a `%` or `_` in it is a wildcard too.
+/// - The description is moved into `X(50)` ([`receive_description`]).
+///   Low-values or spaces give no description condition; any other text
+///   gives `TR_DESCRIPTION LIKE` the pattern `%`, the text without its
+///   leading and trailing spaces, `%`. The text is not edited, so a `%` or
+///   `_` in it is a wildcard too, and a character outside ASCII stays in the
+///   pattern, which then matches only descriptions holding it.
 ///
 /// `1220-EDIT-TYPECD` moves its text whatever `WS-RETURN-MSG` holds. On a
 /// list request no earlier edit sets one (`1210-EDIT-ARRAY` has no input
@@ -230,7 +233,7 @@ fn edit_type_code(entered: &str, msg: &mut ReturnMsg) -> Option<TranTypeCode> {
 /// padding of the `X(52)` host variable, so the pattern holds exactly the
 /// strung bytes.
 fn description_pattern(entered: &str) -> Option<String> {
-    let field = move_alnum(entered, DESCRIPTION_FIELD_LEN);
+    let field = receive_description(entered);
     if is_spaces_or_low_values(&field) {
         return None;
     }
@@ -240,6 +243,37 @@ fn description_pattern(entered: &str) -> Option<String> {
 /// The COBOL conditions `= SPACES` and `= LOW-VALUES` of a whole field.
 fn is_spaces_or_low_values(field: &str) -> bool {
     field.bytes().all(|byte| byte == b' ') || field.bytes().all(|byte| byte == 0)
+}
+
+/// COTRTLIC 1100-RECEIVE-SCREEN, 1230-EDIT-DESC, 1240-EDIT-ALPHANUM-REQD —
+/// P-COTRTLIC-013, P-COTRTLIC-020, P-COTRTLIC-021
+///
+/// The alphanumeric `MOVE` of an entered description into its `PIC X(50)`
+/// field, the filter `WS-IN-TYPE-DESC` or the row's `WS-ROW-TR-DESC-IN`:
+/// left-justified, padded with spaces to 50 bytes, and cut on the right
+/// after byte 50, as the COBOL cuts it.
+///
+/// A character outside ASCII takes two to four bytes, so the cut can fall
+/// inside one. The COBOL field then keeps its leading bytes, each `0x80` or
+/// more and so no letter, digit or space. That character is kept whole here,
+/// standing for those bytes, so the text stays valid UTF-8 and the edits see
+/// what they see in the COBOL field. In a text of at most 50 characters the
+/// first character outside ASCII starts before byte 50, so that character
+/// is always received: the row edit refuses it as not alphanumeric
+/// (V-COTRTLIC-014), and the filter pattern holds it, so the count finds
+/// only descriptions holding it (V-COTRTLIC-002 when none does). Cutting
+/// before the character instead would drop it and edit, store or search the
+/// shorter text before it.
+fn receive_description(entered: &str) -> String {
+    let mut end = entered.len().min(DESCRIPTION_FIELD_LEN);
+    // The end of the text is always a boundary, so this stops.
+    while !entered.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut field = String::with_capacity(end.max(DESCRIPTION_FIELD_LEN));
+    field.push_str(entered.get(..end).unwrap_or_default());
+    field.extend(repeat_n(' ', DESCRIPTION_FIELD_LEN.saturating_sub(end)));
+    field
 }
 
 /// Lists the transaction types that pass the filters, one page from the start
@@ -622,10 +656,10 @@ pub async fn update_description<S: TranTypeMasterStore>(
 /// COTRTLIC 1100-RECEIVE-SCREEN — P-COTRTLIC-013
 ///
 /// `TRTYPDI X(50)` holding `*` or spaces leaves `WS-ROW-TR-DESC-IN` at
-/// `LOW-VALUES`, given here as `None`; any other text is moved in without
-/// its leading and trailing spaces.
+/// `LOW-VALUES`, given here as `None`; any other text is moved in
+/// ([`receive_description`]) without its leading and trailing spaces.
 fn receive_row_description(entered: &str) -> Option<String> {
-    let field = move_alnum(entered, DESCRIPTION_FIELD_LEN);
+    let field = receive_description(entered);
     let text = field.trim_end_matches(' ');
     if text.is_empty() || text == LIT_ASTERISK {
         return None;
@@ -645,13 +679,13 @@ fn is_unchanged(entered: &str, listed: &str) -> bool {
 /// COTRTLIC 1240-EDIT-ALPHANUM-REQD with [`FIELD_TRANSACTION_DESC`], length
 /// 50 — P-COTRTLIC-021, V-COTRTLIC-013, V-COTRTLIC-014
 ///
-/// The work field is the row description in `X(50)`: `LOW-VALUES` (`None`),
-/// or a text that fills it with spaces or low-values, is not supplied.
-/// `INSPECT … CONVERTING` turns `A-Z`, `a-z` and `0-9` to spaces, and any
-/// character it leaves other than a space rejects the text.
+/// The work field is the row description in `X(50)`
+/// ([`receive_description`]): `LOW-VALUES` (`None`), or a text that fills it
+/// with spaces or low-values, is not supplied. `INSPECT … CONVERTING` turns
+/// `A-Z`, `a-z` and `0-9` to spaces, and any character it leaves other than
+/// a space rejects the text, a character outside ASCII included.
 fn edit_alphanum_reqd(entered: Option<String>) -> Result<String, DomainError> {
-    let supplied =
-        entered.filter(|text| !is_spaces_or_low_values(&move_alnum(text, DESCRIPTION_FIELD_LEN)));
+    let supplied = entered.filter(|text| !is_spaces_or_low_values(&receive_description(text)));
     let Some(text) = supplied else {
         return Err(DomainError::empty(field_edit_message(
             FIELD_TRANSACTION_DESC,
@@ -891,6 +925,12 @@ mod tests {
     fn edit_filters_classify_the_type_and_description_filters() {
         // P-COTRTLIC-018, P-COTRTLIC-020, P-COTRTLIC-003, V-COTRTLIC-001.
         let low_values = "\0".repeat(50);
+        // A character the 50-byte cut splits is kept whole, and the cut still
+        // drops what follows it.
+        let split_two = format!("{}\u{e9}", "A".repeat(49));
+        let split_four = format!("{}\u{1f600}", "A".repeat(48));
+        let split_then_more = format!("{split_two}B");
+        let (two_pattern, four_pattern) = (format!("%{split_two}%"), format!("%{split_four}%"));
         let cases = [
             (None, None, "", None, false),
             (Some(""), Some(""), "", None, false),
@@ -905,6 +945,29 @@ mod tests {
             (None, Some("  pay  "), "", Some("%pay%"), false),
             (None, Some("10%_"), "", Some("%10%_%"), false),
             (Some("0A"), Some("PAY"), "", Some("%PAY%"), true),
+            (None, Some("\u{e9}"), "", Some("%\u{e9}%"), false),
+            (None, Some(" Caf\u{e9} "), "", Some("%Caf\u{e9}%"), false),
+            (
+                None,
+                Some(split_two.as_str()),
+                "",
+                Some(two_pattern.as_str()),
+                false,
+            ),
+            (
+                None,
+                Some(split_four.as_str()),
+                "",
+                Some(four_pattern.as_str()),
+                false,
+            ),
+            (
+                None,
+                Some(split_then_more.as_str()),
+                "",
+                Some(two_pattern.as_str()),
+                false,
+            ),
         ];
         for (type_filter, desc_filter, type_code, pattern, rejected) in cases {
             let mut msg = ReturnMsg::default();
@@ -1027,6 +1090,9 @@ mod tests {
         let on_type = none.clone().with_field(FIELD_TYPE_FILTER);
         let on_desc = none.with_field(FIELD_DESC_FILTER);
         let on_both = on_type.clone().with_field(FIELD_DESC_FILTER);
+        // No seeded description holds a character outside ASCII, so a filter
+        // that keeps one matches nothing.
+        let split = format!("{}\u{e9}", "A".repeat(49));
         let cases = [
             (Some("0A"), None, &type_code),
             (Some("1"), None, &type_code),
@@ -1034,6 +1100,9 @@ mod tests {
             (Some("99"), None, &on_type),
             (None, Some("ZZZ"), &on_desc),
             (None, Some("pay"), &on_desc),
+            (None, Some("\u{e9}"), &on_desc),
+            (None, Some("PURCHAS\u{e9}"), &on_desc),
+            (None, Some(split.as_str()), &on_desc),
             (Some("01"), Some("PAY"), &on_both),
             (Some("0A"), Some("ZZZ"), &on_both),
         ];
@@ -1199,6 +1268,10 @@ mod tests {
         let not_alphanumeric = field_edit_message(label, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY);
         let invalid = DomainError::invalid(not_alphanumeric);
         let low_values = "\0".repeat(50);
+        // Texts whose last character the 50-byte receive splits: the field
+        // keeps its lead bytes, which are no letter, digit or space.
+        let split_two = format!("{}\u{e9}", "A".repeat(49));
+        let split_four = format!("{}\u{1f600}", "A".repeat(48));
         let cases = [
             ("01", "", &missing),
             ("01", "     ", &missing),
@@ -1209,6 +1282,12 @@ mod tests {
             ("01", "PURCHASE-RETAIL", &invalid),
             ("01", " *", &invalid),
             ("01", "Caf\u{e9}", &invalid),
+            ("01", "Espa\u{f1}a", &invalid),
+            ("01", "\u{1f600}", &invalid),
+            ("01", "PURCHASE \u{20ac}", &invalid),
+            ("01", split_two.as_str(), &invalid),
+            ("01", split_four.as_str(), &invalid),
+            ("99", "Caf\u{e9}", &invalid),
             ("01", "PAY\0", &invalid),
         ];
         for (type_code, entered, expected) in cases {

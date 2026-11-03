@@ -108,14 +108,16 @@ const OUTCOME_OK: &str = "ok";
 ///
 /// # Errors
 ///
-/// - 400 with an empty message for a filter longer than its BMS field or a
-///   description filter not in ASCII, on `TRTYPE` or `TRDESC`, and for a
-///   `start_key` longer than two characters or not in ASCII, on no field;
-///   400 for a malformed query; and 400 for a type code filter that is not
-///   two digits, on `TRTYPE` (V-COTRTLIC-001). The filters are checked
-///   first, then the start key, before the master is read.
+/// - 400 with an empty message for a filter longer than its BMS field, on
+///   `TRTYPE` or `TRDESC`, and for a `start_key` longer than two characters
+///   or not in ASCII, on no field; 400 for a malformed query; and 400 for a
+///   type code filter that is not two digits, on `TRTYPE` (V-COTRTLIC-001).
+///   The filters are checked first, then the start key, before the master
+///   is read.
 /// - 401 without a valid token; 403 for a token that is not an admin's.
-/// - 404 when no type passes the filters (V-COTRTLIC-002).
+/// - 404 when no type passes the filters (V-COTRTLIC-002), a description
+///   filter holding a character outside ASCII included, which is searched as
+///   entered.
 /// - 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,
 ///   V-COTRTLIC-026), with the no-records text when the filter count fails
 ///   (V-COTRTLIC-028), and with `Unexpected error` when the database cannot
@@ -127,7 +129,7 @@ const OUTCOME_OK: &str = "ok";
     params(TranTypeListQuery, TranTypeListPageQuery),
     responses(
         (status = 200, description = "One page of transaction types, with the page-boundary text in `message` where the COBOL shows one", body = Page<TranTypeResponse>),
-        (status = 400, description = "A filter or the start key is longer than its field or not ASCII, the type code filter is not two digits, or the query is malformed", body = ErrorBody),
+        (status = 400, description = "A filter is longer than its field, the start key is longer than its field or not ASCII, the type code filter is not two digits, or the query is malformed", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an admin's", body = ErrorBody),
         (status = 404, description = "No transaction type passes the filters", body = ErrorBody),
@@ -244,8 +246,9 @@ pub async fn create_tran_type(
 ///   query or body, and the key and description edits: on `TRTYPCD` or
 ///   `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,
 ///   V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`
-///   (V-COTRTLIC-013, V-COTRTLIC-014), where a key or description holding a
-///   character outside ASCII is also refused with an empty message.
+///   (V-COTRTLIC-013, V-COTRTLIC-014), where a key holding a character
+///   outside ASCII is also refused with an empty message. A description
+///   holding one gets the alphanumeric edit's text with either origin.
 /// - 401 without a valid token; 403 for a token that is not an admin's.
 /// - 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).
 /// - 500 with the Db2 or lock text when the read or the update fails
@@ -676,12 +679,12 @@ mod tests {
             ]
             .map(|(name, place)| (name.to_owned(), place.to_owned()))
         );
-        // The description filter and the start key, in ASCII; the key two
-        // characters long.
+        // The description filter, fifty characters of any text the search
+        // takes as entered; the start key, two characters in ASCII.
         let list_parameters = list["parameters"].as_array().expect("parameters");
         let description = &list_parameters[1]["schema"];
         assert_eq!(description["maxLength"], 50);
-        assert_eq!(description["pattern"], "^[\\x00-\\x7F]*$");
+        assert!(description.get("pattern").is_none(), "{description}");
         let start_key = &list_parameters[2];
         assert_eq!(start_key["required"], false);
         assert_eq!(start_key["schema"]["type"], "string");

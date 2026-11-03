@@ -22,6 +22,15 @@
 //! such codes as its `X(2)` input holds them (P-COBTUPDT-007). Every
 //! expectation below is the padded order `01` … `07`, `A\x01`, `A `.
 //!
+//! `PostgreSQL` text cannot hold NUL, which a Db2 host variable can. A start
+//! key holding NUL must still position the cursors where Db2 does, so each
+//! such case below has a twin from the NUL-free key the store binds instead
+//! (`\0 ` and `\x01\x01`, `0\0` and `0\x01`, `A\0` and the stored `A\x01`)
+//! with the same expected codes. A key or filter holding NUL names no stored
+//! row: the count is 0, the page empty, and the keyed statements of
+//! `TranTypeMasterStore` and `TranTypeFileReader` answer `NotFound`
+//! (`SQLCODE` +100, `INVALID KEY`) and leave the unit of work usable.
+//!
 //! The test starts its own container through `carddemo_testkit::TestStack`,
 //! so it needs a running Docker daemon (AAP 0.10.4). The two codes are
 //! inserted through the `TranTypeMasterStore` port, so the test adds no
@@ -31,11 +40,13 @@ use carddemo_domain::entities::TranTypeMaster;
 use carddemo_domain::messages::{
     NO_MORE_PAGES_FOR_THESE_SEARCH_CONDITIONS, NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC,
 };
-use carddemo_domain::numeric::{Alnum, TranTypeCode};
-use carddemo_domain::ports::{Browse, Direction, TranTypeFilter, TranTypeMasterStore};
+use carddemo_domain::numeric::{Alnum, TranCategoryCode, TranTypeCode};
+use carddemo_domain::ports::{
+    Browse, Direction, PortError, TranTypeFileReader, TranTypeFilter, TranTypeMasterStore,
+};
 use carddemo_domain::rules::tran_type_list::{self, TranTypeListInput};
-use carddemo_persistence::Db;
 use carddemo_persistence::seed::{self, PreparedSeed, SeedMode, SeedSources};
+use carddemo_persistence::{Db, UnitOfWork};
 use carddemo_testkit::{TestStack, block_on, fixtures};
 
 /// The code `A`, stored as `A` and held as the `X(2)` bytes `A `.
@@ -50,6 +61,39 @@ const SEEDED: [[u8; 2]; 7] = [*b"01", *b"02", *b"03", *b"04", *b"05", *b"06", *b
 
 /// A limit beyond every row, so a page shows the cursor's whole membership.
 const ALL: u16 = 20;
+
+/// Codes holding a NUL byte: alone and padded, doubled, after a digit, and
+/// after `A`, where the NUL-free start bound would be the stored [`A_CONTROL`].
+const NUL_CODES: [[u8; 2]; 4] = [*b"\0 ", *b"\0\0", *b"0\0", *b"A\0"];
+
+/// One `count_tran_types` filter and the count it must give, as `(name, type
+/// code, description pattern, count)`.
+type CountCase = (&'static str, Option<[u8; 2]>, Option<&'static str>, u64);
+
+/// The `count_tran_types` filters: the filters the two codes inserted match,
+/// then filters holding a NUL byte, which match no row.
+const COUNT_CASES: [CountCase; 10] = [
+    ("no filter", None, None, 9),
+    ("description ALPHA", None, Some("%ALPHA%"), 2),
+    ("type A", Some(A), None, 1),
+    (
+        "type A\\x01, description ALPHA",
+        Some(A_CONTROL),
+        Some("%ALPHA%"),
+        1,
+    ),
+    ("type A\\0", Some(*b"A\0"), None, 0),
+    ("type 0\\0", Some(*b"0\0"), None, 0),
+    ("type \\0\\0", Some(*b"\0\0"), None, 0),
+    ("description %\\0%", None, Some("%\0%"), 0),
+    ("description %A\\0B%", None, Some("%A\0B%"), 0),
+    (
+        "type A, description %ALPHA\\0%",
+        Some(A),
+        Some("%ALPHA\0%"),
+        0,
+    ),
+];
 
 /// The fixture seed of the repository's sources, prepared on the calling
 /// thread before [`block_on`], outside every runtime, as an adapter prepares
@@ -142,6 +186,16 @@ impl BrowseCase {
             description: None,
             expected,
         }
+    }
+
+    /// An unfiltered case from `start`, every row fetched.
+    fn from_start(
+        name: &'static str,
+        start: [u8; 2],
+        direction: Direction,
+        expected: Vec<TranTypeCode>,
+    ) -> Self {
+        Self::unfiltered(name, Some(start), direction, ALL, expected)
     }
 
     /// A case with the type filter `TR_TYPE = type_code`, every row fetched.
@@ -272,16 +326,132 @@ fn browse_cases() -> Vec<BrowseCase> {
     ]
 }
 
+/// The `browse_tran_types` cases of start keys holding a NUL byte, in both
+/// directions, with a short limit and under a type filter, each beside its
+/// NUL-free twin with the same codes (`A\\x01`'s twins are in
+/// [`browse_cases`]).
+fn nul_start_cases() -> Vec<BrowseCase> {
+    use Direction::{Backward, Forward};
+    let every_type = || seeded_then(&[A_CONTROL, A]);
+    vec![
+        BrowseCase::from_start("forward from \\0", *b"\0 ", Forward, every_type()),
+        BrowseCase::from_start(
+            "forward from \\x01\\x01",
+            *b"\x01\x01",
+            Forward,
+            every_type(),
+        ),
+        BrowseCase::from_start("backward below \\0", *b"\0 ", Backward, Vec::new()),
+        BrowseCase::from_start(
+            "backward below \\x01\\x01",
+            *b"\x01\x01",
+            Backward,
+            Vec::new(),
+        ),
+        BrowseCase::from_start("forward from 0\\0", *b"0\0", Forward, every_type()),
+        BrowseCase::from_start("forward from 0\\x01", *b"0\x01", Forward, every_type()),
+        BrowseCase::from_start("backward below 0\\0", *b"0\0", Backward, Vec::new()),
+        BrowseCase::from_start("backward below 0\\x01", *b"0\x01", Backward, Vec::new()),
+        BrowseCase::from_start(
+            "forward from A\\0",
+            *b"A\0",
+            Forward,
+            codes(&[A_CONTROL, A]),
+        ),
+        BrowseCase::from_start(
+            "backward below A\\0",
+            *b"A\0",
+            Backward,
+            then_seeded_descending(&[]),
+        ),
+        BrowseCase::unfiltered(
+            "forward from 0\\0, three rows",
+            Some(*b"0\0"),
+            Forward,
+            3,
+            codes(&SEEDED[..3]),
+        ),
+        BrowseCase::of_type(
+            "type A\\x01 forward from A\\0",
+            A_CONTROL,
+            *b"A\0",
+            Forward,
+            codes(&[A_CONTROL]),
+        ),
+        BrowseCase::of_type(
+            "type A\\x01 forward from A\\x01",
+            A_CONTROL,
+            A_CONTROL,
+            Forward,
+            codes(&[A_CONTROL]),
+        ),
+        BrowseCase::of_type(
+            "type A\\x01 backward below A\\0",
+            A_CONTROL,
+            *b"A\0",
+            Backward,
+            Vec::new(),
+        ),
+    ]
+}
+
+/// The `browse_tran_types` cases of type and description filters holding a
+/// NUL byte, which match no row, whatever the start key and direction.
+fn nul_filter_cases() -> Vec<BrowseCase> {
+    use Direction::{Backward, Forward};
+    vec![
+        BrowseCase::of_type(
+            "type A\\0 forward from A\\0",
+            *b"A\0",
+            *b"A\0",
+            Forward,
+            Vec::new(),
+        ),
+        BrowseCase::of_type(
+            "type 0\\0 backward below A",
+            *b"0\0",
+            A,
+            Backward,
+            Vec::new(),
+        ),
+        BrowseCase {
+            type_code: Some(*b"\0\0"),
+            ..BrowseCase::unfiltered(
+                "type \\0\\0 from the first type",
+                None,
+                Forward,
+                ALL,
+                Vec::new(),
+            )
+        },
+        BrowseCase::described("description %A\\0% forward", "%A\0%", Forward, Vec::new()),
+        BrowseCase::described("description %\\0% backward", "%\0%", Backward, Vec::new()),
+        BrowseCase {
+            start: Some(*b"0\0"),
+            ..BrowseCase::described(
+                "description %ALPHA\\0% from 0\\0",
+                "%ALPHA\0%",
+                Forward,
+                Vec::new(),
+            )
+        },
+    ]
+}
+
 /// `browse_tran_types` compares and orders the codes as their padded `X(2)`
 /// bytes: each case's page holds exactly the codes its cursor fetches, in
-/// fetch order.
+/// fetch order, a start key holding NUL included.
 #[test]
 fn browse_tran_types_follows_the_padded_key_order() {
     let prepared = fixture_seed();
     block_on(async {
         let (_stack, db) = seeded_with_both_codes(prepared).await;
         let mut uow = db.begin().await.expect("a unit of work");
-        for case in browse_cases() {
+        let cases = browse_cases()
+            .into_iter()
+            .chain(nul_start_cases())
+            .chain(nul_filter_cases());
+        for case in cases {
             let browse = Browse {
                 start_key: case.start.map(code),
                 direction: case.direction,
@@ -299,6 +469,100 @@ fn browse_tran_types_follows_the_padded_key_order() {
             assert_eq!(codes_of(&page), case.expected, "{}", case.name);
         }
         uow.rollback()
+            .await
+            .expect("the read-only unit of work ends");
+    });
+}
+
+/// Asserts that every keyed statement of the master store and of the file
+/// reader answers `NotFound` for `tran_type`, a code holding a NUL byte.
+async fn assert_keyed_not_found(uow: &mut UnitOfWork, tran_type: TranTypeCode) {
+    let master = TranTypeMaster::try_new(tran_type, "NUL KEY".to_owned())
+        .expect("a CHAR(2) code and a VARCHAR(50) description");
+    let category = TranCategoryCode::new(1).expect("a 9(04) category code");
+    let mut store = uow.store();
+    let outcomes = [
+        (
+            "read_tran_type",
+            store.read_tran_type(tran_type).await.map(|_| ()),
+        ),
+        ("update_tran_type", store.update_tran_type(master).await),
+        ("delete_tran_type", store.delete_tran_type(tran_type).await),
+        (
+            "read_tran_type_file",
+            store.read_tran_type_file(tran_type).await.map(|_| ()),
+        ),
+        (
+            "read_tran_category_file",
+            store
+                .read_tran_category_file(tran_type, category)
+                .await
+                .map(|_| ()),
+        ),
+    ];
+    for (method, outcome) in outcomes {
+        assert_eq!(outcome, Err(PortError::NotFound), "{method} {tran_type:?}");
+    }
+}
+
+/// A key or filter holding a NUL byte names no stored row, as a Db2 host
+/// variable holding `X'00'` finds none: each [`COUNT_CASES`] filter counts
+/// its rows, those holding NUL none, and every keyed statement answers
+/// `NotFound` for each of [`NUL_CODES`], the code `A\0` included, whose
+/// NUL-free start bound is the stored `A\x01`. No statement fails on the
+/// server, so the unit of work still reads type 01 from the master and both
+/// processing copies and commits, and the masters are unchanged afterwards.
+#[test]
+fn a_nul_key_or_filter_names_no_stored_row() {
+    let prepared = fixture_seed();
+    block_on(async {
+        let (_stack, db) = seeded_with_both_codes(prepared).await;
+        let mut uow = db.begin().await.expect("a unit of work");
+        for (name, type_code, description, expected) in COUNT_CASES {
+            let filter = TranTypeFilter {
+                type_code: type_code.map(code),
+                description: description.map(str::to_owned),
+            };
+            let count = uow.store().count_tran_types(filter).await;
+            assert_eq!(count, Ok(expected), "{name}");
+        }
+        for bytes in NUL_CODES {
+            assert_keyed_not_found(&mut uow, code(bytes)).await;
+        }
+        let purchase = code(*b"01");
+        let master = uow.store().read_tran_type(purchase).await;
+        assert_eq!(
+            master.map(|master| master.tr_description),
+            Ok("PURCHASE".to_owned())
+        );
+        let record = uow.store().read_tran_type_file(purchase).await;
+        assert_eq!(record.map(|record| record.tran_type), Ok(purchase));
+        let category = TranCategoryCode::new(1).expect("a 9(04) category code");
+        let record = uow
+            .store()
+            .read_tran_category_file(purchase, category)
+            .await;
+        assert_eq!(record.map(|record| record.tran_cat_cd), Ok(category));
+        uow.commit().await.expect("the unit of work commits");
+
+        let mut after = db.begin().await.expect("a unit of work");
+        let every_type = Browse {
+            start_key: None,
+            direction: Direction::Forward,
+            limit: ALL,
+        };
+        let page = after
+            .store()
+            .browse_tran_types(every_type, TranTypeFilter::default())
+            .await
+            .expect("every type");
+        assert_eq!(codes_of(&page), seeded_then(&[A_CONTROL, A]));
+        assert!(
+            page.iter().all(|master| master.tr_description != "NUL KEY"),
+            "no update reached a stored type: {page:?}"
+        );
+        after
+            .rollback()
             .await
             .expect("the read-only unit of work ends");
     });
@@ -380,6 +644,26 @@ fn list_cases() -> Vec<ListCase> {
             next_key: Some(A),
             prev_key: Some(*b"02"),
             message: None,
+        },
+        ListCase {
+            name: "F8 from 0\\0 shows the first seven types",
+            start: Some(*b"0\0"),
+            direction: Forward,
+            page_size: tran_type_list::SCREEN_ROWS,
+            items: codes(&SEEDED),
+            next_key: Some(A_CONTROL),
+            prev_key: Some(*b"01"),
+            message: None,
+        },
+        ListCase {
+            name: "F7 from \\0 finds no type below it and re-reads the first page",
+            start: Some(*b"\0 "),
+            direction: Backward,
+            page_size: tran_type_list::SCREEN_ROWS,
+            items: codes(&SEEDED),
+            next_key: Some(A_CONTROL),
+            prev_key: None,
+            message: Some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC),
         },
     ]
 }

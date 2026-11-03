@@ -12,7 +12,10 @@
 //!   STEP10, P-TRANBKP-003, P-TRANBKP-005), so that no record leaves the
 //!   master without being in its backup;
 //! - `Db::begin_snapshot`, the read-only unit on one snapshot the TRANREPT
-//!   backup pages the master in.
+//!   backup pages the master in;
+//! - `PgStore::read_transaction`, COTRN01C READ-TRANSACT-FILE —
+//!   P-COTRN01C-004, for a TRAN-ID holding a NUL byte, which no stored row
+//!   can hold.
 //!
 //! Every test starts its own container through `carddemo_testkit::TestStack`,
 //! so it needs a running Docker daemon (AAP 0.10.4). The transaction master
@@ -31,7 +34,7 @@ use carddemo_domain::numeric::{
     AccountId, Alnum, CardNumber, MerchantId, Money, RewardPoints, RewardRate, TranCategoryCode,
     TranId, TranTypeCode,
 };
-use carddemo_domain::ports::{PortError, TransactionWriter};
+use carddemo_domain::ports::{PortError, TransactionReader, TransactionWriter};
 use carddemo_domain::rewards::RewardStore;
 use carddemo_persistence::{Db, PersistenceError, UnitOfWork};
 use carddemo_testkit::{TestStack, block_on};
@@ -312,6 +315,38 @@ fn pages_hold_every_live_row_once_in_tran_id_order() {
                 "limit {limit}: the last page is short"
             );
         }
+    });
+}
+
+/// COTRN01C READ-TRANSACT-FILE — P-COTRN01C-004: a TRAN-ID holding a NUL
+/// byte between other characters, first, after a live TRAN-ID's first 15
+/// characters, alone or in every byte names no stored transaction. The read
+/// answers `NotFound`, the `NOTFND` of the COBOL `READ`, and fails no
+/// statement on the server, so the unit of work still reads the live row
+/// afterwards.
+#[test]
+fn a_tran_id_holding_nul_is_not_found() {
+    block_on(async {
+        let stack = TestStack::postgres().await;
+        let db = Db::from_pool(stack.pool().clone());
+        let live = write_live(&db, &[record("0000000000000001", 100)]).await;
+        let mut uow = db.begin().await.expect("a unit of work");
+        let keys = [
+            TranId::move_from("A\0B"),
+            TranId::move_from("\0AAAAAAAAAAAAAAA"),
+            TranId::move_from("000000000000000\0"),
+            TranId::move_from("\0"),
+            TranId::from_alnum(Alnum::from_array([0; 16])),
+        ];
+        for key in keys {
+            let read = uow.store().read_transaction(key).await;
+            assert_eq!(read, Err(PortError::NotFound), "{key:?}");
+        }
+        let read = uow.store().read_transaction(live[0].tran_id).await;
+        assert_eq!(read, Ok(live[0].clone()), "the live row after the NUL keys");
+        uow.rollback()
+            .await
+            .expect("the read-only unit of work ends");
     });
 }
 

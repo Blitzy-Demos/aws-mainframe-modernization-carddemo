@@ -22,11 +22,12 @@
 //!   confirmation, `reports`), and, for free text a rule stores, no NUL
 //!   character beside other text ([`storable_text`],
 //!   [`storable_text_of_width`]), which `PostgreSQL` text cannot hold. Where
-//!   a program's audited edit reads the value, that edit answers it and no
-//!   encoding check precedes it: the `COTRTUPC` type code and description
-//!   (`admin_transaction_types`), the `CORPT00C` date parts (`reports`), and
-//!   the sign-on fields, which get the width check and then the `COSGN00C`
-//!   blank edits (`auth`).
+//!   a program's audited edit reads the value, or its rule searches the value
+//!   as entered, the rule answers it and no encoding check precedes it: the
+//!   `COTRTUPC` type code and description and the `COTRTLIC` row description
+//!   and description filter (`admin_transaction_types`), the `CORPT00C` date
+//!   parts (`reports`), and the sign-on fields, which get the width check and
+//!   then the `COSGN00C` blank edits (`auth`).
 //!   The reward DTOs (`admin_reward_rules`, `rewards`) serve no COBOL program
 //!   or BMS map and are the exception: their requests carry their own
 //!   required members and request-written checks.

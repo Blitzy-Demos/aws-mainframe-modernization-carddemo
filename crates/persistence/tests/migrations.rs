@@ -4,15 +4,22 @@
 //! Every test starts its own `postgres:16.15` container through
 //! [`TestStack::postgres`], which applies the migrations, and reads the
 //! `PostgreSQL` catalogs back: the applied versions, the tables and the view, the
-//! foreign keys with their delete rules, the indexes that replace the VSAM and
-//! Db2 keys and alternate indexes, and the column types of the money, rate and
-//! points fields. Two tests write rows to prove the constraints behave as the
-//! catalogs say: the `TRAN-ID` key that holds among live rows only (E-09) and
-//! the reward invariants (AAP 0.3.5).
+//! foreign keys with their delete rules, the primary key of every table with its
+//! columns in key order, the identity columns with their generation and sequence
+//! options, the indexes that replace the VSAM and Db2 keys and alternate
+//! indexes, the `C` collation of the text columns and index keys, and the column
+//! types of the money, rate and points fields. Two tests write rows to prove the
+//! constraints behave as the catalogs say: the `TRAN-ID` key that holds among
+//! live rows only (E-09) and the reward invariants (AAP 0.3.5). The key and the
+//! collation tests then change the schema and assert that their reads report
+//! exactly the change: dropped and reordered primary keys, altered identities,
+//! and a column and its indexes sharing a collation other than `C`, which the
+//! printed index definitions do not show.
 //!
-//! The tests need a running Docker daemon (AAP 0.10.4). Every statement is a
-//! compile-time checked `sqlx` macro, so `.sqlx/` carries their metadata for
-//! offline builds.
+//! The tests need a running Docker daemon (AAP 0.10.4). Every read and write is
+//! a compile-time checked `sqlx` macro, so `.sqlx/` carries their metadata for
+//! offline builds; the DDL the tests run, a second database and the schema
+//! changes, goes through [`TestStack::exec_sql`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -82,6 +89,23 @@ const VSAM_TABLES: [&str; 10] = [
     "transaction_category_balances",
 ];
 
+/// The collation of every text column and text index key, as
+/// [`column_collations`] and [`index_key_collations`] spell it: `C` sorts and
+/// compares by byte value, the order of the COBOL keys and string comparisons,
+/// where the database default (`en_US.utf8`) does not (the conventions of
+/// `migrations/0001_reference_data.sql` and `0002_master_data.sql`).
+const C_COLLATION: &str = r#"pg_catalog."C""#;
+
+/// The database default collation, which a text column takes when its
+/// definition names none.
+const DEFAULT_COLLATION: &str = r#"pg_catalog."default""#;
+
+/// The one text column not held to `C`, as (table, column): `password_hash`,
+/// the argon2id PHC string stored in place of `SEC-USR-PWD`
+/// (`migrations/0002_master_data.sql:L116, L243`). It holds no COBOL field
+/// value, and no key or comparison orders it.
+const NOT_C_COLUMNS: [(&str, &str); 1] = [("users", "password_hash")];
+
 /// The `TRAN-ID` of the first `dailytran.txt` record, used by the tests that
 /// write transaction rows.
 const TRAN_ID: &str = "0000000006835800";
@@ -129,6 +153,88 @@ impl ForeignKey {
             referenced_columns: owned(referenced_columns),
             on_delete: on_delete.to_owned(),
         }
+    }
+}
+
+/// The primary key of one table of the `public` schema, its columns in key
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PrimaryKey {
+    table: String,
+    name: String,
+    columns: Vec<String>,
+}
+
+impl PrimaryKey {
+    fn new(table: &str, name: &str, columns: &[&str]) -> Self {
+        Self {
+            table: table.to_owned(),
+            name: name.to_owned(),
+            columns: columns.iter().map(|&column| column.to_owned()).collect(),
+        }
+    }
+}
+
+/// A primary key the schema must hold, with the COBOL key or the identity it
+/// replaces.
+struct ExpectedPrimaryKey {
+    table: &'static str,
+    name: &'static str,
+    columns: &'static [&'static str],
+    replaces: &'static str,
+}
+
+impl ExpectedPrimaryKey {
+    fn key(&self) -> PrimaryKey {
+        PrimaryKey::new(self.table, self.name, self.columns)
+    }
+}
+
+/// One identity column of the `public` schema with the options of its
+/// sequence; `generation` is `ALWAYS` or `BY DEFAULT`, as `GENERATED ... AS
+/// IDENTITY` spells it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct IdentityColumn {
+    table: String,
+    column: String,
+    data_type: String,
+    generation: String,
+    start: i64,
+    increment: i64,
+    minimum: i64,
+    maximum: i64,
+    cycle: bool,
+}
+
+impl IdentityColumn {
+    /// A `BIGINT GENERATED ALWAYS AS IDENTITY` column with the sequence options
+    /// `PostgreSQL` gives an identity that names none: from 1 by 1 up to the
+    /// `bigint` maximum, without cycling.
+    fn always(table: &str, column: &str) -> Self {
+        Self {
+            table: table.to_owned(),
+            column: column.to_owned(),
+            data_type: "bigint".to_owned(),
+            generation: "ALWAYS".to_owned(),
+            start: 1,
+            increment: 1,
+            minimum: 1,
+            maximum: 9_223_372_036_854_775_807,
+            cycle: false,
+        }
+    }
+}
+
+/// An identity column the schema must hold, with the source that makes it one.
+struct ExpectedIdentity {
+    table: &'static str,
+    column: &'static str,
+    source: &'static str,
+}
+
+impl ExpectedIdentity {
+    fn identity(&self) -> IdentityColumn {
+        IdentityColumn::always(self.table, self.column)
     }
 }
 
@@ -182,6 +288,74 @@ struct ExpectedIndex {
     primary: bool,
     predicate: Option<&'static str>,
     replaces: &'static str,
+}
+
+/// The collation of one text column of a table or view of the `public` schema.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ColumnCollation {
+    table: String,
+    column: String,
+    collation: String,
+}
+
+impl ColumnCollation {
+    fn new(table: &str, column: &str, collation: &str) -> Self {
+        Self {
+            table: table.to_owned(),
+            column: column.to_owned(),
+            collation: collation.to_owned(),
+        }
+    }
+}
+
+/// One key of an index of the `public` schema: its 1-based position among the
+/// index's keys, its text as `pg_get_indexdef` prints that key alone, and its
+/// collation, `None` for a key whose type has none.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct KeyCollation {
+    table: String,
+    index: String,
+    position: i32,
+    key: String,
+    collation: Option<String>,
+}
+
+impl KeyCollation {
+    fn new(
+        (table, index): (&str, &str),
+        position: i32,
+        key: &str,
+        collation: Option<&str>,
+    ) -> Self {
+        Self {
+            table: table.to_owned(),
+            index: index.to_owned(),
+            position,
+            key: key.to_owned(),
+            collation: collation.map(str::to_owned),
+        }
+    }
+}
+
+/// A padded-key expression of an index of [`EXPECTED_INDEXES`]: the text
+/// column it pads, the index, and the key's position and text.
+struct PaddedKey {
+    table: &'static str,
+    column: &'static str,
+    index: &'static str,
+    position: i32,
+    key: &'static str,
+}
+
+impl PaddedKey {
+    fn key_collation(&self, collation: &str) -> KeyCollation {
+        KeyCollation::new(
+            (self.table, self.index),
+            self.position,
+            self.key,
+            Some(collation),
+        )
+    }
 }
 
 /// The type `information_schema.columns` reports for one column.
@@ -300,6 +474,84 @@ WHERE con.contype = 'f' AND nsp.nspname = 'public'"#
     .collect()
 }
 
+/// Every primary key of the `public` schema besides that of sqlx's own
+/// `_sqlx_migrations`, its key columns in key order.
+async fn primary_keys(pool: &PgPool) -> BTreeSet<PrimaryKey> {
+    sqlx::query!(
+        r#"SELECT
+    cls.relname::text AS "table_name!",
+    con.conname::text AS "name!",
+    ARRAY(
+        SELECT att.attname::text
+        FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+        JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = k.attnum
+        ORDER BY k.ord
+    ) AS "columns!"
+FROM pg_constraint con
+JOIN pg_namespace nsp ON nsp.oid = con.connamespace
+JOIN pg_class cls ON cls.oid = con.conrelid
+WHERE con.contype = 'p' AND nsp.nspname = 'public' AND cls.relname <> '_sqlx_migrations'"#
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the primary keys from pg_constraint")
+    .into_iter()
+    .map(|row| PrimaryKey {
+        table: row.table_name,
+        name: row.name,
+        columns: row.columns,
+    })
+    .collect()
+}
+
+/// Every identity column of the `public` schema with its generation and the
+/// options of the sequence it owns, which `pg_depend` links to the column as an
+/// internal dependency.
+async fn identity_columns(pool: &PgPool) -> BTreeSet<IdentityColumn> {
+    sqlx::query!(
+        r#"SELECT
+    cls.relname::text AS "table_name!",
+    att.attname::text AS "column_name!",
+    format_type(att.atttypid, att.atttypmod) AS "data_type!",
+    CASE att.attidentity
+        WHEN 'a' THEN 'ALWAYS'
+        WHEN 'd' THEN 'BY DEFAULT'
+    END AS "generation!",
+    seq.seqstart AS "start!",
+    seq.seqincrement AS "increment!",
+    seq.seqmin AS "minimum!",
+    seq.seqmax AS "maximum!",
+    seq.seqcycle AS "cycle!"
+FROM pg_attribute att
+JOIN pg_class cls ON cls.oid = att.attrelid
+JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+JOIN pg_depend dep
+    ON dep.classid = 'pg_class'::regclass
+    AND dep.refclassid = 'pg_class'::regclass
+    AND dep.refobjid = cls.oid
+    AND dep.refobjsubid = att.attnum
+    AND dep.deptype = 'i'
+JOIN pg_sequence seq ON seq.seqrelid = dep.objid
+WHERE nsp.nspname = 'public' AND att.attidentity <> '' AND NOT att.attisdropped"#
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the identity columns from pg_attribute and pg_sequence")
+    .into_iter()
+    .map(|row| IdentityColumn {
+        table: row.table_name,
+        column: row.column_name,
+        data_type: row.data_type,
+        generation: row.generation,
+        start: row.start,
+        increment: row.increment,
+        minimum: row.minimum,
+        maximum: row.maximum,
+        cycle: row.cycle,
+    })
+    .collect()
+}
+
 /// Every index of the `public` schema, ordered by table and name.
 async fn indexes(pool: &PgPool) -> Vec<IndexRow> {
     sqlx::query!(
@@ -379,6 +631,73 @@ ORDER BY 1, 2"#
     .expect("read the floating-point columns from information_schema.columns")
     .into_iter()
     .map(|row| format!("{}.{} ({})", row.table_name, row.column_name, row.udt_name))
+    .collect()
+}
+
+/// The collation `pg_attribute` records for every text column of the tables
+/// and views of the `public` schema besides sqlx's own `_sqlx_migrations`. A
+/// column whose type has no collation records collation 0, which no
+/// `pg_collation` row joins.
+async fn column_collations(pool: &PgPool) -> BTreeSet<ColumnCollation> {
+    sqlx::query!(
+        r#"SELECT
+    cls.relname::text AS "table_name!",
+    att.attname::text AS "column_name!",
+    quote_ident(cnsp.nspname) || '.' || quote_ident(coll.collname) AS "collation!"
+FROM pg_attribute att
+JOIN pg_class cls ON cls.oid = att.attrelid
+JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+JOIN pg_collation coll ON coll.oid = att.attcollation
+JOIN pg_namespace cnsp ON cnsp.oid = coll.collnamespace
+WHERE nsp.nspname = 'public'
+  AND cls.relkind IN ('r', 'p', 'v', 'm')
+  AND cls.relname <> '_sqlx_migrations'
+  AND att.attnum > 0
+  AND NOT att.attisdropped"#
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the column collations from pg_attribute")
+    .into_iter()
+    .map(|row| ColumnCollation {
+        table: row.table_name,
+        column: row.column_name,
+        collation: row.collation,
+    })
+    .collect()
+}
+
+/// Every key of every index on the tables of the `public` schema besides
+/// `_sqlx_migrations`, with the collation `pg_index.indcollation` records for
+/// it; a key whose type has no collation records collation 0, read as `None`.
+async fn index_key_collations(pool: &PgPool) -> BTreeSet<KeyCollation> {
+    sqlx::query!(
+        r#"SELECT
+    tbl.relname::text AS "table_name!",
+    idx.relname::text AS "index_name!",
+    k.n AS "position!",
+    pg_get_indexdef(ind.indexrelid, k.n, false) AS "key!",
+    quote_ident(cnsp.nspname) || '.' || quote_ident(coll.collname) AS "collation?"
+FROM pg_index ind
+JOIN pg_class idx ON idx.oid = ind.indexrelid
+JOIN pg_class tbl ON tbl.oid = ind.indrelid
+JOIN pg_namespace nsp ON nsp.oid = tbl.relnamespace
+CROSS JOIN LATERAL generate_series(1, ind.indnkeyatts::int4) AS k(n)
+LEFT JOIN pg_collation coll ON coll.oid = ind.indcollation[k.n - 1]
+LEFT JOIN pg_namespace cnsp ON cnsp.oid = coll.collnamespace
+WHERE nsp.nspname = 'public' AND tbl.relname <> '_sqlx_migrations'"#
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the index key collations from pg_index")
+    .into_iter()
+    .map(|row| KeyCollation {
+        table: row.table_name,
+        index: row.index_name,
+        position: row.position,
+        key: row.key,
+        collation: row.collation,
+    })
     .collect()
 }
 
@@ -558,15 +877,66 @@ fn assert_violation<T>(
     );
 }
 
+/// The items of `expected` that `actual` lacks (missing) and the items of
+/// `actual` that `expected` lacks (unexpected), each in ascending order.
+fn set_difference<'a, T: Ord>(
+    expected: &'a BTreeSet<T>,
+    actual: &'a BTreeSet<T>,
+) -> (Vec<&'a T>, Vec<&'a T>) {
+    (
+        expected.difference(actual).collect(),
+        actual.difference(expected).collect(),
+    )
+}
+
 /// Asserts that `actual` equals `expected`, listing what is missing and what is
 /// unexpected; `what` names the compared items.
 fn assert_same_set<T: Ord + Debug>(what: &str, expected: &BTreeSet<T>, actual: &BTreeSet<T>) {
-    let missing: Vec<&T> = expected.difference(actual).collect();
-    let unexpected: Vec<&T> = actual.difference(expected).collect();
+    let (missing, unexpected) = set_difference(expected, actual);
     assert!(
         missing.is_empty() && unexpected.is_empty(),
         "{what} differ from the migrations\nmissing: {missing:#?}\nunexpected: {unexpected:#?}"
     );
+}
+
+/// Asserts that `changed`, read after a schema change, differs from `expected`
+/// by exactly `missing` and `unexpected`; `what` names the compared items and
+/// the change.
+fn assert_differences<T: Ord + Debug>(
+    what: &str,
+    (expected, changed): (&BTreeSet<T>, &BTreeSet<T>),
+    missing: &BTreeSet<T>,
+    unexpected: &BTreeSet<T>,
+) {
+    let wanted: (Vec<&T>, Vec<&T>) = (missing.iter().collect(), unexpected.iter().collect());
+    assert_eq!(
+        set_difference(expected, changed),
+        wanted,
+        "{what}: (missing, unexpected)"
+    );
+}
+
+/// The columns of `columns` sorted by a collation other than `C`, besides
+/// those of [`NOT_C_COLUMNS`].
+fn columns_not_in_c(columns: &BTreeSet<ColumnCollation>) -> BTreeSet<&ColumnCollation> {
+    columns
+        .iter()
+        .filter(|column| {
+            column.collation != C_COLLATION
+                && !NOT_C_COLUMNS.contains(&(column.table.as_str(), column.column.as_str()))
+        })
+        .collect()
+}
+
+/// The keys of `keys` that have a collation other than `C`.
+fn keys_not_in_c(keys: &BTreeSet<KeyCollation>) -> BTreeSet<&KeyCollation> {
+    keys.iter()
+        .filter(|key| {
+            key.collation
+                .as_deref()
+                .is_some_and(|collation| collation != C_COLLATION)
+        })
+        .collect()
 }
 
 /// Asserts that `applied` records exactly the five embedded migrations, each
@@ -740,6 +1110,274 @@ fn foreign_keys_and_delete_rules() {
     assert_same_set("foreign keys", &expected, &actual);
 }
 
+/// The primary key of every base table, in [`BASE_TABLES`] order, with the
+/// COBOL, Db2 or IMS key it replaces or the identity the AAP gives the table.
+const EXPECTED_PRIMARY_KEYS: [ExpectedPrimaryKey; 18] = [
+    ExpectedPrimaryKey {
+        table: "transaction_types",
+        name: "xtran_type",
+        columns: &["tr_type"],
+        replaces: "TRANSACTION_TYPE PRIMARY KEY(TR_TYPE) (TRNTYPE.ddl:L4)",
+    },
+    ExpectedPrimaryKey {
+        table: "transaction_categories",
+        name: "x_tran_type_catg",
+        columns: &["trc_type_code", "trc_type_category"],
+        replaces: "TRANSACTION_TYPE_CATEGORY PRIMARY KEY(TRC_TYPE_CODE,TRC_TYPE_CATEGORY) \
+                   (TRNTYCAT.ddl:L5)",
+    },
+    ExpectedPrimaryKey {
+        table: "trantype_file",
+        name: "trantype_file_pkey",
+        columns: &["tran_type"],
+        replaces: "TRANTYPE KSDS KEYS(2 0), TRAN-TYPE (TRANTYPE.jcl:L40)",
+    },
+    ExpectedPrimaryKey {
+        table: "trancatg_file",
+        name: "trancatg_file_pkey",
+        columns: &["tran_type_cd", "tran_cat_cd"],
+        replaces: "TRANCATG KSDS KEYS(6 0), TRAN-CAT-KEY (TRANCATG.jcl:L40)",
+    },
+    ExpectedPrimaryKey {
+        table: "disclosure_groups",
+        name: "disclosure_groups_pkey",
+        columns: &["dis_acct_group_id", "dis_tran_type_cd", "dis_tran_cat_cd"],
+        replaces: "DISCGRP KSDS KEYS(16 0), DIS-GROUP-KEY (DISCGRP.jcl:L40)",
+    },
+    ExpectedPrimaryKey {
+        table: "customers",
+        name: "customers_pkey",
+        columns: &["customer_id"],
+        replaces: "CUSTDAT KSDS KEYS(9 0), CUST-ID (CUSTFILE.jcl:L50)",
+    },
+    ExpectedPrimaryKey {
+        table: "accounts",
+        name: "accounts_pkey",
+        columns: &["account_id"],
+        replaces: "ACCTDAT KSDS KEYS(11 0), ACCT-ID (ACCTFILE.jcl:L40)",
+    },
+    ExpectedPrimaryKey {
+        table: "cards",
+        name: "cards_pkey",
+        columns: &["card_number"],
+        replaces: "CARDDAT KSDS KEYS(16 0), CARD-NUM (CARDFILE.jcl:L54)",
+    },
+    ExpectedPrimaryKey {
+        table: "card_xref",
+        name: "card_xref_pkey",
+        columns: &["xref_card_num"],
+        replaces: "CCXREF KSDS KEYS(16 0), XREF-CARD-NUM (XREFFILE.jcl:L43)",
+    },
+    ExpectedPrimaryKey {
+        table: "users",
+        name: "users_pkey",
+        columns: &["user_id"],
+        replaces: "USRSEC KSDS KEYS(8,0), SEC-USR-ID (DUSRSECJ.jcl:L65)",
+    },
+    ExpectedPrimaryKey {
+        table: "transactions",
+        name: "transactions_pkey",
+        columns: &["transaction_id"],
+        replaces: "the row identity of E-09, the reward accrual foreign key target (AAP 0.5.3.4)",
+    },
+    ExpectedPrimaryKey {
+        table: "transaction_category_balances",
+        name: "transaction_category_balances_pkey",
+        columns: &["trancat_acct_id", "trancat_type_cd", "trancat_cd"],
+        replaces: "TCATBALF KSDS KEYS(17 0), TRAN-CAT-KEY (TCATBALF.jcl:L40)",
+    },
+    ExpectedPrimaryKey {
+        table: "pending_auth_summaries",
+        name: "pending_auth_summaries_pkey",
+        columns: &["pa_acct_id"],
+        replaces: "PAUTSUM0 root sequence field ACCNTID, SEQ,U (DBPAUTP0.dbd:L30)",
+    },
+    ExpectedPrimaryKey {
+        table: "pending_auth_details",
+        name: "pending_auth_details_pkey",
+        columns: &["auth_id"],
+        replaces: "the identity REST key of /authorizations/{id} (AAP 0.5.3.4)",
+    },
+    ExpectedPrimaryKey {
+        table: "auth_fraud",
+        name: "auth_fraud_pkey",
+        columns: &["card_num", "auth_ts"],
+        replaces: "AUTHFRDS PRIMARY KEY(CARD_NUM,AUTH_TS) (AUTHFRDS.ddl:L28)",
+    },
+    ExpectedPrimaryKey {
+        table: "reward_rules",
+        name: "reward_rules_pkey",
+        columns: &["rule_id"],
+        replaces: "the rule identity, the lowest of which wins a tie of equal rates (AAP 0.3.5)",
+    },
+    ExpectedPrimaryKey {
+        table: "reward_balances",
+        name: "reward_balances_pkey",
+        columns: &["account_id"],
+        replaces: "the one reward balance of an account (AAP 0.3.5)",
+    },
+    ExpectedPrimaryKey {
+        table: "reward_accruals",
+        name: "reward_accruals_pkey",
+        columns: &["accrual_id"],
+        replaces: "the accrual identity, the reward history page key (AAP 0.3.5)",
+    },
+];
+
+/// The four identity columns, each `BIGINT GENERATED ALWAYS AS IDENTITY` with
+/// the default sequence options, so no writer supplies a value and every value
+/// is new.
+const EXPECTED_IDENTITY_COLUMNS: [ExpectedIdentity; 4] = [
+    ExpectedIdentity {
+        table: "transactions",
+        column: "transaction_id",
+        source: "is the row identity no writer supplies; COMBTRAN revives a row by \
+                 updating it, never by inserting its old identity \
+                 (migrations/0003_transactions.sql:L126-129, AAP 0.5.3.4)",
+    },
+    ExpectedIdentity {
+        table: "pending_auth_details",
+        column: "auth_id",
+        source: "is the generated REST key that is never reused \
+                 (migrations/0004_authorizations.sql:L156, L246, AAP 0.5.3.4)",
+    },
+    ExpectedIdentity {
+        table: "reward_rules",
+        column: "rule_id",
+        source: "is an identity no writer supplies, which the seed refresh's RESTART \
+                 IDENTITY restarts at 1 (migrations/0005_rewards.sql:L45-47, AAP 0.3.5)",
+    },
+    ExpectedIdentity {
+        table: "reward_accruals",
+        column: "accrual_id",
+        source: "is an identity no writer supplies (migrations/0005_rewards.sql:L45, \
+                 AAP 0.3.5)",
+    },
+];
+
+/// Every base table has the primary key of [`EXPECTED_PRIMARY_KEYS`], with its
+/// columns in key order, and the four columns of [`EXPECTED_IDENTITY_COLUMNS`]
+/// are the only identities, `GENERATED ALWAYS` from 1 by 1 without cycling.
+/// No foreign key references `customers`, `cards` or `users`, so nothing else
+/// would notice their keys missing. Dropping those three keys, reordering a
+/// composite one, relaxing an identity to `BY DEFAULT` and dropping another
+/// identity are then each reported exactly.
+#[test]
+fn primary_keys_and_identity_columns() {
+    let stack = block_on(TestStack::postgres());
+    let keyed: BTreeSet<&str> = EXPECTED_PRIMARY_KEYS.iter().map(|key| key.table).collect();
+    assert_eq!(
+        keyed,
+        BTreeSet::from(BASE_TABLES),
+        "tables with an expected primary key"
+    );
+
+    let keys = block_on(primary_keys(stack.pool()));
+    for expected in &EXPECTED_PRIMARY_KEYS {
+        let on_table: Vec<&PrimaryKey> = keys
+            .iter()
+            .filter(|key| key.table == expected.table)
+            .collect();
+        assert_eq!(
+            on_table,
+            [&expected.key()],
+            "primary key of {}, which replaces {}",
+            expected.table,
+            expected.replaces
+        );
+    }
+    let expected_keys: BTreeSet<PrimaryKey> = EXPECTED_PRIMARY_KEYS
+        .iter()
+        .map(ExpectedPrimaryKey::key)
+        .collect();
+    assert_same_set("primary keys", &expected_keys, &keys);
+
+    let identities = block_on(identity_columns(stack.pool()));
+    for expected in &EXPECTED_IDENTITY_COLUMNS {
+        let on_column: Vec<&IdentityColumn> = identities
+            .iter()
+            .filter(|identity| {
+                identity.table == expected.table && identity.column == expected.column
+            })
+            .collect();
+        assert_eq!(
+            on_column,
+            [&expected.identity()],
+            "identity {}.{}, which {}",
+            expected.table,
+            expected.column,
+            expected.source
+        );
+    }
+    let expected_identities: BTreeSet<IdentityColumn> = EXPECTED_IDENTITY_COLUMNS
+        .iter()
+        .map(ExpectedIdentity::identity)
+        .collect();
+    assert_same_set("identity columns", &expected_identities, &identities);
+
+    check_key_and_identity_changes(&stack, &expected_keys, &expected_identities);
+}
+
+/// Drops the primary keys of `customers`, `cards` and `users`, none of which a
+/// foreign key references, recreates `disclosure_groups_pkey` over its columns
+/// in another order, makes `transactions.transaction_id` `GENERATED BY DEFAULT`
+/// and drops the identity of `reward_rules.rule_id`; the catalog reads must
+/// report exactly these changes against `expected_keys` and
+/// `expected_identities`.
+fn check_key_and_identity_changes(
+    stack: &TestStack,
+    expected_keys: &BTreeSet<PrimaryKey>,
+    expected_identities: &BTreeSet<IdentityColumn>,
+) {
+    block_on(stack.exec_sql(
+        "ALTER TABLE customers DROP CONSTRAINT customers_pkey;
+ALTER TABLE cards DROP CONSTRAINT cards_pkey;
+ALTER TABLE users DROP CONSTRAINT users_pkey;
+ALTER TABLE disclosure_groups
+    DROP CONSTRAINT disclosure_groups_pkey,
+    ADD CONSTRAINT disclosure_groups_pkey
+        PRIMARY KEY (dis_tran_type_cd, dis_acct_group_id, dis_tran_cat_cd);
+ALTER TABLE transactions ALTER COLUMN transaction_id SET GENERATED BY DEFAULT;
+ALTER TABLE reward_rules ALTER COLUMN rule_id DROP IDENTITY;",
+    ));
+
+    let removed: BTreeSet<PrimaryKey> = EXPECTED_PRIMARY_KEYS
+        .iter()
+        .filter(|key| ["customers", "cards", "users", "disclosure_groups"].contains(&key.table))
+        .map(ExpectedPrimaryKey::key)
+        .collect();
+    let reordered = PrimaryKey::new(
+        "disclosure_groups",
+        "disclosure_groups_pkey",
+        &["dis_tran_type_cd", "dis_acct_group_id", "dis_tran_cat_cd"],
+    );
+    assert_differences(
+        "primary keys after dropping customers_pkey, cards_pkey and users_pkey and \
+         reordering disclosure_groups_pkey",
+        (expected_keys, &block_on(primary_keys(stack.pool()))),
+        &removed,
+        &BTreeSet::from([reordered]),
+    );
+
+    let by_default = IdentityColumn {
+        generation: "BY DEFAULT".to_owned(),
+        ..IdentityColumn::always("transactions", "transaction_id")
+    };
+    assert_differences(
+        "identity columns after making transactions.transaction_id GENERATED BY DEFAULT \
+         and dropping the identity of reward_rules.rule_id",
+        (
+            expected_identities,
+            &block_on(identity_columns(stack.pool())),
+        ),
+        &BTreeSet::from([
+            IdentityColumn::always("transactions", "transaction_id"),
+            IdentityColumn::always("reward_rules", "rule_id"),
+        ]),
+        &BTreeSet::from([by_default]),
+    );
+}
+
 /// The indexes that replace the keys and alternate indexes of the COBOL
 /// files and tables, checked on their key lists, uniqueness and predicates.
 const EXPECTED_INDEXES: [ExpectedIndex; 18] = [
@@ -791,8 +1429,10 @@ const EXPECTED_INDEXES: [ExpectedIndex; 18] = [
     },
     // The definitions of the three padded-key indexes (transaction_types_padded_tr_type
     // above, users_padded_user_id and transaction_category_balances_padded_key) print no
-    // COLLATE: "C" is the collation each rpad expression takes from its column, and
-    // pg_indexes prints only a differing one, so these key lists also pin the byte order.
+    // COLLATE. pg_indexes prints a key's COLLATE only where it differs from the collation
+    // its expression takes from the column, so these key lists cannot tell "C" from any
+    // other collation the column and the index share. text_columns_and_keys_sort_by_c_collation
+    // reads the column and index-key collations from the catalogs and pins "C".
     ExpectedIndex {
         table: "users",
         name: "users_padded_user_id",
@@ -920,6 +1560,8 @@ const EXPECTED_INDEXES: [ExpectedIndex; 18] = [
 /// `transactions_retained_tran_id`, which serves the COMBTRAN revive lookup
 /// over the non-live rows, is not unique. A `TRAN-ID` held by non-live rows may
 /// therefore be issued again, and several non-live rows may share it (E-09).
+/// The key lists print no collation a key shares with its column, so
+/// `text_columns_and_keys_sort_by_c_collation` checks the collations.
 #[test]
 fn indexes_exist_with_expected_shape() {
     let stack = block_on(TestStack::postgres());
@@ -979,6 +1621,145 @@ fn indexes_exist_with_expected_shape() {
         ],
         "tran_id must be unique among live rows only: the partial live-row key is the one \
          unique index led by tran_id, and the retained-row index is not unique"
+    );
+}
+
+/// The padded-key expressions of `transaction_types_padded_tr_type`,
+/// `users_padded_user_id` and `transaction_category_balances_padded_key`, whose
+/// byte order is the COBOL key order of their [`EXPECTED_INDEXES`] entries.
+const PADDED_KEYS: [PaddedKey; 3] = [
+    PaddedKey {
+        table: "transaction_types",
+        column: "tr_type",
+        index: "transaction_types_padded_tr_type",
+        position: 1,
+        key: "rpad((tr_type)::text, 2)",
+    },
+    PaddedKey {
+        table: "users",
+        column: "user_id",
+        index: "users_padded_user_id",
+        position: 1,
+        key: "rpad((user_id)::text, 8)",
+    },
+    PaddedKey {
+        table: "transaction_category_balances",
+        column: "trancat_type_cd",
+        index: "transaction_category_balances_padded_key",
+        position: 2,
+        key: "rpad((trancat_type_cd)::text, 2)",
+    },
+];
+
+/// Every text column of the tables and the view, and every text key of their
+/// indexes, sorts by `C`, the byte order of the COBOL keys and string
+/// comparisons (the conventions of `migrations/0001_reference_data.sql` and
+/// `0002_master_data.sql`); only the columns of [`NOT_C_COLUMNS`] are exempt.
+/// The columns and keys of [`PADDED_KEYS`] and the view's `tran_id` are among
+/// those read, so the check is not vacuous. The collations come from
+/// `pg_attribute` and `pg_index`: once `users.user_id` and its padded index
+/// share the default collation, the key list `indexes_exist_with_expected_shape`
+/// compares is unchanged, while these reads report the column and both of its
+/// keys.
+#[test]
+fn text_columns_and_keys_sort_by_c_collation() {
+    let stack = block_on(TestStack::postgres());
+    let columns = block_on(column_collations(stack.pool()));
+    let keys = block_on(index_key_collations(stack.pool()));
+    for padded in &PADDED_KEYS {
+        assert!(
+            columns.contains(&ColumnCollation::new(
+                padded.table,
+                padded.column,
+                C_COLLATION
+            )),
+            "{}.{}, padded by {}, must sort by C; the columns are {columns:#?}",
+            padded.table,
+            padded.column,
+            padded.index
+        );
+        assert!(
+            keys.contains(&padded.key_collation(C_COLLATION)),
+            "key {} of {} must be {} sorting by C; the keys are {keys:#?}",
+            padded.position,
+            padded.index,
+            padded.key
+        );
+    }
+    assert!(
+        columns.contains(&ColumnCollation::new(
+            "transaction_master",
+            "tran_id",
+            C_COLLATION
+        )),
+        "the view's tran_id must sort by C; the columns are {columns:#?}"
+    );
+    let columns_off_c = columns_not_in_c(&columns);
+    assert!(
+        columns_off_c.is_empty(),
+        "text columns sorted by a collation other than C: {columns_off_c:#?}"
+    );
+    let keys_off_c = keys_not_in_c(&keys);
+    assert!(
+        keys_off_c.is_empty(),
+        "index keys sorted by a collation other than C: {keys_off_c:#?}"
+    );
+
+    check_shared_default_collation(&stack);
+}
+
+/// Gives `users.user_id` the default collation, which rebuilds `users_pkey`
+/// under it, and recreates `users_padded_user_id` without `COLLATE`, so the
+/// expression takes the column's collation. The key list of that index stays
+/// the one [`EXPECTED_INDEXES`] pins, while the collation reads report exactly
+/// the column and its two keys.
+fn check_shared_default_collation(stack: &TestStack) {
+    block_on(stack.exec_sql(
+        r#"DROP INDEX users_padded_user_id;
+ALTER TABLE users ALTER COLUMN user_id TYPE VARCHAR(8) COLLATE "default";
+CREATE INDEX users_padded_user_id ON users ((rpad(user_id, 8)));"#,
+    ));
+
+    let expected = EXPECTED_INDEXES
+        .iter()
+        .find(|index| index.name == "users_padded_user_id")
+        .expect("users_padded_user_id is an expected index");
+    let rebuilt = block_on(indexes(stack.pool()));
+    let index = rebuilt
+        .iter()
+        .find(|index| index.name == expected.name)
+        .expect("users_padded_user_id exists after its rebuild");
+    assert_eq!(
+        index.key_list(),
+        expected.keys,
+        "{} under the default collation: {}",
+        expected.name,
+        index.definition
+    );
+
+    let padded = PADDED_KEYS
+        .iter()
+        .find(|key| key.index == expected.name)
+        .expect("users_padded_user_id has a padded key");
+    let columns = block_on(column_collations(stack.pool()));
+    assert_eq!(
+        columns_not_in_c(&columns),
+        BTreeSet::from([&ColumnCollation::new("users", "user_id", DEFAULT_COLLATION)]),
+        "text columns sorted by a collation other than C once users.user_id has the default"
+    );
+    let keys = block_on(index_key_collations(stack.pool()));
+    assert_eq!(
+        keys_not_in_c(&keys),
+        BTreeSet::from([
+            &KeyCollation::new(
+                ("users", "users_pkey"),
+                1,
+                "user_id",
+                Some(DEFAULT_COLLATION)
+            ),
+            &padded.key_collation(DEFAULT_COLLATION),
+        ]),
+        "index keys sorted by a collation other than C once users.user_id has the default"
     );
 }
 

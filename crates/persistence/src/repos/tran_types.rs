@@ -55,6 +55,33 @@
 //!   (P-COTRTLIC-020) and binds unchanged. `ESCAPE ''` turns off the backslash
 //!   escape `PostgreSQL` applies by default, since the Db2 predicate names no
 //!   escape character; `LIKE` stays case-sensitive, as in Db2.
+//! - A key holding a NUL byte names no stored type, because `PostgreSQL` text
+//!   cannot hold NUL. Binding one would fail on the server with an encoding
+//!   error (SQLSTATE `22021`) rather than find no row, so the keyed reads, the
+//!   update and the delete answer [`PortError::NotFound`] for it without a
+//!   query, as the Db2 statements answer `SQLCODE` +100 and the `CBTRN03C`
+//!   `READ`s `INVALID KEY`. The insert has no such answer: the column cannot
+//!   store the code, and the statement's failure is reported as
+//!   [`PortError::Unavailable`], as for any other value the column refuses.
+//! - A type filter or description pattern holding a NUL byte matches no row,
+//!   as Db2 finds none for a host variable holding `X'00'`: no stored code
+//!   holds NUL, and under `ESCAPE ''` a NUL in the pattern is a literal
+//!   character only text holding NUL could match. The count is 0 and the page
+//!   empty, without a query.
+//! - A start key holding a NUL byte bounds the cursors through a NUL-free key
+//!   that selects exactly the same codes (`start_bound`): the characters
+//!   before its first NUL, followed by U+0001 up to the key's two characters,
+//!   so `"\0 "` binds as `"\x01\x01"` and `"0\0"` as `"0\x01"`. Every
+//!   character of a padded stored code is at least U+0001: the column `CHECK`
+//!   admits U+0001 to U+00FF, and the padding is a space. For a stored code
+//!   `s` padded to two characters, if `s` differs from the key before the
+//!   key's first NUL, it differs from the bound there by the same characters
+//!   and compares with both alike. Otherwise its next character is above NUL,
+//!   so `s > key`, and that character and the rest are each at least the
+//!   bound's U+0001, so `s >= bound`. Hence `s >= key` exactly when
+//!   `s >= bound`, and `s < key` exactly when `s < bound`, in the
+//!   `rpad(…, 2) COLLATE "C"` order: the forward cursor stays inclusive and
+//!   the backward cursor strict, through the same statements.
 //!
 //! # Writes
 //!
@@ -76,6 +103,9 @@
 //! column's `CHECK` admits. Any other form is refused by the database and
 //! reported as [`PortError::Unavailable`]; this file never trims it.
 
+use std::borrow::Cow;
+use std::iter;
+
 use carddemo_domain::entities::{TranCategoryRecord, TranTypeMaster, TranTypeRecord};
 use carddemo_domain::numeric::{TranCategoryCode, TranTypeCode};
 use carddemo_domain::ports::{
@@ -95,6 +125,17 @@ const TYPE_FILE: &str = "trantype_file";
 
 /// The VSAM processing copy `TRANCATG`.
 const CATEGORY_FILE: &str = "trancatg_file";
+
+/// The COBOL figurative constant `LOW-VALUE`, which `PostgreSQL` text cannot
+/// hold.
+const LOW_VALUE: u8 = 0x00;
+
+/// [`LOW_VALUE`] as a character of a code's text or of a description pattern.
+const NUL: char = '\0';
+
+/// The lowest character a stored code holds: the column `CHECK` admits
+/// U+0001 to U+00FF.
+const LOWEST_STORED: char = '\u{1}';
 
 /// A `transaction_types` row as the master reads select it: `TR_TYPE` and
 /// `TR_DESCRIPTION`, the columns `DCLTRANSACTION-TYPE` fetches into.
@@ -130,14 +171,58 @@ fn masters(rows: Vec<MasterRow>) -> PortResult<Vec<TranTypeMaster>> {
         .map_err(PortError::from)
 }
 
+/// Whether `code` holds a NUL byte, and so names no stored type.
+fn holds_nul(code: TranTypeCode) -> bool {
+    code.as_bytes().contains(&LOW_VALUE)
+}
+
+/// The text a code parameter binds, the code right-trimmed, or `None` when
+/// the code holds a NUL byte and so names no stored type.
+fn key_text(code: &TranTypeCode) -> Option<Cow<'_, str>> {
+    (!holds_nul(*code)).then(|| code.trimmed())
+}
+
+/// The text a cursor's start bound binds: the start key right-trimmed, or,
+/// when it holds a NUL byte, the NUL-free key that selects exactly the same
+/// stored codes, as the module documentation proves. That key is the
+/// characters of the trimmed key before its first NUL, one per byte, followed
+/// by [`LOWEST_STORED`] up to the key's width.
+fn start_bound(start: &TranTypeCode) -> Cow<'_, str> {
+    key_text(start).unwrap_or_else(|| {
+        let width = start.as_bytes().len();
+        Cow::Owned(
+            start
+                .trimmed()
+                .chars()
+                .take_while(|&character| character != NUL)
+                .chain(iter::repeat(LOWEST_STORED))
+                .take(width)
+                .collect(),
+        )
+    })
+}
+
+/// Whether `filter` holds a NUL byte in its type code or its description
+/// pattern, and so matches no stored row (the module documentation).
+fn matches_nothing(filter: &TranTypeFilter) -> bool {
+    filter.type_code.is_some_and(holds_nul)
+        || filter
+            .description
+            .as_deref()
+            .is_some_and(|pattern| pattern.contains(NUL))
+}
+
 impl TranTypeMasterStore for PgStore<'_, '_> {
     /// `COTRTUPC` `9100-GET-TRANSACTION-TYPE` — P-COTRTUPC-021
     /// [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1469-1511]:
     /// `SELECT TR_TYPE, TR_DESCRIPTION … WHERE TR_TYPE = :DCL-TR-TYPE`. No row
-    /// is `SQLCODE` +100, [`PortError::NotFound`]. The read runs under its own
-    /// savepoint, as every statement of this store does.
+    /// is `SQLCODE` +100, [`PortError::NotFound`], and so is a code holding a
+    /// NUL byte, without a query. The read runs under its own savepoint, as
+    /// every statement of this store does.
     async fn read_tran_type(&mut self, code: TranTypeCode) -> PortResult<TranTypeMaster> {
-        let key = code.trimmed();
+        let Some(key) = key_text(&code) else {
+            return Err(PortError::NotFound);
+        };
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             MasterRow,
@@ -179,12 +264,20 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// directly; otherwise the scan reads that index from the first or last
     /// key. The description filter is a `$n IS NULL OR …` test in all three,
     /// as the module documentation explains.
+    ///
+    /// A type filter or description pattern holding a NUL byte matches no
+    /// row: the page is empty, without a query. A start key holding a NUL byte
+    /// binds as the NUL-free key that bounds the cursor at exactly the same
+    /// codes (`start_bound`).
     async fn browse_tran_types(
         &mut self,
         browse: Browse<TranTypeCode>,
         filter: TranTypeFilter,
     ) -> PortResult<Vec<TranTypeMaster>> {
-        let start = browse.start_key.as_ref().map(TranTypeCode::trimmed);
+        if matches_nothing(&filter) {
+            return Ok(Vec::new());
+        }
+        let start = browse.start_key.as_ref().map(start_bound);
         let type_code = filter.type_code.as_ref().map(TranTypeCode::trimmed);
         let pattern = filter.description.as_deref();
         let limit = limit_i64(browse.limit)?;
@@ -205,7 +298,12 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// A type filter has its own static statement, so `tr_type = code` reads
     /// `xtran_type` under a generic prepared plan too; without one every type
     /// is counted. The description filter is a `$n IS NULL OR …` test in both.
+    /// A type filter or description pattern holding a NUL byte matches no row:
+    /// the count is 0, without a query.
     async fn count_tran_types(&mut self, filter: TranTypeFilter) -> PortResult<u64> {
+        if matches_nothing(&filter) {
+            return Ok(0);
+        }
         let type_code = filter.type_code.as_ref().map(TranTypeCode::trimmed);
         let pattern = filter.description.as_deref();
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
@@ -268,9 +366,11 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// [app/app-transaction-type-db2/cbl/COBTUPDT.cbl:L166-195]. The
     /// description is stored exactly as given. No row with the code is
     /// `SQLCODE` +100, [`PortError::NotFound`], which `COTRTUPC` answers with
-    /// its insert.
+    /// its insert; a code holding a NUL byte is too, without a query.
     async fn update_tran_type(&mut self, rec: TranTypeMaster) -> PortResult<()> {
-        let key = rec.tr_type.trimmed();
+        let Some(key) = key_text(&rec.tr_type) else {
+            return Err(PortError::NotFound);
+        };
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "UPDATE transaction_types SET tr_description = $2 WHERE tr_type = $1",
@@ -292,9 +392,12 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// [app/app-transaction-type-db2/cbl/COBTUPDT.cbl:L196-226]. Categories
     /// that still reference the type are `SQLCODE` -532,
     /// [`PortError::Restricted`]; no row with the code is +100,
-    /// [`PortError::NotFound`].
+    /// [`PortError::NotFound`], and so is a code holding a NUL byte, without a
+    /// query.
     async fn delete_tran_type(&mut self, code: TranTypeCode) -> PortResult<()> {
-        let key = code.trimmed();
+        let Some(key) = key_text(&code) else {
+            return Err(PortError::NotFound);
+        };
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "DELETE FROM transaction_types WHERE tr_type = $1",
@@ -315,7 +418,8 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
 /// Up to `limit` types in ascending byte order of the code padded to its
 /// `X(2)` bytes, from `start` inclusive, or from the first type, read on
 /// `conn` by the static statement of the keys present. `type_code` and
-/// `start` are right-trimmed codes; each bound pads `start` back with `rpad`.
+/// `start` are right-trimmed codes, `start` made NUL-free by `start_bound`;
+/// each bound pads `start` back with `rpad`.
 async fn types_forward(
     conn: &mut sqlx::PgConnection,
     type_code: Option<&str>,
@@ -383,8 +487,8 @@ async fn types_forward(
 /// P-COTRTLIC-020. Up to `limit` types in descending byte order of the code
 /// padded to its `X(2)` bytes, strictly below `start`, or from the last type,
 /// read on `conn` by the static statement of the keys present. `type_code`
-/// and `start` are right-trimmed codes; each bound pads `start` back with
-/// `rpad`.
+/// and `start` are right-trimmed codes, `start` made NUL-free by
+/// `start_bound`; each bound pads `start` back with `rpad`.
 async fn types_backward(
     conn: &mut sqlx::PgConnection,
     type_code: Option<&str>,
@@ -448,10 +552,13 @@ impl TranTypeFileReader for PgStore<'_, '_> {
     /// `CBTRN03C` `1500-B-LOOKUP-TRANTYPE` — P-CBTRN03C-005
     /// [app/cbl/CBTRN03C.cbl:L494-502]: the random `READ TRANTYPE-FILE INTO
     /// TRAN-TYPE-RECORD` by `FD-TRAN-TYPE`. `INVALID KEY` is
-    /// [`PortError::NotFound`]. The record is rebuilt with its `X(50)`
-    /// description padded (P-CVTRA03Y-001, P-CVTRA03Y-002).
+    /// [`PortError::NotFound`], and so is a code holding a NUL byte, without a
+    /// query. The record is rebuilt with its `X(50)` description padded
+    /// (P-CVTRA03Y-001, P-CVTRA03Y-002).
     async fn read_tran_type_file(&mut self, code: TranTypeCode) -> PortResult<TranTypeRecord> {
-        let key = code.trimmed();
+        let Some(key) = key_text(&code) else {
+            return Err(PortError::NotFound);
+        };
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "SELECT tran_type, tran_type_desc FROM trantype_file WHERE tran_type = $1",
@@ -469,15 +576,17 @@ impl TranTypeFileReader for PgStore<'_, '_> {
     /// `CBTRN03C` `1500-C-LOOKUP-TRANCATG` — P-CBTRN03C-005
     /// [app/cbl/CBTRN03C.cbl:L504-512]: the random `READ TRANCATG-FILE INTO
     /// TRAN-CAT-RECORD` by `FD-TRAN-CAT-KEY`, the type code followed by the
-    /// `9(04)` category. `INVALID KEY` is [`PortError::NotFound`]. The record
-    /// is rebuilt with its `X(50)` description padded (P-CVTRA04Y-001 to
-    /// P-CVTRA04Y-003).
+    /// `9(04)` category. `INVALID KEY` is [`PortError::NotFound`], and so is a
+    /// type code holding a NUL byte, without a query. The record is rebuilt
+    /// with its `X(50)` description padded (P-CVTRA04Y-001 to P-CVTRA04Y-003).
     async fn read_tran_category_file(
         &mut self,
         code: TranTypeCode,
         category: TranCategoryCode,
     ) -> PortResult<TranCategoryRecord> {
-        let key = code.trimmed();
+        let Some(key) = key_text(&code) else {
+            return Err(PortError::NotFound);
+        };
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "SELECT tran_type_cd, tran_cat_cd, tran_cat_type_desc
@@ -503,10 +612,62 @@ impl TranTypeFileReader for PgStore<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use carddemo_domain::numeric::TranTypeCode;
+    use carddemo_domain::numeric::{Alnum, TranTypeCode};
+    use carddemo_domain::ports::TranTypeFilter;
 
-    use super::{MASTER, MasterRow};
+    use super::{MASTER, MasterRow, key_text, matches_nothing, start_bound};
     use crate::PersistenceError;
+
+    /// The code of the two `X(2)` bytes `bytes`.
+    fn code(bytes: [u8; 2]) -> TranTypeCode {
+        TranTypeCode::from_alnum(Alnum::from_array(bytes))
+    }
+
+    #[test]
+    fn a_nul_key_binds_nothing_and_a_nul_start_key_its_nul_free_bound() {
+        // (code, the key a keyed statement binds, the start bound a cursor binds)
+        let cases = [
+            (*b"01", Some("01"), "01"),
+            (*b"7 ", Some("7"), "7"),
+            (*b"  ", Some(""), ""),
+            (*b"A\x01", Some("A\u{1}"), "A\u{1}"),
+            (*b"\xE9 ", Some("\u{e9}"), "\u{e9}"),
+            (*b"\0 ", None, "\u{1}\u{1}"),
+            (*b"\0\0", None, "\u{1}\u{1}"),
+            (*b"\0A", None, "\u{1}\u{1}"),
+            (*b"0\0", None, "0\u{1}"),
+            (*b"A\0", None, "A\u{1}"),
+            (*b" \0", None, " \u{1}"),
+            (*b"\xE9\0", None, "\u{e9}\u{1}"),
+        ];
+        for (bytes, key, bound) in cases {
+            let tran_type = code(bytes);
+            assert_eq!(key_text(&tran_type).as_deref(), key, "{bytes:?}");
+            assert_eq!(start_bound(&tran_type), bound, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn a_filter_holding_nul_matches_nothing() {
+        let cases = [
+            (None, None, false),
+            (Some(*b"01"), None, false),
+            (Some(*b"  "), Some("%PAY%"), false),
+            (None, Some("%\u{1}%"), false),
+            (Some(*b"0\0"), None, true),
+            (Some(*b"\0\0"), None, true),
+            (None, Some("%\0%"), true),
+            (None, Some("%A\0B%"), true),
+            (Some(*b"02"), Some("%PAY\0%"), true),
+        ];
+        for (type_code, description, expected) in cases {
+            let filter = TranTypeFilter {
+                type_code: type_code.map(code),
+                description: description.map(str::to_owned),
+            };
+            assert_eq!(matches_nothing(&filter), expected, "{filter:?}");
+        }
+    }
 
     fn row(tr_type: &str, tr_description: &str) -> MasterRow {
         MasterRow {

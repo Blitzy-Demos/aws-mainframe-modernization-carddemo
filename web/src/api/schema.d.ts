@@ -213,14 +213,16 @@ export interface paths {
          *
          *     # Errors
          *
-         *     - 400 with an empty message for a filter longer than its BMS field or a
-         *       description filter not in ASCII, on `TRTYPE` or `TRDESC`, and for a
-         *       `start_key` longer than two characters or not in ASCII, on no field;
-         *       400 for a malformed query; and 400 for a type code filter that is not
-         *       two digits, on `TRTYPE` (V-COTRTLIC-001). The filters are checked
-         *       first, then the start key, before the master is read.
+         *     - 400 with an empty message for a filter longer than its BMS field, on
+         *       `TRTYPE` or `TRDESC`, and for a `start_key` longer than two characters
+         *       or not in ASCII, on no field; 400 for a malformed query; and 400 for a
+         *       type code filter that is not two digits, on `TRTYPE` (V-COTRTLIC-001).
+         *       The filters are checked first, then the start key, before the master
+         *       is read.
          *     - 401 without a valid token; 403 for a token that is not an admin's.
-         *     - 404 when no type passes the filters (V-COTRTLIC-002).
+         *     - 404 when no type passes the filters (V-COTRTLIC-002), a description
+         *       filter holding a character outside ASCII included, which is searched as
+         *       entered.
          *     - 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,
          *       V-COTRTLIC-026), with the no-records text when the filter count fails
          *       (V-COTRTLIC-028), and with `Unexpected error` when the database cannot
@@ -294,8 +296,9 @@ export interface paths {
          *       query or body, and the key and description edits: on `TRTYPCD` or
          *       `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,
          *       V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`
-         *       (V-COTRTLIC-013, V-COTRTLIC-014), where a key or description holding a
-         *       character outside ASCII is also refused with an empty message.
+         *       (V-COTRTLIC-013, V-COTRTLIC-014), where a key holding a character
+         *       outside ASCII is also refused with an empty message. A description
+         *       holding one gets the alphanumeric edit's text with either origin.
          *     - 401 without a valid token; 403 for a token that is not an admin's.
          *     - 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).
          *     - 500 with the Db2 or lock text when the read or the update fails
@@ -2376,10 +2379,7 @@ export interface components {
          *     must-be-supplied text (V-COTRTUPC-007, V-COTRTLIC-013).
          */
         TranTypeUpdateRequest: {
-            /**
-             * @description The new description, `X(50)`: letters, digits and spaces, so ASCII
-             *     only.
-             */
+            /** @description The new description, `X(50)`: letters, digits and spaces. */
             description?: string | null;
         };
         /**
@@ -3106,9 +3106,8 @@ export interface operations {
                  */
                 type_code?: string;
                 /**
-                 * @description The description filter, `TRDESC` `X(50)` in ASCII: the types whose
-                 *     description contains this text, its leading and trailing spaces
-                 *     dropped.
+                 * @description The description filter, `TRDESC` `X(50)`: the types whose description
+                 *     contains this text, its leading and trailing spaces dropped.
                  */
                 description?: string;
                 /**
@@ -3142,7 +3141,7 @@ export interface operations {
                     "application/json": components["schemas"]["Page_TranTypeResponse"];
                 };
             };
-            /** @description A filter or the start key is longer than its field or not ASCII, the type code filter is not two digits, or the query is malformed */
+            /** @description A filter is longer than its field, the start key is longer than its field or not ASCII, the type code filter is not two digits, or the query is malformed */
             400: {
                 headers: {
                     [name: string]: unknown;

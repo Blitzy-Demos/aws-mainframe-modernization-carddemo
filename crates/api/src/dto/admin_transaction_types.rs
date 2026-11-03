@@ -57,10 +57,10 @@
 //!
 //! Both programs `MOVE` the UTF-8 bytes of a value into its `X(n)` field, so
 //! a character above `U+007F` takes two to four bytes there. Where an audited
-//! edit reads every byte that `MOVE` keeps, the edit answers such a value
-//! with its own text, and nothing here precedes it; where none does, the
-//! value is held to ASCII ([`crate::dto::ascii_text`]) and answered as an
-//! over-length one:
+//! edit reads every byte that `MOVE` keeps, or the rule searches the value as
+//! entered, the rule answers such a value with its own text, and nothing here
+//! precedes it; where neither holds, the value is held to ASCII
+//! ([`crate::dto::ascii_text`]) and answered as an over-length one:
 //!
 //! - `COTRTUPC` (`POST`, and `PUT` without `origin`): the type code, from the
 //!   body or the `{id}` segment, goes to `1245-EDIT-NUM-REQD`, and the
@@ -72,18 +72,23 @@
 //!   before anything is read or written. No ASCII check is added.
 //! - `COTRTLIC` (`PUT` with `origin=list`, and `DELETE`): the `{id}` segment
 //!   is the listed row's `TRTTYPn` and has no edit, so a non-ASCII segment
-//!   would address the type its first two bytes spell. The row description
-//!   is received into `X(50)` cut at a character boundary
-//!   (`1100-RECEIVE-SCREEN`), so a non-ASCII character that straddles byte 50
-//!   would be dropped with the rest of the text and the ASCII text before it
-//!   stored. Both are held to ASCII, on no field, as their rows name none.
+//!   would address the type its first two bytes spell; it is held to ASCII,
+//!   on no field, as the rows name none. The row description goes to
+//!   `1240-EDIT-ALPHANUM-REQD`. The rule receives it into `X(50)`
+//!   (`1100-RECEIVE-SCREEN`) keeping whole a character that byte 50 splits,
+//!   which stands for the lead bytes the COBOL field keeps, so the edit reads
+//!   every non-ASCII character of a description within the length and
+//!   refuses it `can have numbers or alphabets only.` (V-COTRTLIC-014)
+//!   before anything is written. No ASCII check is added.
 //! - `COTRTLIC` list (`GET`): the type code filter goes to
 //!   `1220-EDIT-TYPECD`, whose `IS NUMERIC` refuses a byte of `0x80` or more
 //!   with its own text (V-COTRTLIC-001), so no ASCII check is added. The
 //!   description filter is moved into `X(50)` by `1230-EDIT-DESC` with no
-//!   content edit (P-COTRTLIC-020), cut at a character boundary, so a
-//!   non-ASCII filter that passes the 50-character length could be cut short
-//!   and a shorter text searched; it is held to ASCII on `TRDESC`. The
+//!   content edit (P-COTRTLIC-020), and the rule keeps whole a character
+//!   that byte 50 splits, so a non-ASCII filter is searched as entered: the
+//!   count finds only descriptions holding its characters, and a filter
+//!   matching none is answered `No Records found for these filter
+//!   conditions` (V-COTRTLIC-002). No ASCII check is added. The
 //!   `start_key` is the `X(2)` COMMAREA key `WS-CA-FIRST-TR-CODE` or
 //!   `WS-CA-LAST-TR-CODE` that the program sets from the rows it showed
 //!   (P-COTRTLIC-030, P-COTRTLIC-031, P-COTRTLIC-033) and no edit reads, so a
@@ -264,38 +269,33 @@ pub struct TranTypeListQuery {
     #[param(max_length = 2, pattern = r"^(?: {0,2}|\x00{2}|[0-9]{2})$")]
     #[validate(length(max = TYPE_CODE_MAX_LEN))]
     pub type_code: Option<String>,
-    /// The description filter, `TRDESC` `X(50)` in ASCII: the types whose
-    /// description contains this text, its leading and trailing spaces
-    /// dropped.
-    // COTRTLIC 1230-EDIT-DESC — P-COTRTLIC-020: the filter is moved into
-    // `X(50)` byte for byte with no content edit, so the ASCII check stands
-    // where no audited edit reads the bytes (see the module's notes on the
-    // encoding).
+    /// The description filter, `TRDESC` `X(50)`: the types whose description
+    /// contains this text, its leading and trailing spaces dropped.
+    // COTRTLIC 1230-EDIT-DESC — P-COTRTLIC-020: the filter has no content
+    // edit, and the rule searches it as entered, a character outside ASCII
+    // included, so only its length is checked here (see the module's notes
+    // on the encoding).
     #[serde(default)]
-    #[param(max_length = 50, pattern = "^[\\x00-\\x7F]*$")]
-    #[validate(
-        length(max = DESCRIPTION_MAX_LEN),
-        custom(function = "crate::dto::ascii_text")
-    )]
+    #[param(max_length = 50)]
+    #[validate(length(max = DESCRIPTION_MAX_LEN))]
     pub description: Option<String>,
 }
 
 impl TranTypeListQuery {
-    /// Rejects a filter longer than its BMS field, and a description filter
-    /// holding a character above `U+007F`: 400 with an empty message on
-    /// `TRTYPE` or `TRDESC`.
+    /// Rejects a filter longer than its BMS field: 400 with an empty message
+    /// on `TRTYPE` or `TRDESC`.
     ///
-    /// COTRTLIC 1230-EDIT-DESC — P-COTRTLIC-020: the description filter is
-    /// moved into `X(50)` with no edit of its bytes, which would cut a
-    /// non-ASCII filter short of the text entered. A non-ASCII type code
-    /// filter is left to `1220-EDIT-TYPECD`, which refuses it with its own
-    /// text (V-COTRTLIC-001). Blank and low-value filters pass, for the
-    /// rule's no-condition reading.
+    /// COTRTLIC 1220-EDIT-TYPECD, 1230-EDIT-DESC — P-COTRTLIC-020,
+    /// V-COTRTLIC-001, V-COTRTLIC-002: within the length each filter reaches
+    /// the rule as entered. `1220-EDIT-TYPECD` refuses a non-ASCII type code
+    /// filter with its own text, and a non-ASCII description filter is
+    /// searched as entered, so one that matches no type is answered by the
+    /// count. Blank and low-value filters pass, for the rule's no-condition
+    /// reading.
     ///
     /// # Errors
     ///
-    /// The 400 [`ApiError`] when a filter exceeds its length, or the
-    /// description filter is not ASCII.
+    /// The 400 [`ApiError`] when a filter exceeds its length.
     pub fn check(&self) -> Result<(), ApiError> {
         self.validate().map_err(|errors| {
             reject_invalid(&errors, TranTypeListField::of_filter, OVER_LENGTH_MESSAGE)
@@ -520,13 +520,12 @@ pub struct TranTypeUpdateQuery {
 /// must-be-supplied text (V-COTRTUPC-007, V-COTRTLIC-013).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema, Validate)]
 pub struct TranTypeUpdateRequest {
-    /// The new description, `X(50)`: letters, digits and spaces, so ASCII
-    /// only.
-    // The pattern is checked here only for `origin=list`; without `origin`
-    // the COTRTUPC alphanumeric edit refuses every non-ASCII description with
-    // its audited text (see the module's notes on the encoding).
+    /// The new description, `X(50)`: letters, digits and spaces.
+    // No pattern: the alphanumeric edit of either origin refuses every
+    // non-ASCII description with its audited text (see the module's notes on
+    // the encoding).
     #[serde(default)]
-    #[schema(max_length = 50, pattern = "^[\\x00-\\x7F]*$")]
+    #[schema(max_length = 50)]
     #[validate(length(max = DESCRIPTION_MAX_LEN))]
     pub description: Option<String>,
 }
@@ -546,18 +545,18 @@ impl TranTypeUpdateRequest {
     /// message, on `TRTYDSC` without `origin` and on no field with
     /// `origin=list`, whose rows name none.
     ///
-    /// With `origin=list` a description holding a character above `U+007F`
-    /// is rejected the same way: `COTRTLIC` `1100-RECEIVE-SCREEN` cuts the
-    /// row description at 50 bytes (P-COTRTLIC-013), which could drop such a
-    /// character and store the text before it. Without `origin`,
-    /// `COTRTUPC` `1230-EDIT-ALPHANUM-REQD` answers it with its own text
-    /// (V-COTRTUPC-008). Blank descriptions pass either way, for the
-    /// must-be-supplied edits (V-COTRTUPC-007, V-COTRTLIC-013).
+    /// Within the length the description reaches the rule as entered, so a
+    /// character above `U+007F` gets the alphanumeric text of the program:
+    /// `COTRTUPC` `1230-EDIT-ALPHANUM-REQD` without `origin`
+    /// (V-COTRTUPC-008), and with `origin=list` `COTRTLIC`
+    /// `1240-EDIT-ALPHANUM-REQD` (V-COTRTLIC-014), whose 50-byte receive
+    /// keeps whole a character the cut splits (P-COTRTLIC-013). Blank
+    /// descriptions pass either way, for the must-be-supplied edits
+    /// (V-COTRTUPC-007, V-COTRTLIC-013).
     ///
     /// # Errors
     ///
-    /// The 400 [`ApiError`] when the description exceeds its length, or,
-    /// with `origin=list`, is not ASCII.
+    /// The 400 [`ApiError`] when the description exceeds its length.
     pub fn check(&self, origin: Option<TranTypeOrigin>) -> Result<(), ApiError> {
         match origin {
             None => self.validate().map_err(|errors| reject_upsert(&errors)),
@@ -655,14 +654,11 @@ struct ListedTypeCodeKey<'a> {
 }
 
 /// The row description of a `COTRTLIC` inline update, an absent one empty,
-/// under the length check of [`TranTypeUpdateRequest`] and the ASCII check
-/// of its 50-byte receive.
+/// under the length check of [`TranTypeUpdateRequest`]. Its content is left
+/// to `1240-EDIT-ALPHANUM-REQD` (V-COTRTLIC-013, V-COTRTLIC-014).
 #[derive(Validate)]
 struct ListRowDescription<'a> {
-    #[validate(
-        length(max = DESCRIPTION_MAX_LEN),
-        custom(function = "crate::dto::ascii_text")
-    )]
+    #[validate(length(max = DESCRIPTION_MAX_LEN))]
     description: &'a str,
 }
 
@@ -672,9 +668,9 @@ fn reject_upsert(errors: &ValidationErrors) -> ApiError {
 }
 
 /// The 400 of a `COTRTLI` row key or row description, or of the list's
-/// `start_key`, that fails its length or ASCII check, on no field: the rows
-/// of the row actions name none (V-COTRTLIC-012 to V-COTRTLIC-023), and no
-/// BMS field holds the COMMAREA start key.
+/// `start_key`, that fails its length check, or a key its ASCII check, on no
+/// field: the rows of the row actions name none (V-COTRTLIC-012 to
+/// V-COTRTLIC-023), and no BMS field holds the COMMAREA start key.
 fn reject_list_row(errors: &ValidationErrors) -> ApiError {
     reject_invalid(
         errors,
@@ -933,12 +929,7 @@ mod tests {
                 type_code: Some(code.clone()),
                 description: Some(description.clone()),
             };
-            // The description filter is also held to ASCII.
-            assert_eq!(
-                filters.check().is_ok(),
-                description.is_ascii(),
-                "{description:?}"
-            );
+            assert!(filters.check().is_ok(), "{description:?}");
             let create = TranTypeCreateRequest {
                 type_code: Some(code.clone()),
                 description: Some(description.clone()),
@@ -947,13 +938,9 @@ mod tests {
             let update = TranTypeUpdateRequest {
                 description: Some(description.clone()),
             };
-            assert!(update.check(None).is_ok(), "{description:?}");
-            // The inline update also holds the description to ASCII.
-            assert_eq!(
-                update.check(Some(TranTypeOrigin::List)).is_ok(),
-                description.is_ascii(),
-                "{description:?}"
-            );
+            for origin in [None, Some(TranTypeOrigin::List)] {
+                assert!(update.check(origin).is_ok(), "{description:?} {origin:?}");
+            }
         }
         assert!(TranTypeListQuery::default().check().is_ok());
         assert!(TranTypeCreateRequest::default().check().is_ok());
@@ -1088,38 +1075,50 @@ mod tests {
                 );
             }
         }
+    }
 
+    #[test]
+    fn non_ascii_descriptions_reach_the_alphanumeric_edit_of_either_origin() {
+        let list = Some(TranTypeOrigin::List);
         let descriptions = [
             "Caf\u{e9}".to_owned(),
-            // 50 characters, 51 bytes: the 50-byte receive of COTRTLIC would
-            // drop the last one and store the 49 letters before it.
+            "Espa\u{f1}a".to_owned(),
+            // 50 characters, 51 bytes: the 50-byte receive of COTRTLIC splits
+            // the last one, which its rule keeps whole.
             format!("{}\u{e9}", chars("A", DESCRIPTION_MAX_LEN - 1)),
             chars("\u{e9}", DESCRIPTION_MAX_LEN),
             "\u{20ac}".to_owned(),
             "\u{1f600}".to_owned(),
         ];
+        let alphanumeric =
+            field_edit_message(FIELD_TRANSACTION_DESC, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY);
         for description in descriptions {
             let update = TranTypeUpdateRequest {
                 description: Some(description.clone()),
             };
-            assert_eq!(
-                body(update.check(list)),
-                over_length(&[]),
-                "{description:?}"
-            );
+            // COTRTLIC: the row description reaches 1240-EDIT-ALPHANUM-REQD as
+            // entered, which refuses it on no field (V-COTRTLIC-014, the
+            // rule's own tests).
+            assert!(update.check(list).is_ok(), "{description:?}");
+            let listed = update.clone().into_list_update("01");
+            assert_eq!(listed.description, description);
             // COTRTUPC: 1230-EDIT-ALPHANUM-REQD refuses it with its audited
             // text (V-COTRTUPC-008, V-COTRTUPC-018).
             assert!(update.check(None).is_ok(), "{description:?}");
             let input = update.into_upsert_input("01".to_owned());
             let error = tran_type_update::edit(&input, None).expect_err("the edit refuses it");
-            let alphanumeric =
-                field_edit_message(FIELD_TRANSACTION_DESC, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY);
             assert_eq!(
                 edit_error(&error),
                 (ErrorKind::Invalid, alphanumeric.as_str(), vec!["TRTYDSC"]),
                 "{description:?}"
             );
         }
+        // Over the length, a non-ASCII description is refused as any other.
+        let long = TranTypeUpdateRequest {
+            description: Some(chars("\u{e9}", DESCRIPTION_MAX_LEN + 1)),
+        };
+        assert_eq!(body(long.check(list)), over_length(&[]));
+        assert_eq!(body(long.check(None)), over_length(&["TRTYDSC"]));
         // Blank descriptions reach the must-be-supplied edits of both origins.
         for description in ["", "   ", "*", "\0", "PURCHASE", "\u{7f}"] {
             let update = TranTypeUpdateRequest {
@@ -1133,42 +1132,46 @@ mod tests {
     }
 
     #[test]
-    fn the_list_filters_hold_the_description_to_ascii_and_leave_the_code_to_its_edit() {
+    fn the_list_filters_leave_the_description_to_the_search_and_the_code_to_its_edit() {
         // COTRTLIC 1230-EDIT-DESC moves the description filter into X(50) with
-        // no edit of its bytes (P-COTRTLIC-020), so a non-ASCII filter is
-        // refused on TRDESC as an over-length one is: (filter, refused).
+        // no content edit (P-COTRTLIC-020), and the rule keeps whole a
+        // character the 50-byte cut splits, so every filter within the length
+        // is searched as entered: (filter, the LIKE pattern of the count).
+        let split = format!("{}\u{e9}", chars("A", DESCRIPTION_MAX_LEN - 1));
         let descriptions = [
-            ("\u{e9}".to_owned(), true),
-            ("\u{80}".to_owned(), true),
-            ("\u{20ac}".to_owned(), true),
-            ("\u{1f600}".to_owned(), true),
-            // 50 characters, 51 bytes: the move would search the 49 letters.
+            ("\u{e9}".to_owned(), Some("%\u{e9}%".to_owned())),
+            ("\u{80}".to_owned(), Some("%\u{80}%".to_owned())),
+            ("\u{20ac}".to_owned(), Some("%\u{20ac}%".to_owned())),
+            ("\u{1f600}".to_owned(), Some("%\u{1f600}%".to_owned())),
+            (" Caf\u{e9} ".to_owned(), Some("%Caf\u{e9}%".to_owned())),
+            // 50 characters, 51 bytes: the last one is searched too.
+            (split.clone(), Some(format!("%{split}%"))),
             (
-                format!("{}\u{e9}", chars("A", DESCRIPTION_MAX_LEN - 1)),
-                true,
+                chars("A", DESCRIPTION_MAX_LEN),
+                Some(format!("%{}%", chars("A", DESCRIPTION_MAX_LEN))),
             ),
-            (chars("A", DESCRIPTION_MAX_LEN), false),
-            (String::new(), false),
-            ("   ".to_owned(), false),
-            ("\0".to_owned(), false),
-            ("%pur_".to_owned(), false),
-            ("\u{7f}".to_owned(), false),
+            (String::new(), None),
+            ("   ".to_owned(), None),
+            ("%pur_".to_owned(), Some("%%pur_%".to_owned())),
+            ("\u{7f}".to_owned(), Some("%\u{7f}%".to_owned())),
         ];
-        for (description, refused) in descriptions {
+        for (description, pattern) in descriptions {
             let filters = TranTypeListQuery {
                 type_code: None,
                 description: Some(description.clone()),
             };
-            if refused {
-                assert_eq!(
-                    body(filters.check()),
-                    over_length(&["TRDESC"]),
-                    "{description:?}"
-                );
-            } else {
-                assert!(filters.check().is_ok(), "{description:?}");
-            }
+            assert!(filters.check().is_ok(), "{description:?}");
+            let mut msg = ReturnMsg::default();
+            let edited = tran_type_list::edit_filters(None, Some(&description), &mut msg);
+            assert_eq!(edited.description, pattern, "{description:?}");
+            assert!(msg.is_off(), "{description:?}");
         }
+        // Over the length, a non-ASCII filter is refused as any other.
+        let long = TranTypeListQuery {
+            type_code: None,
+            description: Some(chars("\u{e9}", DESCRIPTION_MAX_LEN + 1)),
+        };
+        assert_eq!(body(long.check()), over_length(&["TRDESC"]));
         // 1220-EDIT-TYPECD refuses every non-ASCII type code filter with its
         // audited text (V-COTRTLIC-001): a byte of 0x80 or more is not NUMERIC.
         for code in ["\u{e9}", "9\u{e9}", "\u{80}", "\u{20ac}", "\u{1f600}"] {
@@ -1559,7 +1562,8 @@ mod tests {
             filters[1]["schema"]["maxLength"],
             json!(DESCRIPTION_MAX_LEN)
         );
-        assert_eq!(filters[1]["schema"]["pattern"], json!("^[\\x00-\\x7F]*$"));
+        // The description filter is searched as entered: no pattern.
+        assert!(filters[1]["schema"].get("pattern").is_none(), "{filters}");
 
         // The page position: the two-character ASCII start key, then the
         // shared query's parameters (their schemas: the handler's tests).
@@ -1601,9 +1605,10 @@ mod tests {
             update["properties"]["description"]["maxLength"],
             json!(DESCRIPTION_MAX_LEN)
         );
-        assert_eq!(
-            update["properties"]["description"]["pattern"],
-            json!("^[\\x00-\\x7F]*$")
+        // Either origin's alphanumeric edit answers the content: no pattern.
+        assert!(
+            update["properties"]["description"].get("pattern").is_none(),
+            "{update}"
         );
         assert!(update["properties"].get("type_code").is_none(), "{update}");
 

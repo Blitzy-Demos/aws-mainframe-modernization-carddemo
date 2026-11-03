@@ -37,6 +37,12 @@
 //! only on a control character inside a key, which no allocated TRAN-ID, no
 //! fixture record and no CT00 start key (numeric, P-COTRN00C-005) holds.
 //!
+//! A TRAN-ID holding a NUL byte names no stored transaction, because
+//! `PostgreSQL` text cannot hold NUL. Binding one would fail on the server
+//! with an encoding error (SQLSTATE `22021`) rather than find no row, so
+//! [`TransactionReader::read_transaction`] answers [`PortError::NotFound`]
+//! for it without a query, as the COBOL `READ` answers `NOTFND`.
+//!
 //! The CR00 date selection, [`TransactionReader::transactions_by_proc_date`],
 //! orders and pages by the padded keys instead: `rpad(tran_card_num, 16)` and
 //! `rpad(tran_id, 16)`, the space-padded `X(16)` text, against its keyset bound
@@ -227,6 +233,10 @@ impl RecordBinds {
 /// The start of a forward browse from `LOW-VALUES`: the empty text sorts before
 /// every stored key, so the browse starts at the first record of the file.
 const LOW_VALUES: &str = "";
+
+/// One byte of COBOL `LOW-VALUES`, which `PostgreSQL` text cannot hold: a
+/// TRAN-ID holding it names no stored transaction.
+const LOW_VALUE: u8 = 0x00;
 
 /// `STARTBR` at `start` with `READNEXT`: live rows with a TRAN-ID of at least
 /// `start`, ascending, up to `limit`; with `account`, only rows whose card the
@@ -444,8 +454,12 @@ impl TransactionReader for PgStore<'_, '_> {
     /// [app/cbl/COTRN01C.cbl:L267-296]: the live row with the TRAN-ID. The
     /// COBOL reads `UPDATE` and rewrites nothing, so a read without a lock
     /// gives the same result. No row is the `NOTFND` the rule turns into
-    /// "Transaction ID NOT found...".
+    /// "Transaction ID NOT found...", and so is a TRAN-ID holding a NUL byte,
+    /// without a query.
     async fn read_transaction(&mut self, id: TranId) -> PortResult<Transaction> {
+        if id.as_bytes().contains(&LOW_VALUE) {
+            return Err(PortError::NotFound);
+        }
         let key = id.trimmed();
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(

@@ -9,8 +9,10 @@
 //! acknowledges the request and only then writes, in a database transaction of
 //! its own (AAP 0.3.3). The steps it sequences are:
 //!
-//! 1. [`parse_request`], the `UNSTRING` of `2100-EXTRACT-REQUEST-MSG`, and
-//!    [`parse_amount`], its `FUNCTION NUMVAL` of the amount;
+//! 1. [`convert_request`], the `MQGMO-CONVERT` get of `3100-READ-REQUEST-MQ`;
+//!    [`parse_request`], the `UNSTRING` of `2100-EXTRACT-REQUEST-MSG`,
+//!    [`storable`], which holds back receivers `PostgreSQL` text cannot
+//!    store, and [`parse_amount`], its `FUNCTION NUMVAL` of the amount;
 //! 2. [`gather`], the reads of `5100-READ-XREF-RECORD` to
 //!    `5500-READ-AUTH-SUMMRY`, with the `9500-LOG-ERROR` records they raise;
 //! 3. [`decide`] and [`reply_body`], `6000-MAKE-DECISION` and its reply text;
@@ -184,6 +186,22 @@ const NON_DIGITS: Unproven = Unproven {
 const COUNT_PAST_9999: Unproven = Unproven {
     escalation_id: "E-78",
 };
+
+/// Request text whose conversion into the program's single-byte code page the
+/// repository does not pin: a body that is not UTF-8, or a character outside
+/// ISO 8859-1 (E-80).
+const UNCONVERTED_TEXT: Unproven = Unproven {
+    escalation_id: "E-80",
+};
+
+/// A `LOW-VALUE` byte in a request receiver the detail stores as text, which
+/// `PostgreSQL` text cannot hold (E-81, E-07).
+const UNSTORABLE_TEXT: Unproven = Unproven {
+    escalation_id: "E-81",
+};
+
+/// The `LOW-VALUE` byte X'00', the one byte `PostgreSQL` text cannot hold.
+const LOW_VALUE: u8 = 0x00;
 
 /// A request whose COBOL result the audit cannot pin: the escalation that holds
 /// its input class at `halt` (AAP 0.9.6). The consumer logs it with the
@@ -592,16 +610,47 @@ pub fn request_read_failure_entry(comp_code: i64, reason: i64) -> ErrorLogEntry 
     )
 }
 
-/// COPAUA0C 3100-READ-REQUEST-MQ — P-COPAUA0C-002: the outcome of a request
-/// longer than [`REQUEST_BUFFER_LEN`], or `None` for one that fits.
+/// COPAUA0C 3100-READ-REQUEST-MQ — P-COPAUA0C-002: the request text as the
+/// `MQGET` with `MQGMO-CONVERT`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L389-391] puts a
+/// message of format `MQFMT-STRING`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L397] into
+/// `W01-GET-BUFFER`.
 ///
-/// `MQGET` into the 500-byte `W01-GET-BUFFER` without
-/// `MQGMO-ACCEPT-TRUNCATED-MSG` fails such a message with [`MQCC_WARNING`] and
-/// [`MQRC_TRUNCATED_MSG_FAILED`], which takes the M003 branch: a critical
-/// record and the end of the task, with no reply.
+/// The queue manager converts the characters of a string message into the
+/// program's single-byte code page, so every `X(n)` receiver and the reply
+/// count characters. The replacement reads `body` as UTF-8, the encoding its
+/// replies are published in, and carries each character as the ISO 8859-1
+/// byte of the same code point: the code page the repository's EBCDIC data
+/// (CP037) maps to one for one, and the one [`Alnum::as_text`] reads back. An
+/// ASCII body is returned unchanged (E-80).
+///
+/// # Errors
+///
+/// [`Unproven`] `E-80` (halt) when `body` is not UTF-8 or holds a character
+/// above `U+00FF`: the queue-manager CCSID that would decide their conversion
+/// is not in the repository, so the request gets no read, no reply and no
+/// write.
+pub fn convert_request(body: &[u8]) -> Result<Vec<u8>, Unproven> {
+    let text = std::str::from_utf8(body).map_err(|_| UNCONVERTED_TEXT)?;
+    text.chars()
+        .map(|character| u8::try_from(character).map_err(|_| UNCONVERTED_TEXT))
+        .collect()
+}
+
+/// COPAUA0C 3100-READ-REQUEST-MQ — P-COPAUA0C-002: the outcome of a request
+/// whose converted text ([`convert_request`]) is longer than
+/// [`REQUEST_BUFFER_LEN`], or `None` for one that fits.
+///
+/// `MQGMO-CONVERT` converts the message into the 500-byte `W01-GET-BUFFER`,
+/// so `data` is the converted text, one byte per character: 500 `É`, 1000
+/// bytes of UTF-8, fit. Without `MQGMO-ACCEPT-TRUNCATED-MSG` the get fails a
+/// longer message with [`MQCC_WARNING`] and [`MQRC_TRUNCATED_MSG_FAILED`],
+/// which takes the M003 branch: a critical record and the end of the task,
+/// with no reply.
 #[must_use]
-pub fn oversize_request_entry(body: &[u8]) -> Option<ErrorLogEntry> {
-    (body.len() > REQUEST_BUFFER_LEN)
+pub fn oversize_request_entry(data: &[u8]) -> Option<ErrorLogEntry> {
+    (data.len() > REQUEST_BUFFER_LEN)
         .then(|| request_read_failure_entry(MQCC_WARNING, MQRC_TRUNCATED_MSG_FAILED))
 }
 
@@ -710,8 +759,10 @@ fn numeric_receiver<const N: usize>(field: Option<&[u8]>) -> Alnum<N> {
 /// processing code, amount text, merchant category code, acquirer country
 /// code, POS entry mode, merchant ID, name, city, state, zip and transaction
 /// ID, each moved to its receiver's width; text after the 18th field is
-/// ignored. At most [`REQUEST_BUFFER_LEN`] bytes are read: a longer request
-/// never reaches this paragraph ([`oversize_request_entry`]).
+/// ignored. `body` is the converted request text ([`convert_request`]), one
+/// byte per character, so the widths count characters. At most
+/// [`REQUEST_BUFFER_LEN`] bytes are read: a longer request never reaches this
+/// paragraph ([`oversize_request_entry`]).
 #[must_use]
 pub fn parse_request(body: &[u8]) -> AuthRequest {
     let data = body.get(..REQUEST_BUFFER_LEN).unwrap_or(body);
@@ -737,6 +788,55 @@ pub fn parse_request(body: &[u8]) -> AuthRequest {
         pa_rq_merchant_zip: alnum_receiver(field(16)),
         pa_rq_transaction_id: alnum_receiver(field(17)),
         fields_received: fields.len(),
+    }
+}
+
+/// COPAUA0C 2100-EXTRACT-REQUEST-MSG / 8500-INSERT-AUTH — P-COPAUA0C-004,
+/// P-COPAUA0C-014: whether every receiver the detail stores as text can be
+/// stored, checked after the `UNSTRING`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L354-374].
+///
+/// `8500-INSERT-AUTH` moves the auth date and time, the card number, the auth
+/// type, the expiry date, the message type and source, the merchant category
+/// and acquirer country codes, the merchant ID, name, city, state and zip and
+/// the transaction ID into `PENDING-AUTH-DETAILS` and inserts the segment
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L877-919]. IMS keeps any
+/// byte, but `PostgreSQL` text cannot hold X'00' (E-07), and the card number
+/// is also the key of the cross-reference read. Only the bytes a receiver
+/// holds count: an X'00' cut off at the receiver's width, or after the 18th
+/// field, is in no receiver.
+///
+/// The amount text and the numeric processing code and POS entry mode are not
+/// stored as text, and their non-digit bytes keep their own cases:
+/// [`parse_amount`] (E-28) and [`write_plan`] (E-47).
+///
+/// # Errors
+///
+/// [`Unproven`] `E-81` (halt) when one of those receivers holds X'00': the
+/// request gets no read, no reply and no write, so no approval is sent for an
+/// authorization whose detail could not be inserted.
+pub fn storable(req: &AuthRequest) -> Result<(), Unproven> {
+    let stored: [&[u8]; 15] = [
+        req.pa_rq_auth_date.as_bytes(),
+        req.pa_rq_auth_time.as_bytes(),
+        req.pa_rq_card_num.as_bytes(),
+        req.pa_rq_auth_type.as_bytes(),
+        req.pa_rq_card_expiry_date.as_bytes(),
+        req.pa_rq_message_type.as_bytes(),
+        req.pa_rq_message_source.as_bytes(),
+        req.pa_rq_merchant_catagory_code.as_bytes(),
+        req.pa_rq_acqr_country_code.as_bytes(),
+        req.pa_rq_merchant_id.as_bytes(),
+        req.pa_rq_merchant_name.as_bytes(),
+        req.pa_rq_merchant_city.as_bytes(),
+        req.pa_rq_merchant_state.as_bytes(),
+        req.pa_rq_merchant_zip.as_bytes(),
+        req.pa_rq_transaction_id.as_bytes(),
+    ];
+    if stored.iter().any(|receiver| receiver.contains(&LOW_VALUE)) {
+        Err(UNSTORABLE_TEXT)
+    } else {
+        Ok(())
     }
 }
 
@@ -1109,17 +1209,25 @@ pub fn decidable(context: &AuthContext) -> Result<(), Unproven> {
 /// auth time come from the request; the response code, the reason and the
 /// approved amount (`-zzzzzzzzz9.99`) from `decision`. Each is followed by a
 /// comma, and byte 64 ends the message: [`format::cp00_reply`] builds the 64
-/// bytes of the first-message reply (E-13).
+/// bytes of the first-message reply (E-13) from the receivers' bytes, in the
+/// code page of the converted request ([`convert_request`]).
+///
+/// The text returned holds one character per byte of that message, so it is
+/// 64 characters whatever they are: the transaction ID `TXNÉ` comes back
+/// followed by the 11 spaces of its `X(15)`, and the consumer publishes the
+/// text as UTF-8, the encoding the request was read in (E-80).
 #[must_use]
 pub fn reply_body(req: &AuthRequest, decision: &AuthDecision) -> String {
     format::cp00_reply(
-        &req.pa_rq_card_num.as_alnum().as_text(),
-        &req.pa_rq_transaction_id.as_text(),
-        &req.pa_rq_auth_time.as_text(),
-        &decision.resp_code.as_text(),
-        &decision.reason.as_text(),
+        req.pa_rq_card_num.as_alnum(),
+        &req.pa_rq_transaction_id,
+        &req.pa_rq_auth_time,
+        &decision.resp_code,
+        &decision.reason,
         decision.approved_amount,
     )
+    .as_text()
+    .into_owned()
 }
 
 /// COPAUA0C 8000-WRITE-AUTH-TO-DB, 8400-UPDATE-SUMMARY and 8500-INSERT-AUTH —
@@ -1321,10 +1429,10 @@ mod tests {
 
     use super::{
         AuthContext, AuthDecision, AuthRequest, ERR_APPLICATION, ERR_PROGRAM, ErrorLevel,
-        ErrorLogEntry, ErrorSource, Lookup, REQUEST_BUFFER_LEN, SummaryWrite, WriteStep, decidable,
-        decide, gather, oversize_request_entry, parse_amount, parse_request, reply_body,
-        reply_failure_entry, request_read_failure_entry, write_failure_entry, write_plan,
-        xref_read_failure_entry,
+        ErrorLogEntry, ErrorSource, Lookup, REQUEST_BUFFER_LEN, SummaryWrite, WriteStep,
+        convert_request, decidable, decide, gather, oversize_request_entry, parse_amount,
+        parse_request, reply_body, reply_failure_entry, request_read_failure_entry, storable,
+        write_failure_entry, write_plan, xref_read_failure_entry,
     };
     use crate::entities::{
         Account, CardXref, Customer, FraudFlag, MatchStatus, PA_ACCOUNT_STATUS_OCCURS,
@@ -1453,12 +1561,13 @@ mod tests {
         }
     }
 
-    /// Parses `body`, reads `store` for it and decides it.
+    /// Converts and parses `body`, reads `store` for it and decides it.
     fn authorize(
         store: &mut FakeStore,
         body: &str,
     ) -> (AuthRequest, Money<10>, AuthContext, AuthDecision) {
-        let request = parse_request(body.as_bytes());
+        let data = convert_request(body.as_bytes()).expect("convertible request text");
+        let request = parse_request(&data);
         let amount = parse_amount(&request).expect("a pinned amount");
         let context = block_on(gather(store, &request));
         let decision = decide(amount, &context);
@@ -1613,6 +1722,154 @@ mod tests {
         assert_eq!(entry.message, messages::FAILED_TO_READ_REQUEST_MQ);
         let fits = vec![b' '; REQUEST_BUFFER_LEN];
         assert_eq!(oversize_request_entry(&fits), None);
+    }
+
+    #[test]
+    fn the_get_converts_each_character_to_one_iso_8859_1_byte_and_halts_the_rest() {
+        // P-COPAUA0C-002: MQGMO-CONVERT of an MQFMT-STRING request; E-80 for
+        // text the conversion cannot pin.
+        /// A body and the converted text, or the escalation, it gives.
+        type Case<'a> = (&'a [u8], Result<&'a [u8], &'static str>);
+        let ascii = request_text(FIXTURE_CARD, "100.00", "TXN000000000001");
+        let cases: [Case<'_>; 11] = [
+            (ascii.as_bytes(), Ok(ascii.as_bytes())),
+            (b"", Ok(b"")),
+            ("É".as_bytes(), Ok(b"\xC9")),
+            ("Ü".as_bytes(), Ok(b"\xDC")),
+            ("CAFÉ MÜNCHEN".as_bytes(), Ok(b"CAF\xC9 M\xDCNCHEN")),
+            ("\u{80}\u{FF}".as_bytes(), Ok(b"\x80\xFF")),
+            ("€".as_bytes(), Err("E-80")),
+            ("CAFÉ MÜNCHEN €".as_bytes(), Err("E-80")),
+            ("\u{100}".as_bytes(), Err("E-80")),
+            (b"\xC9", Err("E-80")),
+            (b"TXN\xC3", Err("E-80")),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                convert_request(body)
+                    .as_deref()
+                    .map_err(|unproven| unproven.escalation_id),
+                expected,
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_500_byte_buffer_counts_converted_characters() {
+        // P-COPAUA0C-002: MQGMO-CONVERT puts the converted text into
+        // W01-GET-BUFFER X(500), so 500 'É' (1000 bytes of UTF-8) fit.
+        for (character, count, oversize) in [
+            ('É', REQUEST_BUFFER_LEN, false),
+            ('É', REQUEST_BUFFER_LEN + 1, true),
+            ('N', REQUEST_BUFFER_LEN, false),
+            ('N', REQUEST_BUFFER_LEN + 1, true),
+        ] {
+            let body = character.to_string().repeat(count);
+            let data = convert_request(body.as_bytes()).expect("ISO 8859-1 text");
+            assert_eq!(data.len(), count, "{character} x {count}");
+            let entry = oversize_request_entry(&data);
+            assert_eq!(
+                entry.map(|entry| entry.location),
+                oversize.then_some("M003"),
+                "{character} x {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_low_value_in_a_receiver_the_detail_stores_as_text_is_held_at_e81() {
+        // P-COPAUA0C-004, P-COPAUA0C-014 (E-81): PostgreSQL text cannot hold
+        // X'00'. The amount (E-28) and the numeric receivers (E-47) keep their
+        // own cases, and an X'00' cut off at a receiver's width or sent after
+        // the 18th field is in no receiver.
+        let text = request_text(FIXTURE_CARD, "100.00", "TXN000000000001");
+        let with_field = |position: usize, field: &str| {
+            let mut fields: Vec<&str> = text.split(',').collect();
+            fields[position] = field;
+            fields.join(",")
+        };
+        let stored = [0, 1, 2, 3, 4, 5, 6, 9, 10, 12, 13, 14, 15, 16, 17];
+        let mut cases: Vec<(String, Result<(), &str>)> = stored
+            .into_iter()
+            .map(|position| (with_field(position, "\0"), Err("E-81")))
+            .collect();
+        cases.extend([
+            (text.clone(), Ok(())),
+            (with_field(7, "\0"), Ok(())),
+            (with_field(8, "\0"), Ok(())),
+            (with_field(11, "\0"), Ok(())),
+            (with_field(13, "FIXTURE MERCHANT 22 CH\0"), Ok(())),
+            (with_field(17, "TXN000000000001\0"), Ok(())),
+            (format!("{text},\0EXTRA"), Ok(())),
+        ]);
+        for (body, expected) in cases {
+            let request = parse_request(body.as_bytes());
+            assert_eq!(
+                storable(&request).map_err(|unproven| unproven.escalation_id),
+                expected,
+                "{body:?}"
+            );
+        }
+
+        let amount = parse_request(with_field(8, "5.\u{0}0").as_bytes());
+        assert_eq!(
+            parse_amount(&amount).map_err(|unproven| unproven.escalation_id),
+            Err("E-28")
+        );
+        for position in [7, 11] {
+            let body = with_field(position, "0\0");
+            let (request, amount, context, decision) = authorize(&mut fixture_store(), &body);
+            assert_eq!(storable(&request), Ok(()), "{body:?}");
+            assert_eq!(
+                write_plan(&request, amount, &context, &decision, at(PINNED))
+                    .map_err(|unproven| unproven.escalation_id),
+                Err("E-47"),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ascii_text_keeps_its_characters_at_the_receiver_widths() {
+        // P-COPAUA0C-004, P-COPAUA0C-011, P-COPAUA0C-014 (E-80): X(n) counts
+        // characters, so the reply is 64 characters and the detail stores the
+        // characters sent; byte 64 is written as a space (E-25).
+        let long_name = "Ü".repeat(23);
+        let long_transaction = "É".repeat(16);
+        let cut_name = "Ü".repeat(22);
+        let cut_transaction = "É".repeat(15);
+        let cases = [
+            ("CAFÉ MÜNCHEN", "TXNÉ", "CAFÉ MÜNCHEN", "TXNÉ           "),
+            (
+                long_name.as_str(),
+                long_transaction.as_str(),
+                cut_name.as_str(),
+                cut_transaction.as_str(),
+            ),
+        ];
+        for (name, transaction, stored_name, echoed) in cases {
+            let body =
+                request_text(FIXTURE_CARD, "100.00", transaction).replace("FIXTURE MERCHANT", name);
+            let mut store = fixture_store();
+            let (request, amount, context, decision) = authorize(&mut store, &body);
+            let reply = reply_body(&request, &decision);
+            assert_eq!(
+                reply,
+                format!("{FIXTURE_CARD},{echoed},120000,00,0000,        100.00, ")
+            );
+            assert_eq!(reply.chars().count(), 64, "{transaction}");
+            let plan = write_plan(&request, amount, &context, &decision, at(PINNED))
+                .expect("a pinned plan")
+                .expect("a plan for a found card");
+            assert_eq!(plan.detail.pa_merchant_name.trimmed(), stored_name);
+            assert_eq!(plan.detail.pa_transaction_id.trimmed(), echoed.trim_end());
+        }
+        let body = request_text(FIXTURE_CARD, "100.00", "TXNÉ");
+        let (request, _, _, decision) = authorize(&mut fixture_store(), &body);
+        let reply = reply_body(&request, &decision).into_bytes();
+        assert_eq!(reply.get(17..22), Some(&b"TXN\xC3\x89"[..]));
+        assert_eq!(reply.get(22..34), Some(&b"           ,"[..]));
     }
 
     #[test]

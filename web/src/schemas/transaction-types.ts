@@ -13,18 +13,20 @@
  * COTRTLIC and COTRTUPC). These schemas block only input the server rejects,
  * with the server's text, in the order the server rejects it:
  *
- * 1. Each field holds at most the characters of its BMS field: `X(2)` for the
- *    type codes, `X(50)` for the descriptions
+ * 1. Each field holds at most the characters of its BMS field, counted in
+ *    code points as the server counts them: `X(2)` for the type codes,
+ *    `X(50)` for the descriptions
  *    [app/app-transaction-type-db2/cpy-bms/COTRTLI.cpy:L66-90]
  *    [app/app-transaction-type-db2/cpy-bms/COTRTUP.cpy:L60-66]. The server
  *    checks these lengths before any COBOL edit and answers them with an
  *    empty message, so these issues keep zod's own text and no COBOL edit
- *    runs after one. The inline update's row key and row description, and
- *    the list's description filter, are also held to ASCII there, answered
- *    the same way: COTRTLIC addresses the row by its key unedited and cuts
- *    each description at 50 bytes. The CTTU key and description edits and
- *    the list's type code filter edit refuse a non-ASCII entry with their
- *    own texts.
+ *    runs after one. The inline update's row key is also held to ASCII
+ *    there, answered the same way: COTRTLIC addresses the row by its key
+ *    unedited. Every other entry within its length reaches the COBOL edits
+ *    as entered: the CTTU key and description edits, the inline update's
+ *    description edit and the list's type code filter edit refuse a
+ *    non-ASCII entry with their own texts, and the list's description filter
+ *    is searched as entered.
  * 2. The COBOL edits that depend on the entry alone, with their audited texts.
  *
  * Server-only outcomes: a code already on file on add (V-COTRTUPC-015), a
@@ -121,12 +123,39 @@ const ALPHANUMERIC_OR_SPACE = /^[A-Za-z0-9 ]*$/;
 const ALL_SPACES = /^ *$/;
 
 /**
- * ASCII text, the OpenAPI `pattern` of the `{id}` path segment, of the
- * update's description and of the list's description filter, which the
- * server checks for `origin=list`, `DELETE` and the list: the issue keeps
- * zod's default regex text, as the server's answer has no message.
+ * ASCII text, the OpenAPI `pattern` of the `{id}` path segment, which the
+ * server checks for `origin=list` and `DELETE`: the issue keeps zod's
+ * default regex text, as the server's answer has no message.
  */
 const ASCII_TEXT = /^[\x00-\x7F]*$/;
+
+/**
+ * The length of a value in Unicode code points, not UTF-16 code units: the
+ * server's `validator` length and the OpenAPI `maxLength` count Unicode
+ * scalar values.
+ */
+function codePointLength(value: string): number {
+  return Array.from(value).length;
+}
+
+/**
+ * The length check of a field of `width` characters, counted by
+ * `codePointLength`: an over-length value gets the issue `.max(width)` gives,
+ * with zod's own text.
+ */
+function maxCodePoints(width: number) {
+  return (value: string, ctx: z.RefinementCtx): void => {
+    if (codePointLength(value) > width) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.too_big,
+        maximum: width,
+        type: "string",
+        inclusive: true,
+        exact: false,
+      });
+    }
+  };
+}
 
 /** The entry moved into its `X(width)` map field: padded with spaces. */
 function mapField(value: string, width: number): string {
@@ -152,7 +181,7 @@ function isNotSupplied(value: string, width: number): boolean {
  * and anything else (`1`, `0`, `*`, `0A`) is refused.
  */
 function typeCodeFilterEdit(value: string, ctx: z.RefinementCtx): void {
-  if (value.length > TYPE_CODE_LENGTH) {
+  if (codePointLength(value) > TYPE_CODE_LENGTH) {
     return;
   }
   const field = mapField(value, TYPE_CODE_LENGTH);
@@ -208,27 +237,23 @@ function descriptionEditMessage(
 
 /**
  * A description field edited on its own: the length check, then, within the
- * length, the description edits. An absent description is the empty field.
- * With `asciiOnly`, the ASCII check the server applies to the COTRTLIC row
- * description joins the length check, and the edits run only when both pass.
+ * length, the description edits, which refuse a character outside ASCII as
+ * not alphanumeric, as both programs do. An absent description is the empty
+ * field.
  */
-function descriptionField(messages: DescriptionMessages, asciiOnly: boolean) {
-  const text = z
+function descriptionField(messages: DescriptionMessages) {
+  return z
     .string({ required_error: messages.descriptionMustBeSupplied })
-    .max(DESCRIPTION_LENGTH);
-  const checked = asciiOnly ? text.regex(ASCII_TEXT) : text;
-  return checked.superRefine((value, ctx) => {
-    if (
-      value.length > DESCRIPTION_LENGTH ||
-      (asciiOnly && !ASCII_TEXT.test(value))
-    ) {
-      return;
-    }
-    const message = descriptionEditMessage(value, messages);
-    if (message !== undefined) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message });
-    }
-  });
+    .superRefine(maxCodePoints(DESCRIPTION_LENGTH))
+    .superRefine((value, ctx) => {
+      if (codePointLength(value) > DESCRIPTION_LENGTH) {
+        return;
+      }
+      const message = descriptionEditMessage(value, messages);
+      if (message !== undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+      }
+    });
 }
 
 // The shapes below are keyed by the DTOs' own properties: every member of
@@ -250,10 +275,12 @@ export type TranTypeListFilterQuery = Pick<
 /**
  * The list filters. Both are optional: an absent, empty or blank filter
  * selects every type. Keys follow the audit `Order` (TRTYPE 1, TRDESC 2);
- * the description filter has no COBOL edit beyond its length and the ASCII
- * check the server adds, as COTRTLIC 1230-EDIT-DESC moves it into `X(50)`
- * byte for byte (P-COTRTLIC-020). Both issues keep zod's own text, as the
- * server answers them with an empty message on `TRDESC`.
+ * the description filter has no COBOL edit beyond its length, as COTRTLIC
+ * 1230-EDIT-DESC moves it into `X(50)` with no content edit
+ * (P-COTRTLIC-020) and the server searches it as entered, a character
+ * outside ASCII included; a filter that matches no type is the server's to
+ * answer (V-COTRTLIC-002). The length issue keeps zod's own text, as the
+ * server answers it with an empty message on `TRDESC`.
  *
  * A blank filter stays `""` here rather than being transformed to
  * `undefined`: a transform makes the schema's output type differ from its
@@ -263,10 +290,13 @@ export type TranTypeListFilterQuery = Pick<
 export const tranTypeListFilterSchema = z.object({
   type_code: z
     .string()
-    .max(TYPE_CODE_LENGTH)
+    .superRefine(maxCodePoints(TYPE_CODE_LENGTH))
     .superRefine(typeCodeFilterEdit)
     .optional(),
-  description: z.string().max(DESCRIPTION_LENGTH).regex(ASCII_TEXT).optional(),
+  description: z
+    .string()
+    .superRefine(maxCodePoints(DESCRIPTION_LENGTH))
+    .optional(),
 }) satisfies z.ZodType<TranTypeListFilterQuery>;
 
 export type TranTypeListFilterValues = z.infer<typeof tranTypeListFilterSchema>;
@@ -308,7 +338,7 @@ export const tranTypeListBmsFieldMap: Record<
 // --- CTLI inline description update (COTRTLI TRTYPDn, F10)
 
 const inlineEditBodyShape = {
-  description: descriptionField(TRAN_TYPE_LIST_MESSAGES, true),
+  description: descriptionField(TRAN_TYPE_LIST_MESSAGES),
 } satisfies Record<keyof TranTypeUpdateRequest, z.ZodTypeAny>;
 
 /**
@@ -317,7 +347,21 @@ const inlineEditBodyShape = {
  * description still submits.
  */
 export const tranTypeInlineEditSchema = z.object({
-  type_code: z.string().max(TYPE_CODE_LENGTH).regex(ASCII_TEXT).optional(),
+  // The ASCII check follows the length check, as on the server. `.regex`
+  // would run before the code point refinement, so zod's own regex issue is
+  // added here instead.
+  type_code: z
+    .string()
+    .superRefine(maxCodePoints(TYPE_CODE_LENGTH))
+    .superRefine((value, ctx) => {
+      if (!ASCII_TEXT.test(value)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.invalid_string,
+          validation: "regex",
+        });
+      }
+    })
+    .optional(),
   ...inlineEditBodyShape,
 }) satisfies z.ZodType<TranTypeUpdateRequest>;
 
@@ -352,20 +396,20 @@ const createShape = {
     .string({
       required_error: TRAN_TYPE_UPSERT_MESSAGES.typeCodeMustBeSupplied,
     })
-    .max(TYPE_CODE_LENGTH),
+    .superRefine(maxCodePoints(TYPE_CODE_LENGTH)),
   description: z
     .string({
       required_error: TRAN_TYPE_UPSERT_MESSAGES.descriptionMustBeSupplied,
     })
-    .max(DESCRIPTION_LENGTH),
+    .superRefine(maxCodePoints(DESCRIPTION_LENGTH)),
 } satisfies Record<keyof TranTypeCreateRequest, z.ZodTypeAny>;
 
 export const tranTypeCreateSchema = z
   .object(createShape)
   .superRefine((values, ctx) => {
     if (
-      values.type_code.length > TYPE_CODE_LENGTH ||
-      values.description.length > DESCRIPTION_LENGTH
+      codePointLength(values.type_code) > TYPE_CODE_LENGTH ||
+      codePointLength(values.description) > DESCRIPTION_LENGTH
     ) {
       return;
     }
@@ -396,7 +440,7 @@ export const tranTypeCreateSchema = z
  * description only, the key being the path of a type already shown.
  */
 const updateShape = {
-  description: descriptionField(TRAN_TYPE_UPSERT_MESSAGES, false),
+  description: descriptionField(TRAN_TYPE_UPSERT_MESSAGES),
 } satisfies Record<keyof TranTypeUpdateRequest, z.ZodTypeAny>;
 
 export const tranTypeUpdateSchema = z.object(updateShape) satisfies z.ZodType<

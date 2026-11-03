@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    cls.relname::text AS \"table_name!\",\n    att.attname::text AS \"column_name!\",\n    format_type(att.atttypid, att.atttypmod) AS \"data_type!\",\n    CASE att.attidentity\n        WHEN 'a' THEN 'ALWAYS'\n        WHEN 'd' THEN 'BY DEFAULT'\n    END AS \"generation!\",\n    seq.seqstart AS \"start!\",\n    seq.seqincrement AS \"increment!\",\n    seq.seqmin AS \"minimum!\",\n    seq.seqmax AS \"maximum!\",\n    seq.seqcycle AS \"cycle!\"\nFROM pg_attribute att\nJOIN pg_class cls ON cls.oid = att.attrelid\nJOIN pg_namespace nsp ON nsp.oid = cls.relnamespace\nJOIN pg_depend dep\n    ON dep.classid = 'pg_class'::regclass\n    AND dep.refclassid = 'pg_class'::regclass\n    AND dep.refobjid = cls.oid\n    AND dep.refobjsubid = att.attnum\n    AND dep.deptype = 'i'\nJOIN pg_sequence seq ON seq.seqrelid = dep.objid\nWHERE nsp.nspname = 'public' AND att.attidentity <> '' AND NOT att.attisdropped",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "table_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "column_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "data_type!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "generation!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "start!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "increment!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "minimum!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "maximum!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "cycle!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c87fa98463ad2475e99c0bc3517c6bc7501add232ca2ca23f368343bce3f3a8b"
+}

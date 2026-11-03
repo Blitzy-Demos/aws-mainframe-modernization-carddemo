@@ -31,4 +31,5 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+carddemo-codec.workspace = true
 carddemo-testkit.workspace = true

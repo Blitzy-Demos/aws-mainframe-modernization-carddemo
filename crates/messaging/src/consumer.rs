@@ -62,8 +62,9 @@
 //!   reply's or error record's confirm, recorded before the request is
 //!   acknowledged or rejected.
 //! - `location` is the `CCPAUERY` location or paragraph of a CP00 failure:
-//!   `M004`, `C001` to `C003`, `I002`, `M003`, `2100-EXTRACT-REQUEST-MSG`
-//!   before a rejection. Every other path records `none`; a replied request
+//!   `M004`, `C001` to `C003`, `I002`, `M003`, `3100-READ-REQUEST-MQ`,
+//!   `2100-EXTRACT-REQUEST-MSG` or `6000-MAKE-DECISION` before a rejection.
+//!   Every other path records `none`; a replied request
 //!   records it before its acknowledgement, and CP00's [`Flow::after_ack`]
 //!   then replaces it through [`record_location`] as it logs each
 //!   post-acknowledgement failure: `I003`, `I004` or `8000-WRITE-AUTH-TO-DB`.

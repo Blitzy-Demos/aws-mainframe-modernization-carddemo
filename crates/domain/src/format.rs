@@ -45,14 +45,16 @@
 //! Every literal here is ASCII and so are the parity inputs, so a builder's
 //! result is exactly its record width in bytes. Alphanumeric moves cut on the
 //! right at the receiver width; [`move_alnum`] states what happens to non-ASCII
-//! text.
+//! text. [`cp00_reply`] instead takes its fields as the `X(n)` items they are
+//! and returns the message in their single-byte code page, so its width
+//! counts characters whatever they are (E-80).
 
 use std::fmt;
 use std::iter::repeat_n;
 
 use rust_decimal::Decimal;
 
-use crate::numeric::{Money, MoneyExpr};
+use crate::numeric::{Alnum, Money, MoneyExpr};
 
 /// The most positions an edited picture may have after repetitions are
 /// expanded. The widest carried picture, `-ZZZ,ZZZ,ZZZ.ZZ`, has 15.
@@ -1368,39 +1370,43 @@ pub fn html_tranamt_ln(amount: Money<9>) -> String {
 /// X(02), X(04) and the amount edited `-zzzzzzzzz9.99` — P-COPAUA0C-011,
 /// P-COPAUA0C-021.
 ///
-/// The result is the whole [`CP00_REPLY_LEN`]-byte message: the
+/// The fields are the `X(n)` items the `STRING` reads, so their types fix
+/// their widths, and each byte is one character of the program's single-byte
+/// code page, never part of a multi-byte encoding (E-80). The result is the
+/// whole [`CP00_REPLY_LEN`]-byte message in that code page: the
 /// [`CP00_REPLY_STRING_LEN`] bytes the `STRING` fills and byte 64, which the
-/// `STRING WITH POINTER` length includes but nothing sets. One request per task
-/// makes this the first-message reply (E-13, P-COPAUA0C-027).
+/// `STRING WITH POINTER` length includes but nothing sets. [`Alnum::as_text`]
+/// gives its text, one character per byte. One request per task makes this
+/// the first-message reply (E-13, P-COPAUA0C-027).
 #[must_use]
 pub fn cp00_reply(
-    card_num: &str,
-    transaction_id: &str,
-    auth_id_code: &str,
-    resp_code: &str,
-    resp_reason: &str,
+    card_num: &Alnum<16>,
+    transaction_id: &Alnum<15>,
+    auth_id_code: &Alnum<6>,
+    resp_code: &Alnum<2>,
+    resp_reason: &Alnum<4>,
     approved_amt: Money<10>,
-) -> String {
-    let amount = edit_money(&PIC_CP00_APPROVED_AMT, approved_amt);
-    let mut reply = group(&[
-        (card_num, 16),
-        (",", 1),
-        (transaction_id, 15),
-        (",", 1),
-        (auth_id_code, 6),
-        (",", 1),
-        (resp_code, 2),
-        (",", 1),
-        (resp_reason, 4),
-        (",", 1),
-        (&amount, 14),
-        (",", 1),
-    ]);
+) -> Alnum<CP00_REPLY_LEN> {
+    let amount: Alnum<{ PIC_CP00_APPROVED_AMT.width() }> =
+        Alnum::move_from(&edit_money(&PIC_CP00_APPROVED_AMT, approved_amt));
+    let fields: [&[u8]; 6] = [
+        card_num.as_bytes(),
+        transaction_id.as_bytes(),
+        auth_id_code.as_bytes(),
+        resp_code.as_bytes(),
+        resp_reason.as_bytes(),
+        amount.as_bytes(),
+    ];
+    let mut reply = Vec::with_capacity(CP00_REPLY_LEN);
+    for field in fields {
+        reply.extend_from_slice(field);
+        reply.push(b',');
+    }
     // Byte 64 comes from W02-PUT-BUFFER, which has no VALUE, so the COBOL byte is
     // unpredictable (E-25). It is written as a space, the fill E-25 and
     // P-CVTRA05Y-018 record for never-set bytes; parity comparisons exclude it.
-    reply.push(' ');
-    reply
+    reply.push(b' ');
+    Alnum::move_from_bytes(&reply)
 }
 
 /// The account fields COACCT01 moves into `WS-ACCT-RESPONSE`
@@ -1558,7 +1564,7 @@ mod tests {
         st_line5, st_line6, st_line7, st_line8, st_line9, st_line10, st_line11, st_line12,
         st_line13, st_line14, st_line14a, st_line15, unedited_zoned, unsigned_display,
     };
-    use crate::numeric::{Money, MoneyExpr};
+    use crate::numeric::{Alnum, Money, MoneyExpr};
 
     fn dec(text: &str) -> Decimal {
         text.parse().expect("test decimal literal")
@@ -2198,10 +2204,27 @@ mod tests {
     fn cp00_replies_equal_the_audited_reply_bytes() {
         // P-COPAUA0C-021, P-COPAUA0C-023, P-COPAUA0C-024, P-COPAUA0C-026: the
         // 63 STRING bytes, then byte 64, never set by the COBOL ({UNDEF:1}),
-        // written as a space (E-25).
+        // written as a space (E-25). Each field is first moved into its
+        // CCPAURLY X(n) item, which pads or cuts it.
+        let cp00 = |card: &str,
+                    transaction: &str,
+                    auth_id: &str,
+                    code: &str,
+                    reason: &str,
+                    amount: Money<10>| {
+            cp00_reply(
+                &Alnum::move_from(card),
+                &Alnum::move_from(transaction),
+                &Alnum::move_from(auth_id),
+                &Alnum::move_from(code),
+                &Alnum::move_from(reason),
+                amount,
+            )
+            .to_string()
+        };
         let cases = [
             (
-                cp00_reply(
+                cp00(
                     "0500024453765740",
                     "TXN000000000001",
                     "120000",
@@ -2212,7 +2235,7 @@ mod tests {
                 "0500024453765740,TXN000000000001,120000,00,0000,        100.00,",
             ),
             (
-                cp00_reply(
+                cp00(
                     "0500024453765740",
                     "TXN000000000001",
                     "120000",
@@ -2223,7 +2246,7 @@ mod tests {
                 "0500024453765740,TXN000000000001,120000,05,4100,          0.00,",
             ),
             (
-                cp00_reply(
+                cp00(
                     "0500024453765740",
                     "TXN000000000001",
                     "120000",
@@ -2234,7 +2257,7 @@ mod tests {
                 "0500024453765740,TXN000000000001,120000,00,0000,-        50.00,",
             ),
             (
-                cp00_reply(
+                cp00(
                     "9999999999999999",
                     "TXN000000000002",
                     "120000",
@@ -2246,7 +2269,7 @@ mod tests {
             ),
             // Short fields are space-padded, long ones cut, at CCPAURLY widths.
             (
-                cp00_reply(
+                cp00(
                     "4111",
                     "TXN-LONGER-THAN-15",
                     "1200",

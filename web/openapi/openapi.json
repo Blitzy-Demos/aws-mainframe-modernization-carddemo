@@ -501,7 +501,7 @@
           "admin-transaction-types"
         ],
         "summary": "Lists the transaction types that pass the filters: one page from\n`start_key` in `direction` (CTLI ENTER, F8 and F7).",
-        "description": "COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,\n8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,\nP-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,\nV-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,\nV-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,\nV-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response\nreplaces the 3270 send of the `CTRTLIA` map, a mandated deviation.\n\nA page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,\nin ascending type code order. Without `start_key` both directions read\nthe first page from the start of the table: backward is F7 on the first\npage, which re-reads that page with `No previous pages to display`\n(P-COTRTLIC-004, V-COTRTLIC-009). An empty result and a page boundary are\n200 with the COBOL text in `message` (E-54).\n\n# Errors\n\n- 400 with an empty message for a filter longer than its BMS field or a\n  description filter not in ASCII, on `TRTYPE` or `TRDESC`, and for a\n  `start_key` longer than two characters or not in ASCII, on no field;\n  400 for a malformed query; and 400 for a type code filter that is not\n  two digits, on `TRTYPE` (V-COTRTLIC-001). The filters are checked\n  first, then the start key, before the master is read.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type passes the filters (V-COTRTLIC-002).\n- 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,\n  V-COTRTLIC-026), with the no-records text when the filter count fails\n  (V-COTRTLIC-028), and with `Unexpected error` when the database cannot\n  be reached.",
+        "description": "COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,\n8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,\nP-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,\nV-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,\nV-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,\nV-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response\nreplaces the 3270 send of the `CTRTLIA` map, a mandated deviation.\n\nA page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,\nin ascending type code order. Without `start_key` both directions read\nthe first page from the start of the table: backward is F7 on the first\npage, which re-reads that page with `No previous pages to display`\n(P-COTRTLIC-004, V-COTRTLIC-009). An empty result and a page boundary are\n200 with the COBOL text in `message` (E-54).\n\n# Errors\n\n- 400 with an empty message for a filter longer than its BMS field, on\n  `TRTYPE` or `TRDESC`, and for a `start_key` longer than two characters\n  or not in ASCII, on no field; 400 for a malformed query; and 400 for a\n  type code filter that is not two digits, on `TRTYPE` (V-COTRTLIC-001).\n  The filters are checked first, then the start key, before the master\n  is read.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type passes the filters (V-COTRTLIC-002), a description\n  filter holding a character outside ASCII included, which is searched as\n  entered.\n- 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,\n  V-COTRTLIC-026), with the no-records text when the filter count fails\n  (V-COTRTLIC-028), and with `Unexpected error` when the database cannot\n  be reached.",
         "operationId": "list_tran_types",
         "parameters": [
           {
@@ -518,12 +518,11 @@
           {
             "name": "description",
             "in": "query",
-            "description": "The description filter, `TRDESC` `X(50)` in ASCII: the types whose\ndescription contains this text, its leading and trailing spaces\ndropped.",
+            "description": "The description filter, `TRDESC` `X(50)`: the types whose description\ncontains this text, its leading and trailing spaces dropped.",
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 50,
-              "pattern": "^[\\x00-\\x7F]*$"
+              "maxLength": 50
             }
           },
           {
@@ -576,7 +575,7 @@
             }
           },
           "400": {
-            "description": "A filter or the start key is longer than its field or not ASCII, the type code filter is not two digits, or the query is malformed",
+            "description": "A filter is longer than its field, the start key is longer than its field or not ASCII, the type code filter is not two digits, or the query is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -724,7 +723,7 @@
           "admin-transaction-types"
         ],
         "summary": "Updates the description of the type `{id}`: without `origin` the\n`COTRTUP` maintenance screen (CTTU), with `origin=list` the inline update\nof a listed row (CTLI).",
-        "description": "Without `origin`: COTRTUPC 9000-READ-TRANTYPE, 1200-EDIT-MAP-INPUTS,\n1205-COMPARE-OLD-NEW, 9600-WRITE-PROCESSING — P-COTRTUPC-007,\nP-COTRTUPC-008, P-COTRTUPC-015 to P-COTRTUPC-021, V-COTRTUPC-001 to\nV-COTRTUPC-011. A request that repeats the stored values writes nothing\nand is 200 with `No change detected with respect to values fetched.`\n(V-COTRTUPC-006); a change is committed with `Changes committed to\ndatabase`.\n\nWith `origin=list`: COTRTLIC 1211-EDIT-ARRAY-DESC, 1240-EDIT-ALPHANUM-REQD,\n9200-UPDATE-RECORD — P-COTRTLIC-009, P-COTRTLIC-010, P-COTRTLIC-013,\nP-COTRTLIC-017, P-COTRTLIC-021, V-COTRTLIC-012 to V-COTRTLIC-014,\nV-COTRTLIC-016 to V-COTRTLIC-018. The update is committed with\n`HIGHLIGHTED row was updated`, or with `No change detected with respect to\ndatabase values.` when only the case changed, which `COTRTLIC` still\nwrites (V-COTRTLIC-012, E-73). Either answer also carries `info`, the info\nline `HIGHLIGHTED row was updated` that `9200-UPDATE-RECORD` sets once the\nupdate is stored (P-COTRTLIC-009); without `origin` there is no `info`.\n\n# Errors\n\n- 400 for a key or description longer than its BMS field, a malformed\n  query or body, and the key and description edits: on `TRTYPCD` or\n  `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,\n  V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`\n  (V-COTRTLIC-013, V-COTRTLIC-014), where a key or description holding a\n  character outside ASCII is also refused with an empty message.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).\n- 500 with the Db2 or lock text when the read or the update fails\n  (V-COTRTUPC-005, V-COTRTUPC-009 to V-COTRTUPC-011, V-COTRTLIC-017,\n  V-COTRTLIC-018); nothing is written.",
+        "description": "Without `origin`: COTRTUPC 9000-READ-TRANTYPE, 1200-EDIT-MAP-INPUTS,\n1205-COMPARE-OLD-NEW, 9600-WRITE-PROCESSING — P-COTRTUPC-007,\nP-COTRTUPC-008, P-COTRTUPC-015 to P-COTRTUPC-021, V-COTRTUPC-001 to\nV-COTRTUPC-011. A request that repeats the stored values writes nothing\nand is 200 with `No change detected with respect to values fetched.`\n(V-COTRTUPC-006); a change is committed with `Changes committed to\ndatabase`.\n\nWith `origin=list`: COTRTLIC 1211-EDIT-ARRAY-DESC, 1240-EDIT-ALPHANUM-REQD,\n9200-UPDATE-RECORD — P-COTRTLIC-009, P-COTRTLIC-010, P-COTRTLIC-013,\nP-COTRTLIC-017, P-COTRTLIC-021, V-COTRTLIC-012 to V-COTRTLIC-014,\nV-COTRTLIC-016 to V-COTRTLIC-018. The update is committed with\n`HIGHLIGHTED row was updated`, or with `No change detected with respect to\ndatabase values.` when only the case changed, which `COTRTLIC` still\nwrites (V-COTRTLIC-012, E-73). Either answer also carries `info`, the info\nline `HIGHLIGHTED row was updated` that `9200-UPDATE-RECORD` sets once the\nupdate is stored (P-COTRTLIC-009); without `origin` there is no `info`.\n\n# Errors\n\n- 400 for a key or description longer than its BMS field, a malformed\n  query or body, and the key and description edits: on `TRTYPCD` or\n  `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,\n  V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`\n  (V-COTRTLIC-013, V-COTRTLIC-014), where a key holding a character\n  outside ASCII is also refused with an empty message. A description\n  holding one gets the alphanumeric edit's text with either origin.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).\n- 500 with the Db2 or lock text when the read or the update fails\n  (V-COTRTUPC-005, V-COTRTUPC-009 to V-COTRTUPC-011, V-COTRTLIC-017,\n  V-COTRTLIC-018); nothing is written.",
         "operationId": "update_tran_type",
         "parameters": [
           {
@@ -4721,9 +4720,8 @@
               "string",
               "null"
             ],
-            "description": "The new description, `X(50)`: letters, digits and spaces, so ASCII\nonly.",
-            "maxLength": 50,
-            "pattern": "^[\\x00-\\x7F]*$"
+            "description": "The new description, `X(50)`: letters, digits and spaces.",
+            "maxLength": 50
           }
         }
       },

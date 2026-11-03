@@ -10,7 +10,9 @@
 //! (`CARDDEMO_QUEUE_PAUTH_REQUEST`). Every result comes from
 //! `carddemo_domain::rules::auth_decision`; this file sequences its steps:
 //!
-//! 1. [`Flow::handle`]: the 500-byte buffer check, the parse and the amount
+//! 1. [`Flow::handle`]: the conversion of the request text and the 500-byte
+//!    buffer check (`3100-READ-REQUEST-MQ`), the parse, the check that the
+//!    stored receivers are storable and the amount
 //!    (`2100-EXTRACT-REQUEST-MSG`), the reads in a read-only unit of work
 //!    (`5100` to `5500`), the decision and the reply (`6000`, `7100`);
 //! 2. the consumer publishes the reply, waits for its confirm and acknowledges
@@ -37,11 +39,14 @@
 //! # Halt cases
 //!
 //! An input whose COBOL result the audit cannot pin reaches this flow as an
-//! `auth_decision::Unproven` naming its `halt` escalation. A request amount
-//! of that kind gets no reply, nor does a card the cross-reference lacks,
-//! whose decision on the first message of a task tests a flag no statement
-//! set (E-41); a write plan of that kind writes nothing. Each is logged with
-//! the escalation ID and its request is rejected without requeue (AAP 0.9.6).
+//! `auth_decision::Unproven` naming its `halt` escalation. Request text the
+//! get's conversion cannot pin (E-80), a receiver the detail stores holding
+//! X'00', which `PostgreSQL` text cannot hold (E-81), and an unproven request
+//! amount are rejected before any read or reply. A card the cross-reference
+//! lacks gets no reply either, because its decision on the first message of
+//! a task tests a flag no statement set (E-41); a write plan of that kind
+//! writes nothing. Each is logged with the escalation ID and its request is
+//! rejected without requeue (AAP 0.9.6).
 
 use std::time::Duration;
 
@@ -59,9 +64,15 @@ use crate::consumer::{self, Disposition, FailureAction, Flow, PublishFailure, Re
 use crate::db_deadline::{BoundedStore, DB_DEADLINE, bounded};
 use crate::ids;
 
+/// COPAUA0C 3100-READ-REQUEST-MQ — P-COPAUA0C-002: the paragraph a request
+/// whose text the `MQGMO-CONVERT` get cannot pin (E-80) is rejected at,
+/// recorded as the message span's `location`.
+const READ_PARAGRAPH: &str = "3100-READ-REQUEST-MQ";
+
 /// COPAUA0C 2100-EXTRACT-REQUEST-MSG — P-COPAUA0C-004: the paragraph a
-/// request with an unproven amount is rejected at, recorded as the message
-/// span's `location`.
+/// request with an unproven amount, or with a receiver holding X'00' that
+/// `PostgreSQL` text cannot store (E-81), is rejected at, recorded as the
+/// message span's `location`.
 const EXTRACT_PARAGRAPH: &str = "2100-EXTRACT-REQUEST-MSG";
 
 /// COPAUA0C 6000-MAKE-DECISION — P-COPAUA0C-028: the paragraph a request
@@ -150,14 +161,16 @@ impl Flow for Cp00Flow {
     /// Extracts the request, reads what the decision needs and answers with
     /// the `CCPAURLY` reply to the request's `reply_to`. A request is rejected
     /// without a reply when it is longer than the 500-byte buffer (`M003`),
-    /// when its amount is unproven, when a read fails critically (`C001` to
-    /// `C003`, `I002`) or when it names no reply queue (`M004`): each of those
-    /// ends the COBOL task before or at `7100-SEND-RESPONSE`, after its
-    /// no-syncpoint get has consumed the request. A card the cross-reference
-    /// lacks is rejected too, after its `A001` warning, because its decision
-    /// is unproven (E-41): no guessed reply is sent.
+    /// when a read fails critically (`C001` to `C003`, `I002`) or when it
+    /// names no reply queue (`M004`): each of those ends the COBOL task before
+    /// or at `7100-SEND-RESPONSE`, after its no-syncpoint get has consumed the
+    /// request. A request whose text the get's conversion cannot pin (E-80),
+    /// whose stored receivers hold X'00' (E-81) or whose amount is unproven is
+    /// rejected before any read, and a card the cross-reference lacks after
+    /// its `A001` warning, because its decision is unproven (E-41): no guessed
+    /// reply is sent.
     async fn handle(&self, req: &Request) -> Disposition<PendingWrite> {
-        let (request, amount) = match self.extract(req) {
+        let (request, amount) = match extract(req, &self.clock) {
             Ok(extracted) => extracted,
             Err(location) => return Disposition::Reject { location },
         };
@@ -235,29 +248,6 @@ impl Flow for Cp00Flow {
 }
 
 impl Cp00Flow {
-    /// COPAUA0C 3100-READ-REQUEST-MQ / 2100-EXTRACT-REQUEST-MSG — P-COPAUA0C-002,
-    /// P-COPAUA0C-004, P-COPAUA0C-016, P-COPAUA0C-025
-    /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L351-380].
-    ///
-    /// A body longer than `W01-GET-BUFFER PIC X(500)` fails the COBOL get with
-    /// the critical `M003` record and no reply. Otherwise the request is
-    /// parsed and its amount converted. Returns the location the request is
-    /// rejected at when it gets no reply.
-    fn extract(&self, req: &Request) -> Result<(AuthRequest, Money<10>), &'static str> {
-        if let Some(entry) = auth_decision::oversize_request_entry(&req.body) {
-            self.log_entry(&entry);
-            return Err(entry.location);
-        }
-        let request = auth_decision::parse_request(&req.body);
-        match auth_decision::parse_amount(&request) {
-            Ok(amount) => Ok((request, amount)),
-            Err(unproven) => {
-                log_unproven(req, unproven, EXTRACT_PARAGRAPH);
-                Err(EXTRACT_PARAGRAPH)
-            }
-        }
-    }
-
     /// COPAUA0C 5100-READ-XREF-RECORD to 5500-READ-AUTH-SUMMRY — P-COPAUA0C-005
     /// to P-COPAUA0C-008, P-COPAUA0C-034
     /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L472-641].
@@ -360,6 +350,54 @@ impl Cp00Flow {
     /// stamped with the flow's clock.
     fn log_entry(&self, entry: &ErrorLogEntry) {
         log_record(entry, &self.clock);
+    }
+}
+
+/// COPAUA0C 3100-READ-REQUEST-MQ / 2100-EXTRACT-REQUEST-MSG — P-COPAUA0C-002,
+/// P-COPAUA0C-004, P-COPAUA0C-016, P-COPAUA0C-025
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L386-432]
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L351-380].
+///
+/// In the order the COBOL meets them:
+///
+/// 1. the body is converted as the `MQGMO-CONVERT` get converts it
+///    ([`auth_decision::convert_request`]); text that is not UTF-8 or holds a
+///    character outside ISO 8859-1 is unproven (E-80) and rejected at
+///    `3100-READ-REQUEST-MQ`;
+/// 2. converted text longer than `W01-GET-BUFFER PIC X(500)` fails the get
+///    with the critical `M003` record;
+/// 3. the converted text is parsed; a receiver the detail stores as text
+///    holding X'00', which `PostgreSQL` text cannot hold
+///    ([`auth_decision::storable`]), is unproven (E-81) and rejected at
+///    `2100-EXTRACT-REQUEST-MSG`;
+/// 4. the amount is converted; an unproven amount is rejected there too.
+///
+/// Each record is logged stamped with `clock`. Returns the location the
+/// request is rejected at when it gets no reply; such a request is neither
+/// read nor written.
+fn extract(req: &Request, clock: &impl Clock) -> Result<(AuthRequest, Money<10>), &'static str> {
+    let data = match auth_decision::convert_request(&req.body) {
+        Ok(data) => data,
+        Err(unproven) => {
+            log_unproven(req, unproven, READ_PARAGRAPH);
+            return Err(READ_PARAGRAPH);
+        }
+    };
+    if let Some(entry) = auth_decision::oversize_request_entry(&data) {
+        log_record(&entry, clock);
+        return Err(entry.location);
+    }
+    let request = auth_decision::parse_request(&data);
+    if let Err(unproven) = auth_decision::storable(&request) {
+        log_unproven(req, unproven, EXTRACT_PARAGRAPH);
+        return Err(EXTRACT_PARAGRAPH);
+    }
+    match auth_decision::parse_amount(&request) {
+        Ok(amount) => Ok((request, amount)),
+        Err(unproven) => {
+            log_unproven(req, unproven, EXTRACT_PARAGRAPH);
+            Err(EXTRACT_PARAGRAPH)
+        }
     }
 }
 
@@ -484,7 +522,8 @@ async fn write_segments<S: AuthorizationStore>(
 
 /// Logs an input class whose COBOL result the audit cannot pin: the
 /// escalation that holds it at `halt` and the paragraph whose output is
-/// skipped for it, the reply at `2100` or the writes at `8000` (AAP 0.9.6).
+/// skipped for it, the reply at `3100`, `2100` or `6000` or the writes at
+/// `8000` (AAP 0.9.6).
 fn log_unproven(req: &Request, unproven: Unproven, paragraph: &'static str) {
     tracing::error!(
         flow = Cp00Flow::NAME,
@@ -593,6 +632,7 @@ fn logged_event_key(entry: &ErrorLogEntry) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::future::{self, Future};
     use std::io;
     use std::pin::pin;
@@ -600,6 +640,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::{Duration, Instant};
 
+    use carddemo_codec::{CustomerLayout, decode_ascii_file};
     use carddemo_domain::clock::{AnyClock, Clock};
     use carddemo_domain::entities::{
         Account, AuthFraud, CardXref, Customer, NewPendingAuthDetail, PendingAuthDetail,
@@ -607,7 +648,7 @@ mod tests {
     };
     use carddemo_domain::messages;
     use carddemo_domain::numeric::{
-        AccountGroupId, AccountId, Alnum, AuthId, CardNumber, CustSsn, CustomerId, FicoScore, Money,
+        AccountGroupId, AccountId, Alnum, AuthId, CardNumber, CustomerId, Money,
     };
     use carddemo_domain::ports::{AuthorizationStore, Browse, Direction, PortError, PortResult};
     use carddemo_domain::rules::auth_decision::{
@@ -615,7 +656,7 @@ mod tests {
         SummaryWrite, Unproven, WriteStep,
     };
     use carddemo_persistence::connect_with_statement_timeout;
-    use carddemo_testkit::TestStack;
+    use carddemo_testkit::{TestStack, fixtures};
 
     use super::{
         Cp00Flow, NoReply, POST_ACK_BUDGET, PendingWrite, WRITE_CALLS, log_record,
@@ -700,28 +741,19 @@ mod tests {
         }
     }
 
-    /// Customer 50 as `custdata.txt` L50 decodes.
+    /// Customer 50 as `custdata.txt` L50 decodes through the shared
+    /// [`CustomerLayout`] [app/data/ASCII/custdata.txt:L50].
     fn fixture_customer() -> Customer {
-        Customer {
-            cust_id: CustomerId::new(50).expect("a customer number"),
-            cust_first_name: Alnum::move_from("Aniya"),
-            cust_middle_name: Alnum::move_from("Von"),
-            cust_last_name: Alnum::move_from("Kessler"),
-            cust_addr_line_1: Alnum::move_from("618 Deshaun Route"),
-            cust_addr_line_2: Alnum::move_from("Apt. 802"),
-            cust_addr_line_3: Alnum::move_from("Altenwerthshire"),
-            cust_addr_state_cd: Alnum::move_from("NC"),
-            cust_addr_country_cd: Alnum::move_from("USA"),
-            cust_addr_zip: Alnum::move_from("12546"),
-            cust_phone_num_1: Alnum::move_from("(908)119-8310"),
-            cust_phone_num_2: Alnum::move_from("(373)693-8684"),
-            cust_ssn: CustSsn::new(20_973_888).expect("a nine-digit number"),
-            cust_govt_issued_id: Alnum::move_from("00000000000049368437"),
-            cust_dob_yyyy_mm_dd: Alnum::move_from("1961-06-08"),
-            cust_eft_account_id: Alnum::move_from("0053581756"),
-            cust_pri_card_holder_ind: Alnum::move_from("Y"),
-            cust_fico_credit_score: FicoScore::new(274).expect("a three-digit score"),
-        }
+        let path = fixtures::ascii_dir().join("custdata.txt");
+        let bytes =
+            fs::read(&path).unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+        let id = CustomerId::new(50).expect("a customer number");
+        decode_ascii_file::<CustomerLayout>(&bytes)
+            .unwrap_or_else(|err| panic!("cannot decode {}: {err}", path.display()))
+            .into_iter()
+            .map(|framed| framed.record.customer)
+            .find(|customer| customer.cust_id == id)
+            .unwrap_or_else(|| panic!("{} holds no customer 50", path.display()))
     }
 
     /// What the reads find for the fixture card in the seeded state: its
@@ -757,10 +789,11 @@ mod tests {
         }
     }
 
-    /// Parses `body` and answers it against `context`, as `handle` does after
-    /// the reads.
+    /// Converts and parses `body` and answers it against `context`, as
+    /// `handle` does after the reads.
     fn answer(req: &Request, context: AuthContext) -> Result<(Reply, PendingWrite), NoReply> {
-        let request = auth_decision::parse_request(&req.body);
+        let data = auth_decision::convert_request(&req.body).expect("convertible request text");
+        let request = auth_decision::parse_request(&data);
         let amount = auth_decision::parse_amount(&request).expect("a pinned amount");
         respond(req, request, amount, context)
     }
@@ -960,6 +993,17 @@ mod tests {
     }
 
     #[test]
+    fn the_context_customer_is_the_fixture_record_of_customer_50() {
+        // 000000050 Aniya Alba Von ... OR ... 623 [app/data/ASCII/custdata.txt:L50].
+        let customer = fixture_customer();
+        assert_eq!(customer.cust_first_name.trimmed(), "Aniya");
+        assert_eq!(customer.cust_middle_name.trimmed(), "Alba");
+        assert_eq!(customer.cust_last_name.trimmed(), "Von");
+        assert_eq!(customer.cust_addr_state_cd.trimmed(), "OR");
+        assert_eq!(customer.cust_fico_credit_score.to_string(), "623");
+    }
+
+    #[test]
     fn the_reply_queue_is_the_reply_to_without_its_blank_padding() {
         // P-COPAUA0C-002, P-COPAUA0C-012: WS-REPLY-QNAME X(48) to MQOD-OBJECTNAME.
         let cases = [
@@ -1011,6 +1055,80 @@ mod tests {
         let second = answer(&req, fixture_context()).expect("a reply").0;
         assert_ne!(first.message_id, second.message_id);
         assert_eq!(first.body, second.body);
+    }
+
+    #[test]
+    fn a_non_ascii_request_is_answered_with_the_characters_it_sent() {
+        // P-COPAUA0C-002, P-COPAUA0C-011, P-COPAUA0C-014 (E-80): the reply
+        // body is the UTF-8 of the 64-character reply, the transaction ID
+        // TXNÉ followed by the 11 spaces of its X(15), and the detail keeps
+        // the merchant name sent.
+        let body = request_text(FIXTURE_CARD, "100.00", "TXNÉ")
+            .replace("FIXTURE MERCHANT", "CAFÉ MÜNCHEN");
+        let req = request(&body, Some("CP00.REPLY.QUEUE"));
+        let (reply, work) = answer(&req, fixture_context()).expect("a reply queue is named");
+        assert_eq!(
+            reply.body,
+            "0500024453765740,TXNÉ           ,120000,00,0000,        100.00, ".as_bytes()
+        );
+        assert_eq!(reply.body.get(17..22), Some(&b"TXN\xC3\x89"[..]));
+        let text = String::from_utf8(reply.body).expect("a UTF-8 reply");
+        assert_eq!(text.chars().count(), 64);
+        let plan = plan_of(&work).expect("a found card is written");
+        assert_eq!(plan.detail.pa_merchant_name.trimmed(), "CAFÉ MÜNCHEN");
+        assert_eq!(plan.detail.pa_transaction_id.trimmed(), "TXNÉ");
+    }
+
+    #[test]
+    fn extract_converts_checks_the_buffer_then_parses_as_the_cobol_does() {
+        // P-COPAUA0C-002, P-COPAUA0C-004 (E-80, E-81, E-28): text the
+        // conversion cannot pin is rejected at 3100; converted text past 500
+        // bytes is M003, whatever its UTF-8 length; a stored receiver holding
+        // X'00' and an unproven amount are rejected at 2100. None of them is
+        // read or answered.
+        let ascii = request_text(FIXTURE_CARD, "100.00", "TXN000000000001");
+        let name = "FIXTURE MERCHANT";
+        let named = |merchant: &str| ascii.replace(name, merchant);
+        // The name that makes the converted text exactly the 500-byte buffer.
+        let filling = "É".repeat(auth_decision::REQUEST_BUFFER_LEN - ascii.len() + name.len());
+        // The text as a Latin-1 sender encodes it: one byte per character.
+        let latin1: Vec<u8> = named("CAFÉ MÜNCHEN")
+            .chars()
+            .map(|character| u8::try_from(character).expect("an ISO 8859-1 character"))
+            .collect();
+        let cases: [(Vec<u8>, Result<i64, &str>); 9] = [
+            (ascii.clone().into_bytes(), Ok(10_000)),
+            (named("CAFÉ MÜNCHEN").into_bytes(), Ok(10_000)),
+            (named(&filling).into_bytes(), Ok(10_000)),
+            (named(&format!("{filling}É")).into_bytes(), Err("M003")),
+            (named("CAFÉ €").into_bytes(), Err(super::READ_PARAGRAPH)),
+            (latin1, Err(super::READ_PARAGRAPH)),
+            (
+                named("NUL\0MERCHANT").into_bytes(),
+                Err(super::EXTRACT_PARAGRAPH),
+            ),
+            (
+                request_text(FIXTURE_CARD, "abc", "TXN000000000001").into_bytes(),
+                Err(super::EXTRACT_PARAGRAPH),
+            ),
+            (
+                request_text(FIXTURE_CARD, "5.00", "TXN000000000001\0").into_bytes(),
+                Ok(500),
+            ),
+        ];
+        for (body, expected) in cases {
+            let req = Request {
+                body,
+                ..request("", Some("CP00.REPLY.QUEUE"))
+            };
+            let extracted = super::extract(&req, &pinned_clock());
+            assert_eq!(
+                extracted.map(|(_, amount)| amount.cents()),
+                expected,
+                "{:?}",
+                req.body
+            );
+        }
     }
 
     #[test]
@@ -1295,12 +1413,29 @@ mod tests {
     #[test]
     fn a_detail_insert_the_server_cancels_keeps_the_summary_written_before_it() {
         // P-COPAUA0C-013, P-COPAUA0C-014, P-COPAUA0C-035: another session holds
-        // the detail table far longer than the statement timeout. The server
-        // cancels the detail insert (I004), the summary written before it is
-        // committed, and the write ends while the lock is still held, so
-        // neither the insert nor the COMMIT waits for the lock.
-        const STATEMENT_TIMEOUT: Duration = Duration::from_millis(500);
-        const LOCK_HELD: Duration = Duration::from_secs(8);
+        // the detail table until the test releases it. The server cancels the
+        // detail insert (I004), the summary written before it is committed,
+        // and the write ends while the lock is still held, so neither the
+        // insert nor the COMMIT waits for the lock.
+        //
+        // The lock session is one DO statement: it locks the table, then polls
+        // cp00_lock_release until the test inserts the release row, so it
+        // holds the lock for as long as the test needs, however late the test
+        // runs. The write starts only once pg_locks shows the lock granted.
+        // Every wait is bounded, and a lock session that fails or ends before
+        // its release fails the test with its cause, so nothing waits forever.
+        //
+        // The flow's pool applies the statement timeout to every statement of
+        // the flow, its reads and the summary write included. The lock is held
+        // until the release however long the insert waits, so the timeout is
+        // set long enough for those statements to finish on a loaded host.
+        const STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+        // The longest the lock may take to be granted, and the lock session
+        // to end once released.
+        const SESSION_WAIT: Duration = Duration::from_secs(30);
+        // The longest the write may take: every call of it within its
+        // database deadline, plus a margin for the test's own scheduling.
+        const WRITE_LIMIT: Duration = POST_ACK_BUDGET.saturating_add(Duration::from_secs(5));
         let stack = Arc::new(carddemo_testkit::block_on(TestStack::postgres()));
         carddemo_testkit::block_on(async {
             stack.seed().await.expect("the fixture state loads");
@@ -1314,31 +1449,63 @@ mod tests {
                 panic!("a found card within its limit is answered");
             };
 
+            stack
+                .exec_sql("CREATE TABLE cp00_lock_release (released boolean NOT NULL)")
+                .await;
             let locker = Arc::clone(&stack);
             let lock = tokio::spawn(async move {
-                // The sleep is LOCK_HELD.
+                // Without a transaction block the statement runs in a
+                // transaction of its own, which holds the lock until the
+                // statement ends and rolls back on any error, releasing it.
+                // In READ COMMITTED each poll reads a fresh snapshot, so it
+                // sees the committed release row. The statement gives up after
+                // 300 seconds, longer than SESSION_WAIT and WRITE_LIMIT
+                // together, so it ends unreleased only after the test failed.
                 locker
                     .exec_sql(
-                        "BEGIN; LOCK TABLE pending_auth_details IN ACCESS EXCLUSIVE MODE; \
-                         SELECT pg_sleep(8); COMMIT",
+                        "DO $$ \
+                         DECLARE give_up timestamptz := \
+                           clock_timestamp() + interval '300 seconds'; \
+                         BEGIN \
+                           LOCK TABLE pending_auth_details IN ACCESS EXCLUSIVE MODE; \
+                           WHILE NOT EXISTS (SELECT 1 FROM cp00_lock_release) LOOP \
+                             IF clock_timestamp() > give_up THEN \
+                               RAISE EXCEPTION 'no release row within 300 seconds'; \
+                             END IF; \
+                             PERFORM pg_sleep(0.02); \
+                           END LOOP; \
+                         END $$",
                     )
                     .await;
             });
             let granted = "SELECT count(*) FROM pg_locks JOIN pg_class ON pg_class.oid = \
                            pg_locks.relation WHERE pg_class.relname = 'pending_auth_details' \
                            AND pg_locks.mode = 'AccessExclusiveLock' AND pg_locks.granted";
+            let waiting = Instant::now();
             while stack.fetch_text_rows(granted).await != [[Some("1".to_owned())]] {
+                if lock.is_finished() {
+                    await_lock_session(lock, SESSION_WAIT).await;
+                    panic!("the lock session ended before its lock was seen granted");
+                }
+                assert!(
+                    waiting.elapsed() < SESSION_WAIT,
+                    "the lock was not granted within {SESSION_WAIT:?}"
+                );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
 
             let started = Instant::now();
-            flow.after_ack(&req, after_ack).await;
+            tokio::time::timeout(WRITE_LIMIT, flow.after_ack(&req, after_ack))
+                .await
+                .unwrap_or_else(|_| panic!("the write did not end within {WRITE_LIMIT:?}"));
             let took = started.elapsed();
-            assert!(
-                took >= STATEMENT_TIMEOUT && took < LOCK_HELD,
-                "the write took {took:?}"
-            );
-            assert!(!lock.is_finished(), "the lock is still held");
+            assert!(took >= STATEMENT_TIMEOUT, "the write took {took:?}");
+            // Nothing has released the lock yet, so a lock session still
+            // running proves the write ended while the lock was held.
+            if lock.is_finished() {
+                await_lock_session(lock, SESSION_WAIT).await;
+                panic!("the lock session ended before its release");
+            }
             assert_eq!(
                 stack
                     .fetch_text_rows(
@@ -1348,7 +1515,10 @@ mod tests {
                     .await,
                 [[Some("1".to_owned()), Some("10.00".to_owned())]]
             );
-            lock.await.expect("the lock session ends");
+            stack
+                .exec_sql("INSERT INTO cp00_lock_release VALUES (true)")
+                .await;
+            await_lock_session(lock, SESSION_WAIT).await;
             assert_eq!(
                 stack
                     .fetch_text_rows("SELECT count(*) FROM pending_auth_details")
@@ -1356,5 +1526,17 @@ mod tests {
                 [[Some("0".to_owned())]]
             );
         });
+    }
+
+    /// Awaits the lock session `lock` for at most `limit`, and panics with the
+    /// cause when it failed, its panic naming the database error, or when it
+    /// is still running after `limit`.
+    async fn await_lock_session(lock: tokio::task::JoinHandle<()>, limit: Duration) {
+        let Ok(ended) = tokio::time::timeout(limit, lock).await else {
+            panic!("the lock session did not end within {limit:?}");
+        };
+        if let Err(error) = ended {
+            panic!("the lock session failed: {error}");
+        }
     }
 }
