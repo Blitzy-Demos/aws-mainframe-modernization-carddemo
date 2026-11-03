@@ -18,6 +18,10 @@
 // - Administrators list every rule, active and soft-deleted, in rule order,
 //   create, edit and soft-delete a rule through the screens with the
 //   requests they send, and a second delete of an ended rule changes nothing.
+// - The new-rule form, submitted with Save, answers each rule check of the
+//   rewards specification on its own field: the exact text in the field's
+//   FieldError, the input marked invalid, focus moved from Save to it, and no
+//   rule stored.
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
 
 import type { components } from "../src/api/schema";
@@ -176,6 +180,75 @@ function ruleRow(page: Page, ruleId: string): Locator {
   return tableByCaption(content(page), SCREENS.ruleList.caption)
     .getByRole("row")
     .filter({ has: page.getByRole("cell", { name: ruleId, exact: true }) });
+}
+
+type RuleField = keyof typeof UNMAPPED_LABELS.rewardRule;
+
+/** The reward-rule form's fields in screen order. */
+const RULE_FIELDS = [
+  "typeCode",
+  "categoryCode",
+  "rate",
+  "minAmount",
+  "maxAmount",
+  "activeFrom",
+  "activeTo",
+] as const satisfies readonly RuleField[];
+
+/** A rule the server accepts: the rule-test pair, unbounded and open-ended. */
+const VALID_RULE: Readonly<Record<RuleField, string>> = {
+  typeCode: FIXTURE_KEYS.ruleTestTypeCode,
+  categoryCode: FIXTURE_KEYS.ruleTestCategoryCode,
+  rate: "2.5000",
+  minAmount: "",
+  maxAmount: "",
+  activeFrom: "2022-01-01",
+  activeTo: "",
+};
+
+/**
+ * The three rule checks (AAP 0.3.5), each as the field values that fail it,
+ * the field it is reported on and its messages.rs text. The form's schema
+ * answers a signed rate before any request is sent; the server answers the
+ * two cross-field checks with 400 and the field in `fields[]`. The text is
+ * the same on either path.
+ */
+const INVALID_RULES = [
+  {
+    check: "a negative reward rate",
+    entered: { rate: "-1" },
+    field: "rate",
+    message: MESSAGES.REWARD_RATE_NEGATIVE,
+  },
+  {
+    check: "a minimum above the maximum",
+    entered: { minAmount: "100.00", maxAmount: "10.00" },
+    field: "minAmount",
+    message: MESSAGES.REWARD_MIN_EXCEEDS_MAX,
+  },
+  {
+    check: "an end before the start",
+    entered: { activeFrom: "2022-02-01", activeTo: "2022-01-01" },
+    field: "activeTo",
+    message: MESSAGES.REWARD_ACTIVE_TO_BEFORE_FROM,
+  },
+] as const satisfies readonly {
+  check: string;
+  entered: Partial<Record<RuleField, string>>;
+  field: RuleField;
+  message: string;
+}[];
+
+/** Fills every field of the reward-rule form with `values`, in screen order. */
+async function fillRuleForm(page: Page, values: Readonly<Record<RuleField, string>>): Promise<void> {
+  for (const field of RULE_FIELDS) {
+    await textbox(page, UNMAPPED_LABELS.rewardRule[field]).fill(values[field]);
+  }
+}
+
+/** The FieldError of `input`: the alert inside the input's Field. */
+function fieldErrorOf(input: Locator): Locator {
+  return input.locator('xpath=ancestor::*[@data-slot="field"][1]').getByRole("alert");
 }
 
 test.describe("a balance above 2^53", () => {
@@ -558,4 +631,34 @@ test.describe("admin reward rules", () => {
     const after = (await rules(request)).find((rule) => rule.rule_id === endedId);
     expect(after?.active_to).toBe(endedAt);
   });
+
+  // forms.spec.ts submits these with Enter from the last field, keyboard only.
+  // Here Save is clicked, so focus has to move from the button to the
+  // rejected field, and the text has to be the field's FieldError rather than
+  // a toast alone.
+  for (const invalid of INVALID_RULES) {
+    test(`the new-rule form rejects ${invalid.check} on its field`, async ({ page }) => {
+      const answers: number[] = [];
+      page.on("response", (response) => {
+        if (isRequestTo(response.request(), ruleEndpoint("POST"))) {
+          answers.push(response.status());
+        }
+      });
+      await signIn(page, "admin");
+      await page.goto(SCREENS.ruleForm.newRoute);
+      await expect(content(page).getByRole("heading", { level: 1 })).toHaveText(SCREENS.ruleForm.newTitle);
+      await fillRuleForm(page, { ...VALID_RULE, ...invalid.entered });
+      await formButton(page, SCREENS.ruleForm.save).click();
+
+      const input = textbox(page, UNMAPPED_LABELS.rewardRule[invalid.field]);
+      await expect(fieldErrorOf(input)).toHaveText(invalid.message);
+      await expect(input).toHaveAttribute("aria-invalid", "true");
+      await expect(input).toBeFocused();
+      await expect(page).toHaveURL(urlPath(SCREENS.ruleForm.newRoute));
+      expect(
+        answers.filter((status) => status !== 400),
+        "the rejected rule is answered by the form or by a 400 only",
+      ).toEqual([]);
+    });
+  }
 });
