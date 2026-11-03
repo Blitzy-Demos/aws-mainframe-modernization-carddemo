@@ -1,0 +1,419 @@
+// FN tests of CU02, the COUSR02C "Update User" screen (UserEditPage): valid
+// input reaches PUT /admin/users/{id} as the request body the API defines,
+// input the schema rejects sends nothing and marks its field, and a server
+// rejection marks the field it names, toasts its message and takes the focus.
+//
+// E-21 runs through every case: GET returns no password, so the password field
+// starts empty and disabled, the body leaves `password` out unless "Change
+// password" is checked, and a checked password is required. A checked password
+// goes out as typed, case kept (E-20).
+//
+// The network is the stubbed global the API client looks up on every request;
+// it answers GET from the DUSRSECJ seed row of USER0001 and PUT with each
+// test's answer.
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent, { type UserEvent } from "@testing-library/user-event";
+import {
+  createMemoryRouter,
+  RouterProvider,
+  type RouteObject,
+} from "react-router";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { components } from "@/api/schema";
+import type { RouteHandle } from "@/components/page-header";
+import { ThemeProvider } from "@/components/theme-provider";
+import { Toaster } from "@/components/ui/sonner";
+
+import UserEditPage from "./UserEditPage";
+
+type Schemas = components["schemas"];
+type UserSummary = Schemas["UserSummary"];
+type UserUpdateRequest = Schemas["UserUpdateRequest"];
+type UserUpdateField = Schemas["UserUpdateField"];
+type UserMessageResponse = Schemas["UserMessageResponse"];
+type ErrorBody = Schemas["ErrorBody"];
+
+// The audited COUSR02C texts [app/cbl/COUSR02C.cbl:L186-243].
+const FIRST_NAME_EMPTY = "First Name can NOT be empty..."; // V-COUSR02C-005
+const PASSWORD_EMPTY = "Password can NOT be empty..."; // V-COUSR02C-007
+const PLEASE_MODIFY = "Please modify to update ..."; // V-COUSR02C-010
+const UPDATED = "User USER0001 has been updated ..."; // P-COUSR02C-006
+
+// USER0001 as DUSRSECJ loads it [app/jcl/DUSRSECJ.jcl:L40], without the
+// password the API never returns.
+const USER0001 = {
+  user_id: "USER0001",
+  first_name: "LAWRENCE",
+  last_name: "THOMAS",
+  usr_type: "U",
+} as const satisfies UserSummary;
+
+const EDIT_PATH = "/admin/users/USER0001/edit";
+const USER_LIST_PATH = "/admin/users";
+const API_USER_PATH = "/api/admin/users/USER0001";
+
+// The route table of the admin domain (AAP 0.5.4.1), nested so PageHeader
+// builds its trail from the handles. `users/edit` is the edit page reached
+// without a user ID.
+const routes: RouteObject[] = [
+  {
+    path: "/admin",
+    handle: { crumb: "Administration" } satisfies RouteHandle,
+    children: [
+      { index: true, element: <p>Administration home</p> },
+      {
+        path: "users",
+        handle: { crumb: "Users" } satisfies RouteHandle,
+        children: [
+          { index: true, element: <p>User list</p> },
+          { path: "edit", element: <UserEditPage /> },
+          {
+            path: ":userId/edit",
+            element: <UserEditPage />,
+            handle: { crumb: "Update User" } satisfies RouteHandle,
+          },
+        ],
+      },
+    ],
+  },
+];
+
+type Sent = { method: string; pathname: string; body: unknown };
+
+let sent: Sent[];
+let stored: UserSummary;
+let answerPut: (body: unknown) => Response;
+let queryClient: QueryClient;
+
+function puts(): Sent[] {
+  return sent.filter(({ method }) => method === "PUT");
+}
+
+// The JSON object a request carried, so its keys can be checked one by one.
+function objectBody({ body }: Sent): Record<string, unknown> {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new Error(`Expected a JSON object body, got ${JSON.stringify(body)}`);
+  }
+  return Object.fromEntries(Object.entries(body));
+}
+
+// The write's 200, P-COUSR02C-006. The user is stored too, so the read the
+// mutation's invalidation triggers returns what was written.
+function updated(user: UserSummary): Response {
+  stored = user;
+  return Response.json({
+    user,
+    message: UPDATED,
+  } satisfies UserMessageResponse);
+}
+
+function rejected(
+  status: number,
+  code: string,
+  message: string,
+  field: UserUpdateField,
+): Response {
+  return Response.json(
+    { code, message, fields: [{ field, message }] } satisfies ErrorBody,
+    { status },
+  );
+}
+
+beforeEach(() => {
+  sent = [];
+  stored = USER0001;
+  answerPut = () => {
+    throw new Error("Unexpected PUT");
+  };
+  queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const network = vi.fn(async (request: Request): Promise<Response> => {
+    const { pathname } = new URL(request.url);
+    const body: unknown =
+      request.method === "PUT" ? await request.clone().json() : undefined;
+    sent.push({ method: request.method, pathname, body });
+    if (pathname === API_USER_PATH && request.method === "GET") {
+      return Response.json(stored);
+    }
+    if (pathname === API_USER_PATH && request.method === "PUT") {
+      return answerPut(body);
+    }
+    return Response.json(
+      { code: "NOT_FOUND", message: `No stub for ${request.method} ${pathname}` },
+      { status: 404 },
+    );
+  });
+  vi.stubGlobal("fetch", network);
+});
+
+afterEach(() => {
+  queryClient.clear();
+  vi.unstubAllGlobals();
+});
+
+function renderAt(path: string) {
+  const router = createMemoryRouter(routes, { initialEntries: [path] });
+  render(
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>
+      <Toaster />
+    </ThemeProvider>,
+  );
+  return { router, user: userEvent.setup() };
+}
+
+function asInput(element: HTMLElement): HTMLInputElement {
+  if (!(element instanceof HTMLInputElement)) {
+    throw new Error(`Expected an input, got <${element.tagName}>`);
+  }
+  return element;
+}
+
+function textbox(name: string): HTMLInputElement {
+  return asInput(screen.getByRole("textbox", { name }));
+}
+
+// A password input has no ARIA role, so it is found by its label. The exact
+// match leaves out the "Change password" checkbox.
+function passwordInput(): HTMLInputElement {
+  return asInput(screen.getByLabelText("Password", { selector: "input" }));
+}
+
+function changePassword(): HTMLElement {
+  return screen.getByRole("checkbox", { name: "Change password" });
+}
+
+// The FieldError of an input: the role="alert" element its
+// aria-describedby names.
+function fieldErrorOf(input: HTMLElement): string | null {
+  const ids = (input.getAttribute("aria-describedby") ?? "")
+    .split(" ")
+    .filter((id) => id !== "");
+  const alert = ids
+    .map((id) => document.getElementById(id))
+    .find((element) => element?.getAttribute("role") === "alert");
+  return alert?.textContent ?? null;
+}
+
+// The Sonner toast showing `message`, once it has appeared.
+async function toastShowing(message: string): Promise<HTMLElement> {
+  return waitFor(() => {
+    const shown = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-sonner-toast]"),
+    ).find((element) => element.textContent?.includes(message) === true);
+    if (shown === undefined) {
+      throw new Error(`No toast shows "${message}"`);
+    }
+    return shown;
+  });
+}
+
+// The form once GET /admin/users/USER0001 has filled it (P-COUSR02C-002).
+async function loadedForm(): Promise<void> {
+  const firstName = asInput(
+    await screen.findByRole("textbox", { name: "First Name" }),
+  );
+  await waitFor(() => {
+    expect(firstName.value).toBe(USER0001.first_name);
+  });
+}
+
+async function replaceText(
+  user: UserEvent,
+  input: HTMLInputElement,
+  text: string,
+): Promise<void> {
+  await user.clear(input);
+  await user.paste(text);
+}
+
+describe("UserEditPage (CU02, COUSR02C)", () => {
+  it.each([
+    {
+      variant: "unchecked switch, Save",
+      password: undefined,
+      expected: {
+        first_name: "LARRY",
+        last_name: "THOMAS",
+        usr_type: "U",
+      } satisfies UserUpdateRequest,
+    },
+    {
+      variant: "checked switch, Enter in the password field",
+      password: "NewPass1",
+      expected: {
+        first_name: "LARRY",
+        last_name: "THOMAS",
+        password: "NewPass1",
+        usr_type: "U",
+      } satisfies UserUpdateRequest,
+    },
+  ])(
+    "shows USER0001 without its password and sends the PUT the switch decides ($variant)",
+    async ({ password, expected }) => {
+      const { user, router } = renderAt(EDIT_PATH);
+      await loadedForm();
+
+      expect(
+        screen.getByRole("heading", { level: 1, name: "Update User" }),
+      ).toBeTruthy();
+      expect(textbox("User ID").value).toBe("USER0001");
+      expect(textbox("User ID").readOnly).toBe(true);
+      expect(textbox("Last Name").value).toBe("THOMAS");
+      expect(textbox("User Type").value).toBe("U");
+      // E-21: the current password is never shown.
+      expect(passwordInput().value).toBe("");
+      expect(passwordInput().disabled).toBe(true);
+      expect(changePassword().getAttribute("aria-checked")).toBe("false");
+
+      answerPut = () => updated({ ...USER0001, first_name: "LARRY" });
+      await replaceText(user, textbox("First Name"), "LARRY");
+      if (password === undefined) {
+        await user.click(screen.getByRole("button", { name: "Save" }));
+      } else {
+        await user.click(changePassword());
+        expect(passwordInput().disabled).toBe(false);
+        await user.type(passwordInput(), `${password}{Enter}`);
+      }
+
+      await waitFor(() => {
+        expect(puts()).toHaveLength(1);
+      });
+      const [put] = puts();
+      expect(put.pathname).toBe(API_USER_PATH);
+      const body = objectBody(put);
+      expect(body).toStrictEqual(expected);
+      expect(Object.hasOwn(body, "password")).toBe(password !== undefined);
+
+      const success = await toastShowing(UPDATED);
+      expect(success.getAttribute("data-type")).toBe("success");
+      // The form holds the saved user, the password emptied behind the switch.
+      await waitFor(() => {
+        expect(textbox("First Name").value).toBe("LARRY");
+        expect(passwordInput().value).toBe("");
+        expect(passwordInput().disabled).toBe(true);
+      });
+      expect(router.state.location.pathname).toBe(EDIT_PATH);
+    },
+  );
+
+  it("saves with Save and exit, then returns to the user list (PF3)", async () => {
+    const { user, router } = renderAt(EDIT_PATH);
+    await loadedForm();
+    answerPut = () => updated({ ...USER0001, last_name: "THOMSON" });
+
+    await replaceText(user, textbox("Last Name"), "THOMSON");
+    await user.click(screen.getByRole("button", { name: "Save and exit" }));
+
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe(USER_LIST_PATH);
+    });
+    expect(puts()).toHaveLength(1);
+    expect(objectBody(puts()[0])).toStrictEqual({
+      first_name: "LAWRENCE",
+      last_name: "THOMSON",
+      usr_type: "U",
+    } satisfies UserUpdateRequest);
+    expect((await toastShowing(UPDATED)).getAttribute("data-type")).toBe(
+      "success",
+    );
+  });
+
+  it.each([
+    {
+      variant: "Change password checked, password left empty",
+      enter: async (user: UserEvent) => {
+        await user.click(changePassword());
+      },
+      field: passwordInput,
+      message: PASSWORD_EMPTY,
+    },
+    {
+      variant: "first name cleared",
+      enter: async (user: UserEvent) => {
+        await user.clear(textbox("First Name"));
+      },
+      field: () => textbox("First Name"),
+      message: FIRST_NAME_EMPTY,
+    },
+  ])(
+    "sends nothing and marks the field when the schema rejects the input ($variant)",
+    async ({ enter, field, message }) => {
+      const { user } = renderAt(EDIT_PATH);
+      await loadedForm();
+
+      await enter(user);
+      await user.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(field().getAttribute("aria-invalid")).toBe("true");
+      });
+      expect(fieldErrorOf(field())).toBe(message);
+      expect(document.activeElement).toBe(field());
+      expect(puts()).toHaveLength(0);
+    },
+  );
+
+  // The page has no USRIDIN key field to submit: the user ID comes only from
+  // the route, which the user list's row actions supply (E-61, E-56), so the
+  // edit page reached without one returns to that list without a request.
+  it("returns to the user list without a request when the route has no user ID", async () => {
+    const { router } = renderAt("/admin/users/edit");
+
+    expect(await screen.findByText("User list")).toBeTruthy();
+    expect(router.state.location.pathname).toBe(USER_LIST_PATH);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("marks, toasts and focuses the field a server rejection names", async () => {
+    const { user } = renderAt(EDIT_PATH);
+    await loadedForm();
+    // LOW-VALUES: a first name of NUL characters passes the schema, and the
+    // server answers it as the empty field (V-COUSR02C-005).
+    answerPut = () => rejected(400, "EMPTY", FIRST_NAME_EMPTY, "FNAME");
+
+    await replaceText(user, textbox("First Name"), "\u0000\u0000");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    const error = await toastShowing(FIRST_NAME_EMPTY);
+    expect(error.getAttribute("data-type")).toBe("error");
+    expect(objectBody(puts()[0])).toStrictEqual({
+      first_name: "\u0000\u0000",
+      last_name: "THOMAS",
+      usr_type: "U",
+    } satisfies UserUpdateRequest);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(textbox("First Name"));
+    });
+    expect(textbox("First Name").getAttribute("aria-invalid")).toBe("true");
+    expect(fieldErrorOf(textbox("First Name"))).toBe(FIRST_NAME_EMPTY);
+    expect(puts()).toHaveLength(1);
+  });
+
+  it("shows the unchanged-save answer as a prompt, not a success", async () => {
+    const { user } = renderAt(EDIT_PATH);
+    await loadedForm();
+    answerPut = () =>
+      Response.json({
+        user: stored,
+        message: PLEASE_MODIFY,
+      } satisfies UserMessageResponse);
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    const prompt = await toastShowing(PLEASE_MODIFY);
+    expect(prompt.getAttribute("data-type")).not.toBe("success");
+    expect(prompt.getAttribute("data-type")).not.toBe("error");
+    expect(objectBody(puts()[0])).toStrictEqual({
+      first_name: "LAWRENCE",
+      last_name: "THOMAS",
+      usr_type: "U",
+    } satisfies UserUpdateRequest);
+    expect(textbox("First Name").getAttribute("aria-invalid")).toBe("false");
+  });
+});
