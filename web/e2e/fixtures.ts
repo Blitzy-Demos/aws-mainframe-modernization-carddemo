@@ -1503,26 +1503,71 @@ export async function signIn(page: Page, role: Role): Promise<void> {
   await expect(page).toHaveURL(urlPath(user.landing));
 }
 
+// Tab cannot always wrap around the document. The sonner toast list sits
+// after the page content, and on losing focus it moves focus back to the
+// element focused before the list, so while a toast is shown Tab loops between
+// that element and the toast. tabTo therefore starts with Shift+Tab toward a
+// target that precedes the focused element, and reverses once when focus comes
+// back to an element it already rested on. The second rule also covers a
+// focused element that was disabled or removed: focus is then on the body,
+// and Chrome resumes Tab from where the element was, which document order
+// cannot tell.
+
+// Whether `target` comes before the focused element in document order.
+async function precedesFocus(target: Locator): Promise<boolean> {
+  return target.evaluate((element) => {
+    const focused = document.activeElement;
+    return (
+      focused !== null &&
+      focused !== element &&
+      (focused.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_PRECEDING) !== 0
+    );
+  });
+}
+
 /**
- * Presses Tab (Shift+Tab with `backward`) until `target` has focus, at most
- * `maxPresses` times, so the target is proven reachable from the keyboard.
+ * Presses Tab or Shift+Tab until `target` has focus, at most `maxPresses`
+ * times, so the target is proven reachable from the keyboard. Without
+ * `backward` the direction is chosen by document order and reversed once if
+ * focus loops; with it the direction is fixed.
  */
 export async function tabTo(
   page: Page,
   target: Locator,
   options: { backward?: boolean; maxPresses?: number } = {},
 ): Promise<void> {
-  const key = options.backward === true ? "Shift+Tab" : "Tab";
+  await expect(target).toBeVisible();
+  let backward = options.backward ?? (await precedesFocus(target));
+  let reversible = options.backward === undefined;
   // Enough for the longest form (COACTUP) after the skip link and sidebar.
   const maxPresses = options.maxPresses ?? 200;
-  await expect(target).toBeVisible();
-  for (let presses = 0; presses < maxPresses; presses += 1) {
-    if (await target.evaluate((element) => element === document.activeElement)) {
-      return;
+  // The elements focus has rested on, kept in the page so they compare by
+  // identity.
+  const visited = await page.evaluateHandle(() => new Set<Element>());
+  try {
+    for (let presses = 0; presses < maxPresses; presses += 1) {
+      if (await target.evaluate((element) => element === document.activeElement)) {
+        return;
+      }
+      const looped = await visited.evaluate((seen) => {
+        const focused = document.activeElement;
+        if (focused === null) {
+          return false;
+        }
+        const again = seen.has(focused);
+        seen.add(focused);
+        return again;
+      });
+      if (looped && reversible) {
+        backward = !backward;
+        reversible = false;
+      }
+      await page.keyboard.press(backward ? "Shift+Tab" : "Tab");
     }
-    await page.keyboard.press(key);
+  } finally {
+    await visited.dispose();
   }
-  await expect(target, `reachable with ${key} within ${maxPresses} presses`).toBeFocused();
+  await expect(target, `reachable from the keyboard within ${maxPresses} presses`).toBeFocused();
 }
 
 /** Replaces the value of the focused input with `text`, typed key by key. */
@@ -1534,13 +1579,13 @@ export async function typeInFocused(page: Page, text: string): Promise<void> {
   }
 }
 
-/** Tabs to `field` and types `text` into it. */
+/** Tabs to `field` (either direction, see `tabTo`) and types `text` into it. */
 export async function typeInto(page: Page, field: Locator, text: string): Promise<void> {
   await tabTo(page, field);
   await typeInFocused(page, text);
 }
 
-/** Tabs to `control` and presses Enter on it. */
+/** Tabs to `control` (either direction, see `tabTo`) and presses Enter on it. */
 export async function pressControl(page: Page, control: Locator): Promise<void> {
   await tabTo(page, control);
   await page.keyboard.press("Enter");

@@ -29,6 +29,7 @@ import {
   controlLocator,
   expect,
   expectMessage,
+  expectScreen,
   FIXTURE_KEYS,
   isRequestTo,
   latestTranId,
@@ -213,15 +214,17 @@ function firstDataRow(page: Page): Locator {
 }
 
 // Next (PF8) changes the first row of a browse and Previous (PF7) brings the
-// first page back.
+// first page back. The row is compared by innerText on both sides: its
+// textContent runs the cells together, so it never equals the innerText taken
+// here, and the not-equal check would pass vacuously.
 async function pagesForwardAndBack(page: Page, nextId: string, previousId: string): Promise<void> {
   const firstRow = firstDataRow(page);
   await expect(firstRow).toBeVisible();
   const firstPage = (await firstRow.innerText()).trim();
   await enterOn(page, nextId);
-  await expect(firstRow).not.toHaveText(firstPage);
+  await expect(firstRow).not.toHaveText(firstPage, { useInnerText: true });
   await enterOn(page, previousId);
-  await expect(firstRow).toHaveText(firstPage);
+  await expect(firstRow).toHaveText(firstPage, { useInnerText: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +235,9 @@ test.describe("keyboard path", () => {
   test("skip link first, then the sidebar, then the page content", async ({ page }) => {
     await signInWithKeyboard(page, "user");
     await page.goto("/");
+    // Pages load lazily inside the shell: a Tab pressed while the content is
+    // still empty finds nothing after it and wraps back to the skip link.
+    await expectScreen(page);
     const skip = page.getByRole("link", { name: "Skip to content", exact: true });
     await page.keyboard.press("Tab");
     await expect(skip).toBeFocused();
@@ -452,12 +458,14 @@ test.describe("card update (F-COCRDLI-006, F-COCRDUP-002, F-COCRDUP-004, F-COCRD
   });
 
   test("saves a new name on card", async ({ page }) => {
-    await typeInto(page, nameOnCard(page), "E2E Card Holder");
+    // Letters and spaces only: 1230-EDIT-NAME refuses any other character
+    // (V-COCRDUPC-011), a digit included.
+    await typeInto(page, nameOnCard(page), "Endtoend Card Holder");
     await expectWrite(page, rowEndpoint("F-COCRDUP-005"), () => enterOn(page, "F-COCRDUP-005"));
     await expectMessage(page, MESSAGES.CHANGES_COMMITTED_TO_DATABASE);
     expect(
       await psql(`SELECT card_embossed_name FROM cards WHERE card_number = ${sqlLiteral(FIXTURE_KEYS.card)}`),
-    ).toMatch(/^E2E Card Holder$/i);
+    ).toMatch(/^Endtoend Card Holder$/i);
   });
 
   test("Back returns to the card view", async ({ page }) => {
