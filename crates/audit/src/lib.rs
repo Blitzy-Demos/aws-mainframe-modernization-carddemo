@@ -6,8 +6,8 @@
 //! headings. This crate is their one parser: [`Document::parse`] reads a file into
 //! [`Table`]s that keep their heading context and 1-based source lines, and keeps the
 //! [`Document::stray_table_lines`] that no table reads; the cell helpers
-//! [`citations`], [`malformed_citations`], [`code_span`], [`key_values`] and
-//! [`no_message_escalation`] read the cell conventions the audits define;
+//! [`citations`], [`malformed_citations`], [`code_span`], [`cell_code_spans`],
+//! [`key_values`] and [`no_message_escalation`] read the cell conventions the audits define;
 //! [`ids_with_prefix`], [`scan_cited_ids`] and [`coverage`]
 //! prove that every audit row ID is cited by a test and that no test cites an ID the audit
 //! does not define. [`Repo`] resolves the repository paths that citations name, ignoring
@@ -777,6 +777,46 @@ pub struct CodeSpan {
 pub fn code_span(cell: &str) -> Option<CodeSpan> {
     let chars: Vec<char> = cell.chars().collect();
     let span = code_spans(&chars).into_iter().next()?;
+    Some(CodeSpan {
+        text: span_text(&chars, span),
+        width: width_after(&chars[span.end..]),
+    })
+}
+
+/// Every code span of a cell, in order, or an empty `Vec` when the cell holds none.
+///
+/// Each `text` follows the rules of [`code_span`]. Each `width` is the first `width=<n>`
+/// that [`code_span`] would read after the span's closing delimiter and before the next span
+/// opens, or before the end of the cell for the last span, so a width written after a later
+/// span never applies to an earlier one. A cell with one span gives exactly the
+/// [`code_span`] of that cell.
+///
+/// ```text
+/// `a` width=5 `b` `c` (width=3)   -> a with width 5, b without, c with width 3
+/// x=`a` y=`b` width=4             -> a without width, b with width 4
+/// `` `x` `` ` y `                 -> `x`, then " y " unstripped
+/// ```
+#[must_use]
+pub fn cell_code_spans(cell: &str) -> Vec<CodeSpan> {
+    let chars: Vec<char> = cell.chars().collect();
+    let spans = code_spans(&chars);
+    spans
+        .iter()
+        .enumerate()
+        .map(|(index, &span)| {
+            let next = spans.get(index + 1).map_or(chars.len(), |next| next.start);
+            CodeSpan {
+                text: span_text(&chars, span),
+                width: width_after(&chars[span.end..next]),
+            }
+        })
+        .collect()
+}
+
+/// The text of the code span `span` of `chars`, as [`code_span`] defines it: the content
+/// between the delimiters, losing one space at each side only when the delimiter has 2 or
+/// more backticks and the content begins and ends with a space and is not all spaces.
+fn span_text(chars: &[char], span: CodeSpanRange) -> String {
     let content = &chars[span.content..span.closer];
     let padded = content.first() == Some(&' ')
         && content.last() == Some(&' ')
@@ -786,10 +826,7 @@ pub fn code_span(cell: &str) -> Option<CodeSpan> {
     } else {
         content
     };
-    Some(CodeSpan {
-        text: text.iter().collect(),
-        width: width_after(&chars[span.end..]),
-    })
+    text.iter().collect()
 }
 
 /// The value of the first `width=<digits>` in `rest` not preceded by a word character.
@@ -1675,6 +1712,64 @@ mod tests {
         assert_eq!(text("`unclosed ``x``").as_deref(), Some("x"));
         assert_eq!(text("no span here"), None);
         assert_eq!(text("`unclosed"), None);
+    }
+
+    #[test]
+    fn cell_code_spans_in_order_with_their_own_widths() {
+        for (cell, expected) in [
+            (
+                "`a` width=5 `b` `c` (width=3)",
+                vec![("a", Some(5)), ("b", None), ("c", Some(3))],
+            ),
+            // A width after a later span never applies to an earlier one.
+            ("x=`a` y=`b` width=4", vec![("a", None), ("b", Some(4))]),
+            (
+                "`a` subwidth=2 `b`width=7 width=8",
+                vec![("a", None), ("b", Some(7))],
+            ),
+            (
+                "`` `x` `` ` y ` ```  z  ```",
+                vec![("`x`", None), (" y ", None), (" z ", None)],
+            ),
+            (
+                r#"reply=`"0,{UNDEF:1}"` width=64; text=`` "a`b" ``"#,
+                vec![(r#""0,{UNDEF:1}""#, Some(64)), (r#""a`b""#, None)],
+            ),
+            ("no span width=5", vec![]),
+        ] {
+            let found: Vec<(String, Option<usize>)> = cell_code_spans(cell)
+                .into_iter()
+                .map(|span| (span.text, span.width))
+                .collect();
+            let expected: Vec<(String, Option<usize>)> = expected
+                .into_iter()
+                .map(|(text, width)| (text.to_owned(), width))
+                .collect();
+            assert_eq!(found, expected, "{cell}");
+        }
+    }
+
+    #[test]
+    fn cell_code_spans_of_one_span_is_code_span() {
+        for cell in [
+            r#"`"abc"` (width=80)"#,
+            "`x` width_x=5 width=6",
+            "`x` width=99999999999999999999999",
+            "width=5 `x`",
+            "`Payment ok.  `",
+            "` a `",
+            "`` `x` ``",
+            "``   ``",
+            "`unclosed ``x``",
+            "no span here",
+            "`unclosed",
+        ] {
+            assert_eq!(
+                cell_code_spans(cell),
+                code_span(cell).into_iter().collect::<Vec<_>>(),
+                "{cell}"
+            );
+        }
     }
 
     #[test]

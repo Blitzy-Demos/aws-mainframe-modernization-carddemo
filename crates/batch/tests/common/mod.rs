@@ -15,10 +15,14 @@
 //! the `carddemo-api` handlers drive, because `carddemo-batch` cannot depend on that crate.
 //! Each runs in one `UnitOfWork`, so a test can interleave online changes with batch runs.
 
+use std::borrow::Cow;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use carddemo_audit::{CodeSpan, Document, KeyValue, PARITY_COMMON_COLUMNS, Repo, Row, Table};
 use carddemo_domain::entities::Transaction;
@@ -45,6 +49,32 @@ pub use carddemo_testkit::block_on;
 /// report range `2022-01-01` to `2022-07-06` [app/jcl/TRANREPT.jcl:L43-44]. Pass it as the
 /// `clock` of [`Harness::run`], which hands it to the binary as `CARDDEMO_CLOCK_OVERRIDE`.
 pub const TRANREPT_CLOCK: &str = "2022-07-01T12:00:00Z";
+
+/// The bound [`Harness::run`] puts on each `batch` child unless [`Harness::with_run_timeout`]
+/// sets another: 300 seconds.
+///
+/// A child that has not exited when the bound passes is killed, reaped and reported, so a run
+/// blocked on a database lock, a file or a pipe fails its test instead of hanging it. A
+/// healthy run ends far sooner: the longest runs of these tests, a `posttran`, `intcalc` or
+/// `cbpaup0j` over the fixture corpus in an unoptimised build, take seconds. The margin is for
+/// a shared host that runs many builds, test binaries and containers at once, where a run can
+/// be slowed many times over without being stuck.
+pub const RUN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often [`Harness::run`] checks whether its child has exited.
+const RUN_POLL: Duration = Duration::from_millis(20);
+
+/// How long [`Harness::run`] waits, once its child has exited or been reaped, for the end of
+/// the child's stdout and stderr. Both pipes close when the child exits, so the wait is only
+/// long when another process inherited them and holds them open.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// The origin of the bound of a harness that [`Harness::with_run_timeout`] did not change, as
+/// the message of a run that reaches the bound names it.
+const DEFAULT_ORIGIN: &str = "the default RUN_TIMEOUT";
+
+/// The origin of a bound that [`Harness::with_run_timeout`] set.
+const OVERRIDE_ORIGIN: &str = "set by Harness::with_run_timeout";
 
 /// The columns of each row [`Harness::live_master_rows`] returns, in order: the view
 /// `transaction_master` of migration `0003`, the row identity followed by
@@ -85,6 +115,10 @@ const CT02_DATE: &str = "2022-06-10";
 /// A migrated, seeded `PostgreSQL` test database with private output directories for the
 /// `batch` binary.
 ///
+/// Every `batch` child the harness runs is bounded: [`RUN_TIMEOUT`], or the bound
+/// [`Harness::with_run_timeout`] sets for every run of the harness. A child still running at
+/// the bound is killed and reaped, and its run panics with what it wrote.
+///
 /// Dropping the harness removes the database container. The output directories are removed
 /// too, unless the thread is panicking, so a failed test leaves its generation and statement
 /// files behind for inspection.
@@ -92,6 +126,10 @@ pub struct Harness {
     stack: TestStack,
     batch_dir: PathBuf,
     statement_dir: PathBuf,
+    /// The bound on each `batch` child [`Harness::run`] spawns.
+    run_timeout: Duration,
+    /// Where `run_timeout` was set: [`DEFAULT_ORIGIN`] or [`OVERRIDE_ORIGIN`].
+    run_timeout_origin: &'static str,
 }
 
 impl Harness {
@@ -114,7 +152,27 @@ impl Harness {
             stack,
             batch_dir: fixtures::temp_dir("batch"),
             statement_dir: fixtures::temp_dir("statements"),
+            run_timeout: RUN_TIMEOUT,
+            run_timeout_origin: DEFAULT_ORIGIN,
         }
+    }
+
+    /// Bounds every run of this harness, through [`Harness::run`] and [`Harness::run_expect`],
+    /// by `timeout` in place of [`RUN_TIMEOUT`]: a `batch` child still running `timeout` after
+    /// its start is killed and reaped, and its run panics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timeout` is zero, a bound that would kill every child at its first check.
+    #[must_use]
+    pub fn with_run_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "the bound on a batch run must be longer than zero"
+        );
+        self.run_timeout = timeout;
+        self.run_timeout_origin = OVERRIDE_ORIGIN;
+        self
     }
 
     /// The test stack: its pool, its database URL and its text-typed SQL helpers.
@@ -153,9 +211,21 @@ impl Harness {
     /// that pins every time-dependent output; `None` removes the variable, so the child reads
     /// the system clock.
     ///
+    /// The child reads an empty stdin. Its stdout and stderr are each read on a thread of their
+    /// own while it runs, so a child that fills one pipe never stalls. It must exit within the
+    /// bound of the harness, [`RUN_TIMEOUT`] unless [`Harness::with_run_timeout`] set another,
+    /// checked every 20 ms. A child still running at the bound, or one whose state cannot be
+    /// read, is killed with `SIGKILL` and reaped, so it leaves neither a process nor a zombie.
+    ///
     /// # Panics
     ///
-    /// Panics if the binary cannot be spawned.
+    /// Panics if the binary cannot be spawned. Panics, after killing and reaping the child, if
+    /// it does not exit within the bound or its state cannot be read: the message names the
+    /// arguments, the pid, the bound and where it was set, the time of the kill, the kill and
+    /// reap results (a killed child is reaped with `signal: 9 (SIGKILL)`), and the stderr and
+    /// stdout captured until then. Panics if the output cannot be drained: a reader thread
+    /// cannot start (the child is then killed and reaped first), a read fails, or a pipe is
+    /// still open 10 seconds after the child has ended, held by a process that inherited it.
     #[must_use]
     pub fn run(&self, args: &[&str], clock: Option<&str>) -> Output {
         let program = env!("CARGO_BIN_EXE_batch");
@@ -166,24 +236,63 @@ impl Harness {
             .env(keys::DATABASE_URL, self.stack.database_url())
             .env(keys::BATCH_DIR, &self.batch_dir)
             .env(keys::STATEMENT_DIR, &self.statement_dir)
-            .env(keys::FIXTURE_DIR, fixtures::ascii_dir());
+            .env(keys::FIXTURE_DIR, fixtures::ascii_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if let Some(instant) = clock {
             command.env(keys::CLOCK_OVERRIDE, instant);
         } else {
             command.env_remove(keys::CLOCK_OVERRIDE);
         }
-        command
-            .output()
-            .unwrap_or_else(|error| panic!("cannot run {program} {args:?}: {error}"))
+        let started = Instant::now();
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("cannot run {program} {args:?}: {error}"));
+        let pid = child.id();
+        let pipes = Pipes::drain(&mut child).unwrap_or_else(|error| {
+            let ended = kill_and_reap(&mut child);
+            panic!("cannot read the output of batch {args:?} (pid {pid}): {error}; {ended}")
+        });
+        let waited = wait_within(
+            &mut child,
+            started,
+            self.run_timeout,
+            self.run_timeout_origin,
+        );
+        let status = waited.unwrap_or_else(|failure| {
+            let (stdout, stderr) = pipes.collect();
+            panic!(
+                "batch {args:?} (pid {pid}) {failure}\n--- stderr ---\n{}\n--- stdout ---\n{}",
+                shown(&stderr),
+                shown(&stdout),
+            )
+        });
+        match pipes.collect() {
+            (Ok(stdout), Ok(stderr)) => Output {
+                status,
+                stdout,
+                stderr,
+            },
+            (stdout, stderr) => panic!(
+                "batch {args:?} (pid {pid}) exited with {status}, but its output could not be \
+                 drained\n--- stderr ---\n{}\n--- stdout ---\n{}",
+                shown(&stderr),
+                shown(&stdout),
+            ),
+        }
     }
 
     /// Runs `batch <args>` as [`Harness::run`] does and checks that it exits with `code`, the
-    /// condition code of the job (0, 4, 8, 16, or a REPRO code).
+    /// condition code of the job (0, 4, 8, 16, or a REPRO code). The bound of the harness
+    /// applies, [`RUN_TIMEOUT`] unless [`Harness::with_run_timeout`] set another.
     ///
     /// # Panics
     ///
-    /// Panics if the binary cannot be spawned, or if it exits with another code or by a
-    /// signal. The message shows the arguments, both codes, and the child's stderr and stdout.
+    /// Panics as [`Harness::run`] does: if the binary cannot be spawned, if it does not exit
+    /// within the bound (it is then killed and reaped), or if its output cannot be drained.
+    /// Panics if it exits with another code or by a signal. The message shows the arguments,
+    /// both codes, and the child's stderr and stdout.
     #[must_use]
     pub fn run_expect(&self, args: &[&str], clock: Option<&str>, code: i32) -> Output {
         let output = self.run(args, clock);
@@ -304,6 +413,138 @@ fn generation_number(dataset: &str, file_name: &str) -> Option<u16> {
     }
     let number: u16 = digits.parse().ok()?;
     (number >= 1).then_some(number)
+}
+
+/// Waits for `child` to exit while less than `bound` has passed since `started`, checking
+/// every [`RUN_POLL`], and returns its exit status.
+///
+/// When the bound passes, or the child's state cannot be read, the child is killed and reaped,
+/// and the error says why, with the bound, `origin` (where the bound was set), the time of the
+/// kill and the kill and reap results.
+fn wait_within(
+    child: &mut Child,
+    started: Instant,
+    bound: Duration,
+    origin: &str,
+) -> Result<ExitStatus, String> {
+    let problem = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                let elapsed = started.elapsed();
+                if elapsed >= bound {
+                    break format!("did not exit within its bound of {bound:?} ({origin})");
+                }
+                thread::sleep(RUN_POLL.min(bound - elapsed));
+            }
+            Err(error) => {
+                break format!(
+                    "could not be checked for an exit ({error}) under its bound of {bound:?} \
+                     ({origin})"
+                );
+            }
+        }
+    };
+    let stopped_at = started.elapsed();
+    let ended = kill_and_reap(child);
+    Err(format!(
+        "{problem}; it was stopped {stopped_at:?} after its start: {ended}"
+    ))
+}
+
+/// Kills `child` with `SIGKILL`, waits for it so it leaves no zombie, and describes both
+/// results, for example `kill sent SIGKILL, reap returned signal: 9 (SIGKILL)`. A child that
+/// exited just before the kill is reaped with its own status.
+fn kill_and_reap(child: &mut Child) -> String {
+    let killed = match child.kill() {
+        Ok(()) => "kill sent SIGKILL".to_owned(),
+        Err(error) => format!("kill failed ({error})"),
+    };
+    let reaped = match child.wait() {
+        Ok(status) => format!("reap returned {status}"),
+        Err(error) => format!("reap failed ({error})"),
+    };
+    format!("{killed}, {reaped}")
+}
+
+/// The stdout and stderr of a `batch` child, each read to its end on a thread of its own, so
+/// the child never blocks on a full pipe while [`Harness::run`] waits for its exit.
+struct Pipes {
+    stdout: Receiver<io::Result<Vec<u8>>>,
+    stderr: Receiver<io::Result<Vec<u8>>>,
+}
+
+impl Pipes {
+    /// Takes both pipes of `child` and starts their reader threads.
+    fn drain(child: &mut Child) -> io::Result<Self> {
+        Ok(Self {
+            stdout: read_on_thread(child.stdout.take(), "stdout")?,
+            stderr: read_on_thread(child.stderr.take(), "stderr")?,
+        })
+    }
+
+    /// The bytes of both pipes as `(stdout, stderr)`, waiting at most [`DRAIN_GRACE`] for both
+    /// together. Called once, after the child has exited or been reaped.
+    fn collect(&self) -> (Result<Vec<u8>, String>, Result<Vec<u8>, String>) {
+        let until = Instant::now() + DRAIN_GRACE;
+        (
+            received(&self.stdout, "stdout", until),
+            received(&self.stderr, "stderr", until),
+        )
+    }
+}
+
+/// Reads `pipe`, the child's stream `name`, to its end on a new thread, which sends the bytes
+/// or the read error on the returned channel.
+///
+/// # Errors
+///
+/// The child has no such pipe, or the thread cannot be started.
+fn read_on_thread<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    name: &'static str,
+) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
+    let mut pipe = pipe.ok_or_else(|| io::Error::other(format!("the child has no {name} pipe")))?;
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name(format!("batch-{name}"))
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let read = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            // The receiver is gone only when the run has already failed and stopped waiting.
+            let _ = sender.send(read);
+        })?;
+    Ok(receiver)
+}
+
+/// The bytes the reader of the child's stream `name` sends on `receiver` before `until`, or
+/// why there are none: the read failed, the stream was still open at `until`, or the reader
+/// ended without sending.
+fn received(
+    receiver: &Receiver<io::Result<Vec<u8>>>,
+    name: &str,
+    until: Instant,
+) -> Result<Vec<u8>, String> {
+    match receiver.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => Err(format!("{name} could not be read: {error}")),
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "{name} was still open {DRAIN_GRACE:?} after the child ended, held by a process \
+             that inherited it"
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(format!("the {name} reader ended without a result"))
+        }
+    }
+}
+
+/// A drained stream for a panic message: its bytes as lossy UTF-8, or why it has none, in
+/// angle brackets.
+fn shown(drained: &Result<Vec<u8>, String>) -> Cow<'_, str> {
+    match drained {
+        Ok(bytes) => String::from_utf8_lossy(bytes),
+        Err(problem) => Cow::Owned(format!("<{problem}>")),
+    }
 }
 
 /// The parity oracle audit `docs/parity/parity-oracle-audit.md`, parsed by `carddemo_audit`.

@@ -683,6 +683,7 @@ dependencies = [
 name = "carddemo-messaging"
 version = "0.1.0"
 dependencies = [
+ "carddemo-audit",
  "carddemo-codec",
  "carddemo-domain",
  "carddemo-persistence",

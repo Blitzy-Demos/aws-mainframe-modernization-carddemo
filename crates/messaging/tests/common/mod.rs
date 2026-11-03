@@ -17,7 +17,9 @@
 //! [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L411-413].
 //!
 //! [`audit_row`] and [`audit_texts`] read `docs/parity/parity-oracle-audit.md`,
-//! where every expected value of these tests comes from.
+//! where every expected value of these tests comes from, through
+//! `carddemo_audit`: a row is the data table row its parser finds, so the review
+//! logs, which repeat row IDs, are never read.
 //!
 //! Every broker operation the harness awaits is bounded: by the caller's
 //! deadline where there is one, by `READY_TIMEOUT` while the consumers
@@ -31,6 +33,9 @@ use std::io;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
+use carddemo_audit::{
+    CodeSpan, Document, PARITY_AUDIT_PATH, PARITY_COMMON_COLUMNS, Repo, Row, Table,
+};
 use carddemo_domain::clock::AnyClock;
 use carddemo_messaging::Running;
 use carddemo_persistence::Db;
@@ -65,14 +70,11 @@ const SERVICE_NAME: &str = "mq-test";
 /// Filter directives of the captured telemetry: the `mq` binary's default.
 const LOG_DIRECTIVES: &str = "info";
 
-/// File name of the parity oracle audit under `docs/parity`.
-const PARITY_AUDIT: &str = "parity-oracle-audit.md";
-
 /// Header of the audit column whose code spans are a row's exact texts.
-const EXPECTED_RESULT: &str = "Expected result";
+const EXPECTED_RESULT: &str = PARITY_COMMON_COLUMNS[5];
 
-/// Text of the parity oracle audit, read once per test process.
-static AUDIT_TEXT: OnceLock<String> = OnceLock::new();
+/// The parity oracle audit, read and parsed once per test process.
+static AUDIT: OnceLock<Audit> = OnceLock::new();
 
 /// One writer onto a harness's capture buffer. The telemetry makes one per
 /// line and writes each line in a single call, so lines never interleave.
@@ -588,20 +590,32 @@ impl Harness {
 /// The line of `docs/parity/parity-oracle-audit.md` that holds the row `id`,
 /// for example `P-CODATE01-013`, as stored.
 ///
-/// The row is the first table line whose first cell is `id`: a row's own table
-/// precedes the review log that repeats its ID.
+/// The row is the data table row `carddemo_audit` finds with
+/// `Document::find_row`; review logs, which repeat the ID, are never searched.
 ///
 /// # Panics
 ///
-/// Panics if the audit cannot be read or holds no row `id`.
+/// Panics, naming the path, if the audit cannot be found or read, and, naming
+/// the row, if no data table holds a row `id` (review logs excluded).
 #[must_use]
 pub fn audit_row(id: &str) -> String {
-    let lines: Vec<&str> = audit_text().lines().collect();
-    lines[row_index(&lines, id)].to_owned()
+    let audit = audit();
+    let (_, row) = audit.row(id);
+    // `Document::parse` numbers the lines of `str::lines` from 1.
+    audit
+        .text
+        .lines()
+        .nth(row.line - 1)
+        .unwrap_or_else(|| panic!("audit row {id} is past the end of {PARITY_AUDIT_PATH}"))
+        .to_owned()
 }
 
 /// The exact texts of the "Expected result" cell of the audit row `id`, in
 /// cell order, as the audit's conventions define them.
+///
+/// The row, its cell and the cell's code spans come from `carddemo_audit`:
+/// review logs are never searched, and a code span's `width=<n>` is the first
+/// one after it and before the next span (`cell_code_spans`).
 ///
 /// An exact text is a code span holding a double-quoted string, with `\"` and
 /// `\\` as its escapes, and `\|` standing for `|` as in every table cell. A
@@ -612,203 +626,83 @@ pub fn audit_row(id: &str) -> String {
 ///
 /// # Panics
 ///
-/// Panics, naming the row, if the audit cannot be read, holds no row `id`, its
-/// table has no "Expected result" column, the cell holds no code span, a code
-/// span is not a well-formed double-quoted string, or a padded value would be
-/// longer than its width, holds a `{FIELD}` placeholder of unknown length, or
-/// holds a `{UNDEF:` that starts no well-formed `{UNDEF:n}`: unterminated, or
-/// with an n that is empty, not all digits or too large for a length.
+/// Panics, naming the path, if the audit cannot be found or read, and, naming
+/// the row, if no data table holds a row `id` (review logs excluded), its table
+/// has no "Expected result" column or the row no such cell, the cell holds no
+/// code span, a code span is not a well-formed double-quoted string, or a padded
+/// value would be longer than its width, holds a `{FIELD}` placeholder of
+/// unknown length, or holds a `{UNDEF:` that starts no well-formed
+/// `{UNDEF:n}`: unterminated, or with an n that is empty, not all digits or too
+/// large for a length.
 #[must_use]
 pub fn audit_texts(id: &str) -> Vec<String> {
-    let lines: Vec<&str> = audit_text().lines().collect();
-    let index = row_index(&lines, id);
-    let column = header_cells(&lines, index, id)
-        .iter()
-        .position(|cell| cell == EXPECTED_RESULT)
-        .unwrap_or_else(|| panic!("the table of audit row {id} has no {EXPECTED_RESULT:?} column"));
-    let cells = split_cells(lines[index]);
-    let cell = cells
-        .get(column)
-        .unwrap_or_else(|| panic!("audit row {id} has no {EXPECTED_RESULT:?} cell"));
-    let texts = exact_texts(cell, id);
+    let (table, row) = audit().row(id);
     assert!(
-        !texts.is_empty(),
+        table.column(EXPECTED_RESULT).is_some(),
+        "the table of audit row {id} has no {EXPECTED_RESULT:?} column"
+    );
+    let cell = table
+        .cell(row, EXPECTED_RESULT)
+        .unwrap_or_else(|| panic!("audit row {id} has no {EXPECTED_RESULT:?} cell"));
+    let spans = carddemo_audit::cell_code_spans(cell);
+    assert!(
+        !spans.is_empty(),
         "the {EXPECTED_RESULT:?} cell of audit row {id} holds no code span"
     );
-    texts
+    spans.iter().map(|span| exact_text(span, id)).collect()
 }
 
-/// The audit's text, read on first use.
+/// The parity oracle audit as stored, with the tables `carddemo_audit` parses
+/// from it.
+struct Audit {
+    /// The file's text.
+    text: String,
+    /// The text's tables.
+    doc: Document,
+}
+
+impl Audit {
+    /// The data table row `id`, with its table. Review logs are never searched.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the row, if no data table holds a row `id`.
+    fn row(&self, id: &str) -> (&Table, &Row) {
+        self.doc
+            .find_row(id)
+            .unwrap_or_else(|| panic!("audit row {id} not found in {PARITY_AUDIT_PATH}"))
+    }
+}
+
+/// The audit, read and parsed on first use.
 ///
 /// # Panics
 ///
-/// Panics, naming the path, if the file cannot be read.
-fn audit_text() -> &'static str {
-    AUDIT_TEXT.get_or_init(|| {
-        let path = fixtures::parity_doc(PARITY_AUDIT);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+/// Panics, naming the path, if the file cannot be found or read.
+fn audit() -> &'static Audit {
+    AUDIT.get_or_init(|| {
+        let repo = Repo::new(fixtures::repo_root());
+        let path = repo.resolve(PARITY_AUDIT_PATH).unwrap_or_else(|| {
+            panic!(
+                "{PARITY_AUDIT_PATH} not found under {}",
+                repo.root.display()
+            )
+        });
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        let doc = Document::parse(&text);
+        Audit { text, doc }
     })
 }
 
-/// The index in `lines` of the first table line whose first cell is `id`.
-fn row_index(lines: &[&str], id: &str) -> usize {
-    lines
-        .iter()
-        .position(|line| {
-            // `contains` only skips lines that cannot hold the ID.
-            is_table_line(line)
-                && line.contains(id)
-                && split_cells(line).first().is_some_and(|cell| cell == id)
-        })
-        .unwrap_or_else(|| panic!("audit row {id} not found in {PARITY_AUDIT}"))
-}
-
-/// The header cells of the table holding the row at `index`: the line directly
-/// above the table's delimiter row.
-fn header_cells(lines: &[&str], index: usize, id: &str) -> Vec<String> {
-    let delimiter = (0..index)
-        .rev()
-        .take_while(|&at| is_table_line(lines[at]))
-        .find(|&at| is_delimiter_row(lines[at]))
-        .unwrap_or_else(|| panic!("audit row {id} is not below a table delimiter row"));
-    let header = delimiter
-        .checked_sub(1)
-        .map(|at| lines[at])
-        .filter(|line| is_table_line(line))
-        .unwrap_or_else(|| panic!("the table of audit row {id} has no header line"));
-    split_cells(header)
-}
-
-/// Whether `line` belongs to a pipe table.
-fn is_table_line(line: &str) -> bool {
-    line.trim_start().starts_with('|')
-}
-
-/// Whether `line` is a table delimiter row: every cell is a run of `-` with an
-/// optional `:` at either end.
-fn is_delimiter_row(line: &str) -> bool {
-    let cells = split_cells(line);
-    !cells.is_empty()
-        && cells.iter().all(|cell| {
-            let cell = cell.strip_prefix(':').unwrap_or(cell);
-            let cell = cell.strip_suffix(':').unwrap_or(cell);
-            !cell.is_empty() && cell.chars().all(|ch| ch == '-')
-        })
-}
-
-/// The trimmed cells of a table line, as GitHub reads them. One leading `|`
-/// and the empty cell after a trailing `|` are dropped. A `|` ends a cell only
-/// outside code spans, and `\|` stands for a literal `|` everywhere, code spans
-/// included.
-fn split_cells(line: &str) -> Vec<String> {
-    let line = line.trim();
-    let body = line.strip_prefix('|').unwrap_or(line);
-    let chars: Vec<char> = body.chars().collect();
-    let spans = code_spans(&chars);
-    let mut cells = Vec::new();
-    let mut cell = String::new();
-    let mut ended_on_split = false;
-    let mut at = 0;
-    while at < chars.len() {
-        ended_on_split = false;
-        if chars[at] == '\\' && chars.get(at + 1) == Some(&'|') {
-            cell.push('|');
-            at += 2;
-            continue;
-        }
-        if chars[at] == '|' && !spans.iter().any(|span| span.start <= at && at < span.end) {
-            cells.push(std::mem::take(&mut cell));
-            ended_on_split = true;
-        } else {
-            cell.push(chars[at]);
-        }
-        at += 1;
+/// The value of the exact text `span`: its double-quoted string, right-padded
+/// to its width when it has one.
+fn exact_text(span: &CodeSpan, id: &str) -> String {
+    let text = unquote(&span.text, id);
+    match span.width {
+        Some(width) => pad(text, width, id),
+        None => text,
     }
-    if !ended_on_split {
-        cells.push(cell);
-    }
-    cells.iter().map(|cell| cell.trim().to_owned()).collect()
-}
-
-/// One code span of a char sequence: `start..end` covers its delimiters,
-/// `open..close` its content.
-#[derive(Clone, Copy)]
-struct CodeSpan {
-    start: usize,
-    open: usize,
-    close: usize,
-    end: usize,
-}
-
-/// The code spans of `chars` in order, as `CommonMark` delimits them: a run of n
-/// backticks opens a span that the next run of exactly n backticks closes, and
-/// a run without such a closer is literal text.
-fn code_spans(chars: &[char]) -> Vec<CodeSpan> {
-    let run_at = |from: usize| chars[from..].iter().take_while(|&&ch| ch == '`').count();
-    let mut spans = Vec::new();
-    let mut at = 0;
-    while at < chars.len() {
-        if chars[at] != '`' {
-            at += 1;
-            continue;
-        }
-        let run = run_at(at);
-        let mut probe = at + run;
-        let mut closer = None;
-        while probe < chars.len() {
-            if chars[probe] == '`' {
-                let length = run_at(probe);
-                if length == run {
-                    closer = Some(probe);
-                    break;
-                }
-                probe += length;
-            } else {
-                probe += 1;
-            }
-        }
-        match closer {
-            Some(close) => {
-                spans.push(CodeSpan {
-                    start: at,
-                    open: at + run,
-                    close,
-                    end: close + run,
-                });
-                at = close + run;
-            }
-            None => at += run,
-        }
-    }
-    spans
-}
-
-/// The exact texts of the code spans of `cell`, each padded to the width that
-/// follows it.
-fn exact_texts(cell: &str, id: &str) -> Vec<String> {
-    let chars: Vec<char> = cell.chars().collect();
-    code_spans(&chars)
-        .into_iter()
-        .map(|span| {
-            let content = &chars[span.open..span.close];
-            // CommonMark: content that begins and ends with a space, and is not
-            // only spaces, loses one space at each end.
-            let padded = content.first() == Some(&' ')
-                && content.last() == Some(&' ')
-                && content.iter().any(|&ch| ch != ' ');
-            let content: String = if padded {
-                content[1..content.len() - 1].iter().collect()
-            } else {
-                content.iter().collect()
-            };
-            let text = unquote(&content, id);
-            match width_after(&chars[span.end..], id) {
-                Some(width) => pad(text, width, id),
-                None => text,
-            }
-        })
-        .collect()
 }
 
 /// The value of the double-quoted string `content`, whose only escapes are
@@ -835,27 +729,6 @@ fn unquote(content: &str, id: &str) -> String {
         }
     }
     text
-}
-
-/// The `n` of a `width=<n>` that directly follows a code span, spaces between
-/// them allowed.
-fn width_after(rest: &[char], id: &str) -> Option<usize> {
-    let rest: String = rest
-        .iter()
-        .skip_while(|&&ch| ch == ' ' || ch == '\t')
-        .collect();
-    let digits: String = rest
-        .strip_prefix("width=")?
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    if digits.is_empty() {
-        return None;
-    }
-    let width = digits
-        .parse()
-        .unwrap_or_else(|error| panic!("audit row {id}: width={digits} is not a width: {error}"));
-    Some(width)
 }
 
 /// `text` right-padded with spaces to `width` bytes, each `{UNDEF:n}` counting

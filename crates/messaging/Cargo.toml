@@ -30,6 +30,8 @@ chrono.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 
+# carddemo-testkit and carddemo-audit are test support: dev-only, as hygiene.rs asserts.
 [dev-dependencies]
+carddemo-audit.workspace = true
 carddemo-codec.workspace = true
 carddemo-testkit.workspace = true

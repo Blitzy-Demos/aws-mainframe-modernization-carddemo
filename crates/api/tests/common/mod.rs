@@ -356,44 +356,76 @@ pub async fn send(builder: RequestBuilder, token: Option<&str>) -> Resp {
     (status, json, text)
 }
 
-/// Asserts that `resp` is the error answer `status` with the `{code, message,
-/// fields}` body: a non-empty `code`, exactly `message`, and the `field`
-/// values of `fields`, in order.
+/// Asserts that `resp` is the error answer `status` with exactly the
+/// `{code, message, fields}` body `code`, `message` and `fields`.
 ///
-/// `message` is compared untrimmed, because the COBOL texts keep their
-/// trailing dots and spaces. An absent, `null` or empty `fields` equals an
-/// empty `fields` slice.
+/// `code` is the failure class the body publishes: an
+/// `ErrorKind::code()` value such as `NOT_FOUND`, or `UNAUTHENTICATED`,
+/// `FORBIDDEN` or `METHOD_NOT_ALLOWED`. Each `fields` pair is
+/// `(field, message)`: the BMS field name of one body entry, then the text
+/// that entry carries, listed in the order the body gives the entries. The
+/// top-level `message` and every entry's `message` are compared untrimmed,
+/// because the COBOL texts keep their trailing dots and spaces. An absent,
+/// `null` or empty `fields` equals an empty `fields` slice.
 ///
 /// # Panics
 ///
-/// Panics, showing the raw body, on the first part that differs, and if
-/// `fields` in the body is neither absent, `null` nor an array of objects with
-/// a string `field`.
-pub fn assert_error(resp: &Resp, status: StatusCode, message: &str, fields: &[&str]) {
+/// Panics, showing the raw body, on the first part that differs: the status,
+/// the `code`, the `message`, or the ordered `(field, message)` pairs. It also
+/// panics if `fields` in the body is neither absent, `null` nor an array, if
+/// an entry is not an object, or if an entry has no string `field` or no
+/// string `message`, naming that entry and key.
+pub fn assert_error(
+    resp: &Resp,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    fields: &[(&str, &str)],
+) {
     let (actual_status, body, raw) = resp;
     assert_eq!(*actual_status, status, "status of the error answer: {raw}");
-    assert!(
-        body["code"].as_str().is_some_and(|code| !code.is_empty()),
-        "the error body needs a non-empty string `code`: {raw}"
+    assert_eq!(
+        body["code"].as_str(),
+        Some(code),
+        "`code` of the error body: {raw}"
     );
     assert_eq!(
         body["message"].as_str(),
         Some(message),
         "`message` of the error body: {raw}"
     );
-    let named: Vec<&str> = match &body["fields"] {
+    let entries: Vec<(&str, &str)> = match &body["fields"] {
         Value::Null => Vec::new(),
         Value::Array(entries) => entries
             .iter()
-            .map(|entry| {
-                entry["field"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("a `fields` entry has no string `field`: {raw}"))
-            })
+            .enumerate()
+            .map(|(index, entry)| field_entry(index, entry, raw))
             .collect(),
         other => panic!("`fields` of the error body is not an array but {other}: {raw}"),
     };
-    assert_eq!(named, fields, "`fields` of the error body: {raw}");
+    assert_eq!(
+        entries, fields,
+        "`fields` of the error body, as (field, message) pairs: {raw}"
+    );
+}
+
+/// The `(field, message)` pair of the `fields` entry at `index` of an error
+/// body whose raw text is `raw`.
+///
+/// # Panics
+///
+/// Panics, showing `raw`, if the entry is not an object or has no string
+/// `field` or no string `message`.
+fn field_entry<'a>(index: usize, entry: &'a Value, raw: &str) -> (&'a str, &'a str) {
+    let Value::Object(object) = entry else {
+        panic!("`fields` entry {index} of the error body is not an object but {entry}: {raw}");
+    };
+    let text = |key: &str| {
+        object.get(key).and_then(Value::as_str).unwrap_or_else(|| {
+            panic!("`fields` entry {index} of the error body has no string `{key}`: {raw}")
+        })
+    };
+    (text("field"), text("message"))
 }
 
 /// The repository checkout the audits are read from.

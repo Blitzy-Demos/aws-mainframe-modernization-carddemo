@@ -23,6 +23,7 @@
 pub mod common;
 
 use carddemo_audit::Document;
+use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages;
 use carddemo_testkit::block_on;
 use common::{TestApp, assert_error, validation_audit};
@@ -208,16 +209,18 @@ fn a_failed_account_read_answers_with_the_account_file_error() {
         assert_error(
             &viewed,
             view_error.status,
+            ErrorKind::Unexpected.code(),
             &view_error.message,
-            &[view_error.field.as_str()],
+            &[(view_error.field.as_str(), view_error.message.as_str())],
         );
         // V-COACTUPC-007: the fetch of the update reads as the view does.
         let updated = app.put(ACCOUNT_PATH, Some(&token), &body).await;
         assert_error(
             &updated,
             update_error.status,
+            ErrorKind::Unexpected.code(),
             &update_error.message,
-            &[update_error.field.as_str()],
+            &[(update_error.field.as_str(), update_error.message.as_str())],
         );
 
         app.stack().exec_sql(RESTORE_ACCOUNTS).await;

@@ -21,6 +21,7 @@ pub mod common;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages;
 use carddemo_runtime::config::Settings;
 use carddemo_testkit::block_on;
@@ -32,6 +33,12 @@ use serde_json::{Value, json};
 
 /// The one challenge every 401 carries.
 const BEARER: &str = "Bearer";
+
+/// The `code` of a 401 for a request without a valid bearer token.
+const UNAUTHENTICATED: &str = "UNAUTHENTICATED";
+
+/// The `code` of a 403 for a token that is not an admin's, on `/admin/**`.
+const FORBIDDEN: &str = "FORBIDDEN";
 
 /// The seeded admin, `ADMIN001`, type `A` [app/jcl/DUSRSECJ.jcl:L35].
 const SEEDED_ADMIN: &str = "ADMIN001";
@@ -139,10 +146,11 @@ fn new_admin(user_id: &str) -> Value {
 fn assert_unauthenticated(answer: &Answer, case: &str) {
     let (status, body, raw) = &answer.resp;
     assert_eq!(*status, StatusCode::UNAUTHORIZED, "{case}: {raw}");
-    assert_eq!(body["code"], "UNAUTHENTICATED", "{case}: {raw}");
+    assert_eq!(body["code"], UNAUTHENTICATED, "{case}: {raw}");
     assert_error(
         &answer.resp,
         StatusCode::UNAUTHORIZED,
+        UNAUTHENTICATED,
         messages::AUTHENTICATION_REQUIRED,
         &[],
     );
@@ -196,8 +204,9 @@ async fn forged_subject_is_refused(app: &TestApp, admin: &str) {
     assert_error(
         &fetched.resp,
         StatusCode::NOT_FOUND,
+        ErrorKind::NotFound.code(),
         messages::USER_ID_NOT_FOUND,
-        &["USRIDIN"],
+        &[("USRIDIN", messages::USER_ID_NOT_FOUND)],
     );
 
     let control = forged_token(SEEDED_ADMIN, "A");
@@ -242,6 +251,7 @@ async fn stored_subjects_keep_their_gate(app: &TestApp, admin: &str, user: &str)
     assert_error(
         &refused.resp,
         StatusCode::FORBIDDEN,
+        FORBIDDEN,
         messages::ADMIN_ACCESS_REQUIRED,
         &[],
     );
@@ -272,8 +282,9 @@ async fn every_401_carries_the_challenge(app: &TestApp) {
     assert_error(
         &signon.resp,
         StatusCode::UNAUTHORIZED,
+        ErrorKind::SignonFailed.code(),
         messages::WRONG_PASSWORD_TRY_AGAIN,
-        &["PASSWD"],
+        &[("PASSWD", messages::WRONG_PASSWORD_TRY_AGAIN)],
     );
     assert_eq!(signon.challenges, [BEARER], "the sign-on 401 challenge");
 }
