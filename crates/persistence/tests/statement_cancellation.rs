@@ -26,18 +26,21 @@
 //! The test starts its own container through `carddemo_testkit::TestStack`,
 //! so it needs a running Docker daemon (AAP 0.10.4). Committed state is read
 //! through the stack's text-typed SQL helpers on connections that bypass the
-//! proxy, so the test adds no compile-time query.
+//! proxy, so the test adds no compile-time query. It ends by closing the
+//! proxied pool and tearing the proxy down, which frees the proxy's port and
+//! ends its threads. A second test, which needs no Docker, checks that
+//! teardown against a loopback listener standing in for the server.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::mem;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::pin::pin;
 use std::str::FromStr;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Waker};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use carddemo_domain::entities::{
@@ -58,6 +61,10 @@ const PATIENCE: Duration = Duration::from_secs(30);
 /// How long one wait for a held response lasts before the call is polled
 /// again.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How long a proxy's teardown waits for its threads to finish once every
+/// socket they read or write is shut down.
+const TEARDOWN_PATIENCE: Duration = Duration::from_secs(10);
 
 /// The account of each case, one summary each.
 const RELEASE_CASE: u64 = 101;
@@ -178,9 +185,68 @@ impl Shared {
 /// `Sync`. Every request gets exactly one `ReadyForQuery`, so the responses
 /// are matched to the requests in order. TLS is off on the proxied pool, so
 /// the stream is plain.
+///
+/// The proxy owns its threads and sockets, and [`Proxy::shut_down`] stops
+/// them; dropping a proxy that has not been shut down runs it too. The
+/// teardown marks the proxy as stopping, then connects to the proxy's own
+/// port to wake the accept loop, which closes that connection without
+/// dialing the server and returns, closing the listening socket. It shuts
+/// down both sockets of every proxied connection and the client handle the
+/// [`Gate`] keeps, which ends each forwarding thread's blocked read or write,
+/// and then waits at most [`TEARDOWN_PATIENCE`] for every thread to finish.
+/// A connection accepted while the teardown runs is closed, never proxied.
 struct Proxy {
     port: u16,
     shared: Arc<Shared>,
+    /// The proxied connections, for the teardown.
+    connections: Arc<Mutex<Connections>>,
+    /// The accept loop, until the teardown takes it.
+    accept: Option<JoinHandle<()>>,
+    /// What the teardown found, once it has run.
+    outcome: Option<Teardown>,
+}
+
+/// The forwarding threads and sockets of a proxy, which its teardown stops.
+#[derive(Default)]
+struct Connections {
+    /// Set by the teardown: the accept loop proxies no connection after it.
+    stopping: bool,
+    /// A handle on the client socket and on the server socket of every
+    /// proxied connection.
+    sockets: Vec<TcpStream>,
+    /// The two forwarding threads of every proxied connection.
+    workers: Vec<JoinHandle<()>>,
+}
+
+/// Locks `connections`. A thread that panicked while holding the lock left
+/// every recorded handle in place, so the poison is ignored, and the teardown,
+/// which also runs while a failed test unwinds, never panics on it.
+fn lock(connections: &Mutex<Connections>) -> MutexGuard<'_, Connections> {
+    connections.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What a proxy's teardown found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Teardown {
+    /// Whether the accept loop, which owns the listening socket, finished, so
+    /// the socket is closed and its port free.
+    listener_closed: bool,
+    /// How many forwarding threads still ran at the deadline; each is left
+    /// detached.
+    workers_running: usize,
+    /// How many of the finished threads, the accept loop included, ended in a
+    /// panic.
+    panicked: usize,
+}
+
+impl Teardown {
+    /// Every thread finished without a panic, the accept loop with its
+    /// listening socket among them.
+    const CLEAN: Self = Self {
+        listener_closed: true,
+        workers_running: 0,
+        panicked: 0,
+    };
 }
 
 impl Proxy {
@@ -189,18 +255,82 @@ impl Proxy {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
         let port = listener.local_addr().expect("the proxy address").port();
         let shared = Arc::new(Shared::default());
+        let connections = Arc::new(Mutex::new(Connections::default()));
         let accepted = Arc::clone(&shared);
-        thread::spawn(move || {
-            for client in listener.incoming() {
-                let Ok(client) = client else { return };
-                let Ok(server) = TcpStream::connect(upstream) else {
-                    return;
-                };
-                accepted.connected(&client);
-                proxy_connection(client, server, &accepted);
-            }
+        let recorded = Arc::clone(&connections);
+        let accept = thread::spawn(move || {
+            accept_connections(&listener, upstream, &accepted, &recorded);
         });
-        Self { port, shared }
+        Self {
+            port,
+            shared,
+            connections,
+            accept: Some(accept),
+            outcome: None,
+        }
+    }
+
+    /// Stops the proxy as its type's documentation describes, and reports
+    /// what stopping it found. A second call only reports the first call's
+    /// outcome.
+    #[must_use = "the outcome says whether every thread finished"]
+    fn shut_down(&mut self) -> Teardown {
+        if let Some(outcome) = self.outcome {
+            return outcome;
+        }
+        let (sockets, workers) = {
+            let mut connections = lock(&self.connections);
+            connections.stopping = true;
+            (
+                mem::take(&mut connections.sockets),
+                mem::take(&mut connections.workers),
+            )
+        };
+        // Kept open until the wait ends, so the accept loop accepts it; it is
+        // refused when the loop has returned already.
+        let wake = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
+        for socket in &sockets {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        let client = self
+            .shared
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .client
+            .take();
+        if let Some(client) = &client {
+            let _ = client.shutdown(Shutdown::Both);
+        }
+        let accept = self.accept.take();
+        let deadline = Instant::now() + TEARDOWN_PATIENCE;
+        while !accept.iter().chain(&workers).all(JoinHandle::is_finished)
+            && Instant::now() < deadline
+        {
+            thread::sleep(POLL_INTERVAL);
+        }
+        drop(wake);
+        let (mut finished, running): (Vec<_>, Vec<_>) =
+            workers.into_iter().partition(JoinHandle::is_finished);
+        let listener_closed = match accept {
+            Some(accept) if accept.is_finished() => {
+                finished.push(accept);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        let outcome = Teardown {
+            listener_closed,
+            workers_running: running.len(),
+            panicked: finished
+                .into_iter()
+                .map(JoinHandle::join)
+                .filter(Result::is_err)
+                .count(),
+        };
+        self.outcome = Some(outcome);
+        outcome
     }
 
     /// Holds the responses from the next executed `hold` statement on.
@@ -235,18 +365,91 @@ impl Proxy {
     }
 }
 
-/// Starts the two forwarding threads of one proxied connection.
-fn proxy_connection(client: TcpStream, server: TcpStream, shared: &Arc<Shared>) {
+impl Drop for Proxy {
+    /// Runs the teardown unless [`Proxy::shut_down`] already has, and fails
+    /// the test when it is not clean. While a failed test unwinds it only
+    /// reports the outcome, because a panic then would abort the process.
+    fn drop(&mut self) {
+        if self.outcome.is_some() {
+            return;
+        }
+        let outcome = self.shut_down();
+        if thread::panicking() {
+            if outcome != Teardown::CLEAN {
+                eprintln!("the dropped proxy's teardown is not clean: {outcome:?}");
+            }
+        } else {
+            assert_eq!(
+                outcome,
+                Teardown::CLEAN,
+                "the dropped proxy's teardown is clean"
+            );
+        }
+    }
+}
+
+/// The accept loop: proxies every connection to `upstream` until the
+/// teardown marks `connections` as stopping, or until an accept or the
+/// connection to the server fails. The loop's thread owns `listener`, which
+/// closes when the loop returns.
+fn accept_connections(
+    listener: &TcpListener,
+    upstream: SocketAddr,
+    shared: &Arc<Shared>,
+    connections: &Mutex<Connections>,
+) {
+    for client in listener.incoming() {
+        let Ok(client) = client else { return };
+        // The connection that wakes the loop for the teardown is never proxied.
+        if lock(connections).stopping {
+            return;
+        }
+        let Ok(server) = TcpStream::connect(upstream) else {
+            return;
+        };
+        let mut connections = lock(connections);
+        // A teardown that began during the connection to the server has shut
+        // down every socket recorded before it: these two are closed instead.
+        if connections.stopping {
+            return;
+        }
+        shared.connected(&client);
+        proxy_connection(client, server, shared, &mut connections);
+    }
+}
+
+/// Starts the two forwarding threads of one proxied connection, and records
+/// them and a handle on each of its sockets in `connections`.
+fn proxy_connection(
+    client: TcpStream,
+    server: TcpStream,
+    shared: &Arc<Shared>,
+    connections: &mut Connections,
+) {
     let client_reader = client
         .try_clone()
         .expect("a second handle on the client socket");
     let server_writer = server
         .try_clone()
         .expect("a second handle on the server socket");
+    connections.sockets.push(
+        client
+            .try_clone()
+            .expect("a third handle on the client socket"),
+    );
+    connections.sockets.push(
+        server
+            .try_clone()
+            .expect("a third handle on the server socket"),
+    );
     let requests = Arc::clone(shared);
-    thread::spawn(move || forward_requests(client_reader, server_writer, &requests));
+    connections.workers.push(thread::spawn(move || {
+        forward_requests(client_reader, server_writer, &requests);
+    }));
     let responses = Arc::clone(shared);
-    thread::spawn(move || forward_responses(server, client, &responses));
+    connections.workers.push(thread::spawn(move || {
+        forward_responses(server, client, &responses);
+    }));
 }
 
 /// Client to server: every byte is forwarded, after the requests it completes
@@ -565,6 +768,15 @@ async fn proxied_pool(stack: &TestStack, proxy: &Proxy) -> PgPool {
         .expect("the proxied pool connects")
 }
 
+/// Whether nothing listens on loopback `port` any more: a new listener binds
+/// it, or, while another socket holds the port, a connection to it is
+/// refused.
+fn released(port: u16) -> bool {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
+        || TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .is_err_and(|error| error.kind() == ErrorKind::ConnectionRefused)
+}
+
 /// The detail call is dropped while the `RELEASE SAVEPOINT` of the summary's
 /// savepoint has run but is unanswered: the summary still commits with the
 /// detail a later call inserts.
@@ -753,12 +965,86 @@ async fn an_aborted_transaction_is_not_committed(stack: &TestStack, db: &Db) {
 fn an_abandoned_store_call_is_undone_alone_and_its_unit_of_work_still_commits() {
     block_on(async {
         let stack = TestStack::postgres().await;
-        let proxy = Proxy::start(upstream(&stack));
+        let mut proxy = Proxy::start(upstream(&stack));
         let db = Db::from_pool(proxied_pool(&stack, &proxy).await);
         an_unanswered_release_keeps_the_summary(&stack, &db, &proxy).await;
         an_unanswered_savepoint_keeps_the_transaction(&stack, &db, &proxy).await;
         a_blocked_write_is_undone_alone(&stack, &db).await;
         an_unanswered_rollback_keeps_the_transaction(&stack, &db, &proxy).await;
         an_aborted_transaction_is_not_committed(&stack, &db).await;
+        db.close().await;
+        assert_eq!(proxy.shut_down(), Teardown::CLEAN);
+        assert!(released(proxy.port), "the proxy's port is still taken");
     });
+}
+
+/// How the teardown test ends a proxy.
+#[derive(Debug, Clone, Copy)]
+enum Ending {
+    /// [`Proxy::shut_down`], twice: the second call reports the first one's
+    /// outcome.
+    ShutDown,
+    /// Dropping the proxy, which fails the test unless the teardown is clean.
+    Dropped,
+}
+
+/// Ending a proxy, by its teardown or by dropping it, frees its port, ends
+/// its accept loop and the two forwarding threads of a live proxied
+/// connection, and closes both ends of that connection. A loopback listener
+/// stands in for the server, so the test needs no Docker.
+#[test]
+fn an_ended_proxy_frees_its_port_ends_its_threads_and_closes_its_connection() {
+    for ending in [Ending::ShutDown, Ending::Dropped] {
+        let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
+        let mut proxy = Proxy::start(server.local_addr().expect("the server address"));
+        let port = proxy.port;
+        let mut client =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("a connection to the proxy");
+        let (mut backend, _) = server.accept().expect("the proxy connects to the server");
+        for stream in [&client, &backend] {
+            stream
+                .set_read_timeout(Some(TEARDOWN_PATIENCE))
+                .expect("a read timeout");
+        }
+        // A startup message for protocol 3.0 one way and a `ReadyForQuery`
+        // the other prove that both forwarding threads run.
+        let startup = [0_u8, 0, 0, 8, 0, 3, 0, 0];
+        client.write_all(&startup).expect("the client writes");
+        let mut forwarded = [0_u8; 8];
+        backend
+            .read_exact(&mut forwarded)
+            .expect("the request reaches the server");
+        assert_eq!(forwarded, startup, "{ending:?}");
+        let ready = *b"Z\0\0\0\x05I";
+        backend.write_all(&ready).expect("the server writes");
+        let mut passed = [0_u8; 6];
+        client
+            .read_exact(&mut passed)
+            .expect("the response reaches the client");
+        assert_eq!(passed, ready, "{ending:?}");
+        match ending {
+            Ending::ShutDown => {
+                let outcome = proxy.shut_down();
+                assert_eq!(outcome, Teardown::CLEAN, "{ending:?}");
+                assert_eq!(proxy.shut_down(), outcome, "{ending:?}: a second call");
+                drop(proxy);
+            }
+            Ending::Dropped => drop(proxy),
+        }
+        assert!(
+            released(port),
+            "{ending:?}: the proxy's port is still taken"
+        );
+        let mut rest = [0_u8; 1];
+        assert_eq!(
+            client.read(&mut rest).map_err(|error| error.kind()),
+            Ok(0),
+            "{ending:?}: the client sees the end of the stream"
+        );
+        assert_eq!(
+            backend.read(&mut rest).map_err(|error| error.kind()),
+            Ok(0),
+            "{ending:?}: the server sees the end of the stream"
+        );
+    }
 }

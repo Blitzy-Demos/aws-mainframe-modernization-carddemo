@@ -11,8 +11,12 @@
 //! - the inherent reward methods of `PgStore` (`repos::rewards`): the rule
 //!   administration, the balance read and the reward history page;
 //! - `RewardEngine::accrue` over the real store, the one reward calculation
-//!   (AAP 0.6.4). No test selects a rule or computes points itself: the
-//!   expected values are constants.
+//!   (AAP 0.6.4), against the unbounded seed rules and against inserted rules
+//!   with both, one or no amount bounds, which reach the engine through the
+//!   candidate read and its row conversion: amounts at each inclusive bound,
+//!   one cent beyond it, and a higher-rate rule its range excludes. No test
+//!   selects a rule or computes points itself: the expected values are
+//!   constants.
 //!
 //! The invariant `available_points = total_points_earned -
 //! total_points_redeemed` is checked on every balance the store returns, on the
@@ -550,6 +554,8 @@ fn large_points_round_trip_and_overflow_is_an_error() {
 /// as CT02 and POSTTRAN hand it the transaction they post in (AAP 0.3.5):
 /// step (1), an amount of zero or less, and a pair without a rule accrue
 /// nothing; step (4) earns `ceil(amount × rate)` and credits the balance.
+/// Its rules are the unbounded seed rules; the amount bounds are
+/// `engine_applies_amount_bounds_through_pg_store`'s.
 #[test]
 fn engine_accrues_through_pg_store() {
     let prepared = fixture_seed();
@@ -624,6 +630,216 @@ fn engine_accrues_through_pg_store() {
             assert_eq!(stored_accruals(&db, tran.transaction_id).await, 0);
         }
         assert_eq!(stored_balance(&db, account(1)).await, Some((131, 0, 131)));
+    });
+}
+
+/// A rule for the pair at `rate_units`, active from [`seed_start`] with no
+/// end, bounded below by `min_cents` and above by `max_cents` where given.
+fn bounded_rule(
+    type_cd: &str,
+    category_cd: u16,
+    rate_units: i64,
+    min_cents: Option<i64>,
+    max_cents: Option<i64>,
+) -> NewRewardRule {
+    NewRewardRule {
+        min_transaction_amount: min_cents.map(amount),
+        max_transaction_amount: max_cents.map(amount),
+        ..new_rule(type_cd, category_cd, rate_units, seed_start(), None)
+    }
+}
+
+/// Inserts and commits each draft of `rules` through the store, checking that
+/// it takes the paired `rule_id` and is stored exactly as drafted, and returns
+/// the stored rules in the same order.
+async fn commit_rules(db: &Db, rules: Vec<(i64, NewRewardRule)>) -> Vec<RewardRule> {
+    let mut uow = db.begin().await.expect("a unit of work");
+    let mut store = uow.store();
+    let mut created = Vec::new();
+    for (rule_id, draft) in rules {
+        let rule = store
+            .insert_reward_rule(draft.clone())
+            .await
+            .expect("the insert");
+        assert_eq!(rule, RewardRule::from_new(RuleId::from(rule_id), &draft));
+        created.push(rule);
+    }
+    uow.commit().await.expect("the rules commit");
+    created
+}
+
+/// Every committed `reward_accruals` row in `accrual_id` order as
+/// (`transaction_id`, `rule_id`, `points_earned`, `created_at`).
+async fn all_accruals(db: &Db) -> Vec<(i64, i64, i64, DateTime<Utc>)> {
+    sqlx::query!(
+        "SELECT transaction_id, rule_id, points_earned, created_at \
+         FROM reward_accruals ORDER BY accrual_id"
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("the accrual rows read")
+    .into_iter()
+    .map(|row| {
+        (
+            row.transaction_id,
+            row.rule_id,
+            row.points_earned,
+            row.created_at,
+        )
+    })
+    .collect()
+}
+
+/// The committed `reward_accruals` rows of the transaction row `id` as
+/// (`accrual_id`, `account_id`, `rule_id`, `points_earned`, `created_at`).
+async fn accrual_rows(db: &Db, id: TransactionRowId) -> Vec<(i64, i64, i64, i64, DateTime<Utc>)> {
+    sqlx::query!(
+        "SELECT accrual_id, account_id, rule_id, points_earned, created_at \
+         FROM reward_accruals WHERE transaction_id = $1",
+        id.get()
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("the accrual rows read")
+    .into_iter()
+    .map(|row| {
+        (
+            row.accrual_id,
+            row.account_id,
+            row.rule_id,
+            row.points_earned,
+            row.created_at,
+        )
+    })
+    .collect()
+}
+
+/// `RewardEngine::accrue` over the real store against rules with amount
+/// bounds (AAP 0.3.5). Each bound is written by the rule insert, read back by
+/// `candidate_rules`, which returns every rule of the pair whatever the
+/// amount, and applied by the engine: both bounds inclusive, an absent bound
+/// unbounded, and the highest rate among the matches winning. The rules sit
+/// on pairs no seed rule uses, so each pair's candidates are the rules
+/// inserted here:
+///
+/// - rule 3, `03`/`0001` at 1.2345 from 10.00 to 50.00: each bound accrues,
+///   one cent beyond either does not;
+/// - rule 4, `03`/`0002` at 2.0000 from 25.00 with no maximum;
+/// - rule 5, `05`/`0001` at 0.5000 up to 20.00 with no minimum;
+/// - rule 6, `06`/`0002` at 0.2500 with no bounds, from 0.01 to the largest
+///   `S9(09)V99` amount;
+/// - rules 7 and 8, both `07`/`0001`: 5.0000 from 100.00 to 200.00 and 1.0000
+///   from 50.00 to 500.00. The higher rate wins at either of its bounds and,
+///   one cent outside its range, loses to the lower rate, still in range.
+///
+/// Each case posts a live transaction for an account of its own and commits
+/// the accrual in a unit of its own, so the returned accrual, the stored row
+/// of the transaction and the stored balance are exact per case. A miss
+/// stores no accrual and no balance row.
+#[test]
+fn engine_applies_amount_bounds_through_pg_store() {
+    let prepared = fixture_seed();
+    block_on(async {
+        let (_stack, db) = seeded(prepared).await;
+        let rules = vec![
+            (3, bounded_rule("03", 1, 12_345, Some(1_000), Some(5_000))),
+            (4, bounded_rule("03", 2, 20_000, Some(2_500), None)),
+            (5, bounded_rule("05", 1, 5_000, None, Some(2_000))),
+            (6, bounded_rule("06", 2, 2_500, None, None)),
+            (7, bounded_rule("07", 1, 50_000, Some(10_000), Some(20_000))),
+            (8, bounded_rule("07", 1, 10_000, Some(5_000), Some(50_000))),
+        ];
+        let created = commit_rules(&db, rules).await;
+
+        let mut uow = db.begin().await.expect("a unit of work");
+        let mut rewards = uow.rewards();
+        for (type_cd, category_cd, expected) in [
+            ("03", 1, &created[..1]),
+            ("03", 2, &created[1..2]),
+            ("05", 1, &created[2..3]),
+            ("06", 2, &created[3..4]),
+            ("07", 1, &created[4..]),
+        ] {
+            let candidates = rewards
+                .candidate_rules(TranTypeCode::move_from(type_cd), category(category_cd))
+                .await
+                .expect("the candidate read");
+            assert_eq!(candidates, expected, "{type_cd}/{category_cd}");
+        }
+        uow.rollback().await.expect("the read-only unit ends");
+
+        // (account, type, category, amount in cents, and the accrual as
+        // (accrual_id, rule_id, points), or None for no accrual)
+        let cases = [
+            // Rule 3: 10.00 earns ceil(12.345) = 13, 50.00 ceil(61.725) = 62.
+            (11, "03", 1, 1_000, Some((1, 3, 13))),
+            (12, "03", 1, 5_000, Some((2, 3, 62))),
+            (13, "03", 1, 999, None),
+            (14, "03", 1, 5_001, None),
+            // Rule 4: 25.00 earns 50, 999,999,999.99 ceil(1,999,999,999.98).
+            (15, "03", 2, 2_499, None),
+            (16, "03", 2, 2_500, Some((3, 4, 50))),
+            (17, "03", 2, 99_999_999_999, Some((4, 4, 2_000_000_000))),
+            // Rule 5: 0.01 earns ceil(0.005) = 1, 20.00 earns 10.
+            (18, "05", 1, 1, Some((5, 5, 1))),
+            (19, "05", 1, 2_000, Some((6, 5, 10))),
+            (20, "05", 1, 2_001, None),
+            // Rule 6: 0.01 earns ceil(0.0025) = 1, 999,999,999.99
+            // ceil(249,999,999.9975).
+            (21, "06", 2, 1, Some((7, 6, 1))),
+            (22, "06", 2, 99_999_999_999, Some((8, 6, 250_000_000))),
+            // Rules 7 and 8: 99.99 and 200.01 fall outside rule 7 and earn
+            // ceil(99.99) = 100 and ceil(200.01) = 201 under rule 8; 100.00
+            // and 200.00 earn 500 and 1000 under rule 7; 49.99 matches neither.
+            (23, "07", 1, 9_999, Some((9, 8, 100))),
+            (24, "07", 1, 10_000, Some((10, 7, 500))),
+            (25, "07", 1, 20_000, Some((11, 7, 1_000))),
+            (26, "07", 1, 20_001, Some((12, 8, 201))),
+            (27, "07", 1, 4_999, None),
+        ];
+        let mut hits = Vec::new();
+        for (holder_id, type_cd, category_cd, cents, expected) in cases {
+            let case = format!("{type_cd}/{category_cd} at {cents} cents");
+            let holder = account(holder_id);
+            let tran = live_transaction(&db, holder, type_cd, category_cd, cents).await;
+            let mut uow = db.begin().await.expect("a unit of work");
+            let accrued = accrue_at(&mut uow, &tran, holder, at()).await;
+            uow.commit().await.expect("the accrual commits");
+
+            assert_eq!(
+                accrued,
+                expected.map(|(accrual_id, rule_id, earned)| RewardAccrual {
+                    accrual_id: AccrualId::from(accrual_id),
+                    account_id: holder,
+                    transaction_id: tran.transaction_id,
+                    rule_id: RuleId::from(rule_id),
+                    points_earned: points(earned),
+                    created_at: at(),
+                }),
+                "{case}"
+            );
+            let row = expected.map(|(accrual_id, rule_id, earned)| {
+                (accrual_id, holder.to_i64(), rule_id, earned, at())
+            });
+            assert_eq!(
+                accrual_rows(&db, tran.transaction_id).await,
+                row.into_iter().collect::<Vec<_>>(),
+                "{case}"
+            );
+            assert_eq!(
+                stored_balance(&db, holder).await,
+                expected.map(|(_, _, earned)| (earned, 0, earned)),
+                "{case}: available = earned - redeemed"
+            );
+            if let Some((_, rule_id, earned)) = expected {
+                hits.push((tran.transaction_id.get(), rule_id, earned, at()));
+            }
+        }
+        assert_eq!(
+            all_accruals(&db).await,
+            hits,
+            "the misses stored no accrual"
+        );
     });
 }
 

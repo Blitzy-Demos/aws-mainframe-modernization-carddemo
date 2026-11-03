@@ -350,28 +350,6 @@ mod tests {
         assert_eq!(found(None), Err(PortError::NotFound));
     }
 
-    #[test]
-    fn the_rewrite_binds_read_back_as_the_same_record() -> Result<(), NumericError> {
-        let account = first_fixture_account()?;
-        let row = AccountRow {
-            account_id: account.acct_id.to_i64(),
-            acct_active_status: account.acct_active_status.trimmed().into_owned(),
-            acct_curr_bal: account.acct_curr_bal.to_decimal(),
-            acct_credit_limit: account.acct_credit_limit.to_decimal(),
-            acct_cash_credit_limit: account.acct_cash_credit_limit.to_decimal(),
-            acct_open_date: account.acct_open_date.trimmed().into_owned(),
-            acct_expiraion_date: account.acct_expiraion_date.trimmed().into_owned(),
-            acct_reissue_date: account.acct_reissue_date.trimmed().into_owned(),
-            acct_curr_cyc_credit: account.acct_curr_cyc_credit.to_decimal(),
-            acct_curr_cyc_debit: account.acct_curr_cyc_debit.to_decimal(),
-            acct_addr_zip: account.acct_addr_zip.trimmed().into_owned(),
-            acct_group_id: account.acct_group_id.trimmed().into_owned(),
-        };
-        assert_eq!(row.acct_group_id, "", "a blank group ID is stored as ''");
-        assert_eq!(found(Some(row)), Ok(account));
-        Ok(())
-    }
-
     /// A change that puts one column of a row outside its picture.
     type Spoil = fn(&mut AccountRow);
 

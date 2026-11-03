@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT account_id::text AS account_id, acct_active_status::text AS acct_active_status, acct_curr_bal::text AS acct_curr_bal, acct_credit_limit::text AS acct_credit_limit, acct_cash_credit_limit::text AS acct_cash_credit_limit, acct_open_date::text AS acct_open_date, acct_expiraion_date::text AS acct_expiraion_date, acct_reissue_date::text AS acct_reissue_date, acct_curr_cyc_credit::text AS acct_curr_cyc_credit, acct_curr_cyc_debit::text AS acct_curr_cyc_debit, acct_addr_zip::text AS acct_addr_zip, acct_group_id::text AS acct_group_id FROM accounts ORDER BY accounts.account_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "acct_active_status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "acct_curr_bal",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "acct_credit_limit",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "acct_cash_credit_limit",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "acct_open_date",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "acct_expiraion_date",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "acct_reissue_date",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "acct_curr_cyc_credit",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "acct_curr_cyc_debit",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "acct_addr_zip",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "acct_group_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "14a0a6c48e41b9920fa42b2b8fbf38f59cd0b8e10f151fb3a2cb628b536f97d4"
+}
