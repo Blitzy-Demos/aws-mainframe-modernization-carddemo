@@ -221,12 +221,13 @@ test.describe("UI gate", () => {
     await signIn(page, "user");
     const sent = recordAdminRequests(page);
     for (const path of adminPaths()) {
+      // page.goto loads a fresh document, so the previous route's toast is
+      // gone and the one asserted here is this route's own; the session
+      // survives the reload in sessionStorage.
       await page.goto(path);
       await expect(page, path).toHaveURL(urlPath(USERS.user.landing));
-      await expect(
-        notifications(page).getByText(shown(MESSAGES.ADMIN_ACCESS_REQUIRED), { exact: true }),
-        path,
-      ).toHaveCount(1);
+      await expect(adminToast(page), path).toBeVisible();
+      await expect(adminToast(page), path).toHaveCount(1);
     }
     expect(sent).toEqual([]);
   });

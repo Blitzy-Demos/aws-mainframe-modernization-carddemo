@@ -139,7 +139,9 @@ async function focusOnRadio(page: Page): Promise<boolean> {
 
 /**
  * Checks the radio `target`: Tab into its group, arrow keys to the target,
- * Space to check it (a radio group is a single Tab stop).
+ * Space to check it (a radio group is a single Tab stop). Each ArrowDown
+ * waits until focus has left the radio it was pressed on, so every key moves
+ * focus exactly one radio before the next comparison.
  */
 async function chooseRadio(page: Page, target: Locator): Promise<void> {
   await expect(target).toBeVisible();
@@ -150,7 +152,21 @@ async function chooseRadio(page: Page, target: Locator): Promise<void> {
     if (await target.evaluate((element) => element === document.activeElement)) {
       break;
     }
-    await page.keyboard.press("ArrowDown");
+    // The roving-focus group moves focus in a timer after the keydown, not
+    // during it: without this wait the next comparison sees the old radio,
+    // the next key stacks a second move, and a move still pending after the
+    // loop shifts focus (and Space) off the target.
+    const pressedOn = await page.evaluateHandle(() => document.activeElement);
+    try {
+      await page.keyboard.press("ArrowDown");
+      await expect
+        .poll(() => pressedOn.evaluate((element) => element !== document.activeElement), {
+          message: "ArrowDown moves focus off the focused radio",
+        })
+        .toBe(true);
+    } finally {
+      await pressedOn.dispose();
+    }
   }
   await expect(target).toBeFocused();
   await page.keyboard.press("Space");
