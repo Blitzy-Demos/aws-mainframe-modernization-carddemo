@@ -1,0 +1,219 @@
+# CardDemo sign-off checklist
+
+This is the acceptance record of the Rust and React replacement of the CardDemo COBOL application (AAP 0.10). It lists every success criterion with its check, what the check reads, its pass condition and its result, then the verification bindings, the hygiene gates, the escalations that block sign-off, the human COBOL reviews, the known differences and g8.
+
+**Done ≡ o1..o8 ∧ g8 sign-off fully checked.** g8 has no definition in the request (E-18), so it stays unticked and Done is not claimed, whatever the other rows show.
+
+This file never claims more than was run. A check is `passed` only when its command ran in this run and was seen to succeed; a check that could not run is `unverified`, never `passed`.
+
+## How to read this file
+
+- **Done** is `[x]` only when every command in the row's Check ran in this run and passed; otherwise `[ ]`.
+- **Result** is one of:
+  - `passed`: every command of the row ran and passed.
+  - `failed`: a command of the row, or a test target the row names, ran and failed. The Evidence log names it.
+  - `unverified (<reason>)`: the environment lacks what the check needs (AAP 0.10.4).
+  - `pending`: the check, or part of it, has not run yet. The Evidence log says which part ran.
+- A row that names test targets is judged on those targets: a failure in another target of the same `cargo test` command makes the row `pending` when it stopped a named target from running, not `failed`.
+- **Commands** are those of `docs/RUNBOOK.md`, cited by section. A gate command that the runbook gives in another form is noted where it is listed.
+- **Evidence run:** commit `fbd24066e00774a1eda6bbf978af7cfb06f0b874`, 2026-11-04, the parent of the commit that adds this file, which changes no other file. Toolchain: Rust 1.88.0, Node.js 22.23.4, pnpm 9.15.9, Docker 29.9.2 with Compose v5.6.1, GCC. Every command ran from the repository root with `.env.example` loaded (RUNBOOK §3.1), `RUSTFLAGS="-D warnings"` exported (RUNBOOK §11.2) and `SQLX_OFFLINE=true` (RUNBOOK §3.1), except where a row says otherwise. The Compose services ran under their own project name and host ports, which override the localhost defaults of `.env.example`.
+
+## Success criteria
+
+| Done | Criterion | Check | Reads | Pass condition | Result |
+|---|---|---|---|---|---|
+| [ ] | o1 Online parity | `cargo test -p carddemo-api --locked` (RUNBOOK §11.1): the 19 REST transaction tests `crates/api/tests/{cc00_signon,cavw_account_view,caup_account_update,ccli_card_list,ccdl_card_view,ccup_card_update,ct00_transaction_list,ct01_transaction_view,ct02_transaction_add,cr00_reports,cb00_bill_payment,cpvs_auth_summary,cpvd_auth_detail,cu00_user_list,cu01_user_add,cu02_user_update,cu03_user_delete,cttu_tran_type_upsert,ctli_tran_type_list_delete}.rs`, reqwest against the router on testcontainers `postgres:16.15`; `crates/batch/tests/parity_audit_coverage.rs` in `cargo test -p carddemo-batch --locked` (every `P-` ID cited by a test); CM00 and CA00: `web/e2e/navigation.spec.ts` in `pnpm --dir web e2e` (RUNBOOK §11.4); CP00, CDRD and CDRA: `cargo test -p carddemo-messaging --locked` | `docs/parity/parity-oracle-audit.md` sections B and D; `docs/parity/validation-audit.md` | Every endpoint of the online transactions table answers its valid input with the audited result; every `P-` row of an online program is cited by a passing test | failed |
+| [ ] | o2 Batch parity | `cargo test -p carddemo-batch --locked`: `crates/batch/tests/{posttran_rejects,intcalc,tranbkp_combtran,creastmt,tranrept,tranextr_refresh,cbpaup0j,mnttrdb2,batch_cycle}.rs`; the 8 subcommands `posttran`, `intcalc`, `tranbkp`, `combtran`, `creastmt`, `tranrept`, `cbpaup0j` and `mnttrdb2`, each as `cargo run --bin batch -- <subcommand>` (RUNBOOK §9.1, §9.2) | Section D; `app/data/ASCII/dailytran.txt` | The generated `DALYREJS` set ≡ the audit's reject rows (D.1), byte for byte; exit codes as AAP 0.5.3.5 and RUNBOOK §9.4 define them: 0 success, 4 rejects, 8 reward-engine halt (`posttran` only), 16 abend | failed |
+| [ ] | o3 Financial exactness | `crates/domain/tests/{interest,bill_payment,posting_rules,money_props}.rs` in `cargo test -p carddemo-domain --locked`; `crates/batch/tests/intcalc.rs` in `cargo test -p carddemo-batch --locked`; `crates/api/tests/cb00_bill_payment.rs` in `cargo test -p carddemo-api --locked`; the float scan of `crates/testkit/tests/hygiene.rs` (`no_float_in_financial_crates`, `no_float_in_migrations`, `no_float_parsing_in_web`) in `cargo test -p carddemo-testkit --locked` | Sections C and D | Every interest, bill-payment and category-balance value ≡ the audit to 2 decimal places; reward points follow AAP 0.9.2 (exact product, then `ceil`); the scan finds no floating-point type | pending |
+| [x] | o4 Data fidelity | `cargo test -p carddemo-codec --locked`: `crates/codec/tests/fixture_roundtrip.rs` (all 626 ASCII records and the 626 EBCDIC counterpart records, at record and file level), `crates/codec/tests/field_props.rs` (proptest), `crates/codec/tests/ascii_ebcdic_crosscheck.rs`, insta snapshots `crates/codec/tests/snapshots/*.snap` | `app/data/ASCII/*`, `app/data/EBCDIC/*`; section A | encode(decode(bytes)) ≡ bytes for every record and file; the cross-check differs only at E-05, with the EBCDIC rate E-79 corrects | passed |
+| [ ] | o5 Auth parity | `crates/api/tests/cc00_signon.rs` (ADMIN001 and USER0001 with `PASSWORD`, and each COSGN00C failure message) and `crates/api/tests/admin_gate.rs` (every `/admin/**` route, reward rules included) in `cargo test -p carddemo-api --locked`; `web/e2e/admin-gate.spec.ts` in `pnpm --dir web e2e` | `docs/parity/validation-audit.md` (COSGN00C) | ADMIN001 and USER0001 sign on with `PASSWORD`; every `/admin/**` route answers a `U` token with 403, an `A` token with 2xx and no token with 401 | failed |
+| [ ] | o6 Build hygiene | Hygiene gates H1 to H7 below: warning-free build of every target, clippy, formatting, TypeScript and Vite builds, test builds and the `hygiene.rs` scans | — | Zero compiler and clippy warnings, zero `unsafe`, zero lint suppressions | pending |
+| [ ] | o7 Modern frontend | `web/e2e/navigation.spec.ts` (every `F-` ID, every route, both roles), `web/e2e/responsive.spec.ts` (768×1024 and 1280×800), `web/e2e/forms.spec.ts` (keyboard only) and `web/e2e/rewards.spec.ts` in `pnpm --dir web e2e`; `pnpm --dir web test` (page FN tests, `web/src/schemas/schemas.test.ts`, `web/src/test/no-raw-elements.test.ts`, `web/src/test/no-persistent-preferences.test.ts`); `pnpm --dir web typecheck`; `pnpm --dir web gen:api:check` (`web/scripts/check-api-types.mjs`); `cargo test -p carddemo-api --test openapi_spec --locked` (`crates/api/tests/openapi_spec.rs`, RUNBOOK §10.1) | `docs/parity/function-map.md`; `web/openapi/openapi.json` | All pass; no stale OpenAPI document or client types; every `F-` ID cited by `navigation.spec.ts` | failed |
+| [ ] | o8 Rewards | `crates/domain/tests/reward_engine.rs` (`cargo test -p carddemo-domain --locked`); `crates/persistence/tests/rewards_store.rs` (`cargo test -p carddemo-persistence --locked`); `crates/api/tests/{ct02_transaction_add,admin_reward_rules,rewards_balance_history}.rs` (`cargo test -p carddemo-api --locked`); `crates/batch/tests/posttran_rewards.rs` (`cargo test -p carddemo-batch --locked`); `web/src/pages/rewards/RewardsPage.test.tsx` (`pnpm --dir web test`); `web/e2e/rewards.spec.ts` (`pnpm --dir web e2e`) | Request rewards specification (AAP 0.3.5, 0.3.6, 0.9.2) | CRUD and soft delete behave per AAP 0.3.5; CT02 and POSTTRAN accrue through `RewardEngine`; the `CHECK` and the tests hold `available = earned − redeemed`; a stored balance of `9007199254740993` arrives exactly: as the JSON string (`rewards_balance_history.rs`), as rendered text (`RewardsPage.test.tsx`) and on the page (`rewards.spec.ts`) | pending |
+| [ ] | Errors | `crates/api/tests/validation_audit_coverage.rs` (every `V-` row has a test that sends its failing input and asserts the status, the exact `message` and the `fields` entry) and the error cases of `crates/api/tests/*`: missing account, card and user; an empty required field; duplicate adds of a user, a transaction type and a transaction; an empty list; a non-admin call; each reward error; the CT02 rollback (injected engine failure → 500, nothing persisted); all in `cargo test -p carddemo-api --locked`. The POSTTRAN halt (exit 8, `DALYREJS` unchanged): `crates/batch/tests/posttran_rewards.rs` in `cargo test -p carddemo-batch --locked` | `docs/parity/validation-audit.md`; the reward messages of `crates/domain/src/messages.rs` | All pass | pending |
+| [x] | Structural | `crates/domain/tests/manifest_boundary.rs` and `crates/domain/tests/newtype_algebra.rs` (trybuild: `crates/domain/tests/compile_fail/{money_plus_interest_rate,money_plus_reward_rate,money_plus_reward_points,reward_points_plus_money,money_from_f64}.rs`) in `cargo test -p carddemo-domain --locked`; `cargo tree -p carddemo-domain -e normal \| grep -c sqlx` (RUNBOOK §11.2); `git ls-files Cargo.lock web/pnpm-lock.yaml` (RUNBOOK §11.6) | — | No `sqlx` under `domain` (count `0`); every compile-fail case fails with its `.stderr`; both lockfiles tracked | passed |
+| [x] | Protected paths | `git diff --stat 59cc6c2 -- app/cbl app/cpy app/bms app/jcl app/proc app/asm app/csd app/ctl app/maclib app/scheduler app/data/ASCII app/data/EBCDIC`; `git diff --name-status 59cc6c2` (RUNBOOK §11.6) | — | The first prints nothing; the second lists only `A` for AAP 0.2.1 paths and `M .gitignore` | passed |
+| [ ] | Messaging | `cargo test -p carddemo-messaging --locked`: `crates/messaging/tests/{cdrd_date,cdra_account,cp00_authorization,ack_after_confirm}.rs` on testcontainers `rabbitmq:3.13.7-management` with `infra/rabbitmq/*` mounted, and `postgres:16.15` | Sections B and D rows for CODATE01, COACCT01 and COPAUA0C | Reply bodies ≡ the audit (time fields by format); `message_id` and `correlation_id` per AAP 0.3.3; CDRD and CDRA errors arrive on `CARD.DEMO.ERROR`; a failed CP00 reply logs `M004`; no request is acknowledged before its reply's `Ack(None)`; `ack_after_confirm.rs` (reply queue deleted, CDRA read error injected): the error record arrives, the request is rejected and never redelivered | pending |
+| [ ] | Statements | `crates/batch/tests/creastmt.rs` with the snapshots `crates/batch/tests/snapshots/creastmt__stmtfile.snap` and `creastmt__htmlfile.snap`, in `cargo test -p carddemo-batch --locked` | Section D.5 (CREASTMT) | STMTFILE and HTMLFILE ≡ the audit; the lines `lopdf` extracts from `STATEMNT.PS.PDF` ≡ the STMTFILE records, in count and order, with no trimming | failed |
+| [ ] | Sign-off | This file | All of the above | This file holds every row above with its evidence, every `open` and `halt` escalation, the human audit reviews and the known differences; g8 stays unticked, because the request gives no definition (E-18); Done is not claimed until the user confirms g8 | pending |
+
+In this run: o4, Structural and Protected paths passed. o1, o2, o5, o7 and Statements failed, each only on a timeout: a test container that did not start in time, or an end-to-end hook or test that ran past its limit on an overloaded host. No assertion failed (Evidence log). o3, o6, o8, Errors and Messaging are pending, because part of their checks did not run, and Sign-off is pending on g8.
+
+## Verification bindings
+
+The request defines `NAV`, `FN` and `RWD` in its notation and describes `R3`, `R4` and `R18` under "Why Rust". It uses every other ID below without a definition (E-18). For those, the plan satisfies the stated check of the line each ID is attached to and does not claim the ID's meaning, so their status stays `open: meaning` until the user defines them.
+
+| ID | Request definition | Attached to | Check | Status |
+|---|---|---|---|---|
+| `NAV` | All screens navigable via integration test | o7 | `web/e2e/navigation.spec.ts` | failed |
+| `FN` | Every function accepts valid and rejects invalid input | o7, frontend principles, input validation | Page FN tests and `web/src/schemas/schemas.test.ts` (`pnpm --dir web test`), `web/e2e/forms.spec.ts`, the API error tests of the Errors row | pending |
+| `RWD` | Reward engine wiring, balance invariant and CRUD verified | o8 | The o8 row | pending |
+| `R3` | `domain` does not list sqlx; the reward engine lives in `domain` | Rewards wiring | `crates/domain/tests/manifest_boundary.rs`; `cargo tree -p carddemo-domain -e normal \| grep -c sqlx` → `0`; `RewardEngine` in `crates/domain/src/rewards/engine.rs` | passed |
+| `R4` | `query!`/`query_as!` verify SQL against the live schema at compile time | Reward tables, migrations | `cargo build --workspace --locked` with `DATABASE_URL` naming the migrated Compose database and `SQLX_OFFLINE` unset; `cargo sqlx prepare --workspace --check -- --all-targets` (RUNBOOK §10.2); `only_checked_sqlx_macros` in `crates/testkit/tests/hygiene.rs` (bans `sqlx::query(`) | pending |
+| `R18` | Newtype algebra; `Money + Rate` and `Money + RewardPoints` fail to compile | Structural, Money constraint | `crates/domain/tests/newtype_algebra.rs` (trybuild, 5 cases) | passed |
+| `g1a` | Not defined | o1; the preconditions name it unverifiable under static analysis | The o1 row | open: meaning |
+| `g1b` | Not defined | o1; the preconditions name it unverifiable under static analysis | The o1 row | open: meaning |
+| `i9` | Not defined | o2 reject set | `crates/batch/tests/posttran_rejects.rs` | open: meaning |
+| `R1` | Not defined | o3; `reward_rate` newtype, no floating point | The float scan (H7); the `RewardRate` type; `crates/domain/tests/compile_fail/money_plus_reward_rate.rs` | open: meaning |
+| `i2` | Not defined; R18 refers to "the i2 formula" | o3 | `crates/domain/tests/interest.rs`, `crates/batch/tests/intcalc.rs`; `RatedBalance::monthly` (`crates/domain/src/numeric/rates.rs`) as the only typed rate formula. What `i2` names is not assumed | open: meaning |
+| `i8` | Not defined | o4 | The o4 row | open: meaning |
+| `d9` | Not defined | o4 | The o4 row | open: meaning |
+| `R8` | Not defined | o5 | The o5 row | open: meaning |
+| `n5` | Not defined | o5 | The o5 row | open: meaning |
+| `g2` | Not defined | o6 | Hygiene gates | open: meaning |
+| `R15` | Not defined | o6 | Hygiene gates | open: meaning |
+| `g9` | Not defined | CT02 and POSTTRAN reward wiring | `crates/api/tests/ct02_transaction_add.rs`, `crates/batch/tests/posttran_rewards.rs` | open: meaning |
+| `g8` | Not defined | Done; Sign-off | This file collects the evidence; g8 stays unticked (section g8) | open: meaning |
+| `g3a` | Not defined | Only the preconditions, as unverifiable under static analysis | None claimed | open: meaning |
+| `g3b` | Not defined | Only the preconditions, as unverifiable under static analysis | None claimed | open: meaning |
+
+## Hygiene gates
+
+Commands as AAP 0.10.3 gives them. RUNBOOK §11.2 runs H1 and H3 as `cargo build --workspace --all-targets --locked` and `cargo test --workspace --locked` with `RUSTFLAGS="-D warnings"` exported once, which is the same command. H9 is written as RUNBOOK §10.2 gives it, whose `-- --all-targets` also checks the queries in test sources.
+
+| Done | Gate | Command | Pass condition | Result |
+|---|---|---|---|---|
+| [x] | H1 Zero warnings: build | `RUSTFLAGS="-D warnings" cargo build --workspace --all-targets --locked` | Exit 0; no warning. `--all-targets` compiles every library, binary, test and bench target | passed |
+| [x] | H2 Zero warnings: clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Exit 0; `clippy::all` and `clippy::pedantic` deny through `[workspace.lints]` | passed |
+| [ ] | H3 Zero warnings: tests | `RUSTFLAGS="-D warnings" cargo test --workspace --locked` | Exit 0 | pending |
+| [x] | H4 Formatting | `cargo fmt --all -- --check` | Exit 0 | passed |
+| [x] | H5 TypeScript | `pnpm --dir web typecheck` | Exit 0; no warning | passed |
+| [x] | H6 Web build | `pnpm --dir web build` | Exit 0; no warning; no chunk above Vite's 500 kB warning limit; no raised `chunkSizeWarningLimit` | passed |
+| [x] | H7 Source scans | `cargo test -p carddemo-testkit --locked` (`crates/testkit/tests/hygiene.rs`, RUNBOOK §11.1) | `no_unsafe_token` (`unsafe`), `no_rust_lint_suppressions` and `no_web_lint_suppressions` (lint suppressions), `lint_configuration_is_workspace_only`, `no_float_in_financial_crates` and `no_float_in_migrations` (`f32`/`f64`, `REAL`, `DOUBLE PRECISION`, `FLOAT`), `no_float_parsing_in_web` (`parseFloat(`/`Number(`), `fetch_only_in_api_client` (raw `fetch(`), `only_checked_sqlx_macros` (`sqlx::query(`), `no_sql_built_with_format`, `transactions_table_only_in_owning_modules`, `forbidden_crate_edges` all pass | passed |
+| [x] | H8 Supply chain | `cargo deny check` | Exit 0 with `advisories ok, bans ok, licenses ok, sources ok`, under the `deny.toml` policy and its two advisory ignores (E-11) | passed |
+| [x] | H9 Query metadata drift | `cargo sqlx prepare --workspace --check -- --all-targets` with `DATABASE_URL` naming a migrated database and `SQLX_OFFLINE` unset (RUNBOOK §10.2) | Exit 0 | passed |
+| [ ] | H10 Coverage | `cargo llvm-cov --workspace --lcov --output-path target/lcov.info` | Writes `target/lcov.info`; the request sets no threshold, so none is enforced | pending |
+
+## Evidence log
+
+What ran in this run, on the evidence-run commit, and what it showed. Test counts are per test target; `unit` is a crate's library and binary unit tests. A Rust test command stops at its first failing test target, so targets after it did not run.
+
+The host ran at a load average of 26 to 90 on 12 CPUs, on a Docker daemon shared with other workloads: one `docker compose exec -T postgres psql` round trip took 7.2 to 10.2 s. **Every failure in the table below is a timeout of that kind, either a test container that did not start in time or an end-to-end hook or test that ran past its time limit. No assertion failed.**
+
+| Check | Command | Outcome |
+|---|---|---|
+| Protected paths | `git diff --stat 59cc6c2 -- app/cbl app/cpy app/bms app/jcl app/proc app/asm app/csd app/ctl app/maclib app/scheduler app/data/ASCII app/data/EBCDIC`; `git diff --name-status 59cc6c2`; `git ls-files Cargo.lock web/pnpm-lock.yaml` | passed: the first printed nothing; the second printed 649 `A` lines, all under AAP 0.2.1 paths, and `M .gitignore`; the third printed `Cargo.lock` and `web/pnpm-lock.yaml` |
+| H4 | `cargo fmt --all -- --check` | passed: exit 0 |
+| H1 | `cargo build --workspace --all-targets --locked` (`RUSTFLAGS="-D warnings"` exported) | passed: exit 0, no warning |
+| H2 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed: exit 0 |
+| R3 | `cargo tree -p carddemo-domain -e normal \| grep -c sqlx` | passed: `0` |
+| H8 | `cargo deny check` | passed: exit 0, `advisories ok, bans ok, licenses ok, sources ok`, no warning |
+| H9 | `sqlx migrate run --source migrations` (0001 to 0005 applied to the Compose PostgreSQL), then `cargo sqlx prepare --workspace --check -- --all-targets` with `SQLX_OFFLINE` unset | passed: exit 0, no drift |
+| Audit structure | `cargo test -p carddemo-audit --locked` | passed: unit 30, `audit_structure.rs` 15 |
+| Domain | `cargo test -p carddemo-domain --locked` | passed: unit 701, `bill_payment.rs` 12, `interest.rs` 7, `manifest_boundary.rs` 3, `money_props.rs` 16, `newtype_algebra.rs` 6 (the 5 compile-fail cases among them), `posting_rules.rs` 13, `reward_engine.rs` 17 |
+| Codec | `cargo test -p carddemo-codec --locked` | passed: unit 116, `ascii_ebcdic_crosscheck.rs` 3, `field_props.rs` 28, `fixture_roundtrip.rs` 25 |
+| Runtime | `cargo test -p carddemo-runtime --locked` | passed: unit 33, `json_output.rs` 2, doc 3 |
+| H7 | `cargo test -p carddemo-testkit --locked` | passed: unit 5, `compose_tags.rs` 8, `hygiene.rs` 33 |
+| Persistence | `cargo test -p carddemo-persistence --locked` | failed: unit 74, `account_rewrite.rs` 1, `commit_failure.rs` 1, `live_master.rs` 4, `migrations.rs` 9 and `rewards_store.rs` 11 passed; `seed.rs` 5 passed and 8 failed, each with `cannot start the postgres:16.15 test container (is the Docker daemon running?): failed to create a container: Timeout error`; `statement_cancellation.rs`, `statement_isolation.rs` and `tran_type_browse.rs` did not run |
+| API | `cargo test -p carddemo-api --locked` | pending: still running when this file was committed; finished so far, all passed: unit 314, `account_read_isolation.rs` 1, `admin_gate.rs` 2, `admin_reward_rules.rs` 3 |
+| API, targets run alone | `cargo test -p carddemo-api --test openapi_spec --locked` (RUNBOOK §10.1); `cargo test -p carddemo-api --test validation_audit_coverage --locked` | passed: `openapi_spec.rs` 9; `validation_audit_coverage.rs` 2 |
+| Batch | `cargo test -p carddemo-batch --locked` | failed: unit 113, `abend_write_persistence.rs` 2, `authorization_db2_layouts.rs` 6, `batch_cycle.rs` 1, `cbpaup0j.rs` 1 and `cbpaup0j_serialization.rs` 1 passed; `creastmt.rs` 3 passed (`statements_match_audit_text_html_and_pdf`, `audit_describes_every_statement_line`, `p_ids_are_every_statement_row`) and 2 failed (`empty_live_master_abends_reading_trnxfile`, `more_than_ten_transactions_on_a_card_halts_with_exit_16`), each with `cannot start the postgres:16.15 test container (is the Docker daemon running?): failed to start a container: Timeout error`; the 13 targets after it did not run, among them `intcalc.rs`, `mnttrdb2.rs`, `posttran_rejects.rs`, `posttran_rewards.rs`, `tranbkp_combtran.rs`, `tranextr_refresh.rs` and `tranrept.rs` |
+| Batch, target run alone | `cargo test -p carddemo-batch --test parity_audit_coverage --locked` | passed: `parity_audit_coverage.rs` 2 |
+| Messaging | `cargo test -p carddemo-messaging --locked` | pending: not run |
+| Batch subcommands | RUNBOOK §9.1 and §9.2 in order, each as `cargo run --bin batch -- <subcommand>` with its JCL default, on a database of its own: `migrate`, `seed --if-empty`, `seed`, `tranbkp`, `seed --only tranextr`, `posttran --input app/data/ASCII/dailytran.txt`, `intcalc --parm-date 2022071800`, `tranbkp`, `combtran`, `creastmt`, `cbpaup0j --sysin "00,00001,00001,Y"`, `tranrept --start-date 2022-01-01 --end-date 2022-07-06`, `mnttrdb2 --input <one A10INSTALLMENT record>` | passed: exit statuses 0, 0, 0, 12, 0, 4, 0, 0, 0, 0, 0, 0, 0, each the status RUNBOOK §9.1, §9.2 and §9.4 give; `DALYREJS.G0001V00` holds 38 records of 430 bytes; `STATEMNT.PS`, `STATEMNT.HTML` and `STATEMNT.PS.PDF` written |
+| Frontend install | `pnpm --dir web install --frozen-lockfile` | passed: lockfile up to date |
+| H5 | `pnpm --dir web typecheck` | passed: exit 0 |
+| Frontend unit and form tests | `pnpm --dir web test` | passed: 36 files, 870 tests, among them `schemas.test.ts` 154, `no-raw-elements.test.ts` 3, `no-persistent-preferences.test.ts` 4, `RewardsPage.test.tsx` 7 |
+| H6 | `pnpm --dir web build` | passed: exit 0, no warning; largest chunk 318.59 kB; `web/vite.config.ts` sets no `chunkSizeWarningLimit` |
+| Stale client types | `pnpm --dir web gen:api:check` | passed: `API client types are up to date` |
+| End-to-end | `pnpm --dir web e2e` (RUNBOOK §11.4), with the Compose services, a migrated and seeded database on which `posttran` had run, the API and Vite | failed: 838 tests, 267 passed, 3 failed, 568 did not run. Failed: the `beforeAll` hook of `navigation.spec.ts` "with seeded keys" (`"beforeAll" hook timeout of 240000ms exceeded`) in both projects, so its 284 tests per project did not run; `admin-gate.spec.ts:149` at `lg-1280x800` (`Test timeout of 120000ms exceeded`, 2.1 min; the same test passed at `md-768x1024` in 47.7 s). Passed in `md-768x1024`: `admin-gate.spec.ts` 9, `forms.spec.ts` 66, `navigation.spec.ts` 11 (4 function-map coverage tests, every `F-` ID cited among them; the `@smoke` sign-on; both roles' sidebar sections and entries; two breadcrumb trails), `responsive.spec.ts` 34, `rewards.spec.ts` 14; in `lg-1280x800` the same, but `admin-gate.spec.ts` 8 |
+| H3 | `RUSTFLAGS="-D warnings" cargo test --workspace --locked` | pending: not run in this form; the crate suites above ran instead, one command per crate, and H1 compiled every test target warning-free |
+| H10 | `cargo llvm-cov --workspace --lcov --output-path target/lcov.info` | pending: not run; it repeats every suite under instrumentation in a second target tree |
+| R4 live build | `cargo build --workspace --locked` with `DATABASE_URL` naming the migrated Compose database and `SQLX_OFFLINE` unset | pending: not run; H9 compiled every query against that database |
+
+Two observations for the owners of the end-to-end setup:
+
+- `forms.spec.ts:544` and `forms.spec.ts:557` (CT00 browse and paging) need a non-empty live transaction master. In a first end-to-end run, on a database that had only been migrated and seeded as RUNBOOK §11.4 names (sections 5.1 and 5.2), both failed; that run was stopped, the database rebuilt and `posttran` (section 5.3) run, and in the run recorded above both passed.
+- The `navigation.spec.ts` "with seeded keys" hook allows 240 s for up to 52 `docker compose exec` calls, about 3 s each by its own comment; at the 7 to 10 s measured here it cannot finish.
+
+## Open and halt escalations
+
+Each item below is an `open` or `halt` row of `docs/parity/escalations.md`, which holds its full evidence. An `open` item needs the user's decision and blocks sign-off, not code. A `halt` item is a case whose COBOL equivalence cannot be proven: no code guesses its result, the input class and COBOL path are listed here, and work that does not depend on it continued (AAP 0.9.6). Tick an item only when the user has recorded the decision.
+
+### Open
+
+- [ ] **E-10** (open: user confirms). The request pins openapi-fetch ≥7.4, but no 7.x release exists; `web/package.json` uses 0.17.0, which pairs with openapi-typescript 7. Decision needed: confirm 0.17.0.
+- [ ] **E-11** (open: user accepts). `deny.toml` ignores RUSTSEC-2026-0187 (lopdf 0.31, through printpdf 0.7) and RUSTSEC-2025-0111 (tokio-tar, dev-only through testcontainers 0.23), and `unmaintained = "workspace"` leaves five transitive unmaintained crates unreported: instant, paste, proc-macro-error2, rustls-pemfile and ttf-parser. Decision needed: accept these supply-chain exceptions.
+- [ ] **E-18** (open: user defines). `g1a`, `g1b`, `i9`, `R1`, `i2`, `i8`, `d9`, `R8`, `n5`, `g2`, `R15`, `g9`, `g8`, `g3a` and `g3b` are used without a definition (Verification bindings). Decision needed: define each ID, g8 above all, since Done depends on it.
+- [ ] **E-23** (open: user confirms the origin=form selection). COTRTUP F4 delete is carried as `DELETE /admin/transaction-types/{id}?origin=form` with the COTRTUPC key edits and messages; without `origin` the COTRTLIC messages apply. Decision needed: confirm the `origin=form` selection.
+- [ ] **E-27** (open: user confirms the interleaved test scenario). CT02 and CB00 refuse to write on an empty live master [app/cbl/COTRN02C.cbl:L642-668] [app/cbl/COBIL00C.cbl:L441-505], so the interleaved TRANBKP/CT02/COMBTRAN scenario of AAP 0.9.4 must post or reload transactions before its CT02 add. Decision needed: confirm the changed scenario.
+- [ ] **E-30** (open: user confirms). Db2 SQLCODE, SQLSTATE, SQLERRM and DSNTIAC slots in messages carry the Db2 code of the mapped condition (-803, -532, -911, +100), otherwise the PostgreSQL SQLSTATE and message text. Decision needed: confirm the mapping.
+- [ ] **E-37** (open: user confirms). `batch tranbkp` on an empty live master writes an empty `TRANSACT.BKUP(+1)`, keeps the master empty and exits 12 [app/jcl/TRANBKP.jcl:L23-67]. Decision needed: confirm.
+- [ ] **E-39** (open: user confirms). The MQ-ERR-DISPLAY record carries condition code 02 and reason 00000 for a returned, nacked or unconfirmed publish, and 00 and 00000 for an account read error. Decision needed: confirm the codes.
+- [ ] **E-42** (open: user confirms positive zero). A negative value truncated to zero is stored and written as positive zero, overpunch `{` [app/cbl/CBACT04C.cbl:L464-465]; no fixture record reaches the case. Decision needed: confirm positive zero.
+- [ ] **E-44** (open: user confirms the proposed codes). CICS RESP and RESP2 and IMS status slots in message texts: NOTFND carries RESP 13 and RESP2 80; any other PostgreSQL failure carries RESP 17 (IOERR), RESP2 0 and IMS status AO. Decision needed: confirm the codes.
+- [ ] **E-48** (open: user confirms). CR00 `report_type`, `start_date` and `end_date` map onto the CORPT00C report-type fields and six date parts; the SPA confirm dialog stands for CONFIRM Y, so the blank, N and invalid confirmation rows are not reachable through the API. Decision needed: confirm.
+- [ ] **E-51** (open: user confirms). POST of an existing transaction-type code returns 409 with no message; update and insert failures return 500 with the COBOL text, the insert text keeping the +100 of the preceding UPDATE in its SQLCODE slot. Decision needed: confirm.
+- [ ] **E-65** (open: user accepts an edit to a generated file beyond `sonner.tsx` and `sidebar.tsx`). 21 generated `web/src/components/ui/*.tsx` files import `cn` from `@/lib/utils` instead of the unpinned npm package `cn` that shadcn CLI 4.23.0 writes. Decision needed: accept the edit.
+- [ ] **E-70** (open: user confirms). A key typed over COTRTUPC's key-not-found screen is not reproduced: POST of an existing code stays 409 (E-51), and an existing description changes only through PUT of that code. Decision needed: confirm.
+
+### Halt
+
+- [ ] **E-25** (halt: bytes excluded from comparison until the user confirms the space fill). Input class: output bytes the COBOL never sets, from WORKING-STORAGE items without VALUE: TRAN-RECORD FILLER in POSTTRAN and INTCALC output [app/cbl/CBTRN02C.cbl:L424-442] [app/cbl/CBACT04C.cbl:L473-498]; SYSTRAN TRAN-DESC bytes 25-100 [app/cbl/CBACT04C.cbl:L485-489] and the statement bytes built from them [app/cbl/CBSTM03A.CBL:L675-679]; CBTRN03C TRAN-AMT on an empty input [app/cbl/CBTRN03C.cbl:L197-204]; CP00 reply byte 64 [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L722-731]. The replacement writes spaces and the audit marks the bytes `{UNDEF:n}`. Decision needed: confirm the space fill.
+- [ ] **E-26** (halt: proposed severity 0000 for CSUTLDPY-valid dates). Input class: CAUP dates that pass the CSUTLDPY edits, which EDIT-DATE-LE passes as 8-byte arguments to the 10-byte CSUTLDTC linkage [app/cpy/CSUTLDPY.cpy:L284-323] [app/cbl/CSUTLDTC.cbl:L84-86]. Proposed: severity 0000 (valid). Decision needed.
+- [ ] **E-28** (halt: proposed rejections listed in the decision). Input class: malformed `FUNCTION NUMVAL`/`NUMVAL-C` arguments and numeric tests of fields holding non-digits: CR00 custom date parts [app/cbl/CORPT00C.cbl:L305-327], the CP00 request amount [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L376-379], the CDRA key [app/app-vsam-mq/cbl/COACCT01.cbl:L393]. Proposed: reject without a write (CR00 with the field's next audited message, CDRA with the invalid-parameters reply, CP00 by declining with reason 9000). Decision needed.
+- [ ] **E-29** (halt: accounts without a cross-reference). Input class: CB00 for an account whose cross-reference read fails [app/cbl/COBIL00C.cbl:L208-235] [app/cbl/COBIL00C.cbl:L408-436]; no fixture account lacks one. Proposed: 404 `Account ID NOT found...` and no write. Decision needed.
+- [ ] **E-31** (halt: out-of-range dates that are also calendar-invalid, and dates with year 0000). Input class: CEEDAYS feedback for dates with year 0000, and for dates outside 1582-10-15..9999-12-31 that are also calendar-invalid [app/cbl/CSUTLDTC.cbl:L116-149] [app/cbl/COTRN02C.cbl:L389-427] [app/cbl/CORPT00C.cbl:L389-430]. Proposed: 2508 for out-of-range calendar-invalid dates; no code is proposed for year 0000. Decision needed.
+- [ ] **E-33** (halt: more than 51 cards or 10 transactions for a card). Input class: a CREASTMT corpus beyond the CBSTM03A tables [app/cbl/CBSTM03A.CBL:L225-233] [app/cbl/CBSTM03A.CBL:L818-830]. `batch creastmt` stops with exit 16 before writing; the fixture corpus stays inside both limits (audit D.5). Decision needed.
+- [ ] **E-38** (halt: TRANREPT order within a card). Input class: TRANREPT detail lines of one card, sorted without EQUALS [app/jcl/TRANREPT.jcl:L46-48]. Proposed: TRAN-ID order within a card, as audit D.6 records. Decision needed.
+- [ ] **E-40** (halt: midpoints and integer overflow). Input class: `NUMVAL`/`NUMVAL-C` text at a rounding midpoint, or whose integer part exceeds the receiver [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L376-379] [app/cbl/COACTUPC.cbl:L1078-1136]. Proposed: round half away from zero at request parsing; reject integer overflow with the field's invalid-value message. Decision needed.
+- [ ] **E-41** (halt: unknown-card decision on the first message; declined-amount summary update). Input class: a CP00 request for a card not in the cross-reference on a task's first message, and the declined-amount summary update for a found card [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L665-683] [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L819-822]. Proposed: decline with reason 3100; add the request amount. Decision needed.
+- [ ] **E-47** (halt: values holding non-digits in these fields). Input class: values holding a non-digit in numeric redefines and alphanumeric-to-numeric MOVEs of COBIL00C, COCRDUPC, COCRDSLC, COCRDLIC and CSUTLDPY, for example [app/cbl/COBIL00C.cbl:L169-171] [app/cpy/CSUTLDPY.cpy:L111-123]. Proposed: the field is rejected with its own NUMERIC or range text; COBIL00C answers 404 `Account ID NOT found...`. Decision needed.
+- [ ] **E-52** (halt: CPVS accounts without a cross-reference). Input class: CPVS for an account whose cross-reference read finds no row [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L750-755]. Proposed: 404 with the cross-reference text and no list. Decision needed.
+- [ ] **E-53** (halt: PUT for an authorization that cannot be read). Input class: CPVD fraud marking when the read fails or finds nothing [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L230-265]. Proposed: the outcome the GET rows give for that read, with no change. Decision needed.
+- [ ] **E-74** (halt: a sent customer ID holding a non-digit ('*' and spaces included); the user confirms the handling of a sent customer ID or country that differs from the fetched value). Input class: `PUT /accounts/{id}` with a customer ID holding a non-digit [app/cbl/COACTUPC.cbl:L798-800] [app/cbl/COACTUPC.cbl:L4009]; the replacement writes nothing and answers 500 `Update of record failed`. Decision needed, also for a sent customer ID or country that differs from the fetched value.
+- [ ] **E-75** (halt: CVV stored by every update that reaches the REWRITE). Input class: every CCUP update that reaches the REWRITE, which stores the CVV from a field holding spaces [app/cbl/COCRDUPC.cbl:L1464-1465]. The replacement keeps the stored CVV, and the CVV after an update is excluded from comparison. Decision needed.
+- [ ] **E-78** (halt: approved count past 9999). Input class: a CP00 approval that takes `PA-APPROVED-AUTH-CNT` past 9999 [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L813-821]. The replacement writes neither segment and logs the case. Proposed: the TRUNC(STD) result 0000. Decision needed.
+- [ ] **E-80** (halt: request text that is not UTF-8 or holds a character outside ISO 8859-1; the queue-manager CCSID needs the user's decision). Input class: a CP00 request body that is not UTF-8 or holds a character above U+00FF [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L389-391]; it is rejected with no read, no reply and no write. Decision needed: the queue-manager CCSID.
+- [ ] **E-81** (halt: X'00' in a CP00 request receiver the detail stores as text). Input class: a CP00 request with X'00' in a receiver that the pending-authorization detail stores [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L877-895]; it is rejected with no read, no reply and no write. Decision needed.
+
+## Human COBOL review (acceptance items)
+
+AAP 0.9.1 names a conflict. The request asks a reviewer who knows the COBOL sources to check each audit before the dependent code is accepted, while the authoring contract requires that review before the dependent code is written, and an unattended run cannot obtain a human reviewer.
+
+- The pre-code gate was therefore an independent COBOL-informed review within the run: reviewer `blitzy-cobol-reviewer`, who did not author the rows (author `blitzy-audit-author`), read each row against its cited COBOL lines and recorded a verdict in the section's review log. Every row's latest verdict is `pass`.
+- The human review the request names stays open, and acceptance waits for it. Tick an item only when a human reviewer has recorded a verdict for every row of that section.
+- If the user requires the pre-code reviewer to be human, every file the section gates stays unwritten until that review is recorded, and tests never substitute for it.
+
+| Done | Audit section | Rows | In-run review |
+|---|---|---|---|
+| [ ] | `docs/parity/parity-oracle-audit.md` A. Record layouts | 225 `P-` rows | All `pass` ("Review log — A") |
+| [ ] | `docs/parity/parity-oracle-audit.md` B. Per-program rules | 645 `P-` rows | All `pass` ("Review log — B") |
+| [ ] | `docs/parity/parity-oracle-audit.md` C. Arithmetic | 44 `P-` rows | All `pass` ("Review log — C") |
+| [ ] | `docs/parity/parity-oracle-audit.md` D. Fixture expectations | 2086 `P-` rows | All `pass` ("Review log — D") |
+| [ ] | `docs/parity/parity-oracle-audit.md` E. Anomalies | 70 `P-` rows | All `pass` ("Review log — E") |
+| [ ] | `docs/parity/parity-oracle-audit.md` F. Time-dependent fields | 13 `P-` rows | All `pass` ("Review log — F") |
+| [ ] | `docs/parity/validation-audit.md` | 381 `V-` rows | All `pass` ("Review log — validation-audit") |
+| [ ] | `docs/parity/function-map.md` | 144 `F-` rows over the 21 BMS maps | All `pass` ("Review log — function-map") |
+
+## Known differences
+
+- **E-21: the current password is never displayed.** COUSR02C moves `SEC-USR-PWD` into the password edit field when it reads the user [app/cbl/COUSR02C.cbl:L166-170] and counts the password as changed only when the field differs from the stored value [app/cbl/COUSR02C.cbl:L227-229]. An argon2 hash cannot be shown, so `GET /admin/users/{id}` returns no password, and in `PUT /admin/users/{id}` an absent `password` stands for the current value, unchanged and not re-hashed. A present `password` goes through the COUSR02C edits and is compared with the stored value by argon2 verification.
+
+### Mandated deviations
+
+The request itself changes these behaviours, and only these (AAP 0.1.1). They are deviations by mandate, not parity failures.
+
+- HTTP status codes and the `{code, message, fields}` error body replace the 3270 message line.
+- The 403 admin gate: every `/admin/**` endpoint requires `usr_type` `A`, which the COBOL enforces only through menu routing [app/cbl/COMEN01C.cbl:L127-143].
+- Argon2 password hashing replaces the plaintext compare [app/cbl/COSGN00C.cbl:L221-245] (E-20); E-21 above is its one visible consequence.
+- Durable queues, persistent replies without expiry, acknowledgement only after the reply is confirmed, and single delivery replace the non-persistent 5-second replies of CP00 [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L741-779].
+- Queue names are the COBOL literals (`CARD.DEMO.*`), not the README's names.
+- The 3270 PF-key interaction becomes web navigation and forms.
+
+Escalations settled by these clauses or by "Interfaces that change": E-22, E-54, E-56, E-62, E-63, E-69, E-71, E-77, E-82 and E-83 (resolved); E-30, E-39, E-44 and E-48 (open, above); E-74 (halt, above).
+
+## Unverifiable under static analysis
+
+AAP 0.10.4 lists what each suite needs. In an environment without Docker, or without a C linker, these rows can only be recorded as `unverified`, never as `passed`:
+
+- **Without Docker** (testcontainers `postgres:16.15` and `rabbitmq:3.13.7-management`, and the Compose stack the end-to-end tests drive): o1, o2, o5, o8, Errors, Messaging, Statements, the live-schema verification of R4 (H9), NAV, end-to-end FN, and the parts of o3 that run through `crates/batch/tests/intcalc.rs` and `crates/api/tests/cb00_bill_payment.rs`.
+- **Without a C linker:** every Rust suite, and so every row and gate whose check runs `cargo`.
+
+This run had both Docker and a C linker, so no row is `unverified`; rows not yet run are `pending`.
+
+## g8
+
+- [ ] g8 sign-off
+
+The request uses g8 without a definition (E-18), so it stays unticked. Done ≡ o1..o8 ∧ g8 sign-off fully checked, so **Done is not claimed** until the user defines g8 and confirms it, whatever the rows above show.
