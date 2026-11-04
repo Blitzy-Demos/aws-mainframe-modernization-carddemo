@@ -16,6 +16,12 @@ export default defineConfig({
   forbidOnly: true,
   // A retry would let a flaky pass hide a parity failure.
   retries: 0,
+  // The specs drive the real stack: every psql() call in e2e/fixtures.ts is a
+  // `docker compose exec` round trip of seconds, and a sign-on or CT02 add can
+  // take several seconds on a loaded host. Hooks inherit the test timeout;
+  // expect.poll and toHaveURL inherit the expect timeout.
+  timeout: 120_000,
+  expect: { timeout: 15_000 },
   outputDir: "test-results",
   reporter: [["list"], ["html", { outputFolder: "playwright-report", open: "never" }]],
   use: {

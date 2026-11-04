@@ -1211,12 +1211,17 @@ export async function topUpAccruals(
   const lines = series === "" ? [] : series.split("\n");
   const cp = await transactionWriteCheckpoint([accountId]);
   try {
+    // `cp` already covers every add, so each is sent directly: a checkpoint
+    // per add (addTransactionViaApi) would cost six more psql round trips.
     for (const line of lines) {
-      const added = await addTransactionViaApi(request, token, {
-        account_id: accountId,
-        tran_desc: `E2E REWARD HISTORY ${assertDigits(line)}`,
+      const response = await request.post(apiPath("/transactions"), {
+        data: transactionAddBody({
+          account_id: accountId,
+          tran_desc: `E2E REWARD HISTORY ${assertDigits(line)}`,
+        }),
+        headers: bearer(token),
       });
-      expect(added.status, `top-up add ${line} of ${missing}`).toBe(201);
+      expect(response.status(), `top-up add ${line} of ${missing}`).toBe(201);
     }
     expect(
       await psql(

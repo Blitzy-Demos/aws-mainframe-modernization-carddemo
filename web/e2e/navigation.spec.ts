@@ -733,6 +733,10 @@ test.describe("with seeded keys", () => {
   }
 
   test.beforeAll(async () => {
+    // Up to 52 psql fixture calls, each a `docker compose exec` round trip of
+    // up to ~3 s on a loaded host: past the test timeout in
+    // playwright.config.ts that a hook otherwise inherits.
+    test.setTimeout(240_000);
     // A second page on the user and transaction-type lists: one row more
     // than a page holds, copied from USER0001 (its password hash included)
     // and numbered down from type 97.
