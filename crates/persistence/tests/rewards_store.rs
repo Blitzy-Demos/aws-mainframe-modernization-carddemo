@@ -40,6 +40,13 @@
 //! cross-reference [app/data/ASCII/cardxref.txt] gives the fixture account
 //! [app/data/ASCII/acctdata.txt], because `reward_accruals.transaction_id` is a
 //! unique foreign key to `transactions`.
+//!
+//! A concurrent unit of work runs on a thread of its own through
+//! `carddemo_testkit::block_on`, and its wait on a row lock is observed in
+//! `pg_stat_activity` rather than guessed from elapsed time.
+
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use carddemo_domain::entities::{
     NewAccrual, NewRewardRule, NewTransaction, RewardAccrual, RewardBalance, RewardRule,
@@ -66,6 +73,19 @@ const BEYOND_SAFE_INTEGER: i64 = 9_007_199_254_740_993;
 /// `TRAN-ORIG-TS` and `TRAN-PROC-TS` of the written records: 26 characters,
 /// the `X(26)` of both fields [app/cpy/CVTRA05Y.cpy:L16-17].
 const TIMESTAMP: &str = "2022-07-01 12:00:00.000000";
+
+/// The sessions of the test database waiting on a row lock, which a session
+/// waits for as the transaction ID of the lock's holder.
+const ROW_LOCK_WAITS: &str = "SELECT count(*) FROM pg_stat_activity \
+     WHERE datname = current_database() \
+       AND wait_event_type = 'Lock' AND wait_event = 'transactionid'";
+
+/// How long a concurrent unit of work may take to reach or leave a lock wait
+/// before the test fails instead of hanging.
+const WAIT_LIMIT: Duration = Duration::from_secs(30);
+
+/// The pause between two looks at a concurrent unit of work.
+const POLL: Duration = Duration::from_millis(20);
 
 /// The UTC instant at `hour`:00:00 on the given day.
 fn instant(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
@@ -1012,6 +1032,124 @@ fn reward_rule_admin_methods() {
                 .iter()
                 .all(|rule| rule.active_to == Some(deleted_at)),
             "soft-deleted rules stay listed: {listed:?}"
+        );
+        uow.rollback().await.expect("the read-only unit ends");
+    });
+}
+
+/// Waits until a session of the test database waits on a row lock.
+///
+/// The pause between two looks blocks the calling thread rather than
+/// yielding: the test has no timer of its own, and the unit of work under
+/// observation runs on a thread of its own.
+///
+/// # Panics
+///
+/// When no session waits so within [`WAIT_LIMIT`].
+async fn await_row_lock_wait(stack: &TestStack) {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        let rows = stack.fetch_text_rows(ROW_LOCK_WAITS).await;
+        let waiting = rows.first().and_then(|row| row.first()).cloned().flatten();
+        if waiting.is_some_and(|sessions| sessions != "0") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no session waited on a row lock within {WAIT_LIMIT:?}"
+        );
+        thread::sleep(POLL);
+    }
+}
+
+/// The result of the thread `handle`, once it has finished.
+///
+/// # Panics
+///
+/// When the thread does not finish within [`WAIT_LIMIT`], or with the
+/// thread's own panic.
+fn join_within<T>(handle: JoinHandle<T>, what: &str) -> T {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    while !handle.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not finish within {WAIT_LIMIT:?}"
+        );
+        thread::sleep(POLL);
+    }
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// `lock_reward_rule` holds the rule until its unit of work ends, the order
+/// the soft delete of `DELETE /admin/reward-rules/{id}` relies on (AAP
+/// 0.3.5). While a first unit has locked the retail seed rule and ended it at
+/// [`at`] without committing, a second unit's lock of the rule waits. Once
+/// the first commits, the second's lock returns the rule with that end, and
+/// the second's soft delete at a later instant is `Unchanged`, so the end
+/// committed first stays stored. A rule ID no rule holds is `None`.
+#[test]
+fn a_locked_rule_holds_a_second_delete_until_the_first_unit_ends() {
+    let prepared = fixture_seed();
+    block_on(async {
+        let (stack, db) = seeded(prepared).await;
+        let retail = RuleId::from(1);
+        let first_end = at();
+        let ended = RewardRule {
+            active_to: Some(first_end),
+            ..retail_seed_rule()
+        };
+
+        let mut first = db.begin().await.expect("a unit of work");
+        let mut store = first.store();
+        assert_eq!(
+            store.lock_reward_rule(retail).await,
+            Ok(Some(retail_seed_rule()))
+        );
+        assert_eq!(
+            store.soft_delete_reward_rule(retail, first_end).await,
+            Ok(SoftDeleteOutcome::Deleted(ended.clone()))
+        );
+        assert_eq!(store.lock_reward_rule(RuleId::from(999)).await, Ok(None));
+
+        let second = {
+            let db = db.clone();
+            thread::spawn(move || {
+                block_on(async move {
+                    let mut uow = db.begin().await.expect("a unit of work");
+                    let locked = uow.store().lock_reward_rule(retail).await;
+                    (uow, locked)
+                })
+            })
+        };
+        await_row_lock_wait(&stack).await;
+        assert!(
+            !second.is_finished(),
+            "the second lock waits for the first unit"
+        );
+        first.commit().await.expect("the first delete commits");
+
+        let (mut second, locked) = join_within(second, "the second lock");
+        assert_eq!(
+            locked,
+            Ok(Some(ended.clone())),
+            "the second lock reads the end committed first"
+        );
+        assert_eq!(
+            second
+                .store()
+                .soft_delete_reward_rule(retail, first_end + TimeDelta::seconds(1))
+                .await,
+            Ok(SoftDeleteOutcome::Unchanged(ended.clone()))
+        );
+        second.commit().await.expect("the second unit commits");
+
+        let mut uow = db.begin().await.expect("a unit of work");
+        assert_eq!(
+            uow.store().reward_rule(retail).await,
+            Ok(Some(ended)),
+            "the end committed first stays stored"
         );
         uow.rollback().await.expect("the read-only unit ends");
     });

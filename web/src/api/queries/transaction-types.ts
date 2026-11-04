@@ -19,6 +19,10 @@
  *   code, `useTranTypeCreateMutation`.
  * - Failures reach the caller as the client's `ApiError`, unchanged; the COBOL
  *   texts of a success (`message`, and `info` on an inline update) are data.
+ * - A type code in the path of /admin/transaction-types/{id} travels as its
+ *   key segment (lib/key-segment.ts), so the codes `.` and `..`, which
+ *   MNTTRDB2 can store and a URL would drop, still address their type. The
+ *   `typeCode` of each mutation is the stored code.
  */
 import {
   keepPreviousData,
@@ -29,6 +33,7 @@ import {
 
 import { api, unwrap } from "@/api/client";
 import type { components, paths } from "@/api/schema";
+import { encodeKeySegment } from "@/lib/key-segment";
 
 /**
  * The list filters and paging of `GET /admin/transaction-types`: `type_code`
@@ -148,7 +153,7 @@ export function useTranTypeUpdateMutation() {
       unwrap(
         await api.PUT("/admin/transaction-types/{id}", {
           params: {
-            path: { id: typeCode },
+            path: { id: encodeKeySegment(typeCode) },
             query: origin === undefined ? {} : { origin },
           },
           body,
@@ -180,7 +185,7 @@ export function useTranTypeDeleteMutation() {
       unwrap(
         await api.DELETE("/admin/transaction-types/{id}", {
           params: {
-            path: { id: typeCode },
+            path: { id: encodeKeySegment(typeCode) },
             query: origin === undefined ? {} : { origin },
           },
         }),

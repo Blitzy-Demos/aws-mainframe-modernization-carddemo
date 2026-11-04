@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type\n                       FROM users\n                       ORDER BY rpad(user_id, 8) COLLATE \"C\" DESC\n                       LIMIT $1",
+  "query": "SELECT user_id, sec_usr_fname, sec_usr_lname, sec_usr_type\n                       FROM users\n                       WHERE rpad(user_id, 8) COLLATE \"C\" >= rpad($1, 8)\n                       ORDER BY rpad(user_id, 8) COLLATE \"C\" ASC\n                       LIMIT $2",
   "describe": {
     "columns": [
       {
@@ -20,17 +20,13 @@
       },
       {
         "ordinal": 3,
-        "name": "password_hash",
-        "type_info": "Text"
-      },
-      {
-        "ordinal": 4,
         "name": "sec_usr_type",
         "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
+        "Text",
         "Int8"
       ]
     },
@@ -38,9 +34,8 @@
       false,
       false,
       false,
-      false,
       false
     ]
   },
-  "hash": "152fdbecd386bb6f0da055c7c8f5a5f6a5656b4cf7011cc326824358fea6a6f7"
+  "hash": "a58f65144dc653982190e939a5fed01e41d395b817ca7049595fc36013f745ae"
 }

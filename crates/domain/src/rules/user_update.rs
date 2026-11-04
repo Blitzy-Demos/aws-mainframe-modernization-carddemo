@@ -42,7 +42,7 @@
 //! The COBOL moves the stored `SEC-USR-PWD` into the edit field when it shows a
 //! user [app/cbl/COUSR02C.cbl:L166-170] and counts the password as changed only
 //! when the field then differs from it [app/cbl/COUSR02C.cbl:L227-230]. A
-//! stored argon2id hash cannot be shown, so [`lookup`]'s record goes out
+//! stored argon2id hash cannot be shown, so [`lookup`] reads the record
 //! without its password, and in an update an absent password stands for that
 //! reloaded value: unchanged, never verified or re-hashed. A password that is
 //! present goes through the empty edit of [`update`], then
@@ -62,7 +62,7 @@
 use core::fmt;
 
 use crate::auth::{SEC_USR_ID_LEN, SEC_USR_PWD_LEN, hash_stored_password, verify_as_entered};
-use crate::entities::UserSecurity;
+use crate::entities::{UserProfile, UserSecurity};
 use crate::error::DomainError;
 use crate::messages::{
     FIRST_NAME_CAN_NOT_BE_EMPTY, LAST_NAME_CAN_NOT_BE_EMPTY, PASSWORD_CAN_NOT_BE_EMPTY,
@@ -264,8 +264,9 @@ fn unable_to_update() -> DomainError {
 /// Fetches the user `user_id` names for update, as the ENTER key and the
 /// entry from the user list do [app/cbl/COUSR02C.cbl:L143-172]: a blank or
 /// absent ID is rejected before any file access, and otherwise the record is
-/// read with `READ … UPDATE` [app/cbl/COUSR02C.cbl:L322-331]. The record
-/// returned holds the password hash, which the caller never shows (E-21).
+/// read with `READ … UPDATE` [app/cbl/COUSR02C.cbl:L322-331]. The record is
+/// read without its password: the stored hash cannot be shown (E-21), and
+/// nothing here compares it.
 ///
 /// # Errors
 ///
@@ -278,13 +279,13 @@ fn unable_to_update() -> DomainError {
 pub async fn lookup<S: UserStore>(
     store: &mut S,
     user_id: Option<String>,
-) -> Result<UserSecurity, DomainError> {
+) -> Result<UserProfile, DomainError> {
     let user_id = user_id.unwrap_or_default();
     if is_blank(&user_id, SEC_USR_ID_LEN) {
         return Err(empty(USER_ID_CAN_NOT_BE_EMPTY, USRIDIN));
     }
     store
-        .read_user_for_update(UserId::move_from(&user_id))
+        .read_user_profile_for_update(UserId::move_from(&user_id))
         .await
         .map_err(|error| match error {
             PortError::NotFound => DomainError::not_found(USER_ID_NOT_FOUND).with_field(USRIDIN),
@@ -478,7 +479,7 @@ mod tests {
         UserRewrite, UserUpdateCheck, UserUpdateInput, UserUpdateOutcome, lookup, rewrite, update,
     };
     use crate::auth::{hash_stored_password, verify_as_entered};
-    use crate::entities::UserSecurity;
+    use crate::entities::{UserProfile, UserSecurity};
     use crate::error::{DomainError, ErrorKind};
     use crate::messages::{
         FIRST_NAME_CAN_NOT_BE_EMPTY, LAST_NAME_CAN_NOT_BE_EMPTY, PASSWORD_CAN_NOT_BE_EMPTY,
@@ -636,11 +637,12 @@ mod tests {
 
     #[test]
     fn lookup_reads_the_user_for_update() {
-        // P-COUSR02C-002, P-COUSR02C-003: READ UPDATE, then the record shown.
+        // P-COUSR02C-002, P-COUSR02C-003: READ UPDATE, then the record shown,
+        // read without its password (E-21).
         let mut store = seeded();
         let result = block_on(lookup(&mut store, Some("USER0001".to_owned())));
-        assert_eq!(result, Ok(user0001()));
-        assert_eq!(store.calls, ["read_user_for_update"]);
+        assert_eq!(result, Ok(UserProfile::from(&user0001())));
+        assert_eq!(store.calls, ["read_user_profile_for_update"]);
     }
 
     #[test]
@@ -663,7 +665,7 @@ mod tests {
         for (id, failure, expected) in cases {
             let mut store = seeded();
             if let Some(failure) = failure.clone() {
-                store.fail_next("read_user_for_update", failure);
+                store.fail_next("read_user_profile_for_update", failure);
             }
             let result = block_on(lookup(&mut store, Some(id.to_owned())));
             assert_eq!(result, Err(expected), "{id} {failure:?}");

@@ -10,6 +10,9 @@
 // - Every value is sent as the page gives it, never trimmed or case-changed:
 //   the admin programs store the user ID and the password as entered, and only
 //   sign-on upper-cases its own input (E-20).
+// - A user ID in the path of /admin/users/{id} travels as its key segment
+//   (lib/key-segment.ts), so the IDs `.` and `..`, which a URL would drop,
+//   still address their user. Hook arguments and query keys are the stored ID.
 import {
   keepPreviousData,
   useMutation,
@@ -19,6 +22,7 @@ import {
 
 import { api, unwrap } from "@/api/client";
 import type { components, paths } from "@/api/schema";
+import { encodeKeySegment } from "@/lib/key-segment";
 
 type Schemas = components["schemas"];
 
@@ -90,7 +94,7 @@ export function useUser(userId: string) {
     queryFn: async ({ signal }) =>
       unwrap(
         await api.GET("/admin/users/{id}", {
-          params: { path: { id: userId } },
+          params: { path: { id: encodeKeySegment(userId) } },
           signal,
         }),
       ),
@@ -146,7 +150,7 @@ export function useUserUpdateMutation(userId: string) {
     mutationFn: async (body: UserUpdateBody): Promise<UserMessage> =>
       unwrap(
         await api.PUT("/admin/users/{id}", {
-          params: { path: { id: userId } },
+          params: { path: { id: encodeKeySegment(userId) } },
           body,
         }),
       ),
@@ -176,7 +180,7 @@ export function useUserDeleteMutation() {
     mutationFn: async (userId: string): Promise<UserMessage> =>
       unwrap(
         await api.DELETE("/admin/users/{id}", {
-          params: { path: { id: userId } },
+          params: { path: { id: encodeKeySegment(userId) } },
         }),
       ),
     onSuccess: (_data, userId) => {

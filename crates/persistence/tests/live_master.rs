@@ -15,13 +15,19 @@
 //!   backup pages the master in;
 //! - `PgStore::read_transaction`, COTRN01C READ-TRANSACT-FILE —
 //!   P-COTRN01C-004, for a TRAN-ID holding a NUL byte, which no stored row
-//!   can hold.
+//!   can hold;
+//! - `PgStore::browse_transactions` with the `account_id` filter the REST
+//!   resource adds to COTRN00C (E-17), which reads the account's cards one by
+//!   one: every start and direction against the filter of the whole master;
+//! - `PgStore::transactions_by_proc_date`, TRANREPT STEP05R —
+//!   P-TRANREPT-002, whose raw-column bounds must keep exactly the processing
+//!   dates of the `INCLUDE COND`, page by page.
 //!
 //! Every test starts its own container through `carddemo_testkit::TestStack`,
 //! so it needs a running Docker daemon (AAP 0.10.4). The transaction master
 //! starts empty, and the records are `CVTRA05Y` records
-//! [app/cpy/CVTRA05Y.cpy:L4-18] written through the `TransactionWriter` port
-//! on the card the first cross-reference record maps to account 50
+//! [app/cpy/CVTRA05Y.cpy:L4-18] written through the `TransactionWriter` port,
+//! by default on the card the first cross-reference record maps to account 50
 //! [app/data/ASCII/cardxref.txt:L1]. Concurrent units of work run on their own
 //! threads through `carddemo_testkit::block_on`, and a wait on a lock is
 //! observed in `pg_stat_activity` rather than guessed from elapsed time.
@@ -34,8 +40,9 @@ use carddemo_domain::numeric::{
     AccountId, Alnum, CardNumber, MerchantId, Money, RewardPoints, RewardRate, TranCategoryCode,
     TranId, TranTypeCode,
 };
-use carddemo_domain::ports::{PortError, TransactionReader, TransactionWriter};
+use carddemo_domain::ports::{Browse, Direction, PortError, TransactionReader, TransactionWriter};
 use carddemo_domain::rewards::RewardStore;
+use carddemo_domain::rules::transaction_report::select_for_report;
 use carddemo_persistence::{Db, PersistenceError, UnitOfWork};
 use carddemo_testkit::{TestStack, block_on};
 use chrono::{DateTime, TimeZone, Utc};
@@ -87,6 +94,158 @@ fn record(tran_id: &str, cents: i64) -> NewTransaction {
         tran_card_num: CardNumber::move_from(CARD),
         tran_orig_ts: Alnum::move_from(TIMESTAMP),
         tran_proc_ts: Alnum::move_from(TIMESTAMP),
+    }
+}
+
+/// The record [`record`] gives for `tran_id`, on the card `card` and processed
+/// at the `X(26)` bytes `proc_ts`.
+fn record_on(tran_id: &str, card: &str, proc_ts: &[u8]) -> NewTransaction {
+    NewTransaction {
+        tran_card_num: CardNumber::move_from(card),
+        tran_proc_ts: Alnum::move_from_bytes(proc_ts),
+        ..record(tran_id, 100)
+    }
+}
+
+/// The cross-reference of the account-filter browse, `(XREF-CARD-NUM,
+/// XREF-ACCT-ID)`: account 7 holds two cards, account 8 holds one card that
+/// sorts between them and one after them, and account 9 holds the highest card,
+/// which has no transactions. Account 10 has no card. [`XREF_ROWS`] inserts
+/// exactly these rows.
+const XREF: [(&str, u64); 5] = [
+    ("7000000000000001", 7),
+    ("7000000000000002", 8),
+    ("7000000000000003", 7),
+    ("7000000000000004", 8),
+    ("7000000000000005", 9),
+];
+
+/// The `card_xref` rows of [`XREF`]; the customer is the account's number.
+const XREF_ROWS: &str = "INSERT INTO card_xref (xref_card_num, xref_cust_id, xref_acct_id) VALUES \
+     ('7000000000000001', 7, 7), ('7000000000000002', 8, 8), ('7000000000000003', 7, 7), \
+     ('7000000000000004', 8, 8), ('7000000000000005', 9, 9)";
+
+/// The live rows of the account-filter browse, `(TRAN-ID, TRAN-CARD-NUM)`: the
+/// TRAN-IDs of every card interleave with those of the others, each card of
+/// accounts 7 and 8 holds four, and the last row is on [`CARD`], which no
+/// cross-reference row maps to an account.
+const BROWSE_ROWS: [(&str, &str); 13] = [
+    ("0000000000000001", "7000000000000001"),
+    ("0000000000000002", "7000000000000002"),
+    ("0000000000000003", "7000000000000003"),
+    ("0000000000000004", "7000000000000001"),
+    ("0000000000000005", "7000000000000004"),
+    ("0000000000000006", "7000000000000003"),
+    ("0000000000000007", "7000000000000003"),
+    ("0000000000000008", "7000000000000002"),
+    ("0000000000000009", "7000000000000001"),
+    ("0000000000000010", "7000000000000003"),
+    ("0000000000000011", "7000000000000004"),
+    ("0000000000000012", "7000000000000001"),
+    ("0000000000000013", CARD),
+];
+
+/// The page a filter of the whole live master gives: the rows of `live` on a
+/// card [`XREF`] maps to `account`, from `start` inclusive in `direction`
+/// (from the first or the last key when `None`), in TRAN-ID order, at most
+/// `limit` of them.
+fn filtered_page(
+    live: &[Transaction],
+    account: u64,
+    direction: Direction,
+    start: Option<TranId>,
+    limit: u16,
+) -> Vec<Transaction> {
+    let cards: Vec<CardNumber> = XREF
+        .iter()
+        .filter(|(_, owner)| *owner == account)
+        .map(|(card, _)| CardNumber::move_from(card))
+        .collect();
+    let mut kept: Vec<Transaction> = live
+        .iter()
+        .filter(|row| cards.contains(&row.tran_card_num))
+        .filter(|row| match (direction, start) {
+            (_, None) => true,
+            (Direction::Forward, Some(start)) => row.tran_id >= start,
+            (Direction::Backward, Some(start)) => row.tran_id <= start,
+        })
+        .cloned()
+        .collect();
+    kept.sort_by_key(|row| row.tran_id);
+    if direction == Direction::Backward {
+        kept.reverse();
+    }
+    kept.truncate(usize::from(limit));
+    kept
+}
+
+/// The live rows of the report selection, `(TRAN-ID, TRAN-CARD-NUM,
+/// TRAN-PROC-TS)`: processing timestamps of 26, 10 and fewer characters on
+/// both sides of the bounds the selection test reads, on three cards whose
+/// order differs from the TRAN-ID order.
+const PROC_TS_ROWS: [(&str, &str, &[u8]); 12] = [
+    (
+        "0000000000000001",
+        "4000000000000003",
+        b"2022-06-30-23.59.59.999999",
+    ),
+    ("0000000000000002", "4000000000000001", b"2022-06-30"),
+    ("0000000000000003", "4000000000000002", b"2022-07"),
+    ("0000000000000004", "4000000000000003", b"2022-07-0"),
+    ("0000000000000005", "4000000000000001", b"2022-07-01"),
+    (
+        "0000000000000006",
+        "4000000000000002",
+        b"2022-07-01-00.00.00.000000",
+    ),
+    ("0000000000000007", "4000000000000003", b"2022-07-03"),
+    ("0000000000000008", "4000000000000001", b"2022-07-06"),
+    (
+        "0000000000000009",
+        "4000000000000002",
+        b"2022-07-06-23.59.59.999999",
+    ),
+    (
+        "0000000000000010",
+        "4000000000000001",
+        b"2022-07-06\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+    ),
+    ("0000000000000011", "4000000000000003", b"2022-07-07"),
+    (
+        "0000000000000012",
+        "4000000000000002",
+        b"2022-07-07-00.00.00.000000",
+    ),
+];
+
+/// Every page `transactions_by_proc_date` gives in `uow` for the processing
+/// dates `start` to `end`, `limit` rows at a time from the first, each page
+/// after the card number and TRAN-ID of the last row of the page before, up
+/// to and including the first page shorter than `limit`.
+async fn proc_date_pages(
+    uow: &mut UnitOfWork,
+    (start, end): (Alnum<10>, Alnum<10>),
+    limit: u16,
+) -> Vec<Vec<Transaction>> {
+    let mut all = Vec::new();
+    let mut after = None;
+    loop {
+        let page = uow
+            .store()
+            .transactions_by_proc_date(start, end, after, limit)
+            .await
+            .expect("a page of the report selection");
+        let next = match page.last() {
+            Some(last) if page.len() == usize::from(limit) => {
+                Some((last.tran_card_num, last.tran_id))
+            }
+            _ => None,
+        };
+        all.push(page);
+        match next {
+            Some(_) => after = next,
+            None => return all,
+        }
     }
 }
 
@@ -519,5 +678,128 @@ fn snapshot_pages_read_one_committed_state() {
             committed_pages(&db, PAGE).await.concat(),
             [before, later].concat()
         );
+    });
+}
+
+/// COTRN00C STARTBR-TRANSACT-FILE, READNEXT-TRANSACT-FILE,
+/// READPREV-TRANSACT-FILE — P-COTRN00C-006, P-COTRN00C-007, P-COTRN00C-011,
+/// with the `account_id` filter (E-17): for every account of [`XREF`] and one
+/// without a card, every start (from `LOW-VALUES`, from a key of the account
+/// or of another, beyond the last key, below the first, and from
+/// `HIGH-VALUES`) and every limit below, at and above the four rows of one
+/// card and above the eight of the account, the page holds exactly the rows a
+/// filter of the whole master gives, the start key included. Each card is read
+/// on its own, so the rows of the other account's card between the two cards,
+/// of the card after them, and of the card no account holds must neither
+/// appear nor repeat.
+#[test]
+fn the_account_filter_pages_equal_a_filter_of_the_whole_master() {
+    block_on(async {
+        let stack = TestStack::postgres().await;
+        let db = Db::from_pool(stack.pool().clone());
+        stack.exec_sql(XREF_ROWS).await;
+        let stored = stack
+            .fetch_text_rows(
+                "SELECT xref_card_num, xref_acct_id::text FROM card_xref ORDER BY xref_card_num",
+            )
+            .await;
+        let xref: Vec<Vec<Option<String>>> = XREF
+            .iter()
+            .map(|(card, account)| vec![Some((*card).to_owned()), Some(account.to_string())])
+            .collect();
+        assert_eq!(stored, xref, "card_xref holds exactly XREF");
+        let records: Vec<NewTransaction> = BROWSE_ROWS
+            .iter()
+            .map(|(tran_id, card)| record_on(tran_id, card, TIMESTAMP.as_bytes()))
+            .collect();
+        let live = write_live(&db, &records).await;
+
+        let starts = [
+            (Direction::Forward, None),
+            (Direction::Forward, Some("0000000000000005")),
+            (Direction::Forward, Some("0000000000000006")),
+            (Direction::Forward, Some("0000000000000014")),
+            (Direction::Backward, Some("0000000000000009")),
+            (Direction::Backward, Some("0000000000000008")),
+            (Direction::Backward, Some("0000000000000000")),
+            (Direction::Backward, None),
+        ];
+        let mut uow = db.begin().await.expect("a unit of work");
+        for account in [7, 8, 9, 10] {
+            let account_id = AccountId::new(account).expect("a 9(11) account number");
+            for (direction, start) in starts {
+                let start = start.map(TranId::move_from);
+                for limit in [1, 3, 4, 5, 9] {
+                    let browse = Browse {
+                        start_key: start,
+                        direction,
+                        limit,
+                    };
+                    let page = uow
+                        .store()
+                        .browse_transactions(browse, Some(account_id))
+                        .await
+                        .expect("a page of the filtered browse");
+                    assert_eq!(
+                        page,
+                        filtered_page(&live, account, direction, start, limit),
+                        "account {account}, {direction:?} from {start:?}, limit {limit}"
+                    );
+                }
+            }
+        }
+        uow.rollback()
+            .await
+            .expect("the read-only unit of work ends");
+    });
+}
+
+/// TRANREPT STEP05R — P-TRANREPT-002: the pages of
+/// `transactions_by_proc_date` hold exactly the records `select_for_report`
+/// keeps, in its card-number and TRAN-ID order, for processing timestamps on
+/// both sides of every bound: a date equal to the end, the end followed by a
+/// time, the end followed by sixteen U+00FF (the highest timestamp of that
+/// date), the day after, timestamps of 10 characters and shorter, and a start
+/// and an end shorter than 10 characters. The store's own bounds decide, so a
+/// row they wrongly kept would show here even though the report rule drops it.
+/// The pages are read, as CR00 reads them, in one read-only snapshot, with
+/// more than five reads of the one statement at the smallest limit.
+#[test]
+fn proc_date_pages_keep_exactly_the_dates_of_the_include_cond() {
+    block_on(async {
+        let stack = TestStack::postgres().await;
+        let db = Db::from_pool(stack.pool().clone());
+        let records =
+            PROC_TS_ROWS.map(|(tran_id, card, proc_ts)| record_on(tran_id, card, proc_ts));
+        let live = write_live(&db, &records).await;
+
+        let ranges = [
+            ("2022-07-01", "2022-07-06", 6),
+            ("2022-07", "2022-07-06", 8),
+            ("2022-06-30", "2022-07", 3),
+            ("2022-07-06", "2022-07-06", 3),
+            ("2022-07-07", "2022-12-31", 2),
+        ];
+        let mut snapshot = db.begin_snapshot().await.expect("a snapshot unit of work");
+        for (start, end, count) in ranges {
+            let range = (Alnum::move_from(start), Alnum::move_from(end));
+            let expected = select_for_report(&range.0, &range.1, live.clone())
+                .expect("every card number is numeric");
+            assert_eq!(expected.len(), count, "{start} to {end}: the records kept");
+            for limit in [1, 2, 4, 100] {
+                let read = proc_date_pages(&mut snapshot, range, limit).await;
+                let (last, full) = read.split_last().expect("at least one page");
+                assert!(
+                    full.iter().all(|page| page.len() == usize::from(limit))
+                        && last.len() < usize::from(limit),
+                    "{start} to {end}, limit {limit}: full pages, then a short one"
+                );
+                assert_eq!(read.concat(), expected, "{start} to {end}, limit {limit}");
+            }
+        }
+        snapshot
+            .rollback()
+            .await
+            .expect("the snapshot unit of work ends");
     });
 }

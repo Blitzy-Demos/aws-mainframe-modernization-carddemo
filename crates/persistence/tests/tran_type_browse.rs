@@ -9,6 +9,8 @@
 //!   (`TR_TYPE < :WS-START-KEY … ORDER BY TR_TYPE DESC`)
 //!   [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L338-367] — P-COTRTLIC-003,
 //!   P-COTRTLIC-020, P-COTRTLIC-030, P-COTRTLIC-033;
+//! - `PgStore::count_tran_types_before`, the count of the types the backward
+//!   cursor fetches from its start key — P-COTRTLIC-033, P-COTRTLIC-034;
 //! - `carddemo_domain::rules::tran_type_list::list` over that store, the
 //!   first page, F8 (`8000-READ-FORWARD`) and F7 (`8100-READ-BACKWARDS`) —
 //!   P-COTRTLIC-030, P-COTRTLIC-031, P-COTRTLIC-033, P-COTRTLIC-034.
@@ -326,6 +328,27 @@ fn browse_cases() -> Vec<BrowseCase> {
     ]
 }
 
+/// The backward `browse_tran_types` cases of a description filter below a
+/// start key, a pattern holding a NUL byte included, which match no row.
+fn described_below_cases() -> Vec<BrowseCase> {
+    let below_a = |name: &'static str, pattern: &'static str, expected| BrowseCase {
+        start: Some(A),
+        ..BrowseCase::described(name, pattern, Direction::Backward, expected)
+    };
+    vec![
+        below_a(
+            "description ALPHA backward strictly below A",
+            "%ALPHA%",
+            codes(&[A_CONTROL]),
+        ),
+        below_a(
+            "description %ALPHA\\0% backward below A",
+            "%ALPHA\0%",
+            Vec::new(),
+        ),
+    ]
+}
+
 /// The `browse_tran_types` cases of start keys holding a NUL byte, in both
 /// directions, with a short limit and under a type filter, each beside its
 /// NUL-free twin with the same codes (`A\\x01`'s twins are in
@@ -440,7 +463,10 @@ fn nul_filter_cases() -> Vec<BrowseCase> {
 
 /// `browse_tran_types` compares and orders the codes as their padded `X(2)`
 /// bytes: each case's page holds exactly the codes its cursor fetches, in
-/// fetch order, a start key holding NUL included.
+/// fetch order, a start key holding NUL included. For each backward case
+/// from a start key with every row fetched, `count_tran_types_before`
+/// counts exactly the codes the cursor fetches, under the same filters
+/// (P-COTRTLIC-033, P-COTRTLIC-034).
 #[test]
 fn browse_tran_types_follows_the_padded_key_order() {
     let prepared = fixture_seed();
@@ -449,6 +475,7 @@ fn browse_tran_types_follows_the_padded_key_order() {
         let mut uow = db.begin().await.expect("a unit of work");
         let cases = browse_cases()
             .into_iter()
+            .chain(described_below_cases())
             .chain(nul_start_cases())
             .chain(nul_filter_cases());
         for case in cases {
@@ -461,12 +488,23 @@ fn browse_tran_types_follows_the_padded_key_order() {
                 type_code: case.type_code.map(code),
                 description: case.description.map(str::to_owned),
             };
+            let below = match (case.direction, case.start) {
+                (Direction::Backward, Some(start)) if case.limit == ALL => {
+                    Some((filter.clone(), code(start)))
+                }
+                _ => None,
+            };
             let page = uow
                 .store()
                 .browse_tran_types(browse, filter)
                 .await
                 .unwrap_or_else(|error| panic!("{}: {error:?}", case.name));
             assert_eq!(codes_of(&page), case.expected, "{}", case.name);
+            if let Some((filter, key)) = below {
+                let count = uow.store().count_tran_types_before(filter, key).await;
+                let fetched = u64::try_from(case.expected.len()).expect("a short page");
+                assert_eq!(count, Ok(fetched), "{}: the count below the key", case.name);
+            }
         }
         uow.rollback()
             .await

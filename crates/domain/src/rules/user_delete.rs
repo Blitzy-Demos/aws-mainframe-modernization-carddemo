@@ -125,7 +125,8 @@ fn unable_to_update_user() -> DomainError {
 /// COUSR03C DELETE-USER-INFO — P-COUSR03C-004, V-COUSR03C-004,
 /// V-COUSR03C-005 [app/cbl/COUSR03C.cbl:L174-192]: the user-ID edit, then
 /// `READ-USER-SEC-FILE` (a `READ … UPDATE`, P-COUSR03C-003) and
-/// `DELETE-USER-SEC-FILE`, which runs whatever the read answered.
+/// `DELETE-USER-SEC-FILE`, which runs whatever the read answered. The read
+/// leaves out the password, which a delete never compares.
 ///
 /// After a failed read the COBOL `DELETE` has no record held for update and
 /// no `RIDFLD`, so CICS answers `INVREQ` and the delete's `WHEN OTHER` text
@@ -157,7 +158,7 @@ pub async fn delete<S: UserStore>(
         EnteredUserId::Unkeyable => return Err(unable_to_update_user()),
         EnteredUserId::Key(key) => key,
     };
-    let Ok(user) = store.read_user_for_update(key).await else {
+    let Ok(user) = store.read_user_profile_for_update(key).await else {
         return Err(unable_to_update_user());
     };
     delete_user_sec_file(store, user.sec_usr_id).await
@@ -259,7 +260,7 @@ mod tests {
                 message: text.to_owned(),
             };
             assert_eq!(deleted, Ok(expected), "{entered:?}");
-            assert_eq!(store.calls, ["read_user_for_update", "delete_user"]);
+            assert_eq!(store.calls, ["read_user_profile_for_update", "delete_user"]);
             assert!(
                 !store.users.contains_key(&UserId::move_from(entered)),
                 "{entered:?}"
@@ -302,7 +303,7 @@ mod tests {
             let mut store = seeded();
             let result = block_on(delete(&mut store, Some(entered.to_owned())));
             assert_eq!(result, Err(unable_to_update()), "{entered:?}");
-            assert_eq!(store.calls, ["read_user_for_update"], "{entered:?}");
+            assert_eq!(store.calls, ["read_user_profile_for_update"], "{entered:?}");
             assert_eq!(ids(&store), ["ABC", "ADMIN001", "USER0001"]);
         }
     }
@@ -316,10 +317,10 @@ mod tests {
         ];
         for failure in failures {
             let mut store = seeded();
-            store.fail_next("read_user_for_update", failure.clone());
+            store.fail_next("read_user_profile_for_update", failure.clone());
             let result = block_on(delete(&mut store, Some("USER0001".to_owned())));
             assert_eq!(result, Err(unable_to_update()), "{failure:?}");
-            assert_eq!(store.calls, ["read_user_for_update"], "{failure:?}");
+            assert_eq!(store.calls, ["read_user_profile_for_update"], "{failure:?}");
             assert!(store.users.contains_key(&UserId::move_from("USER0001")));
         }
     }
@@ -344,7 +345,7 @@ mod tests {
             store.fail_next("delete_user", failure.clone());
             let result = block_on(delete(&mut store, Some("USER0001".to_owned())));
             assert_eq!(result, Err(expected), "{failure:?}");
-            assert_eq!(store.calls, ["read_user_for_update", "delete_user"]);
+            assert_eq!(store.calls, ["read_user_profile_for_update", "delete_user"]);
             assert!(
                 store.users.contains_key(&UserId::move_from("USER0001")),
                 "a failed delete changes nothing"

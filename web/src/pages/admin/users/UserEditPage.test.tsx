@@ -23,6 +23,7 @@ import {
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { userKeys } from "@/api/queries/admin-users";
 import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -56,6 +57,10 @@ const EDIT_PATH = "/admin/users/USER0001/edit";
 const USER_LIST_PATH = "/admin/users";
 const API_USER_PATH = "/api/admin/users/USER0001";
 
+// The routes of the user `..`, at its key segment `~..`.
+const DOTS_EDIT_PATH = "/admin/users/~../edit";
+const DOTS_API_USER_PATH = "/api/admin/users/~..";
+
 // The route table of the admin domain (AAP 0.5.4.1), nested so PageHeader
 // builds its trail from the handles. `users/edit` is the edit page reached
 // without a user ID.
@@ -86,6 +91,9 @@ type Sent = { method: string; pathname: string; body: unknown };
 
 let sent: Sent[];
 let stored: UserSummary;
+// The path the stub answers GET and PUT on: USER0001's unless a test opens
+// another user.
+let apiUserPath: string;
 let answerPut: (body: unknown) => Response;
 let queryClient: QueryClient;
 
@@ -126,6 +134,7 @@ function rejected(
 beforeEach(() => {
   sent = [];
   stored = USER0001;
+  apiUserPath = API_USER_PATH;
   answerPut = () => {
     throw new Error("Unexpected PUT");
   };
@@ -137,10 +146,10 @@ beforeEach(() => {
     const body: unknown =
       request.method === "PUT" ? await request.clone().json() : undefined;
     sent.push({ method: request.method, pathname, body });
-    if (pathname === API_USER_PATH && request.method === "GET") {
+    if (pathname === apiUserPath && request.method === "GET") {
       return Response.json(stored);
     }
-    if (pathname === API_USER_PATH && request.method === "PUT") {
+    if (pathname === apiUserPath && request.method === "PUT") {
       return answerPut(body);
     }
     return Response.json(
@@ -403,6 +412,63 @@ describe("UserEditPage (CU02, COUSR02C)", () => {
     expect(await screen.findByText("User list")).toBeTruthy();
     expect(router.state.location.pathname).toBe(USER_LIST_PATH);
     expect(sent).toHaveLength(0);
+  });
+
+  // The user ID `..`, which COUSR01C stores and a URL drops as a dot segment,
+  // has its route at the key segment `~..` (lib/key-segment.ts): the page
+  // reads and saves the stored user `..` through that segment.
+  it("reads and saves the user '..' through its key segment ~..", async () => {
+    const dots = {
+      user_id: "..",
+      first_name: "DOTS",
+      last_name: "KEY",
+      usr_type: "U",
+    } as const satisfies UserSummary;
+    const saved = { ...dots, first_name: "DOTTED" } satisfies UserSummary;
+    const savedMessage = "User .. has been updated ...";
+    stored = dots;
+    apiUserPath = DOTS_API_USER_PATH;
+    answerPut = () => {
+      stored = saved;
+      return Response.json({
+        user: saved,
+        message: savedMessage,
+      } satisfies UserMessageResponse);
+    };
+    const { user, router } = renderAt(DOTS_EDIT_PATH);
+
+    const firstName = asInput(
+      await screen.findByRole("textbox", { name: "First Name" }),
+    );
+    await waitFor(() => {
+      expect(firstName.value).toBe(dots.first_name);
+    });
+    expect(textbox("User ID").value).toBe(dots.user_id);
+    // The page keys its read by the stored ID, not by the segment.
+    expect(queryClient.getQueryData(userKeys.detail(dots.user_id))).toEqual(
+      dots,
+    );
+
+    await replaceText(user, textbox("First Name"), saved.first_name);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(puts()).toHaveLength(1);
+    });
+    const [put] = puts();
+    expect(put.pathname).toBe(DOTS_API_USER_PATH);
+    expect(objectBody(put)).toStrictEqual({
+      first_name: saved.first_name,
+      last_name: saved.last_name,
+      usr_type: saved.usr_type,
+    } satisfies UserUpdateRequest);
+    await toastShowing(savedMessage);
+    // Every request, the read and the save, addressed the user `..`.
+    expect(sent.some(({ method }) => method === "GET")).toBe(true);
+    expect(sent.map(({ pathname }) => pathname)).toEqual(
+      sent.map(() => DOTS_API_USER_PATH),
+    );
+    expect(router.state.location.pathname).toBe(DOTS_EDIT_PATH);
   });
 
   it("marks, toasts and focuses the field a server rejection names", async () => {

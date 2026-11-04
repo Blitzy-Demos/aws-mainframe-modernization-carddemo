@@ -61,6 +61,7 @@ import {
   showMessage,
   showSuccess,
 } from "@/lib/api-errors";
+import { decodeKeySegment, keyPathSegment } from "@/lib/key-segment";
 import {
   toTranTypeUpdateRequest,
   tranTypeCreateSchema,
@@ -75,9 +76,9 @@ const LIST_ROUTE = "/admin/transaction-types";
 /** The empty key entry (F-COTRTUP-007, F-COTRTUP-014). */
 const KEY_ENTRY_ROUTE = "/admin/transaction-types/new";
 
-/** The edit route of a type on file. */
+/** The edit route of a type on file, its code as the key segment. */
 function editRoute(typeCode: string): string {
-  return `${LIST_ROUTE}/${encodeURIComponent(typeCode)}/edit`;
+  return `${LIST_ROUTE}/${keyPathSegment(typeCode)}/edit`;
 }
 
 /** `TRTYPCDI` `X(2)` and `TRTYDSCI` `X(50)` of COTRTUP. */
@@ -558,10 +559,11 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
  * code, so another type's route starts from a fresh form.
  */
 export default function TranTypeFormPage(): JSX.Element {
-  const { code } = useParams();
-  return code === undefined ? (
-    <TranTypeAddForm />
-  ) : (
-    <TranTypeEditForm key={code} code={code} />
-  );
+  const { code: segment } = useParams();
+  if (segment === undefined) {
+    return <TranTypeAddForm />;
+  }
+  // The route carries the key segment of the code (lib/key-segment.ts).
+  const code = decodeKeySegment(segment);
+  return <TranTypeEditForm key={code} code={code} />;
 }

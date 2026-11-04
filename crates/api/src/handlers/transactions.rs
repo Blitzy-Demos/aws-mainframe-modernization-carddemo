@@ -36,6 +36,15 @@
 //! (AAP 0.6.4); the COBOL add has no write before the transaction record that
 //! could persist.
 //!
+//! The allocation's advisory lock is held until that transaction ends, and an
+//! add waiting for it holds its pooled connection. So the add is admitted
+//! through the per-process TRAN-ID writer limit
+//! (`AppState::admit_tran_id_writer`) after the body's own check and before
+//! it opens the transaction, and keeps its permit until the transaction has
+//! committed or rolled back: writers beyond the limit queue holding no
+//! connection, and the reads keep the rest of the pool. The permit changes no
+//! lock order, outcome or span field.
+//!
 //! # Telemetry
 //!
 //! Each handler runs inside one INFO span named after its operation, with
@@ -100,6 +109,7 @@ use carddemo_domain::rules::transaction_list;
 use carddemo_domain::rules::transaction_view::{self, TransactionViewInput};
 use carddemo_domain::rules::{AccrualInput, ErrorKind, PortError, PortResult};
 use carddemo_persistence::tx::UnitOfWork;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span};
 
@@ -458,7 +468,9 @@ fn add_span(user_id: &str) -> Span {
 
 /// The CT02 add with the `outcome` it ended in: the key the body names
 /// recorded on `span`, validation in a fresh unit of work, then the writes in
-/// the same unit, committed only when every one of them succeeded.
+/// the same unit, committed only when every one of them succeeded. The TRAN-ID
+/// writer permit validation was admitted with is held until the unit has
+/// committed or rolled back.
 async fn add_transaction(
     state: &AppState,
     body: TransactionAddRequest,
@@ -466,7 +478,9 @@ async fn add_transaction(
 ) -> (&'static str, Result<TransactionAddResponse, ApiError>) {
     let key = add_span_key(body.account_id.as_deref(), body.card_number.as_deref());
     key.record(span);
-    let (mut uow, validated) = match validate_request(state, body).await {
+    // `_writer` is dropped when this function returns, after the unit of work
+    // below has ended.
+    let (_writer, mut uow, validated) = match validate_request(state, body).await {
         Ok(opened) => opened,
         Err(err) => return (unwritten_outcome(&err), Err(err)),
     };
@@ -491,23 +505,26 @@ async fn add_transaction(
 
 /// COTRN02C PROCESS-ENTER-KEY — P-COTRN02C-003, P-COTRN02C-004;
 /// V-COTRN02C-001 to V-COTRN02C-028: the width and encoding check of the
-/// body, then the `COTRN02C` edits in the unit of work the add continues in.
+/// body, then the TRAN-ID writer permit, then the `COTRN02C` edits in the unit
+/// of work the add continues in, returned with the permit, which the caller
+/// holds until that unit ends.
 ///
 /// # Errors
 ///
-/// That check's 400, a failed `Db::begin` (500), or the first edit the
-/// rule rejects; the unit of work is rolled back before an edit error is
-/// returned.
+/// That check's 400, a failed admission or `Db::begin` (500), or the first
+/// edit the rule rejects; the unit of work is rolled back before an edit
+/// error is returned.
 async fn validate_request(
     state: &AppState,
     body: TransactionAddRequest,
-) -> Result<(UnitOfWork, ValidatedTransaction), ApiError> {
+) -> Result<(OwnedSemaphorePermit, UnitOfWork, ValidatedTransaction), ApiError> {
     body.check()?;
     let input = body.into_input();
+    let writer = state.admit_tran_id_writer().await?;
     let mut uow = state.db().begin().await?;
     let validated = transaction_add::validate(&mut uow.store(), input).await;
     match validated {
-        Ok(validated) => Ok((uow, validated)),
+        Ok(validated) => Ok((writer, uow, validated)),
         Err(err) => {
             roll_back(uow).await;
             Err(ApiError::from(err))

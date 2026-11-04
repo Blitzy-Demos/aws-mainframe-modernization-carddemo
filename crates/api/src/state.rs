@@ -14,11 +14,34 @@
 //!   keys come from the path, query or body, and the navigation fields are the
 //!   SPA's routes.
 //! - Everything per process does: the database handle, the settings, the
-//!   processing clock, the token keys and the CORS origin. All of it is built
-//!   once at start-up, by [`PreparedState::new`] from the settings before any
-//!   connection opens and by [`PreparedState::into_state`] once the database
-//!   handle exists. It is immutable afterwards, so a clone is cheap and shared
-//!   across the runtime's threads without locking.
+//!   processing clock, the token keys, the CORS origin and the two admission
+//!   limits. All of it is built once at start-up, by [`PreparedState::new`]
+//!   from the settings before any connection opens and by
+//!   [`PreparedState::into_state`] once the database handle exists. It is
+//!   immutable afterwards, apart from the permits the admission limits lend
+//!   out, so a clone is cheap and shared across the runtime's threads.
+//!
+//! # Admission limits
+//!
+//! Two semaphores bound work whose cost would otherwise grow with the number
+//! of concurrent requests. A request beyond a limit waits for a permit, in
+//! arrival order; none is refused and none times out, because the API has no
+//! rate limiting.
+//!
+//! - `AppState::admit_tran_id_writer` admits the CT02 adds and confirmed
+//!   CB00 payments, the requests that allocate a TRAN-ID. The allocation
+//!   serializes on an advisory lock held until the writer's unit of work
+//!   ends (`carddemo_persistence::ids`), and a writer waiting for it holds a
+//!   pooled connection. A writer therefore takes its permit before it opens
+//!   its unit of work: at most `tran_id_writer_permits` of the pool's
+//!   connections wait on the lock, and a burst of writers queues here, holding
+//!   no connection, while the reads keep the rest of the pool.
+//! - `AppState::admit_argon2` admits argon2id hashing and verification,
+//!   each of which holds about 19 MiB while it runs on tokio's blocking pool,
+//!   one run per CPU the process may use. Concurrent sign-ons then queue for
+//!   a permit instead of each taking a blocking thread and its memory, so the
+//!   process's peak memory has a fixed ceiling. `run_argon2` keeps the
+//!   permit inside the blocking task until the step returns.
 //!
 //! # Time
 //!
@@ -53,13 +76,23 @@ use carddemo_domain::clock::{AnyClock, ClockError};
 use carddemo_domain::rules::{VersionError, VersionKey};
 use carddemo_persistence::tx::Db;
 use carddemo_runtime::config::Settings;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinError;
 
 use crate::auth::jwt::JwtKeys;
+use crate::error::ApiError;
+
+/// The fewest TRAN-ID writers [`tran_id_writer_permits`] admits at once,
+/// whatever the pool size: a CT02 add and a CB00 payment on one account can
+/// then both wait in the database, in the lock order
+/// `carddemo_persistence::ids` documents, as on a full-sized pool.
+const MIN_TRAN_ID_WRITERS: usize = 2;
 
 /// The shared state of the API process.
 ///
-/// Cloning copies a pool handle, four reference counts and the origin
-/// header; every clone sees the same connections, settings, clock and keys.
+/// Cloning copies a pool handle, six reference counts and the origin header;
+/// every clone sees the same connections, settings, clock, keys and admission
+/// limits.
 #[derive(Clone)]
 pub struct AppState {
     db: Db,
@@ -68,6 +101,8 @@ pub struct AppState {
     jwt: Arc<JwtKeys>,
     version_key: Arc<VersionKey>,
     cors_origin: HeaderValue,
+    tran_id_writers: Arc<Semaphore>,
+    argon2_work: Arc<Semaphore>,
 }
 
 impl fmt::Debug for AppState {
@@ -75,7 +110,8 @@ impl fmt::Debug for AppState {
     /// secrets out: [`Settings`] redacts the database and broker URLs and the
     /// JWT secret, [`JwtKeys`] prints only its algorithm and lifetime,
     /// [`VersionKey`] prints `VersionKey(<redacted>)`, and [`Db`] only its
-    /// pool's size and options.
+    /// pool's size and options. The two admission limits show the permits
+    /// they have free.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Exhaustive destructuring: a field added to `AppState` fails to
         // compile here until it is decided whether `Debug` may show it.
@@ -86,6 +122,8 @@ impl fmt::Debug for AppState {
             jwt,
             version_key,
             cors_origin,
+            tran_id_writers,
+            argon2_work,
         } = self;
         f.debug_struct("AppState")
             .field("db", db)
@@ -94,6 +132,11 @@ impl fmt::Debug for AppState {
             .field("jwt", jwt)
             .field("version_key", version_key)
             .field("cors_origin", cors_origin)
+            .field(
+                "tran_id_writer_permits_free",
+                &tran_id_writers.available_permits(),
+            )
+            .field("argon2_permits_free", &argon2_work.available_permits())
             .finish()
     }
 }
@@ -160,6 +203,7 @@ pub struct PreparedState {
     cors_origin: HeaderValue,
     jwt: JwtKeys,
     version_key: VersionKey,
+    argon2_work: Semaphore,
 }
 
 impl PreparedState {
@@ -175,6 +219,8 @@ impl PreparedState {
     ///   seconds, a lifetime checked to give a representable expiry.
     /// - The version key keys the record version tokens with
     ///   `CARDDEMO_JWT_SECRET`.
+    /// - The argon2 admission has `argon2_permits` permits, one per CPU the
+    ///   process may use. No setting sizes it.
     ///
     /// Nothing here connects or reads the environment: `settings` are
     /// already resolved.
@@ -204,6 +250,7 @@ impl PreparedState {
             cors_origin,
             jwt,
             version_key,
+            argon2_work: Semaphore::new(argon2_permits()),
         })
     }
 
@@ -216,7 +263,9 @@ impl PreparedState {
     }
 
     /// The state of the process: the derived values with `db`, the pool
-    /// opened on [`Settings::database_url`].
+    /// opened on [`Settings::database_url`], and the TRAN-ID writer admission,
+    /// whose `tran_id_writer_permits` are sized from that pool's connection
+    /// limit.
     #[must_use]
     pub fn into_state(self, db: Db) -> AppState {
         let Self {
@@ -225,7 +274,9 @@ impl PreparedState {
             cors_origin,
             jwt,
             version_key,
+            argon2_work,
         } = self;
+        let writers = tran_id_writer_permits(db.pool().options().get_max_connections());
         AppState {
             db,
             settings: Arc::new(settings),
@@ -233,8 +284,86 @@ impl PreparedState {
             jwt: Arc::new(jwt),
             version_key: Arc::new(version_key),
             cors_origin,
+            tran_id_writers: Arc::new(Semaphore::new(writers)),
+            argon2_work: Arc::new(argon2_work),
         }
     }
+}
+
+/// The permits of the TRAN-ID writer admission for a pool of
+/// `max_connections`: half the connections but one, rounded down, and never
+/// fewer than [`MIN_TRAN_ID_WRITERS`]. A pool of 10 admits 4 writers.
+///
+/// The writers admitted at once are the most connections that wait on the
+/// TRAN-ID advisory lock together, so more than half the pool stays free for
+/// the reads and for the `USRSEC` read that checks every request's bearer
+/// token, however many writers queue.
+fn tran_id_writer_permits(max_connections: u32) -> usize {
+    // A `u32` fits the `usize` of every 32- and 64-bit target.
+    usize::try_from(max_connections.saturating_sub(1) / 2)
+        .map_or(MIN_TRAN_ID_WRITERS, |half| half.max(MIN_TRAN_ID_WRITERS))
+}
+
+/// The permits of the argon2 admission: the CPUs the process may use, as
+/// [`std::thread::available_parallelism`] counts them, or 1, with a warning,
+/// when it cannot count them.
+///
+/// argon2id runs are CPU-bound, so more of them at once than there are CPUs
+/// only add their memory, never their throughput.
+fn argon2_permits() -> usize {
+    match std::thread::available_parallelism() {
+        Ok(cpus) => cpus.get(),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the CPU count is unknown; argon2 work is admitted one run at a time"
+            );
+            1
+        }
+    }
+}
+
+/// A permit of `permits`, the admission limit named `admission`, once one is
+/// free.
+///
+/// # Errors
+///
+/// [`ApiError::unexpected`] when the semaphore is closed. Neither admission
+/// semaphore is ever closed, so the cause is logged as the defect it would
+/// be, and the request answers without internal detail.
+async fn admitted(
+    permits: &Arc<Semaphore>,
+    admission: &'static str,
+) -> Result<OwnedSemaphorePermit, ApiError> {
+    Arc::clone(permits).acquire_owned().await.map_err(|error| {
+        tracing::error!(admission, error = %error, "admission semaphore closed");
+        ApiError::unexpected()
+    })
+}
+
+/// Runs `step`, an argon2id hash or verification, on tokio's blocking pool
+/// while it holds `permit`, an [`AppState::admit_argon2`] permit.
+///
+/// The permit moves into the blocking task and is released only once `step`
+/// has returned. A blocking task runs to its end even when the request that
+/// awaits it is dropped, its client gone, so a permit the request alone held
+/// would be released while the step's memory is still in use.
+///
+/// # Errors
+///
+/// The [`JoinError`] of a step that panicked, or that the runtime dropped
+/// unstarted while shutting down. The caller logs it and chooses its answer.
+pub(crate) async fn run_argon2<T, F>(permit: OwnedSemaphorePermit, step: F) -> Result<T, JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let output = step();
+        drop(permit);
+        output
+    })
+    .await
 }
 
 /// The reasons [`StateError::CorsOrigin`] gives, one per rule of a serialized
@@ -500,6 +629,31 @@ impl AppState {
     pub fn cors_origin(&self) -> &HeaderValue {
         &self.cors_origin
     }
+
+    /// Waits for a TRAN-ID writer permit, the admission of the module
+    /// documentation. A CT02 add or a confirmed CB00 payment takes it before
+    /// it opens its unit of work and holds it until that unit has committed
+    /// or rolled back, so a writer queued here holds no pooled connection.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::unexpected`] when the semaphore is closed, which nothing
+    /// does; the cause is logged.
+    pub(crate) async fn admit_tran_id_writer(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        admitted(&self.tran_id_writers, "tran_id_writers").await
+    }
+
+    /// Waits for an argon2 permit, the admission of the module documentation.
+    /// The holder passes it to [`run_argon2`] with the argon2id step it
+    /// admits.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::unexpected`] when the semaphore is closed, which nothing
+    /// does; the cause is logged.
+    pub(crate) async fn admit_argon2(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        admitted(&self.argon2_work, "argon2_work").await
+    }
 }
 
 impl FromRef<AppState> for Arc<JwtKeys> {
@@ -514,13 +668,24 @@ impl FromRef<AppState> for Arc<JwtKeys> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use axum::http::StatusCode;
     use carddemo_domain::clock::{AnyClock, Clock, ClockError, FixedClock, SystemClock};
     use carddemo_domain::rules::{VersionError, VersionKey, version_token};
     use carddemo_runtime::config::{Settings, defaults};
     use chrono::{DateTime, Utc};
+    use tokio::sync::{Semaphore, oneshot};
 
-    use super::{AppState, PreparedState, StateError, cors_reason};
+    use super::{
+        AppState, PreparedState, StateError, admitted, cors_reason, run_argon2,
+        tran_id_writer_permits,
+    };
     use crate::auth::jwt::{JwtKeys, UserType};
+    use crate::error::ApiError;
 
     fn assert_send_sync_clone<T: Send + Sync + Clone + 'static>() {}
 
@@ -811,5 +976,133 @@ mod tests {
                 .starts_with("invalid CARDDEMO_JWT_SECRET for the record version key: "),
             "{err}"
         );
+    }
+
+    #[test]
+    fn tran_id_writers_are_half_the_pool_but_one_and_never_fewer_than_two() {
+        // (pool connections, writers admitted at once): the testkit pool
+        // holds 5 connections and the `api` pool 10.
+        for (max_connections, permits) in [(1, 2), (2, 2), (3, 2), (5, 2), (10, 4), (11, 5)] {
+            assert_eq!(
+                tran_id_writer_permits(max_connections),
+                permits,
+                "a pool of {max_connections}"
+            );
+        }
+    }
+
+    #[test]
+    fn argon2_work_is_admitted_once_per_cpu_the_process_may_use() {
+        let derived = derive(&Settings::default()).expect("the defaults are valid");
+        let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        assert_eq!(derived.argon2_work.available_permits(), cpus);
+    }
+
+    /// How long the first admitted argon2 step waits for a second one to
+    /// start, so the test fails instead of hanging when none can.
+    const PARTNER_DEADLINE: Duration = Duration::from_secs(10);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn argon2_steps_run_no_more_at_once_than_the_admission_has_permits() {
+        const PERMITS: usize = 2;
+        const STEPS: usize = 6;
+        let admission = Arc::new(Semaphore::new(PERMITS));
+        let running = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let requests: Vec<_> = (0..STEPS)
+            .map(|step| {
+                let admission = Arc::clone(&admission);
+                let (running, started, most) = (
+                    Arc::clone(&running),
+                    Arc::clone(&started),
+                    Arc::clone(&most),
+                );
+                tokio::spawn(async move {
+                    let permit = admitted(&admission, "test")
+                        .await
+                        .expect("the admission is open");
+                    run_argon2(permit, move || {
+                        most.fetch_max(
+                            running.fetch_add(1, Ordering::SeqCst) + 1,
+                            Ordering::SeqCst,
+                        );
+                        started.fetch_add(1, Ordering::SeqCst);
+                        // The first step waits for a second, so the test sees
+                        // the steps the permits admit together; every later
+                        // step finds two started already.
+                        let until = Instant::now() + PARTNER_DEADLINE;
+                        while started.load(Ordering::SeqCst) < PERMITS && Instant::now() < until {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        step
+                    })
+                    .await
+                    .expect("the step completes")
+                })
+            })
+            .collect();
+        let mut finished = Vec::with_capacity(STEPS);
+        for request in requests {
+            finished.push(request.await.expect("the request task completes"));
+        }
+        assert_eq!(finished, (0..STEPS).collect::<Vec<_>>(), "every step ran");
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            PERMITS,
+            "the most steps that ran at once"
+        );
+        assert_eq!(
+            admission.available_permits(),
+            PERMITS,
+            "every permit is back"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_argon2_step_keeps_its_permit_when_the_request_awaiting_it_is_dropped() {
+        let admission = Arc::new(Semaphore::new(1));
+        let (started, step_started) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let permit = admitted(&admission, "test")
+            .await
+            .expect("the admission is open");
+        let request = tokio::spawn(run_argon2(permit, move || {
+            started.send(()).expect("the test awaits the start");
+            released.recv().expect("the test releases the step");
+        }));
+        step_started.await.expect("the step starts");
+
+        // The client is gone: the request future is dropped while its step
+        // still runs, as a dropped connection drops a handler.
+        request.abort();
+        let aborted = request.await.expect_err("the request was dropped");
+        assert!(aborted.is_cancelled(), "{aborted}");
+        assert_eq!(
+            admission.available_permits(),
+            0,
+            "the running step still holds its permit"
+        );
+
+        release.send(()).expect("the step waits for its release");
+        let again = Arc::clone(&admission)
+            .acquire_owned()
+            .await
+            .expect("the permit returns once the step has returned");
+        drop(again);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_admission_answers_the_unexpected_error_without_panicking() {
+        let admission = Arc::new(Semaphore::new(1));
+        admission.close();
+        let error = admitted(&admission, "test")
+            .await
+            .expect_err("a closed semaphore admits nothing");
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.body(), ApiError::unexpected().body());
     }
 }

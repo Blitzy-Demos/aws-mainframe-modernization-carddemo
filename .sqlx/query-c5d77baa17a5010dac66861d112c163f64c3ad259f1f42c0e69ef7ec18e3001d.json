@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT user_id, sec_usr_fname, sec_usr_lname, sec_usr_type\n                       FROM users\n                       ORDER BY rpad(user_id, 8) COLLATE \"C\" DESC\n                       LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "sec_usr_fname",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "sec_usr_lname",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "sec_usr_type",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c5d77baa17a5010dac66861d112c163f64c3ad259f1f42c0e69ef7ec18e3001d"
+}

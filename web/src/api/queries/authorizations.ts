@@ -127,29 +127,48 @@ export function useAuthorizationDetail(
 }
 
 /**
- * COPAUS1C PF5, MARK-AUTH-FRAUD with COPAUS2C: toggles the fraud mark of
- * `authId`. The request has no body, because PF5 acts on the record shown.
- * The result carries `message`, the success text the page shows.
- *
- * On success the shown detail becomes the replaced one, and the summary pages
- * of the authorization's account are marked stale, so CPVS reads that account
- * again after the write, as PF3 back to COPAUS0C does. Other accounts'
- * summaries are left alone, since the write touched only this account's
- * records. On failure the server has rolled both writes back (ROLL-BACK), so
- * the cache is left alone and the ApiError reaches the page.
+ * The identity a key names, as the server's `i64` parse reads it: the decimal
+ * text without its optional `+` and its leading zeros, so the route aliases
+ * `+0007` and `0007` name the `auth_id` `7` the server answers with. Text in,
+ * text out, so no digit of an ID above 2^53 is lost to a conversion.
  */
-export function useFraudToggleMutation(
-  authId: string,
-): UseMutationResult<FraudToggleResult, Error, void> {
+function authIdentity(authId: string): string {
+  return authId.replace(/^\+?0*/, "");
+}
+
+/**
+ * COPAUS1C PF5, MARK-AUTH-FRAUD with COPAUS2C: toggles the fraud mark of the
+ * authorization whose key is passed to `mutate`, the key of the record shown
+ * when the toggle is confirmed. The request has no body, because PF5 acts on
+ * the record shown. The result carries `message`, the success text the page
+ * shows.
+ *
+ * The key is the mutation's variables, fixed when the toggle starts: the page
+ * stays mounted when its route moves on to another authorization (PF8) while
+ * the PUT is in flight, and the answer still belongs to the key it was sent
+ * for, never to the one shown by the time it arrives.
+ *
+ * On success the requested key's detail becomes the replaced one, and the
+ * summary pages of the authorization's account are marked stale, so CPVS
+ * reads that account again after the write, as PF3 back to COPAUS0C does.
+ * Other accounts' summaries are left alone, since the write touched only this
+ * account's records. On failure the server has rolled both writes back
+ * (ROLL-BACK), so the cache is left alone and the ApiError reaches the page.
+ */
+export function useFraudToggleMutation(): UseMutationResult<
+  FraudToggleResult,
+  Error,
+  string
+> {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async () =>
+    mutationFn: async (authId: string) =>
       unwrap(
         await api.PUT("/authorizations/{id}", {
           params: { path: { id: authId } },
         }),
       ),
-    onSuccess: async (data) => {
+    onSuccess: async (data, authId) => {
       const detailKey = authorizationKeys.detail(authId);
       // A read of the detail still in flight may have been served before the
       // mark committed, so it is stopped rather than allowed to overwrite the
@@ -160,8 +179,12 @@ export function useFraudToggleMutation(
         queryKey: authorizationKeys.summaries(),
         predicate: (query) => isSummaryOf(query, data.detail.account_id),
       });
-      if (shown === undefined) {
-        // No detail to keep a PF8 neighbour from: read it afresh.
+      // The server answers with the detail its path names. A detail of any
+      // other authorization is never written under this key; the key is read
+      // afresh instead, as is one with no detail to keep a PF8 neighbour from.
+      const sameAuthorization =
+        authIdentity(data.detail.auth_id) === authIdentity(authId);
+      if (shown === undefined || !sameAuthorization) {
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: detailKey }),
           summaries,

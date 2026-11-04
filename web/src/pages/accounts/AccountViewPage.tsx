@@ -9,12 +9,16 @@
 // strings and are never turned into numbers.
 //
 // The key edits and the read failures are the server's V-COACTVWC answers.
-// The form schema mirrors the key edits, so the form never sends a key the
-// server is certain to refuse; a key that reaches the server through the URL
-// gets the same text back, shown at ACCTSID with the cursor there.
+// The form schema mirrors the key edits and the route key goes through them
+// too, so the page never sends a key the server is certain to refuse: a key
+// they reject, typed or in the URL, gets its text at ACCTSID with the cursor
+// there and no read, as a key error skips 9000-READ-ACCT
+// [app/cbl/COACTVWC.cbl:L361-374]. A failed read is shown the same way, with
+// a toast as well.
 import {
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type JSX,
@@ -36,6 +40,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { applyApiError } from "@/lib/api-errors";
 import {
+  accountKeyError,
   accountKeySchema,
   accountViewBmsFieldMap,
   type AccountKeyValues,
@@ -245,16 +250,31 @@ export default function AccountViewPage(): JSX.Element {
     defaultValues: { account_id: accountId },
   });
 
-  // The hook sends no request for an empty key, so the key-entry state reads
-  // nothing.
-  const account = useAccount(accountId);
+  // 2210-EDIT-ACCOUNT on the route key: its text, or `null` for a key that
+  // passes and for none at all, the key-entry state.
+  const routeKeyError = useMemo(
+    () => (accountId === "" ? null : accountKeyError(accountId)),
+    [accountId],
+  );
+  const readsAccount = accountId !== "" && routeKeyError === null;
+  // The hook sends no request for an empty key, so the key-entry state and a
+  // route key the edits reject, passed as a blank, read nothing.
+  const account = useAccount(readsAccount ? accountId : "");
   const { error, isFetching, refetch: readAccount } = account;
 
   // ACCTSID shows the key of the account on screen: a new route key replaces
-  // whatever was typed, and its errors with it.
+  // whatever was typed, and its errors with it. A route key the edits reject
+  // is then marked with its text and the cursor placed on it, as
+  // 1300-SETUP-SCREEN-ATTRS positions it [app/cbl/COACTVWC.cbl:L545-552].
+  // keepFieldsRef keeps the input's registered ref, which a plain reset drops
+  // until the next render, so setFocus finds it now.
   useEffect(() => {
-    form.reset({ account_id: accountId });
-  }, [accountId, form]);
+    form.reset({ account_id: accountId }, { keepFieldsRef: true });
+    if (routeKeyError !== null) {
+      form.setError("account_id", { type: "custom", message: routeKeyError });
+      form.setFocus("account_id");
+    }
+  }, [accountId, routeKeyError, form]);
 
   // A failed read is shown once, when its request has settled: the text as a
   // toast and at ACCTSID, and the cursor placed there, as
@@ -282,7 +302,8 @@ export default function AccountViewPage(): JSX.Element {
 
   // The read as one polite status line: its progress, then the account it
   // answered for, never a detail value such as the SSN. It is empty without a
-  // route key and after a failed read, whose toast and field error report it.
+  // route key, for a route key the edits reject, whose field error reports
+  // it, and after a failed read, whose toast and field error report it.
   let statusText = "";
   if (accountId !== "" && isFetching) {
     statusText = "Loading account";
@@ -307,8 +328,10 @@ export default function AccountViewPage(): JSX.Element {
     };
   }, [statusText, account.dataUpdatedAt]);
 
+  // A query the page never enables stays pending, so only a key that is read
+  // gets the placeholder.
   let details: ReactNode = null;
-  if (accountId !== "") {
+  if (readsAccount) {
     if (account.isSuccess) {
       details = <AccountDetails account={account.data} />;
     } else if (account.isPending) {

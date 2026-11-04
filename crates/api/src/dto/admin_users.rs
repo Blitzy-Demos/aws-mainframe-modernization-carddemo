@@ -19,7 +19,8 @@
 //! No response type has a password member, so neither a password nor its
 //! argon2id hash can be serialized: `COUSR00C` never lists `SEC-USR-PWD`, and
 //! the hash that replaces it cannot be shown where `COUSR02C` moves the stored
-//! password into its edit field (P-COUSR02C-007). The request types carry the
+//! password into its edit field (P-COUSR02C-007). Each response is built from
+//! a `UserProfile`, the record without the hash. The request types carry the
 //! password exactly as entered, case kept and untrimmed; the rules pad it to
 //! `PIC X(08)` and hash it. Their `Debug` output leaves the password out, and
 //! they implement no `Serialize`.
@@ -55,7 +56,7 @@ use std::fmt;
 
 use carddemo_domain::rules::ErrorKind;
 use carddemo_domain::rules::user_add::UserAddInput;
-use carddemo_domain::rules::user_list::{UserListPage, UserSecurity};
+use carddemo_domain::rules::user_list::{UserListPage, UserProfile};
 use carddemo_domain::rules::user_update::UserUpdateInput;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -473,8 +474,8 @@ pub struct UserSummary {
     pub usr_type: String,
 }
 
-impl From<&UserSecurity> for UserSummary {
-    fn from(user: &UserSecurity) -> Self {
+impl From<&UserProfile> for UserSummary {
+    fn from(user: &UserProfile) -> Self {
         Self {
             user_id: id_string(&user.sec_usr_id),
             first_name: text(&user.sec_usr_fname),
@@ -523,9 +524,10 @@ pub struct UserMessageResponse {
 }
 
 impl UserMessageResponse {
-    /// The response for `user` with the rule's `message`.
+    /// The response for `user` with the rule's `message`. It takes the record
+    /// without its password, which no response shows (E-21).
     #[must_use]
-    pub fn new(user: &UserSecurity, message: impl Into<String>) -> Self {
+    pub fn new(user: &UserProfile, message: impl Into<String>) -> Self {
         Self {
             user: UserSummary::from(user),
             message: message.into(),
@@ -736,7 +738,7 @@ mod tests {
 
     use axum::extract::Query;
     use axum::http::{StatusCode, Uri};
-    use carddemo_domain::entities::UserSecurity;
+    use carddemo_domain::entities::{UserProfile, UserSecurity};
     use carddemo_domain::error::{DomainError, ErrorKind};
     use carddemo_domain::messages;
     use carddemo_domain::numeric::{Alnum, UserId};
@@ -772,6 +774,12 @@ mod tests {
             password_hash: HASH.to_owned(),
             sec_usr_type: Alnum::move_from(usr_type),
         }
+    }
+
+    /// The [`user`] record without its hash, as the list, the fetch and the
+    /// delete read it and as the add and update handlers pass it on.
+    fn profile(id: &str, first_name: &str, last_name: &str, usr_type: &str) -> UserProfile {
+        UserProfile::from(&user(id, first_name, last_name, usr_type))
     }
 
     /// The error body as JSON.
@@ -876,7 +884,7 @@ mod tests {
 
     #[test]
     fn user_summary_has_exactly_the_four_columns_and_no_password() {
-        let summary = UserSummary::from(&user("ADMIN001", "MARGARET", "GOLD", "A"));
+        let summary = UserSummary::from(&profile("ADMIN001", "MARGARET", "GOLD", "A"));
         let json = serde_json::to_value(&summary).expect("serializes");
         assert_eq!(
             json,
@@ -900,7 +908,7 @@ mod tests {
 
     #[test]
     fn user_summary_trims_trailing_spaces_and_keeps_case() {
-        let summary = UserSummary::from(&user("user1", " Ann", "Lee", "u"));
+        let summary = UserSummary::from(&profile("user1", " Ann", "Lee", "u"));
         assert_eq!(summary.user_id, "user1");
         assert_eq!(summary.first_name, " Ann");
         assert_eq!(summary.last_name, "Lee");
@@ -1456,7 +1464,7 @@ mod tests {
 
     #[test]
     fn message_response_carries_the_summary_and_the_text_unchanged() {
-        let record = user("user0099", "Ann", "Lee", "U");
+        let record = profile("user0099", "Ann", "Lee", "U");
         let message = messages::user_added_message("user0099");
         let response = UserMessageResponse::new(&record, message.clone());
         assert_eq!(
@@ -1482,8 +1490,8 @@ mod tests {
     fn list_page_converts_rows_keys_and_message() {
         let page = UserListPage {
             items: vec![
-                user("ADMIN001", "MARGARET", "GOLD", "A"),
-                user("USER1", "ANN", "LEE", "U"),
+                profile("ADMIN001", "MARGARET", "GOLD", "A"),
+                profile("USER1", "ANN", "LEE", "U"),
             ],
             next_key: Some(UserId::move_from("USER2")),
             prev_key: Some(UserId::move_from("ADMIN001")),

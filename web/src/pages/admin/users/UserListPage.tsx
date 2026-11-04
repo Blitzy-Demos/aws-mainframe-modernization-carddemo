@@ -7,7 +7,9 @@
 //   F8=Forward are the data table's Previous and Next (F-COUSR00-003,
 //   F-COUSR00-004), F3=Back the Back link to /admin (F-COUSR00-002).
 // - The row selectors become row actions (E-54): U is the Edit link to the
-//   CU02 route (F-COUSR00-005), D the Delete button (F-COUSR00-006).
+//   CU02 route (F-COUSR00-005), its user ID the key segment of
+//   lib/key-segment.ts, so a user `.` or `..` keeps its own route; D the
+//   Delete button (F-COUSR00-006).
 // - COUSR03 has no screen of its own (E-58). Delete reads the user, as
 //   COUSR03C's ENTER does on entry from the list (F-COUSR03-001), and the
 //   confirm dialog shows what the read returned. F5=Delete is the dialog's
@@ -64,6 +66,7 @@ import {
   showMessage,
   showSuccess,
 } from "@/lib/api-errors";
+import { keyPathSegment } from "@/lib/key-segment";
 import {
   userListBmsFieldMap,
   userListFilterSchema,
@@ -343,7 +346,7 @@ export default function UserListPage(): JSX.Element {
             <div className="flex items-center gap-1">
               <Button variant="link" size="sm" asChild>
                 <Link
-                  to={`${LIST_ROUTE}/${encodeURIComponent(user.user_id)}/edit`}
+                  to={`${LIST_ROUTE}/${keyPathSegment(user.user_id)}/edit`}
                   state={{ from: LIST_ROUTE }}
                   aria-describedby={describedBy}
                 >

@@ -49,6 +49,7 @@ use std::future::ready;
 use axum::extract::State;
 use carddemo_api::AppState;
 use carddemo_api::auth::{AdminUser, AuthUser, UserType};
+use carddemo_api::dto::KeySegment;
 use carddemo_api::dto::admin_transaction_types::{
     TranTypeDeleteQuery, TranTypeListField, TranTypeListPageQuery, TranTypeListQuery,
     TranTypeOrigin, TranTypeResponse, TranTypeUpdateQuery, TranTypeUpdateRequest,
@@ -264,6 +265,10 @@ const UNREADABLE_05: &str =
 /// Makes the row of type 06 unreadable, the fourth type below 11.
 const UNREADABLE_06: &str =
     "DELETE FROM ctli_test_unreadable; INSERT INTO ctli_test_unreadable VALUES ('06')";
+
+/// Makes the row of type 07 unreadable, the first type below 09.
+const UNREADABLE_07: &str =
+    "DELETE FROM ctli_test_unreadable; INSERT INTO ctli_test_unreadable VALUES ('07')";
 
 /// Makes the row of type 09 unreadable, the eighth type and the second
 /// below 11.
@@ -1455,12 +1460,13 @@ async fn failed_reads(app: &TestApp, token: &str, audits: &Audits) {
 /// text of the cursor step that failed, on `TRTYPE`. A failed `FETCH` of a
 /// row of the forward page names the close (E-73), the failed look-ahead
 /// `FETCH` after a full page the fetch, a failed backward `FETCH` on a
-/// page-back that does not reach the first page the backward fetch, and a
-/// backward cursor that fails before its first row its `OPEN`, whose text
-/// the `FETCH` and `CLOSE` of the unopened cursor keep. The look-behind row
-/// past the backward page, which the program never fetches, fails nothing
-/// the program reads: the page is answered as read. Once the master reads
-/// again, so does the list.
+/// page-back that does not reach the first page the backward fetch, and on
+/// such a page-back a backward cursor that fails before its first row its
+/// `OPEN`, whose text the `FETCH` and `CLOSE` of the unopened cursor keep. On
+/// a page-back that reaches the first page both give way to the first-page
+/// text, with the rows read. The look-behind row past the backward page,
+/// which the program never fetches, fails nothing the program reads: the
+/// page is answered as read. Once the master reads again, so does the list.
 async fn failed_fetches(app: &TestApp, token: &str, audits: &Audits) {
     let master = rows(app, MASTER_ROWS).await;
     let codes: Vec<String> = master.iter().map(|(code, _)| code.clone()).collect();
@@ -1521,7 +1527,7 @@ async fn failed_fetches(app: &TestApp, token: &str, audits: &Audits) {
     app.stack().exec_sql(UNREADABLE_06).await;
     assert_page(app, token, BACK_FROM_11, &page_back).await;
 
-    failed_fetch_texts_give_way_on_the_first_page(app, token, audits, &master[..1]).await;
+    failed_fetch_texts_give_way_on_the_first_page(app, token, audits, &master).await;
     app.stack().exec_sql(RESTORE_ROW_READS).await;
     let expected = stored_first_page(app).await;
     assert_page(app, token, "", &expected).await;
@@ -1532,14 +1538,22 @@ async fn failed_fetches(app: &TestApp, token: &str, audits: &Audits) {
 /// page-back that reaches the first page. The stateless request judges the
 /// page reached from the data (E-54), so a backward cursor that answers +100
 /// within the page, fewer than a page of types preceding the start key, has
-/// reached the first page: F7 from 02 in three-row pages reads `first`, the
-/// stored row of 01, alone and answers the first-page text, with the row 06
-/// still unreadable.
+/// reached the first page: F7 from 02 in three-row pages reads the stored
+/// row of 01 of `master` alone and answers the first-page text, with the
+/// row 06 still unreadable.
+///
+/// F7 from 09, which the seven types 01 to 07 precede, is the page-back from
+/// the second page, so the backward cursor's own failure gives way to the
+/// first-page text too, 200 (V-COTRTLIC-009). With 06 unreadable the cursor
+/// fetches 07 and its `FETCH` of 06 fails: the row fetched stays shown, the
+/// rows above it blank (P-COTRTLIC-034). With 07 unreadable its first row
+/// fails, the `OPEN`, and the list is empty (P-COTRTLIC-039). F8 from either
+/// starts at 09 again (P-COTRTLIC-040).
 async fn failed_fetch_texts_give_way_on_the_first_page(
     app: &TestApp,
     token: &str,
     audits: &Audits,
-    first: &[(String, String)],
+    master: &[(String, String)],
 ) {
     audits.reviewed(&["P-COTRTLIC-044"]);
     assert_eq!(
@@ -1552,14 +1566,39 @@ async fn failed_fetch_texts_give_way_on_the_first_page(
         "the texts of P-COTRTLIC-044"
     );
     audits.ok_row("V-COTRTLIC-009");
-    let expected = page(
-        first,
-        Some("02"),
-        None,
-        Some(messages::NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC),
+    let first_page = messages::NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC;
+    assert_eq!(
+        audited_message(audits, "V-COTRTLIC-009"),
+        first_page,
+        "the text of V-COTRTLIC-009"
     );
+    let expected = page(&master[..1], Some("02"), None, Some(first_page));
     let query = "?start_key=02&direction=backward&page_size=3";
     assert_page(app, token, query, &expected).await;
+
+    audits.reviewed(&["P-COTRTLIC-034", "P-COTRTLIC-039", "P-COTRTLIC-040"]);
+    let before_09: Vec<&str> = master
+        .iter()
+        .map(|(code, _)| code.as_str())
+        .take_while(|code| *code < "09")
+        .collect();
+    assert_eq!(
+        before_09.len(),
+        SCREEN_ROWS,
+        "the types before 09: {before_09:?}"
+    );
+    let seventh: Vec<(String, String)> = master
+        .iter()
+        .filter(|(code, _)| code == "07")
+        .cloned()
+        .collect();
+    let query = "?start_key=09&direction=backward";
+    let fetched = page(&seventh, Some("09"), None, Some(first_page));
+    assert_page(app, token, query, &fetched).await;
+
+    app.stack().exec_sql(UNREADABLE_07).await;
+    let opened = page::<&str>(&[], Some("09"), None, Some(first_page));
+    assert_page(app, token, query, &opened).await;
 }
 
 /// Asserts that `GET {LIST}{query}` answers the error of the validation row
@@ -1688,7 +1727,7 @@ async fn unreachable_database(app: &TestApp, token: &str, audits: &Audits) {
     let row_description = ApiJson(TranTypeUpdateRequest {
         description: Some(description.to_owned()),
     });
-    let path = || ApiPath(code.to_owned());
+    let path = || ApiPath(KeySegment(code.to_owned()));
     let update_answer = update_tran_type(
         State(state.clone()),
         admin(),
@@ -1724,6 +1763,70 @@ fn handler_answer<T>(result: Result<T, ApiError>) -> Resp {
         .unwrap_or_else(|failure| panic!("the error body does not serialize: {failure}"));
     let raw = body.to_string();
     (error.status(), body, raw)
+}
+
+/// Stores the types `.` and `..`: `MNTTRDB2` adds any two characters as a
+/// type code, while the CTTU entry form takes only digits, so SQL stands in
+/// for the batch add.
+const ADD_DOT_TYPES: &str = "INSERT INTO transaction_types (tr_type, tr_description) \
+                             VALUES ('.', 'DOT TYPE'), ('..', 'DOTS TYPE')";
+
+/// The `{id}` segments the types `.` and `..` travel as, behind one more `~`
+/// (`carddemo_api::dto::KeySegment`), since a URL drops dot segments.
+const DOT_TYPE_SEGMENTS: [(&str, &str); 2] = [(".", "~."), ("..", "~..")];
+
+/// The row description the inline update of type `.` stores.
+const RENAMED_DOT_TYPE: &str = "DOT TYPE RENAMED";
+
+/// The listed types `.` and `..` reach the CTLI row actions through their
+/// escaped `{id}` segments: the inline update of `.` (`origin=list`) and the
+/// delete of `..` (no `origin`) act on those stored codes, never on the list
+/// route, and leave every other type as it was.
+#[test]
+fn dot_segment_type_codes_are_updated_and_deleted_through_their_escaped_segments() {
+    let [(updated, update_segment), (deleted, delete_segment)] = DOT_TYPE_SEGMENTS;
+    let app = TestApp::start();
+    carddemo_testkit::block_on(async {
+        let token = app.admin_token().await;
+        app.stack().exec_sql(ADD_DOT_TYPES).await;
+        let before = rows(&app, MASTER_ROWS).await;
+        for (code, _) in DOT_TYPE_SEGMENTS {
+            assert!(
+                before.iter().any(|(stored, _)| stored == code),
+                "{ADD_DOT_TYPES} stores {code}: {before:?}"
+            );
+        }
+
+        let body = json!({ "description": RENAMED_DOT_TYPE });
+        let resp = put_row(&app, &token, update_segment, &body).await;
+        assert_updated(
+            &resp,
+            updated,
+            RENAMED_DOT_TYPE,
+            messages::HIGHLIGHTED_ROW_WAS_UPDATED,
+        );
+
+        let (status, body, raw) = delete_row(&app, &token, delete_segment).await;
+        assert_eq!(status, StatusCode::OK, "the delete of {deleted}: {raw}");
+        let answer = json!({
+            "transaction_type": null,
+            "message": messages::HIGHLIGHTED_ROW_DELETED_HIT_ENTER_TO_CONTINUE,
+        });
+        assert_eq!(body, answer, "the delete of {deleted}: {raw}");
+
+        let expected: Vec<(String, String)> = before
+            .into_iter()
+            .filter(|(code, _)| code != deleted)
+            .map(|(code, description)| {
+                if code == updated {
+                    (code, RENAMED_DOT_TYPE.to_owned())
+                } else {
+                    (code, description)
+                }
+            })
+            .collect();
+        assert_eq!(rows(&app, MASTER_ROWS).await, expected, "the Db2 master");
+    });
 }
 
 /// The `COTRTLIC` row selectors have no REST parameter (E-54): each row action
@@ -2053,6 +2156,8 @@ struct CursorStore {
     failure: Option<(usize, PortError)>,
     /// The direction and start key of every read, in call order.
     reads: Vec<(Direction, Option<TranTypeCode>)>,
+    /// The key of every count of the types before it, in call order.
+    counted: Vec<TranTypeCode>,
     /// The cursor step of every failure answered, in call order.
     failed: Vec<CursorPhase>,
 }
@@ -2072,6 +2177,7 @@ impl CursorStore {
             types,
             failure,
             reads: Vec::new(),
+            counted: Vec::new(),
             failed: Vec::new(),
         }
     }
@@ -2163,6 +2269,22 @@ impl TranTypeMasterStore for CursorStore {
         filter: TranTypeFilter,
     ) -> impl Future<Output = PortResult<u64>> + Send + '_ {
         let count = self.types.iter().filter(|row| passes(&filter, row)).count();
+        ready(u64::try_from(count).map_err(|_| PortError::Unavailable(format!("{count} rows"))))
+    }
+
+    /// The types below `key` that pass the cursors' conditions: the rows a
+    /// backward read from `key` returns with no limit (P-COTRTLIC-033).
+    fn count_tran_types_before(
+        &mut self,
+        filter: TranTypeFilter,
+        key: TranTypeCode,
+    ) -> impl Future<Output = PortResult<u64>> + Send + '_ {
+        self.counted.push(key);
+        let count = self
+            .types
+            .iter()
+            .filter(|row| row.tr_type < key && passes(&filter, row))
+            .count();
         ready(u64::try_from(count).map_err(|_| PortError::Unavailable(format!("{count} rows"))))
     }
 
@@ -2411,10 +2533,8 @@ fn backward_close_failures(audits: &Audits) {
     assert_cursor_answer(audits, &resp, "V-COTRTLIC-027", action);
     assert_eq!(store.failed, [CursorPhase::Close]);
     let reads = [(Direction::Backward, start_key("10"))];
-    assert_eq!(
-        store.reads, reads,
-        "the CLOSE ends the read, no count follows"
-    );
+    assert_eq!(store.reads, reads, "the CLOSE ends the read");
+    assert!(store.counted.is_empty(), "no count follows a CLOSE failure");
 
     let unexpected = messages::UNEXPECTED_ERROR;
     let mut store = CursorStore::new(types, Some((CLOSE_AFTER, unavailable())));
@@ -2446,6 +2566,11 @@ fn backward_close_failures(audits: &Audits) {
         let resp = listed(&mut store, from_10());
         assert_cursor_answer(audits, &resp, id, step);
         assert_eq!(store.failed, [phase], "{id}");
+        let counted = [TranTypeCode::move_from("10")];
+        assert_eq!(
+            store.counted, counted,
+            "{id}: the types before 10 are counted"
+        );
     }
 
     audits.ok_row("V-COTRTLIC-009");

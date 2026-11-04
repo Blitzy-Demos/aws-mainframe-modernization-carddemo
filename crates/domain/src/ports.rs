@@ -67,7 +67,7 @@ use crate::entities::{
     Account, AuthFraud, Card, CardXref, Customer, DisclosureGroup, DisclosureGroupKey,
     NewPendingAuthDetail, NewTransaction, PendingAuthDetail, PendingAuthSummary, TranCatBalance,
     TranCatBalanceKey, TranCategoryRecord, TranTypeMaster, TranTypeRecord, Transaction,
-    UserSecurity,
+    UserProfile, UserSecurity,
 };
 use crate::numeric::{
     AccountId, Alnum, AuthId, CardNumber, CustomerId, TranCategoryCode, TranId, TranTypeCode,
@@ -810,6 +810,30 @@ pub trait TranTypeMasterStore {
         filter: TranTypeFilter,
     ) -> impl Future<Output = PortResult<u64>> + Send + '_;
 
+    /// `SELECT COUNT(1)` of the types that pass `filter` with the
+    /// `C-TR-TYPE-BACKWARD` start condition `TR_TYPE < :start`, `key` the
+    /// start: the number of types a page-back from `key` has before it
+    /// (`COTRTLIC` `8100-READ-BACKWARDS`, P-COTRTLIC-033, P-COTRTLIC-034,
+    /// P-COTRTLIC-039, V-COTRTLIC-009).
+    ///
+    /// `COTRTLIC` keeps the page number in its COMMAREA and decides from it
+    /// whether a page-back reaches the first page; the request carries none
+    /// (E-54), so the rules count instead. The bound is strict, and keys
+    /// compare as their two space-padded bytes, the order and the NUL
+    /// semantics of [`TranTypeMasterStore::browse_tran_types`] backward. The
+    /// count names no description unless `filter` gives one, so a row whose
+    /// description cannot be read fails it only under a description filter.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::Contention`] on a lock timeout or deadlock (`SQLCODE`
+    /// -911); [`PortError::Unavailable`] on any other failure.
+    fn count_tran_types_before(
+        &mut self,
+        filter: TranTypeFilter,
+        key: TranTypeCode,
+    ) -> impl Future<Output = PortResult<u64>> + Send + '_;
+
     /// `INSERT INTO CARDDEMO.TRANSACTION_TYPE`: `COTRTUPC`
     /// `9700-INSERT-RECORD` and `COBTUPDT` `10031-INSERT-DB` (P-COBTUPDT-007).
     /// One legacy write under its own savepoint.
@@ -896,11 +920,17 @@ pub trait TranTypeFileReader {
 /// Used by CC00 (`COSGN00C`) and CU00 to CU03 (`COUSR00C` to `COUSR03C`). The
 /// port stores the user record as given: hashing, verifying and upper-casing
 /// belong to `crate::auth::password` and the rules (E-20).
+///
+/// Only [`UserStore::read_user`] (the sign-on) and
+/// [`UserStore::read_user_for_update`] (the `COUSR02C` password compare and
+/// rewrite) read the password hash. Every other read compares no credential
+/// and returns the key alone or a [`UserProfile`], so no hash is read for it.
 pub trait UserStore {
     /// CICS `READ` of `USRSEC` by `SEC-USR-ID`: `COSGN00C`
-    /// `READ-USER-SEC-FILE` (P-COSGN00C-008) and `COUSR03C`
-    /// `READ-USER-SEC-FILE` (P-COUSR03C-003). The key is compared byte for
-    /// byte, case included.
+    /// `READ-USER-SEC-FILE` (P-COSGN00C-008), whose password compare needs the
+    /// stored hash. The key is compared byte for byte, case included. One of
+    /// the two reads that carry the hash, with
+    /// [`UserStore::read_user_for_update`].
     ///
     /// # Errors
     ///
@@ -911,10 +941,23 @@ pub trait UserStore {
         id: UserId,
     ) -> impl Future<Output = PortResult<UserSecurity>> + Send + '_;
 
+    /// CICS `READ` of `USRSEC` by `SEC-USR-ID` that keeps only the key: the
+    /// `COSGN00C` `READ-USER-SEC-FILE` (P-COSGN00C-008) repeated for a
+    /// verified bearer token, which asks only whether a user still has the
+    /// ID. The key is compared byte for byte, case included, and the stored
+    /// key is returned.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::NotFound`] when no user has the ID (`RESP` 13);
+    /// [`PortError::Unavailable`] on any other failure.
+    fn read_user_key(&mut self, id: UserId)
+    -> impl Future<Output = PortResult<UserId>> + Send + '_;
+
     /// CICS `READ … UPDATE` of `USRSEC`, SQL `SELECT … FOR UPDATE`: `COUSR02C`
     /// `READ-USER-SEC-FILE` before its comparison and rewrite (P-COUSR02C-002,
-    /// P-COUSR02C-003) and `COUSR03C` `DELETE-USER-INFO` before the delete
-    /// (P-COUSR03C-004).
+    /// P-COUSR02C-003), whose password compare needs the stored hash. One of
+    /// the two reads that carry the hash, with [`UserStore::read_user`].
     ///
     /// # Errors
     ///
@@ -926,10 +969,28 @@ pub trait UserStore {
         id: UserId,
     ) -> impl Future<Output = PortResult<UserSecurity>> + Send + '_;
 
+    /// CICS `READ … UPDATE` of `USRSEC` without the password, SQL
+    /// `SELECT … FOR UPDATE` that leaves out the hash: the ENTER fetch of
+    /// `COUSR02C` and `COUSR03C` (`READ-USER-SEC-FILE`, P-COUSR02C-002,
+    /// P-COUSR02C-003, P-COUSR03C-003), which never shows the password (E-21),
+    /// and `COUSR03C` `DELETE-USER-INFO` before the delete (P-COUSR03C-004).
+    /// It takes the same row lock as [`UserStore::read_user_for_update`].
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::NotFound`] when no user has the ID;
+    /// [`PortError::Contention`] when the lock cannot be taken;
+    /// [`PortError::Unavailable`] on any other failure.
+    fn read_user_profile_for_update(
+        &mut self,
+        id: UserId,
+    ) -> impl Future<Output = PortResult<UserProfile>> + Send + '_;
+
     /// The `COUSR00C` user list: `STARTBR` on `SEC-USR-ID` with `READNEXT`
     /// (`PROCESS-PAGE-FORWARD`, P-COUSR00C-003) or `READPREV`
     /// (`PROCESS-PAGE-BACKWARD`, P-COUSR00C-009), rows per the [`Browse`]
-    /// contract in user-ID byte order.
+    /// contract in user-ID byte order. The list shows no password, so each
+    /// row is a [`UserProfile`].
     ///
     /// # Errors
     ///
@@ -938,7 +999,7 @@ pub trait UserStore {
     fn browse_users(
         &mut self,
         browse: Browse<UserId>,
-    ) -> impl Future<Output = PortResult<Vec<UserSecurity>>> + Send + '_;
+    ) -> impl Future<Output = PortResult<Vec<UserProfile>>> + Send + '_;
 
     /// CICS `WRITE` of a new user: `COUSR01C` `WRITE-USER-SEC-FILE`
     /// (P-COUSR01C-004, P-COUSR01C-005). One legacy write under its own

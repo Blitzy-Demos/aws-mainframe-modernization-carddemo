@@ -99,6 +99,34 @@ const TOP_PAGE = {
   message: TOP_OF_PAGE,
 } satisfies UserPage;
 
+// Users `.` and `..`: COUSR01C stores any non-blank ID, and a URL drops
+// these two as dot segments, so their links and requests carry the key
+// segments `~.` and `~..` (lib/key-segment.ts).
+const DOT_USER = {
+  user_id: ".",
+  first_name: "DOT",
+  last_name: "KEY",
+  usr_type: "U",
+} satisfies UserSummary;
+
+const DOTS_USER = {
+  user_id: "..",
+  first_name: "DOTS",
+  last_name: "KEY",
+  usr_type: "U",
+} satisfies UserSummary;
+
+const DOT_USERS_PAGE = {
+  items: [DOT_USER, DOTS_USER, ADMIN001],
+  next_key: null,
+  prev_key: DOT_USER.user_id,
+} satisfies UserPage;
+
+const DOT_USER_CASES = [
+  { listed: DOT_USER, segment: "~.", href: "/admin/users/~./edit" },
+  { listed: DOTS_USER, segment: "~..", href: "/admin/users/~../edit" },
+];
+
 // The list after USER0001 is deleted.
 const AFTER_DELETE_PAGE = {
   items: [ADMIN001, USER0002, USER0003],
@@ -507,6 +535,66 @@ describe("UserListPage CU03 delete", () => {
     expect(sentTo("DELETE", `${LIST_PATH}/USER0001`)).toEqual([]);
     expect(toastSuccess).not.toHaveBeenCalled();
   });
+});
+
+// A user ID that is a dot segment keeps its own edit route and its own
+// requests: the URL holds its key segment, never a path the URL shortens.
+describe("UserListPage dot-segment user IDs", () => {
+  it.each(DOT_USER_CASES)(
+    "Edit of the user '$listed.user_id' opens its CU02 route $href",
+    async ({ listed, href }) => {
+      answer(`GET ${LIST_PATH}`, 200, DOT_USERS_PAGE);
+      const { user } = renderPage();
+      await screen.findByText(ADMIN001.user_id);
+
+      const edit = within(usersTable()).getByRole("link", {
+        name: "Edit",
+        description: listed.user_id,
+      });
+      expect(edit.getAttribute("href")).toBe(href);
+      await user.click(edit);
+
+      expect((await screen.findByText("Update User")).textContent).toBe(
+        "Update User",
+      );
+    },
+  );
+
+  it.each(DOT_USER_CASES)(
+    "Delete of the user '$listed.user_id' reads and deletes $segment",
+    async ({ listed, segment }) => {
+      const deleted = {
+        message: `User ${listed.user_id} has been deleted ...`.padEnd(80, " "),
+        user: listed,
+      } satisfies UserMessageResponse;
+      answer(`GET ${LIST_PATH}`, 200, DOT_USERS_PAGE);
+      answer(`GET ${LIST_PATH}/${segment}`, 200, listed);
+      answer(`DELETE ${LIST_PATH}/${segment}`, 200, deleted);
+      const { user } = renderPage();
+      await screen.findByText(ADMIN001.user_id);
+
+      await user.click(
+        screen.getByRole("button", {
+          name: "Delete",
+          description: listed.user_id,
+        }),
+      );
+      const dialog = await screen.findByRole("alertdialog", {
+        name: "Delete User",
+      });
+      expect(sentTo("GET", `${LIST_PATH}/${segment}`)).toHaveLength(1);
+      expect(within(dialog).getByText(listed.first_name).textContent).toBe(
+        listed.first_name,
+      );
+      await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+      await waitFor(() => {
+        expect(toastSuccess).toHaveBeenCalledWith(deleted.message);
+      });
+      expect(sentTo("DELETE", `${LIST_PATH}/${segment}`)).toHaveLength(1);
+      expect(toastError).not.toHaveBeenCalled();
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

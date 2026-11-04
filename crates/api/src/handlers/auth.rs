@@ -41,8 +41,13 @@
 //!    argon2 work.
 //! 4. The unit of work is rolled back. Sign-on writes nothing, and the pooled
 //!    connection is released before the slow step.
-//! 5. `SignonCheck::verify` on tokio's blocking pool: the argon2id compare of
-//!    the upper-cased password (E-20), which selects the outcome.
+//! 5. `SignonCheck::verify` on tokio's blocking pool, once the per-process
+//!    argon2 limit (`AppState::admit_argon2`) admits it: the argon2id compare
+//!    of the upper-cased password (E-20), which selects the outcome. Sign-ons
+//!    beyond the limit queue for a permit, holding no connection, and the
+//!    blocking task keeps its permit until the compare returns, even when the
+//!    client has gone, so concurrent sign-ons cannot multiply the memory each
+//!    compare holds.
 //! 6. The token is issued and the response lands an administrator on `/admin`
 //!    and any other user on `/` [app/cbl/COSGN00C.cbl:L230-240].
 //!
@@ -82,7 +87,7 @@ use crate::auth::extract::BearerUser;
 use crate::dto::auth::{LoginField, LoginRequest, LoginResponse, MessageResponse};
 use crate::dto::id_string;
 use crate::error::{ApiError, ApiJson, ErrorBody};
-use crate::state::AppState;
+use crate::state::{AppState, run_argon2};
 
 /// The span `outcome` of a sign-on that issued a token.
 const OUTCOME_OK: &str = "ok";
@@ -244,7 +249,7 @@ async fn sign_on_user(state: &AppState, body: LoginRequest) -> Result<LoginRespo
     // before the argon2 work.
     uow.rollback().await?;
 
-    let outcome = verify(looked_up?).await?;
+    let outcome = verify(state, looked_up?).await?;
     let user_id = outcome.user_id.trimmed();
     let usr_type = UserType::from_code(&outcome.usr_type.trimmed());
     let issued = state.jwt().issue(&user_id, usr_type)?;
@@ -285,15 +290,19 @@ fn signon_input(body: LoginRequest) -> Result<SignonInput, ApiError> {
 ///
 /// argon2id verification is memory-hard and CPU-bound and never yields, so it
 /// runs on tokio's blocking pool, where it holds no executor worker that other
-/// requests need, as the sign-on rule requires of an asynchronous adapter.
+/// requests need, as the sign-on rule requires of an asynchronous adapter. It
+/// first waits for a permit of the argon2 limit of `state`, which
+/// `crate::state::run_argon2` moves into the blocking task: the permit is
+/// released when the compare returns, not when this request is dropped.
 ///
 /// # Errors
 ///
-/// The rule's rejection, or [`messages::UNEXPECTED_ERROR`] when the
-/// verification task panics or is cancelled; the task's failure goes to the
-/// log only.
-async fn verify(check: SignonCheck) -> Result<SignonOutcome, ApiError> {
-    let verified = tokio::task::spawn_blocking(move || check.verify())
+/// The rule's rejection, or [`messages::UNEXPECTED_ERROR`] when no permit can
+/// be had or the verification task panics or is cancelled; the failure goes
+/// to the log only.
+async fn verify(state: &AppState, check: SignonCheck) -> Result<SignonOutcome, ApiError> {
+    let permit = state.admit_argon2().await?;
+    let verified = run_argon2(permit, move || check.verify())
         .await
         .map_err(|err| {
             tracing::error!(error = %err, "sign-on verification task failed");

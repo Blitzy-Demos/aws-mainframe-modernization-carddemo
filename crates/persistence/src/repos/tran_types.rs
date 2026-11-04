@@ -389,6 +389,68 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
             .map_err(|_| PortError::Unavailable("COUNT(1) returned a negative count".to_owned()))
     }
 
+    /// `COTRTLIC` `8100-READ-BACKWARDS` — P-COTRTLIC-033, P-COTRTLIC-034,
+    /// P-COTRTLIC-039, V-COTRTLIC-009
+    /// [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L354-367]: `SELECT
+    /// COUNT(1)` with the `C-TR-TYPE-BACKWARD` conditions, `TR_TYPE <
+    /// :WS-START-KEY` and the type and description filters, `key` the start.
+    /// It stands in for the page number the COMMAREA keeps (E-54): the rules
+    /// count the types before a page-back to tell whether it reaches the
+    /// first page.
+    ///
+    /// The bound is the backward cursor's: strict, on the code padded to its
+    /// two bytes `COLLATE "C"`, with a key holding a NUL byte bound through
+    /// its NUL-free twin (`start_bound`), so the count is the number of rows
+    /// the backward cursor fetches from `key` with no limit. A type filter
+    /// has its own static statement, as in `count_tran_types`; the
+    /// description filter is a `$n IS NULL OR …` test, so without it no
+    /// description is read. A type filter or description pattern holding a
+    /// NUL byte matches no row: the count is 0, without a query.
+    async fn count_tran_types_before(
+        &mut self,
+        filter: TranTypeFilter,
+        key: TranTypeCode,
+    ) -> PortResult<u64> {
+        if matches_nothing(&filter) {
+            return Ok(0);
+        }
+        let start = start_bound(&key);
+        let type_code = filter.type_code.as_ref().map(TranTypeCode::trimmed);
+        let pattern = filter.description.as_deref();
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
+        let result = match type_code.as_deref() {
+            Some(code) => {
+                sqlx::query_scalar!(
+                    r#"SELECT COUNT(1) AS "count!"
+                         FROM transaction_types
+                        WHERE tr_type = $1::text
+                          AND rpad(tr_type, 2) COLLATE "C" < rpad($2::text, 2)
+                          AND ($3::text IS NULL OR tr_description LIKE $3::text ESCAPE '')"#,
+                    code,
+                    start.as_ref(),
+                    pattern,
+                )
+                .fetch_one(&mut *sp)
+                .await
+            }
+            None => {
+                sqlx::query_scalar!(
+                    r#"SELECT COUNT(1) AS "count!"
+                         FROM transaction_types
+                        WHERE rpad(tr_type, 2) COLLATE "C" < rpad($1::text, 2)
+                          AND ($2::text IS NULL OR tr_description LIKE $2::text ESCAPE '')"#,
+                    start.as_ref(),
+                    pattern,
+                )
+                .fetch_one(&mut *sp)
+                .await
+            }
+        };
+        let count = settle(sp, result).await?;
+        u64::try_from(count)
+            .map_err(|_| PortError::Unavailable("COUNT(1) returned a negative count".to_owned()))
+    }
+
     /// `INSERT INTO CARDDEMO.TRANSACTION_TYPE (TR_TYPE, TR_DESCRIPTION)`:
     /// `COTRTUPC` `9700-INSERT-RECORD` — P-COTRTUPC-009
     /// [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1596-1602], and

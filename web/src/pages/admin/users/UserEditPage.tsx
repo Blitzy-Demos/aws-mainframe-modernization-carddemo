@@ -50,6 +50,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { applyApiError, showMessage, showSuccess } from "@/lib/api-errors";
+import { decodeKeySegment } from "@/lib/key-segment";
 import {
   toUserUpdateRequest,
   USER_UPDATE_UNCHANGED_MESSAGE,
@@ -437,9 +438,11 @@ function UserEditScreen({ userId }: { userId: string }): JSX.Element {
 }
 
 export default function UserEditPage(): JSX.Element {
-  const { userId } = useParams();
-  if (userId === undefined || userId === "") {
+  const { userId: segment } = useParams();
+  if (segment === undefined || segment === "") {
     return <Navigate to={USER_LIST_ROUTE} replace />;
   }
+  // The route carries the key segment of the user ID (lib/key-segment.ts).
+  const userId = decodeKeySegment(segment);
   return <UserEditScreen key={userId} userId={userId} />;
 }

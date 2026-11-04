@@ -77,6 +77,8 @@ enum Read {
     DetailsForAccount,
     Detail,
     User,
+    UserKey,
+    UserProfileForUpdate,
     BrowseUsers,
     TranType,
     TranTypeFile,
@@ -97,7 +99,7 @@ struct Case {
 }
 
 /// Every case, one read each.
-const CASES: [Case; 25] = [
+const CASES: [Case; 27] = [
     Case {
         read: Read::Account,
         hide: "ALTER TABLE accounts RENAME TO accounts_hidden",
@@ -175,6 +177,16 @@ const CASES: [Case; 25] = [
     },
     Case {
         read: Read::User,
+        hide: "ALTER TABLE users RENAME TO users_hidden",
+        restore: "ALTER TABLE users_hidden RENAME TO users",
+    },
+    Case {
+        read: Read::UserKey,
+        hide: "ALTER TABLE users RENAME TO users_hidden",
+        restore: "ALTER TABLE users_hidden RENAME TO users",
+    },
+    Case {
+        read: Read::UserProfileForUpdate,
         hide: "ALTER TABLE users RENAME TO users_hidden",
         restore: "ALTER TABLE users_hidden RENAME TO users",
     },
@@ -292,6 +304,14 @@ async fn other_read(uow: &mut UnitOfWork, read: Read) -> PortResult<()> {
     match read {
         Read::User => store
             .read_user(UserId::move_from("ADMIN001"))
+            .await
+            .map(|_| ()),
+        Read::UserKey => store
+            .read_user_key(UserId::move_from("ADMIN001"))
+            .await
+            .map(|_| ()),
+        Read::UserProfileForUpdate => store
+            .read_user_profile_for_update(UserId::move_from("ADMIN001"))
             .await
             .map(|_| ()),
         Read::BrowseUsers => store.browse_users(first_page()).await.map(|_| ()),

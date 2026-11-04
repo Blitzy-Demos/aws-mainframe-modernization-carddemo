@@ -471,6 +471,7 @@ mod tests {
 
     use super::auth::extract::{authenticate, require_admin};
     use super::auth::jwt::{JwtKeys, UserType};
+    use super::dto::KeySegment;
     use super::dto::accounts::AccountUpdateRequest;
     use super::dto::admin_transaction_types::{TranTypeUpdateQuery, TranTypeUpdateRequest};
     use super::dto::auth::LoginRequest;
@@ -1108,7 +1109,7 @@ mod tests {
             .route(
                 "/admin/transaction-types/{id}",
                 put(
-                    |ApiPath(_): ApiPath<String>,
+                    |ApiPath(_): ApiPath<KeySegment>,
                      ApiQuery(_): ApiQuery<TranTypeUpdateQuery>,
                      ApiJson(_): ApiJson<TranTypeUpdateRequest>| async {
                         "type updated"
@@ -1335,7 +1336,7 @@ mod tests {
                 "/admin/transaction-types/{id}",
                 put(
                     |_: SignedOnAdmin,
-                     ApiPath(_): ApiPath<String>,
+                     ApiPath(_): ApiPath<KeySegment>,
                      ApiQuery(_): ApiQuery<TranTypeUpdateQuery>,
                      ApiJson(_): ApiJson<TranTypeUpdateRequest>| async {
                         "type updated"

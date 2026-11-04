@@ -252,9 +252,11 @@ pub(crate) fn verified_user(extensions: &Extensions) -> Option<&AuthUser> {
 /// A token verifies until it expires, while the user its `sub` names may have
 /// been deleted since sign-on (`DELETE /admin/users/{id}`), or may never have
 /// existed when the token was signed with the key outside `POST /auth/login`.
-/// The ID is read back as sign-on read it, through [`UserStore::read_user`],
-/// byte for byte. Nothing else of the stored record is compared: the actor's
-/// type stays the verified token's `usr_type`.
+/// The ID is read back by the key sign-on reads, byte for byte, through
+/// [`UserStore::read_user_key`], which selects the key alone: nothing else of
+/// the stored record is compared, so neither the names, the type nor the
+/// password hash is read. The actor's type stays the verified token's
+/// `usr_type`.
 ///
 /// `transaction` is the code of the operation the request asks for
 /// (`crate::transaction_of`). A refusal is recorded on the request span with
@@ -278,7 +280,7 @@ pub(crate) async fn require_signed_on_user<S: UserStore>(
     let Ok(id) = UserId::from_trimmed(&user.user_id) else {
         return Err(unknown_subject(transaction));
     };
-    match store.read_user(id).await {
+    match store.read_user_key(id).await {
         Ok(_) => Ok(user),
         Err(PortError::NotFound) => Err(unknown_subject(transaction)),
         Err(err) => {
@@ -399,7 +401,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::get;
-    use carddemo_domain::entities::UserSecurity;
+    use carddemo_domain::entities::{UserProfile, UserSecurity};
     use carddemo_domain::messages;
     use carddemo_domain::numeric::{Alnum, UserId};
     use carddemo_domain::ports::{Browse, PortError, PortResult, UserStore};
@@ -1036,15 +1038,15 @@ mod tests {
     const READ_DETAIL: &str = "connection reset by 10.0.0.7:5432 while reading users";
 
     /// A `USRSEC` holding at most one user, which records the key of every
-    /// `read_user` and fails every other call, since the subject check makes
-    /// none.
+    /// `read_user_key` and fails every other call, since the subject check
+    /// makes none: it reads neither the record nor its hash.
     #[derive(Default)]
     struct OneUserStore {
         /// The stored user, if any.
         user: Option<UserSecurity>,
         /// The failure every read answers instead, if any.
         failure: Option<PortError>,
-        /// The key of each `read_user`, in order.
+        /// The key of each `read_user_key`, in order.
         reads: Vec<UserId>,
     }
 
@@ -1084,14 +1086,19 @@ mod tests {
     }
 
     impl UserStore for OneUserStore {
-        async fn read_user(&mut self, id: UserId) -> PortResult<UserSecurity> {
+        async fn read_user(&mut self, _id: UserId) -> PortResult<UserSecurity> {
+            Err(not_made("read_user"))
+        }
+
+        async fn read_user_key(&mut self, id: UserId) -> PortResult<UserId> {
             self.reads.push(id);
             if let Some(failure) = &self.failure {
                 return Err(failure.clone());
             }
             self.user
-                .clone()
-                .filter(|user| user.sec_usr_id == id)
+                .as_ref()
+                .map(|user| user.sec_usr_id)
+                .filter(|stored| *stored == id)
                 .ok_or(PortError::NotFound)
         }
 
@@ -1099,7 +1106,11 @@ mod tests {
             Err(not_made("read_user_for_update"))
         }
 
-        async fn browse_users(&mut self, _browse: Browse<UserId>) -> PortResult<Vec<UserSecurity>> {
+        async fn read_user_profile_for_update(&mut self, _id: UserId) -> PortResult<UserProfile> {
+            Err(not_made("read_user_profile_for_update"))
+        }
+
+        async fn browse_users(&mut self, _browse: Browse<UserId>) -> PortResult<Vec<UserProfile>> {
             Err(not_made("browse_users"))
         }
 

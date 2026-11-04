@@ -1380,7 +1380,7 @@ ALTER TABLE reward_rules ALTER COLUMN rule_id DROP IDENTITY;",
 
 /// The indexes that replace the keys and alternate indexes of the COBOL
 /// files and tables, checked on their key lists, uniqueness and predicates.
-const EXPECTED_INDEXES: [ExpectedIndex; 18] = [
+const EXPECTED_INDEXES: [ExpectedIndex; 20] = [
     ExpectedIndex {
         table: "transaction_types",
         name: "xtran_type",
@@ -1427,10 +1427,11 @@ const EXPECTED_INDEXES: [ExpectedIndex; 18] = [
         predicate: None,
         replaces: "CXACAIX, AIX KEYS(11,25) NONUNIQUEKEY (XREFFILE.jcl:L72-75)",
     },
-    // The definitions of the three padded-key indexes (transaction_types_padded_tr_type
-    // above, users_padded_user_id and transaction_category_balances_padded_key) print no
-    // COLLATE. pg_indexes prints a key's COLLATE only where it differs from the collation
-    // its expression takes from the column, so these key lists cannot tell "C" from any
+    // The definitions of the four padded-key indexes (transaction_types_padded_tr_type
+    // above, users_padded_user_id, transactions_master_padded_card_tran_id and
+    // transaction_category_balances_padded_key) print no COLLATE. pg_indexes prints a key's
+    // COLLATE only where it differs from the collation its expression takes from the
+    // column, so these key lists cannot tell "C" from any
     // other collation the column and the index share. text_columns_and_keys_sort_by_c_collation
     // reads the column and index-key collations from the catalogs and pins "C".
     ExpectedIndex {
@@ -1468,6 +1469,26 @@ const EXPECTED_INDEXES: [ExpectedIndex; 18] = [
         primary: false,
         predicate: Some("in_master"),
         replaces: "TRANSACT AIX KEYS(26 304) NONUNIQUEKEY (TRANFILE.jcl:L82-86, STEP20)",
+    },
+    ExpectedIndex {
+        table: "transactions",
+        name: "transactions_master_padded_card_tran_id",
+        keys: "(rpad((tran_card_num)::text, 16), rpad((tran_id)::text, 16))",
+        unique: false,
+        primary: false,
+        predicate: Some("in_master"),
+        replaces: "the TRANREPT STEP05R sort by card number then TRAN-ID, both padded to X(16), \
+                   of the CR00 keyset pages (TRANREPT.prc:L35-53)",
+    },
+    ExpectedIndex {
+        table: "transactions",
+        name: "transactions_master_card_tran_id",
+        keys: "(tran_card_num, tran_id)",
+        unique: false,
+        primary: false,
+        predicate: Some("in_master"),
+        replaces: "the CT00 account filter (E-17) per card in TRAN-ID order, and the CREASTMT \
+                   STEP010 sort by card number then TRAN-ID (CREASTMT.JCL:L44-55)",
     },
     ExpectedIndex {
         table: "transactions",
@@ -1625,9 +1646,10 @@ fn indexes_exist_with_expected_shape() {
 }
 
 /// The padded-key expressions of `transaction_types_padded_tr_type`,
-/// `users_padded_user_id` and `transaction_category_balances_padded_key`, whose
-/// byte order is the COBOL key order of their [`EXPECTED_INDEXES`] entries.
-const PADDED_KEYS: [PaddedKey; 3] = [
+/// `users_padded_user_id`, `transactions_master_padded_card_tran_id` and
+/// `transaction_category_balances_padded_key`, whose byte order is the COBOL
+/// key order of their [`EXPECTED_INDEXES`] entries.
+const PADDED_KEYS: [PaddedKey; 5] = [
     PaddedKey {
         table: "transaction_types",
         column: "tr_type",
@@ -1641,6 +1663,20 @@ const PADDED_KEYS: [PaddedKey; 3] = [
         index: "users_padded_user_id",
         position: 1,
         key: "rpad((user_id)::text, 8)",
+    },
+    PaddedKey {
+        table: "transactions",
+        column: "tran_card_num",
+        index: "transactions_master_padded_card_tran_id",
+        position: 1,
+        key: "rpad((tran_card_num)::text, 16)",
+    },
+    PaddedKey {
+        table: "transactions",
+        column: "tran_id",
+        index: "transactions_master_padded_card_tran_id",
+        position: 2,
+        key: "rpad((tran_id)::text, 16)",
     },
     PaddedKey {
         table: "transaction_category_balances",

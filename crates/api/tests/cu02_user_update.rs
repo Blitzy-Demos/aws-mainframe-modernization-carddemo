@@ -982,6 +982,110 @@ fn read_and_rewrite_failures_answer_with_their_audited_texts() {
     });
 }
 
+/// The users whose IDs a URL cannot carry as stored, each with the `{id}`
+/// segment it travels as: `.` and `..`, the dot segments a URL drops, and
+/// `~.`, which is `.` after a `~`, each behind one more `~`
+/// (`carddemo_api::dto::KeySegment`).
+const DOT_KEY_USERS: [(&str, &str); 3] = [(".", "~."), ("..", "~.."), ("~.", "~~.")];
+
+/// The add route, `POST /admin/users` (CU01), which stores the dot-key users.
+const USERS_PATH: &str = "/admin/users";
+
+/// The names and type the dot-key users are added with.
+const DOT_KEY_NAMES: (&str, &str, &str) = ("DOT", "KEY", "U");
+
+/// The first name the update of each dot-key user writes.
+const DOT_KEY_FIRST_NAME: &str = "DOTTED";
+
+/// The user IDs `.` and `..`, which `COUSR01C` stores as entered since only a
+/// blank ID is refused, and `~.`, are fetched, updated and deleted through
+/// their escaped `{id}` segments, and every answer is the stored user: never
+/// the user list, another route or another dot-key user. The ordinary
+/// `USER0001` still travels as stored.
+#[test]
+fn dot_segment_user_ids_are_fetched_updated_and_deleted_through_their_escaped_segments() {
+    let user0001 = seeded_user(&parity_audit(), REGULAR_USER_ROW);
+    let (first_name, last_name, usr_type) = DOT_KEY_NAMES;
+    let app = TestApp::start();
+    block_on(async {
+        let token = app.admin_token().await;
+        for (user_id, _) in DOT_KEY_USERS {
+            let body = json!({
+                "user_id": user_id,
+                "first_name": first_name,
+                "last_name": last_name,
+                "password": "PASSWORD",
+                "usr_type": usr_type,
+            });
+            let (status, added, raw) = app.post(USERS_PATH, Some(&token), &body).await;
+            assert_eq!(status, StatusCode::CREATED, "the add of {user_id}: {raw}");
+            assert_eq!(
+                added["user"]["user_id"], user_id,
+                "the add of {user_id}: {raw}"
+            );
+        }
+
+        for (user_id, segment) in DOT_KEY_USERS {
+            let path = user_path(segment);
+            let fetched = app.get(&path, Some(&token)).await;
+            assert_eq!(fetched.0, StatusCode::OK, "GET {path}: {}", fetched.2);
+            assert_eq!(
+                fetched.1,
+                summary(user_id, first_name, last_name, usr_type),
+                "GET {path}: {}",
+                fetched.2
+            );
+            assert_no_password(&fetched);
+
+            let body = form(DOT_KEY_FIRST_NAME, last_name, usr_type, None);
+            let written = app.put(&path, Some(&token), &body).await;
+            let updated = summary(user_id, DOT_KEY_FIRST_NAME, last_name, usr_type);
+            assert_updated(&written, &updated);
+            assert_eq!(
+                stored_user(&app, user_id).await.first_name,
+                DOT_KEY_FIRST_NAME,
+                "PUT {path} rewrites {user_id}"
+            );
+        }
+
+        for (deleted, (user_id, segment)) in DOT_KEY_USERS.iter().enumerate() {
+            let path = user_path(segment);
+            let (status, body, raw) = app.delete(&path, Some(&token)).await;
+            assert_eq!(status, StatusCode::OK, "DELETE {path}: {raw}");
+            assert_eq!(
+                body["message"].as_str(),
+                Some(messages::user_deleted_message(user_id).as_str()),
+                "DELETE {path}: {raw}"
+            );
+            assert_eq!(
+                body["user"],
+                summary(user_id, DOT_KEY_FIRST_NAME, last_name, usr_type),
+                "DELETE {path}: {raw}"
+            );
+            assert!(
+                stored(&app, user_id).await.is_none(),
+                "DELETE {path} deletes {user_id}"
+            );
+            for (kept, _) in &DOT_KEY_USERS[deleted + 1..] {
+                assert!(
+                    stored(&app, kept).await.is_some(),
+                    "DELETE {path} keeps {kept}"
+                );
+            }
+        }
+
+        let path = user_path(&user0001.user_id);
+        let fetched = app.get(&path, Some(&token)).await;
+        assert_eq!(fetched.0, StatusCode::OK, "GET {path}: {}", fetched.2);
+        assert_eq!(
+            fetched.1,
+            seeded_summary(&user0001, &user0001.first_name),
+            "GET {path}: {}",
+            fetched.2
+        );
+    });
+}
+
 /// The request a function map `Endpoint` cell names: the lower-case method
 /// and the path.
 #[derive(Debug, Clone, PartialEq, Eq)]

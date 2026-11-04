@@ -33,6 +33,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { showApiError, showSuccess } from "@/lib/api-errors";
+import { authDetailKeySchema } from "@/schemas/authorizations";
 
 // ---------------------------------------------------------------------------
 // POPULATE-AUTH-DETAILS edits (P-COPAUS1C-005)
@@ -316,6 +317,24 @@ function loadedText(detail: AuthDetail): string {
 }
 
 // ---------------------------------------------------------------------------
+// The route key (COPAUS1C PROCESS-ENTER-KEY)
+// ---------------------------------------------------------------------------
+
+/**
+ * COPAUS1C PROCESS-ENTER-KEY — V-COPAUS1C-001, E-49: the route key as read,
+ * or `""` when the schema that mirrors the server's parse rejects it. A key
+ * that is not a positive integer up to `i64::MAX` is the COBOL path that sets
+ * its error flag with no message and leaves the detail fields empty, so it is
+ * never sent: the hook reads nothing for `""`, and with no record shown no
+ * PF5 or PF8 control exists to send it either. An accepted key is passed on
+ * exactly as routed, its `+` and leading zeros included, so no digit of an ID
+ * above 2^53 is lost to a conversion.
+ */
+function readKeyOf(authId: string): string {
+  return authDetailKeySchema.safeParse({ auth_id: authId }).success ? authId : "";
+}
+
+// ---------------------------------------------------------------------------
 // Navigation
 // ---------------------------------------------------------------------------
 
@@ -424,10 +443,17 @@ const FRAUD_ACTIONS: Readonly<
   },
 };
 
-/** The dialog's action stays set while it closes, so its text does not change mid-animation. */
-type FraudDialog = Readonly<{ open: boolean; action: FraudAction }>;
+/**
+ * The dialog's action and transaction ID stay set while it closes, so its
+ * text does not change mid-animation. `authId` is the route key of the record
+ * it was opened on, the only one its Confirm may toggle.
+ */
+type FraudDialog = Readonly<{ open: boolean; action: FraudAction; authId: string; tranId: string }>;
 
-const CLOSED_DIALOG: FraudDialog = { open: false, action: "mark" };
+const CLOSED_DIALOG: FraudDialog = { open: false, action: "mark", authId: "", tranId: "" };
+
+/** The failure a toast has shown, kept as the screen's message line. */
+type ShownError = Readonly<{ error: Error; message: string }>;
 
 // ---------------------------------------------------------------------------
 // Page
@@ -436,32 +462,60 @@ const CLOSED_DIALOG: FraudDialog = { open: false, action: "mark" };
 export default function AuthorizationDetailPage(): JSX.Element {
   const { authId = "" } = useParams();
   const [searchParams] = useSearchParams();
-  const query = useAuthorizationDetail(authId);
-  const detail = query.data;
-  const fraudToggle = useFraudToggleMutation(authId);
+  // A key the edit rejects reaches the hook blank, which it never sends. The
+  // screen then holds its header and Back alone: no message (E-49), no toast
+  // and nothing announced, as COPAUS1C sends the map with its fields empty.
+  const readKey = readKeyOf(authId);
+  const query = useAuthorizationDetail(readKey);
+  // A failed read sends COPAU01 with its detail fields cleared, so a record
+  // read earlier under this key (before a purge's 404 or a failed read's 500)
+  // is not presented beside the failure: no card, no PF5 and no PF8 until a
+  // read of the key succeeds again. Back stays to leave the screen.
+  const detail = query.isError ? undefined : query.data;
+  // The key's read outstanding, in flight or waiting offline: its first read,
+  // or the read again of a key whose last read failed, which shows the
+  // skeleton as the first read does.
+  const reading = readKey !== "" && (query.isPending || query.fetchStatus !== "idle");
+  const fraudToggle = useFraudToggleMutation();
   const openNext = useNextAuthorization(detail, query.refetch);
   const [dialog, setDialog] = useState<FraudDialog>(CLOSED_DIALOG);
 
+  // The dialog confirms the PF5 of the record it was opened on. Once that
+  // record is no longer shown, withheld after a failed read or left for
+  // another route key, it closes rather than offer Confirm for it.
+  const dialogOpen = dialog.open && detail !== undefined && dialog.authId === readKey;
+  if (dialog.open && !dialogOpen) {
+    setDialog({ ...dialog, open: false });
+  }
+
   // A failed read is toasted once per error, the repeated effects of
-  // StrictMode included; the Back link stays to leave the screen.
-  const shownError = useRef<unknown>(null);
+  // StrictMode included. The toasted text also stays on the screen as the
+  // 3270 message line did, the same for a first read and a read again, until
+  // the key is read again; the Back link stays to leave the screen. A failure
+  // a read again already supersedes, such as the cached one a return to the
+  // route reads again, is neither toasted again nor shown.
+  const failed = query.isError && query.fetchStatus === "idle" ? query.error : null;
+  const toastedFor = useRef<Error | null>(null);
+  const [shown, setShown] = useState<ShownError | null>(null);
   useEffect(() => {
-    if (query.error === null || shownError.current === query.error) {
+    if (failed === null || toastedFor.current === failed) {
       return;
     }
-    shownError.current = query.error;
-    showApiError(query.error);
-  }, [query.error]);
+    toastedFor.current = failed;
+    setShown({ error: failed, message: showApiError(failed).message });
+  }, [failed]);
+  const errorLine =
+    failed !== null && shown !== null && shown.error === failed ? shown.message : null;
 
   // The read's progress for assistive technology, the reads of PF8 Next and
   // of a PF5 result included. A failed read announces nothing here, as its
-  // toast carries it. The status is emptied on every change of the text and
-  // on every completed read, then filled after STATUS_ANNOUNCE_DELAY_MS, as
-  // DataTable does.
+  // toast and the message line carry it. The status is emptied on every
+  // change of the text and on every completed read, then filled after
+  // STATUS_ANNOUNCE_DELAY_MS, as DataTable does.
   const statusText =
-    authId !== "" && query.isFetching
+    readKey !== "" && query.isFetching
       ? "Loading authorization"
-      : detail !== undefined && !query.isError
+      : detail !== undefined
         ? loadedText(detail)
         : "";
   const { dataUpdatedAt } = query;
@@ -489,9 +543,15 @@ export default function AuthorizationDetailPage(): JSX.Element {
   const fraudAction: FraudAction = detail?.pa_auth_fraud === FRAUD_CONFIRMED ? "remove" : "mark";
   const dialogText = FRAUD_ACTIONS[dialog.action];
 
+  // The PUT names the key of the record shown when Confirm is pressed, fixed
+  // for its whole flight: PF8 may open another authorization before it
+  // answers, and the answer still belongs to this one.
   const confirmFraud = (): void => {
-    setDialog((shown) => ({ ...shown, open: false }));
-    fraudToggle.mutate(undefined, {
+    if (!dialogOpen) {
+      return;
+    }
+    setDialog((current) => ({ ...current, open: false }));
+    fraudToggle.mutate(readKey, {
       onSuccess: (result) => showSuccess(result.message),
       onError: (failure) => showApiError(failure),
     });
@@ -513,7 +573,14 @@ export default function AuthorizationDetailPage(): JSX.Element {
         <>
           <Button
             type="button"
-            onClick={() => setDialog({ open: true, action: fraudAction })}
+            onClick={() =>
+              setDialog({
+                open: true,
+                action: fraudAction,
+                authId: readKey,
+                tranId: detail.pa_transaction_id,
+              })
+            }
           >
             {FRAUD_ACTIONS[fraudAction].control}
           </Button>
@@ -538,17 +605,19 @@ export default function AuthorizationDetailPage(): JSX.Element {
       <PageHeader actions={actions} />
       {detail !== undefined ? (
         <AuthorizationCard detail={detail} />
-      ) : query.isPending ? (
+      ) : reading ? (
         <AuthorizationSkeleton />
+      ) : errorLine !== null ? (
+        <p className="text-sm text-destructive">{errorLine}</p>
       ) : null}
       <p role="status" className="sr-only">
         {announcement}
       </p>
       <ConfirmDialog
-        open={dialog.open}
-        onOpenChange={(open) => setDialog((shown) => ({ ...shown, open }))}
+        open={dialogOpen}
+        onOpenChange={(open) => setDialog((current) => ({ ...current, open }))}
         title={dialogText.title}
-        description={dialogText.describe(detail?.pa_transaction_id ?? "")}
+        description={dialogText.describe(dialog.tranId)}
         confirmLabel="Confirm"
         onConfirm={confirmFraud}
         pending={fraudToggle.isPending}

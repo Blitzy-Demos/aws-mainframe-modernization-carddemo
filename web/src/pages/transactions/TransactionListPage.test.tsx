@@ -64,8 +64,10 @@ const NOT_NUMERIC_KEY = "000000000068358X";
 /** A 16-digit key the schema accepts, answered by the server alone. */
 const SERVER_REJECTED_KEY = "0000000000000099";
 
-// The live master as CT02 fills it after TRANBKP emptied it: each add takes
-// the highest key + 1, so the keys run from 1 (E-09).
+// Synthetic TRAN-IDs of the stubbed master: `transaction(index)` gives fixture
+// record index + 1 the 16-digit key index + 1, so the twelve records sit under
+// 0000000000000001 to 0000000000000012. These are the first key, the tenth
+// (the first page's last row, the PF8 start key) and the eleventh.
 const FIRST_KEY = "0000000000000001";
 const LAST_KEY_OF_FIRST_PAGE = "0000000000000010";
 const FIRST_KEY_OF_SECOND_PAGE = "0000000000000011";

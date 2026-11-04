@@ -41,9 +41,10 @@ use crate::messages;
 use crate::numeric::UserId;
 use crate::ports::{Browse, Direction, UserStore};
 
-/// The user record a [`UserListPage`] holds, re-exported from
-/// [`crate::entities`] for the API adapter, which maps it to its response.
-pub use crate::entities::UserSecurity;
+/// The user record a [`UserListPage`] holds, without its password,
+/// re-exported from [`crate::entities`] for the API adapter, which maps it to
+/// its response.
+pub use crate::entities::UserProfile;
 
 /// The BMS field every COUSR00C message concerns: each path moves -1 to
 /// `USRIDINL`, so the cursor stays on the search field.
@@ -74,9 +75,9 @@ pub struct UserListInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserListPage {
     /// The users shown, one item per filled row (P-COUSR00C-010,
-    /// P-COUSR00C-011). The API publishes only their ID, names and type;
-    /// `SEC-USR-PWD` is never shown.
-    pub items: Vec<UserSecurity>,
+    /// P-COUSR00C-011): their ID, names and type. `SEC-USR-PWD` is never
+    /// shown, so it is never read.
+    pub items: Vec<UserProfile>,
     /// The start key of a forward request that shows the next page, when the
     /// COBOL would set `NEXT-PAGE-YES`: the user the look-ahead read found
     /// after a forward page, and the browse position after a backward page,
@@ -156,7 +157,7 @@ async fn browse<S: UserStore>(
     start_key: Option<UserId>,
     direction: Direction,
     limit: u16,
-) -> Result<Vec<UserSecurity>, DomainError> {
+) -> Result<Vec<UserProfile>, DomainError> {
     let browse = Browse {
         start_key,
         direction,
@@ -303,7 +304,7 @@ async fn page_backward<S: UserStore>(
 #[cfg(test)]
 mod tests {
     use super::{SCREEN_ROWS, USRIDIN, UserListInput, UserListPage, list};
-    use crate::entities::UserSecurity;
+    use crate::entities::{UserProfile, UserSecurity};
     use crate::error::{DomainError, ErrorKind};
     use crate::messages;
     use crate::numeric::{Alnum, UserId};
@@ -627,7 +628,7 @@ mod tests {
         // stored record, and the look-ahead user as the next key.
         let first = run(&mut store, None, Forward, SCREEN_ROWS).expect("page 1");
         assert_eq!(ids(&first), owned(&THIRTEEN[..10]));
-        assert_eq!(first.items[0], user("ADMIN001"));
+        assert_eq!(first.items[0], UserProfile::from(&user("ADMIN001")));
         assert_eq!(text(first.next_key).as_deref(), Some("USER0005"));
         assert_eq!(first.message, None);
 
@@ -699,11 +700,19 @@ mod tests {
             self.0.read_user(id).await
         }
 
+        async fn read_user_key(&mut self, id: UserId) -> PortResult<UserId> {
+            self.0.read_user_key(id).await
+        }
+
         async fn read_user_for_update(&mut self, id: UserId) -> PortResult<UserSecurity> {
             self.0.read_user_for_update(id).await
         }
 
-        async fn browse_users(&mut self, browse: Browse<UserId>) -> PortResult<Vec<UserSecurity>> {
+        async fn read_user_profile_for_update(&mut self, id: UserId) -> PortResult<UserProfile> {
+            self.0.read_user_profile_for_update(id).await
+        }
+
+        async fn browse_users(&mut self, browse: Browse<UserId>) -> PortResult<Vec<UserProfile>> {
             if browse.direction == Backward {
                 return Err(PortError::Unavailable("READPREV failed".to_owned()));
             }

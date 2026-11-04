@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type\n                       FROM users\n                       ORDER BY rpad(user_id, 8) COLLATE \"C\" ASC\n                       LIMIT $1",
+  "query": "SELECT user_id, sec_usr_fname, sec_usr_lname, sec_usr_type FROM users WHERE user_id = $1 FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -20,27 +20,21 @@
       },
       {
         "ordinal": 3,
-        "name": "password_hash",
-        "type_info": "Text"
-      },
-      {
-        "ordinal": 4,
         "name": "sec_usr_type",
         "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      false,
       false
     ]
   },
-  "hash": "292f4b2b15a3e1fb754e8c966baa774aec181b53da0e9a695687172f097e0973"
+  "hash": "1b0bddec35a00a33baa80470187cfaf2d165a29eedfd9ce074f717f07b9c103f"
 }

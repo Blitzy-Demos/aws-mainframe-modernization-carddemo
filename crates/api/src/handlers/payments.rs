@@ -30,6 +30,18 @@
 //! whether it succeeded or not. Only a request that wrote nothing is rolled
 //! back.
 //!
+//! # TRAN-ID writer admission
+//!
+//! Only a confirmed payment allocates a TRAN-ID, under an advisory lock held
+//! until its unit of work ends (`carddemo_persistence::ids`), and a payment
+//! waiting for that lock holds its pooled connection. So once the entry edits
+//! have found the entry confirmed, the handler waits for a permit of the
+//! per-process TRAN-ID writer limit (`AppState::admit_tran_id_writer`) before
+//! it opens the unit of work, and holds it until `complete_payment` has
+//! committed or rolled back: writers beyond the limit queue holding no
+//! connection, and the reads keep the rest of the pool. The blank
+//! confirmation and `N` allocate nothing and take no permit.
+//!
 //! Bill payments accrue no reward points: the reward engine serves only CT02
 //! and POSTTRAN.
 
@@ -63,9 +75,9 @@ const OUTCOME_PROMPTED: &str = "prompted";
 /// both writes or, after a failed write, the one that succeeded (E-19).
 const OUTCOME_COMMITTED: &str = "committed";
 
-/// The span `outcome` of a confirmed payment that persisted nothing: the unit
-/// of work could not be opened, no TRAN-ID could be allocated, or the commit
-/// failed.
+/// The span `outcome` of a confirmed payment that persisted nothing: it could
+/// not be admitted as a TRAN-ID writer, the unit of work could not be opened,
+/// no TRAN-ID could be allocated, or the commit failed.
 const OUTCOME_ROLLED_BACK: &str = "rolled_back";
 
 /// The span `outcome` of a request an edit or a read answered with a 4xx
@@ -168,9 +180,11 @@ pub async fn create_payment(
 ///
 /// The length check and the store-free [`entry_edits`], which answer before
 /// this handler opens a unit of work, then `bill_payment::prepare` in a fresh
-/// unit of work, which repeats those edits with the same answer. Every
-/// outcome but [`BillPaymentStep::Ready`] wrote nothing and is rolled back
-/// here; `Ready` goes on to [`complete_payment`].
+/// unit of work, which repeats those edits with the same answer. A confirmed
+/// entry waits for its TRAN-ID writer permit before that unit of work opens
+/// and holds it until the payment has ended. Every outcome but
+/// [`BillPaymentStep::Ready`] wrote nothing and is rolled back here; `Ready`
+/// goes on to [`complete_payment`].
 async fn process(state: &AppState, body: PaymentRequest) -> PaymentAnswer {
     let span = Span::current();
     if let Err(error) = body.check() {
@@ -182,10 +196,26 @@ async fn process(state: &AppState, body: PaymentRequest) -> PaymentAnswer {
     if let Some(account_id) = account_key {
         span.record("account_id", display(account_id));
     }
-    if let Err(error) = entry_edits(&input) {
-        span.record("outcome", OUTCOME_REJECTED);
-        return Err(error);
-    }
+    let confirmed = match entry_edits(&input) {
+        Ok(confirmed) => confirmed,
+        Err(error) => {
+            span.record("outcome", OUTCOME_REJECTED);
+            return Err(error);
+        }
+    };
+    // Only the confirmed payment allocates a TRAN-ID. `_writer` is dropped
+    // when this function returns, after the unit of work below has ended.
+    let _writer = if confirmed {
+        match state.admit_tran_id_writer().await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                span.record("outcome", OUTCOME_ROLLED_BACK);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let mut uow = match state.db().begin().await {
         Ok(uow) => uow,
         Err(error) => {
@@ -244,7 +274,9 @@ async fn process(state: &AppState, body: PaymentRequest) -> PaymentAnswer {
 /// read the signed-on user from `USRSEC`, so when the database cannot be
 /// reached the request answers 500 from that read before these edits run.
 /// `Ok` leaves `Y`, `y` and blank to the reads of `bill_payment::prepare`,
-/// which edits the entry again with the same answer.
+/// which edits the entry again with the same answer. It holds `true` for the
+/// confirmed `Y` and `y` ([`EntryEdit::Confirmed`]), the entry that allocates
+/// a TRAN-ID, and `false` for blank.
 ///
 /// # Errors
 ///
@@ -253,10 +285,11 @@ async fn process(state: &AppState, body: PaymentRequest) -> PaymentAnswer {
 /// `ACTIDIN` for the `N` confirmation ([`cancelled`]); 400 with code
 /// `INVALID` and `Invalid value. Valid values are (Y/N)...` on `CONFIRM` for
 /// any other confirmation value.
-fn entry_edits(input: &BillPaymentInput) -> Result<(), ApiError> {
+fn entry_edits(input: &BillPaymentInput) -> Result<bool, ApiError> {
     match bill_payment::edit_entry(input)? {
         EntryEdit::Cancelled => Err(cancelled()),
-        EntryEdit::Confirmed | EntryEdit::Unconfirmed => Ok(()),
+        EntryEdit::Confirmed => Ok(true),
+        EntryEdit::Unconfirmed => Ok(false),
     }
 }
 
@@ -269,7 +302,8 @@ fn entry_edits(input: &BillPaymentInput) -> Result<(), ApiError> {
 /// place and a failed rewrite leaves the transaction write in place, as the
 /// `RECOVERY(NONE)` files keep them. A failed allocation wrote nothing and is
 /// rolled back. The account row lock `prepare` took precedes the allocation's
-/// advisory lock, the order `carddemo_persistence::ids` documents.
+/// advisory lock, the order `carddemo_persistence::ids` documents. The caller
+/// holds its TRAN-ID writer permit until this returns.
 async fn complete_payment(
     state: &AppState,
     mut uow: UnitOfWork,
@@ -428,7 +462,8 @@ mod tests {
     fn the_cb00_entry_edits_answer_without_opening_the_store() {
         // COBIL00C PROCESS-ENTER-KEY: V-COBIL00C-001 (order 1), V-COBIL00C-002
         // and V-COBIL00C-003 (order 2) come before READ-ACCTDAT-FILE, so the
-        // edits read no store; Y, y and blank go on to the reads.
+        // edits read no store; Y, y and blank go on to the reads, Y and y as
+        // the confirmed payment that allocates a TRAN-ID.
         let empty = Err(rejection(
             ErrorKind::Empty,
             ACCT_ID_CAN_NOT_BE_EMPTY,
@@ -448,10 +483,10 @@ mod tests {
             (Some("00000000006"), Some("n"), cancelled),
             (Some("00000000006"), Some("X"), invalid.clone()),
             (Some("99999999999"), Some("?"), invalid),
-            (Some("00000000006"), Some("Y"), Ok(())),
-            (Some("00000000006"), Some("y"), Ok(())),
-            (Some("00000000006"), Some(""), Ok(())),
-            (Some("00000000006"), None, Ok(())),
+            (Some("00000000006"), Some("Y"), Ok(true)),
+            (Some("00000000006"), Some("y"), Ok(true)),
+            (Some("00000000006"), Some(""), Ok(false)),
+            (Some("00000000006"), None, Ok(false)),
         ];
         for (account_id, confirm, expected) in cases {
             let input = PaymentRequest {

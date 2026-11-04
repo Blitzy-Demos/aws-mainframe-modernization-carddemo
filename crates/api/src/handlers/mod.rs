@@ -60,7 +60,9 @@ use axum::http::{Method, Uri};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::dto::admin_transaction_types::{TranTypeOrigin, TranTypeUpdateQuery};
+use crate::dto::admin_transaction_types::{
+    TranTypeDeleteOrigin, TranTypeDeleteQuery, TranTypeOrigin, TranTypeUpdateQuery,
+};
 use crate::state::AppState;
 
 /// Every REST route of the `CardDemo` API: the 19 online transactions served
@@ -144,6 +146,11 @@ pub fn router() -> OpenApiRouter<AppState> {
 /// CTTU otherwise, a query that does not deserialize included, as the handler
 /// decides from the same query.
 ///
+/// `DELETE /admin/transaction-types/{id}` serves both as well: it is CTTU when
+/// `uri`'s query is a [`TranTypeDeleteQuery`] with `origin=form`, and CTLI
+/// otherwise, a query that does not deserialize included, as the handler
+/// decides from the same query.
+///
 /// When an extractor refuses a request, so that no handler span opens,
 /// `crate::transaction_of` looks the code up here and `crate::record_refusal`
 /// puts it on the request span.
@@ -171,9 +178,10 @@ pub(crate) fn transaction_code(method: &Method, route: &str, uri: &Uri) -> Optio
         ("POST", "/admin/users") => "CU01",
         ("GET" | "PUT", "/admin/users/{id}") => "CU02",
         ("DELETE", "/admin/users/{id}") => "CU03",
-        ("GET", "/admin/transaction-types") | ("DELETE", "/admin/transaction-types/{id}") => "CTLI",
+        ("GET", "/admin/transaction-types") => "CTLI",
         ("POST", "/admin/transaction-types") => "CTTU",
         ("PUT", "/admin/transaction-types/{id}") => tran_type_update_code(uri),
+        ("DELETE", "/admin/transaction-types/{id}") => tran_type_delete_code(uri),
         ("GET", "/rewards/balance/{account_id}" | "/rewards/history/{account_id}") => "REWARDS",
         ("GET" | "POST", "/admin/reward-rules")
         | ("PUT" | "DELETE", "/admin/reward-rules/{id}") => "REWARD-RULES",
@@ -189,6 +197,16 @@ fn tran_type_update_code(uri: &Uri) -> &'static str {
     match Query::<TranTypeUpdateQuery>::try_from_uri(uri).map(|Query(query)| query.origin) {
         Ok(Some(TranTypeOrigin::List)) => "CTLI",
         Ok(None) | Err(_) => "CTTU",
+    }
+}
+
+/// The transaction of `DELETE /admin/transaction-types/{id}` with `uri`: CTTU
+/// for the `origin=form` F4 delete, else CTLI, from the query the handler's
+/// `ApiQuery<TranTypeDeleteQuery>` deserializes.
+fn tran_type_delete_code(uri: &Uri) -> &'static str {
+    match Query::<TranTypeDeleteQuery>::try_from_uri(uri).map(|Query(query)| query.origin) {
+        Ok(Some(TranTypeDeleteOrigin::Form)) => "CTTU",
+        Ok(None) | Err(_) => "CTLI",
     }
 }
 
@@ -244,7 +262,8 @@ mod tests {
     ];
 
     /// The `transaction` each operation's handler span records, by
-    /// `operationId`; `update_tran_type` without `origin=list`.
+    /// `operationId`; `update_tran_type` without `origin=list` and
+    /// `delete_tran_type` without `origin=form`.
     const TRANSACTIONS: [(&str, &str); 30] = [
         ("login", "CC00"),
         ("logout", "CC00"),
@@ -412,9 +431,31 @@ mod tests {
                 Some(code),
                 "{query}"
             );
+        }
+    }
+
+    #[test]
+    fn the_shared_tran_type_delete_is_cttu_only_with_origin_form() {
+        const ROUTE: &str = "/admin/transaction-types/{id}";
+        for (query, code) in [
+            ("", "CTLI"),
+            ("?", "CTLI"),
+            ("?origin=form", "CTTU"),
+            ("?origin=%66orm", "CTTU"),
+            ("?origin=form&description=x", "CTTU"),
+            ("?origin=list", "CTLI"),
+            ("?origin=", "CTLI"),
+            ("?origin=FORM", "CTLI"),
+            ("?origin=bogus", "CTLI"),
+            ("?origin=form&origin=form", "CTLI"),
+            ("?Origin=form", "CTLI"),
+        ] {
+            let uri: Uri = format!("/admin/transaction-types/01{query}")
+                .parse()
+                .expect("a URI");
             assert_eq!(
                 transaction_code(&Method::DELETE, ROUTE, &uri),
-                Some("CTLI"),
+                Some(code),
                 "{query}"
             );
         }

@@ -12,7 +12,7 @@
 // per test; every answer is typed with the OpenAPI schema, so drift in the
 // response or error shapes fails `tsc`.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
@@ -27,6 +27,7 @@ import {
   type MockInstance,
 } from "vitest";
 
+import { authorizationKeys } from "@/api/queries/authorizations";
 import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -37,6 +38,7 @@ import AuthorizationDetailPage from "./AuthorizationDetailPage";
 
 type AuthDetailResponse = components["schemas"]["AuthDetailResponse"];
 type AuthSummaryResponse = components["schemas"]["AuthSummaryResponse"];
+type FraudToggleResponse = components["schemas"]["FraudToggleResponse"];
 type AuthDetailField = components["schemas"]["AuthDetailField"];
 type ErrorBody = components["schemas"]["ErrorBody"];
 type FetchImpl = (
@@ -158,7 +160,7 @@ const UNEXPECTED: ErrorBody = { code: "UNEXPECTED", message: "Unexpected error" 
 
 function jsonResponse(
   status: number,
-  body: AuthDetailResponse | AuthSummaryResponse | ErrorBody,
+  body: AuthDetailResponse | AuthSummaryResponse | FraudToggleResponse | ErrorBody,
 ): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -188,6 +190,16 @@ function isDetailRead(request: Request, authId: string): boolean {
   const url = new URL(request.url);
   return (
     request.method === "GET" &&
+    url.pathname === `${DETAIL_PATH_PREFIX}${authId}` &&
+    url.search === ""
+  );
+}
+
+/** Whether `request` is PF5's fraud toggle of authorization `authId`. */
+function isFraudToggle(request: Request, authId: string): boolean {
+  const url = new URL(request.url);
+  return (
+    request.method === "PUT" &&
     url.pathname === `${DETAIL_PATH_PREFIX}${authId}` &&
     url.search === ""
   );
@@ -237,6 +249,20 @@ function readStatus(): HTMLElement {
   return screen.getByRole("status");
 }
 
+/**
+ * The elements outside the toasts whose whole text is `text`: the screen's
+ * message line, compared byte for byte, a leading space included.
+ */
+function messageLines(text: string): HTMLElement[] {
+  return screen.queryAllByText(
+    (_content, element) =>
+      element !== null &&
+      element.children.length === 0 &&
+      element.textContent === text &&
+      element.closest("[data-sonner-toaster]") === null,
+  );
+}
+
 /** Waits out the announce delay, so a status still empty announces nothing. */
 async function afterAnnounceDelay(): Promise<void> {
   await act(async () => {
@@ -248,6 +274,57 @@ async function afterAnnounceDelay(): Promise<void> {
 
 /** The location of NEWEST as the summary's "View" link opens it. */
 const NEWEST_ROUTE = `/authorizations/${NEWEST.auth_id}?account_id=${ACCOUNT_1}`;
+
+/** V-COPAUS1C-006's text for IMS status `AO` (E-44). */
+const DETAIL_READ_FAILED = " System error while reading Auth Details: Code:AO";
+
+/**
+ * The failed reads of the record: V-COPAUS1C-005, an ID no detail holds (a
+ * purged authorization, say), a 404 without a message that the page toasts
+ * as UNEXPECTED_ERROR, and V-COPAUS1C-006, a failed detail read, 500.
+ */
+const READ_FAILURES: ReadonlyArray<{ status: number; body: ErrorBody; toasted: string }> = [
+  {
+    status: 404,
+    body: { code: "NOT_FOUND", message: "", fields: [{ field: CARDNUM, message: "" }] },
+    toasted: UNEXPECTED_ERROR,
+  },
+  {
+    status: 500,
+    body: {
+      code: "UNEXPECTED",
+      message: DETAIL_READ_FAILED,
+      fields: [{ field: CARDNUM, message: DETAIL_READ_FAILED }],
+    },
+    toasted: DETAIL_READ_FAILED,
+  },
+];
+
+/**
+ * The screen once a read of NEWEST failed, the first read or a read again
+ * alike: one toast, its text kept as the message line outside any card,
+ * nothing announced, no record, PF5 or PF8, and Back to the account's summary.
+ */
+async function expectFailedRead(toasted: string): Promise<void> {
+  await waitFor(() => {
+    expect(toastError).toHaveBeenCalledWith(toasted);
+  });
+  await waitFor(() => {
+    expect(messageLines(toasted)).toHaveLength(1);
+  });
+  await afterAnnounceDelay();
+  expect(readStatus().textContent).toBe("");
+  expect(toastError).toHaveBeenCalledTimes(1);
+  expect(messageLines(toasted)[0]?.closest("[data-slot='card']")).toBeNull();
+  expect(screen.queryByRole("heading", { level: 2, name: "Authorization" })).toBeNull();
+  expect(document.querySelector("[data-slot='card']")).toBeNull();
+  expect(screen.queryByText(NEWEST.pa_transaction_id)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Mark fraud" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+  expect(screen.getByRole("link", { name: "Back" }).getAttribute("href")).toBe(
+    `/authorizations?account_id=${ACCOUNT_1}`,
+  );
+}
 
 /**
  * Renders the page at `path` in a data router nested as the application's
@@ -363,42 +440,20 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read status", () => {
     expect(toastError).not.toHaveBeenCalled();
   });
 
-  // V-COPAUS1C-005 (an ID no detail holds, a 404 without a message, which the
-  // page toasts as UNEXPECTED_ERROR) and V-COPAUS1C-006 (a failed detail read,
-  // 500): the toast carries the failure, no record is shown and the status
+  // V-COPAUS1C-005 and V-COPAUS1C-006 on the first read: the toast and the
+  // message line carry the failure, no record is shown and the status
   // announces nothing.
-  it.each([
-    {
-      status: 404,
-      body: { code: "NOT_FOUND", message: "", fields: [{ field: CARDNUM, message: "" }] },
-      toasted: UNEXPECTED_ERROR,
-    },
-    {
-      status: 500,
-      body: {
-        code: "UNEXPECTED",
-        message: " System error while reading Auth Details: Code:AO",
-        fields: [
-          { field: CARDNUM, message: " System error while reading Auth Details: Code:AO" },
-        ],
-      },
-      toasted: " System error while reading Auth Details: Code:AO",
-    },
-  ])("toasts a $status answer and leaves the status empty", async ({ status, body, toasted }) => {
-    answer = (request) =>
-      isDetailRead(request, NEWEST.auth_id) ? jsonResponse(status, body) : readStore(request);
-    renderAt(NEWEST_ROUTE);
+  it.each(READ_FAILURES)(
+    "toasts a $status answer and leaves the status empty",
+    async ({ status, body, toasted }) => {
+      answer = (request) =>
+        isDetailRead(request, NEWEST.auth_id) ? jsonResponse(status, body) : readStore(request);
+      renderAt(NEWEST_ROUTE);
 
-    await waitFor(() => {
-      expect(toastError).toHaveBeenCalledWith(toasted);
-    });
-    await afterAnnounceDelay();
-    expect(readStatus().textContent).toBe("");
-    expect(toastError).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("heading", { level: 2, name: "Authorization" })).toBeNull();
-    expect(document.querySelector("[data-slot='card']")).toBeNull();
-    expect(sent()).toEqual([`GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`]);
-  });
+      await expectFailedRead(toasted);
+      expect(sent()).toEqual([`GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`]);
+    },
+  );
 
   // F-COPAU01-006, E-59: PF8 opens the next authorization on the same page
   // component, so the one status stays mounted, is emptied and announces the
@@ -427,6 +482,309 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read status", () => {
       expect(status.textContent).toBe(FOLLOWING_LOADED);
     });
     expect(readStatus()).toBe(status);
+    expect(sent()).toEqual([
+      `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+      `GET ${SUMMARY_PATH}?account_id=${ACCOUNT_1}&start_key=${NEWEST.auth_id}&direction=forward&page_size=1`,
+      `GET ${DETAIL_PATH_PREFIX}${FOLLOWING.auth_id}`,
+    ]);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+});
+
+/** The detail route of `authId`, from the summary of account 1, as the router receives it. */
+function routeOf(authId: string): string {
+  return `/authorizations/${encodeURIComponent(authId)}?account_id=${ACCOUNT_1}`;
+}
+
+describe("AuthorizationDetailPage (CPVD, COPAU01) route key", () => {
+  // V-COPAUS1C-001, E-49: a key that is not a positive integer up to
+  // i64::MAX is the COBOL path that sets the error flag with no message and
+  // leaves the detail fields empty. The page sends nothing and shows its
+  // header with Back to the account's summary, and nothing else.
+  it.each([
+    { key: "abc", why: "not a number" },
+    { key: "0", why: "not positive" },
+    { key: "-1", why: "negative" },
+    { key: "9223372036854775808", why: "above i64::MAX" },
+    { key: "+", why: "a sign without digits" },
+    { key: " ", why: "blank" },
+  ])("sends nothing for the key $key, $why, and shows Back alone", async ({ key }) => {
+    renderAt(routeOf(key));
+
+    const back = await screen.findByRole("link", { name: "Back" });
+    expect(back.getAttribute("href")).toBe(`/authorizations?account_id=${ACCOUNT_1}`);
+    expect(
+      screen.getByRole("heading", { level: 1, name: "View Authorization Details" }),
+    ).not.toBeNull();
+    await afterAnnounceDelay();
+    expect(sent()).toEqual([]);
+    expect(document.querySelector("[data-slot='card']")).toBeNull();
+    expect(document.querySelector("[data-slot='skeleton']")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Mark fraud" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Remove fraud" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+    expect(readStatus().textContent).toBe("");
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  // The server's parse reads an optional `+` and leading zeros, so these keys
+  // name authorization 7: each is sent exactly as routed, never rewritten.
+  it.each(["+0007", "0007"])("sends the accepted key '%s' as routed and shows its record", async (key) => {
+    answer = (request) =>
+      isDetailRead(request, encodeURIComponent(key))
+        ? jsonResponse(200, NEWEST)
+        : readStore(request);
+    renderAt(routeOf(key));
+
+    await waitFor(() => {
+      expect(readStatus().textContent).toBe(NEWEST_LOADED);
+    });
+    expect(screen.getByRole("heading", { level: 2, name: "Authorization" })).not.toBeNull();
+    expect(screen.getByText(NEWEST.pa_transaction_id)).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Mark fraud" })).not.toBeNull();
+    expect(sent()).toEqual([`GET ${DETAIL_PATH_PREFIX}${encodeURIComponent(key)}`]);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+});
+
+/** The COPAUS1C UPDATE-AUTH-DETAILS text of a committed mark (P-COPAUS1C-008). */
+const MARKED_TEXT = "AUTH MARKED FRAUD...";
+
+/** NEWEST as the PUT answers it once marked: the replaced detail, read with no PF8 neighbour. */
+const MARKED_NEWEST: AuthDetailResponse = {
+  ...NEWEST,
+  pa_auth_fraud: "F",
+  pa_fraud_rpt_date: "07/01/22",
+  next_id: null,
+};
+
+describe("AuthorizationDetailPage (CPVD, COPAU01) PF5 fraud mark", () => {
+  // F-COPAU01-005 and F-COPAU01-006: Next stays offered while a mark is sent,
+  // so PF8 can open the next authorization before the PUT answers. The
+  // answer belongs to the authorization it was sent for: the one Next opened
+  // keeps its own record and its own Next, and the marked one is cached with
+  // the neighbour it showed.
+  it("keeps the authorization Next opened while the mark of the one left is in flight", async () => {
+    const toastSuccess = vi.spyOn(toast, "success");
+    const held = holdResponse();
+    answer = (request) =>
+      isFraudToggle(request, NEWEST.auth_id) ? held.reply : readStore(request);
+    const { user, router } = renderAt(NEWEST_ROUTE);
+    await waitFor(() => {
+      expect(readStatus().textContent).toBe(NEWEST_LOADED);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Mark fraud" }));
+    await user.click(await screen.findByRole("button", { name: "Confirm" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe(`/authorizations/${FOLLOWING.auth_id}`);
+    });
+    await waitFor(() => {
+      expect(readStatus().textContent).toBe(FOLLOWING_LOADED);
+    });
+
+    held.send(jsonResponse(200, { detail: MARKED_NEWEST, message: MARKED_TEXT }));
+    await waitFor(() => {
+      expect(toastSuccess).toHaveBeenCalledWith(MARKED_TEXT);
+    });
+    await waitFor(() => {
+      expect(queryClient.isMutating()).toBe(0);
+    });
+
+    // FOLLOWING's screen: its record, its unmarked PF5 and its own Next.
+    expect(screen.getByText(FOLLOWING.pa_transaction_id)).not.toBeNull();
+    expect(screen.queryByText(NEWEST.pa_transaction_id)).toBeNull();
+    expect(screen.getByRole("button", { name: "Mark fraud" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Next" }).hasAttribute("disabled")).toBe(false);
+    expect(queryClient.getQueryData(authorizationKeys.detail(FOLLOWING.auth_id))).toEqual(
+      FOLLOWING,
+    );
+    expect(queryClient.getQueryData(authorizationKeys.detail(NEWEST.auth_id))).toEqual({
+      ...MARKED_NEWEST,
+      next_id: NEWEST.next_id,
+    });
+    expect(sent()).toEqual([
+      `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+      `PUT ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+      `GET ${SUMMARY_PATH}?account_id=${ACCOUNT_1}&start_key=${NEWEST.auth_id}&direction=forward&page_size=1`,
+      `GET ${DETAIL_PATH_PREFIX}${FOLLOWING.auth_id}`,
+    ]);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+});
+
+/** PF8's summary read one row on from NEWEST once no authorization follows it. */
+const NO_PAGE_AFTER_NEWEST: AuthSummaryResponse = {
+  ...PAGE_AFTER_NEWEST,
+  items: [],
+  next_key: null,
+  prev_key: null,
+};
+
+describe("AuthorizationDetailPage (CPVD, COPAU01) read again after a record was shown", () => {
+  // E-59: PF8 at a record whose follower is gone finds no row and reads the
+  // record again. When that read fails, the record purged meanwhile (404) or
+  // its read failing (500), the record read earlier is withheld exactly as
+  // on a failed first read. Returning to the route reads the key again: the
+  // skeleton stands in while that read is in flight, the failure is neither
+  // toasted again nor shown, and a successful answer brings the record back.
+  it.each(READ_FAILURES)(
+    "withholds the record when its read again answers $status, until a read succeeds",
+    async ({ status, body, toasted }) => {
+      let failing = false;
+      answer = (request) => {
+        if (isNextLookup(request)) {
+          return jsonResponse(200, NO_PAGE_AFTER_NEWEST);
+        }
+        if (failing && isDetailRead(request, NEWEST.auth_id)) {
+          return jsonResponse(status, body);
+        }
+        return readStore(request);
+      };
+      const { user, router } = renderAt(NEWEST_ROUTE);
+      await waitFor(() => {
+        expect(readStatus().textContent).toBe(NEWEST_LOADED);
+      });
+
+      failing = true;
+      await user.click(screen.getByRole("button", { name: "Next" }));
+      await expectFailedRead(toasted);
+      expect(router.state.location.pathname).toBe(`/authorizations/${NEWEST.auth_id}`);
+
+      const held = holdResponse();
+      answer = (request) =>
+        isDetailRead(request, NEWEST.auth_id) ? held.reply : readStore(request);
+      await user.click(screen.getByRole("link", { name: "Back" }));
+      expect(await screen.findByText(SUMMARY_MARKER)).not.toBeNull();
+      await act(async () => {
+        await router.navigate(-1);
+      });
+
+      await waitFor(() => {
+        expect(readStatus().textContent).toBe(LOADING);
+      });
+      expect(document.querySelector("[data-slot='card']")?.getAttribute("aria-hidden")).toBe(
+        "true",
+      );
+      expect(messageLines(toasted)).toEqual([]);
+      expect(screen.queryByText(NEWEST.pa_transaction_id)).toBeNull();
+      expect(screen.queryByRole("button", { name: "Mark fraud" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+
+      held.send(jsonResponse(200, NEWEST));
+      await waitFor(() => {
+        expect(readStatus().textContent).toBe(NEWEST_LOADED);
+      });
+      expect(screen.getByText(NEWEST.pa_transaction_id)).not.toBeNull();
+      expect(screen.getByRole("button", { name: "Mark fraud" })).not.toBeNull();
+      expect(screen.getByRole("button", { name: "Next" })).not.toBeNull();
+      expect(messageLines(toasted)).toEqual([]);
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(sent()).toEqual([
+        `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+        `GET ${SUMMARY_PATH}?account_id=${ACCOUNT_1}&start_key=${NEWEST.auth_id}&direction=forward&page_size=1`,
+        `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+        `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+      ]);
+    },
+  );
+
+  /**
+   * NEWEST shown, Next pressed with its lookup held, and PF5's confirm opened
+   * meanwhile. `sendLookup` answers the lookup with the dialog open: no row
+   * after NEWEST, whose read again then fails as a purge's 404, when
+   * `purged`; FOLLOWING's row otherwise. The application reads only on
+   * navigation or action, so PF8's answer is what can change the record
+   * under the dialog.
+   */
+  async function openConfirmDuringNext(purged: boolean): Promise<{
+    user: UserEvent;
+    router: ReturnType<typeof createMemoryRouter>;
+    sendLookup: () => void;
+  }> {
+    const lookup = holdResponse();
+    let shownOnce = false;
+    answer = (request) => {
+      if (isNextLookup(request)) {
+        return lookup.reply;
+      }
+      if (purged && shownOnce && isDetailRead(request, NEWEST.auth_id)) {
+        return jsonResponse(READ_FAILURES[0].status, READ_FAILURES[0].body);
+      }
+      return readStore(request);
+    };
+    const { user, router } = renderAt(NEWEST_ROUTE);
+    await waitFor(() => {
+      expect(readStatus().textContent).toBe(NEWEST_LOADED);
+    });
+    shownOnce = true;
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    await waitFor(() => {
+      expect(sent()).toHaveLength(2);
+    });
+    await user.click(screen.getByRole("button", { name: "Mark fraud" }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(
+      within(dialog).getByText(
+        `The authorization of transaction ${NEWEST.pa_transaction_id} is reported as fraud.`,
+      ),
+    ).not.toBeNull();
+    const page = purged ? NO_PAGE_AFTER_NEWEST : PAGE_AFTER_NEWEST;
+    return { user, router, sendLookup: () => lookup.send(jsonResponse(200, page)) };
+  }
+
+  // F-COPAU01-003, F-COPAU01-005: the confirm belongs to the record it was
+  // opened on. PF8 finding no row reads the record again; that read failing
+  // (a purge's 404) withholds the record, and the confirm closes with it, so
+  // no Confirm is offered for it and no PUT is sent.
+  it("closes an open fraud confirm when a read again withholds its record", async () => {
+    const { router, sendLookup } = await openConfirmDuringNext(true);
+
+    act(() => {
+      sendLookup();
+    });
+    await expectFailedRead(READ_FAILURES[0].toasted);
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
+    expect(router.state.location.pathname).toBe(`/authorizations/${NEWEST.auth_id}`);
+    expect(sent()).toEqual([
+      `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+      `GET ${SUMMARY_PATH}?account_id=${ACCOUNT_1}&start_key=${NEWEST.auth_id}&direction=forward&page_size=1`,
+      `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+    ]);
+  });
+
+  // The same confirm, PF8 finding the next row: the route moves on to
+  // FOLLOWING, and the confirm opened for NEWEST closes rather than offer
+  // Confirm for the record now shown; FOLLOWING's own PF5 opens its own.
+  it("closes an open fraud confirm when Next opens another authorization", async () => {
+    const { user, router, sendLookup } = await openConfirmDuringNext(false);
+
+    act(() => {
+      sendLookup();
+    });
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe(`/authorizations/${FOLLOWING.auth_id}`);
+    });
+    await waitFor(() => {
+      expect(readStatus().textContent).toBe(FOLLOWING_LOADED);
+    });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Mark fraud" }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(
+      within(dialog).getByText(
+        `The authorization of transaction ${FOLLOWING.pa_transaction_id} is reported as fraud.`,
+      ),
+    ).not.toBeNull();
     expect(sent()).toEqual([
       `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
       `GET ${SUMMARY_PATH}?account_id=${ACCOUNT_1}&start_key=${NEWEST.auth_id}&direction=forward&page_size=1`,

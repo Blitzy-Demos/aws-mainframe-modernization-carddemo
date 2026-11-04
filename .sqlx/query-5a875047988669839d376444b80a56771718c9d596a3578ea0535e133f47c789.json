@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT transaction_id AS \"transaction_id!\", tran_id AS \"tran_id!\",\n       tran_type_cd AS \"tran_type_cd!\", tran_cat_cd AS \"tran_cat_cd!\",\n       tran_source AS \"tran_source!\", tran_desc AS \"tran_desc!\", tran_amt AS \"tran_amt!\",\n       tran_merchant_id AS \"tran_merchant_id!\", tran_merchant_name AS \"tran_merchant_name!\",\n       tran_merchant_city AS \"tran_merchant_city!\", tran_merchant_zip AS \"tran_merchant_zip!\",\n       tran_card_num AS \"tran_card_num!\", tran_orig_ts AS \"tran_orig_ts!\",\n       tran_proc_ts AS \"tran_proc_ts!\"\nFROM transaction_master m\nWHERE m.tran_id <= $1\n  AND EXISTS (\n      SELECT 1 FROM card_xref x\n      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $2)\nORDER BY m.tran_id DESC\nLIMIT $3",
+  "query": "SELECT m.transaction_id AS \"transaction_id!\", m.tran_id AS \"tran_id!\",\n       m.tran_type_cd AS \"tran_type_cd!\", m.tran_cat_cd AS \"tran_cat_cd!\",\n       m.tran_source AS \"tran_source!\", m.tran_desc AS \"tran_desc!\", m.tran_amt AS \"tran_amt!\",\n       m.tran_merchant_id AS \"tran_merchant_id!\", m.tran_merchant_name AS \"tran_merchant_name!\",\n       m.tran_merchant_city AS \"tran_merchant_city!\", m.tran_merchant_zip AS \"tran_merchant_zip!\",\n       m.tran_card_num AS \"tran_card_num!\", m.tran_orig_ts AS \"tran_orig_ts!\",\n       m.tran_proc_ts AS \"tran_proc_ts!\"\nFROM card_xref x\nCROSS JOIN LATERAL (\n    SELECT t.transaction_id, t.tran_id, t.tran_type_cd, t.tran_cat_cd, t.tran_source,\n           t.tran_desc, t.tran_amt, t.tran_merchant_id, t.tran_merchant_name,\n           t.tran_merchant_city, t.tran_merchant_zip, t.tran_card_num, t.tran_orig_ts,\n           t.tran_proc_ts\n    FROM transaction_master t\n    WHERE (t.tran_card_num, t.tran_id) <= (x.xref_card_num, $1)\n    ORDER BY t.tran_card_num DESC, t.tran_id DESC\n    LIMIT $3) m\nWHERE x.xref_acct_id = $2 AND m.tran_card_num = x.xref_card_num\nORDER BY m.tran_id DESC\nLIMIT $3",
   "describe": {
     "columns": [
       {
@@ -98,5 +98,5 @@
       true
     ]
   },
-  "hash": "5998232e68141c15ac99ff484d3a2e14ff0f82eea782e53884db8d760eeca1bc"
+  "hash": "5a875047988669839d376444b80a56771718c9d596a3578ea0535e133f47c789"
 }

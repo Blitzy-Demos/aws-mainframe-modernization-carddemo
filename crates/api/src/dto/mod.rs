@@ -42,6 +42,9 @@
 //!   never a floating-point number. Identifiers, codes and keys are strings
 //!   (`id_string`): zero-padded for `9(n)` fields, as the `DISPLAY` field
 //!   holds them.
+//! - A stored user ID or type code that a path segment addresses arrives as
+//!   a [`KeySegment`], which undoes the `~` escape of the keys `.` and `..`
+//!   that a URL could not otherwise carry.
 //! - [`crate::error::ErrorBody`] is the only error shape. Its `fields[].field`
 //!   values are the BMS field names a `<Dto>Field` enum lists; each such enum
 //!   implements `BmsField`.
@@ -70,6 +73,8 @@ use carddemo_domain::numeric::{
 };
 use carddemo_domain::rules::ErrorKind;
 use rust_decimal::Decimal;
+use serde::Deserialize;
+use serde::de::{Deserializer, Error as _};
 use validator::{ValidationError, ValidationErrors};
 
 use crate::error::{ApiError, ErrorFieldBody};
@@ -256,6 +261,76 @@ pub(crate) fn id_string(value: &impl KeyText) -> String {
     value.key_text()
 }
 
+/// The escape a key that would be a dot segment travels behind.
+const KEY_ESCAPE: char = '~';
+
+/// The `message` text, after axum's `Invalid URL: `, of a path whose key
+/// segment is a bare dot segment. It names no client text.
+const DOT_SEGMENT_REFUSED: &str = "a bare `.` or `..` path segment names no key: the key `.` is \
+                                   sent as `~.` and the key `..` as `~..`";
+
+/// Whether `text` is `.` or `..` after zero or more `~`: the keys
+/// [`KeySegment`] carries behind one more `~`.
+fn is_dot_key(text: &str) -> bool {
+    matches!(text.trim_start_matches(KEY_ESCAPE), "." | "..")
+}
+
+/// A stored key as one URL path segment carries it, holding the key itself:
+/// the `{id}` of `GET`, `PUT` and `DELETE /admin/users/{id}` (a user ID
+/// `X(08)`) and of `PUT` and `DELETE /admin/transaction-types/{id}` (a type
+/// code `X(2)`).
+///
+/// Both keys may be `.` or `..`: `COUSR01C` refuses only a blank user ID and
+/// `MNTTRDB2` stores any two characters as a type code. A URL removes those
+/// two dot segments from its path, percent-encoded as `%2E` too (RFC 3986
+/// §5.2.4, the WHATWG URL standard every browser and `reqwest` follow), so
+/// `/admin/users/..` would reach `/admin/` and `/admin/users/.` would reach
+/// `/admin/users/`, neither of them the user. Such a key therefore travels
+/// behind one more `~`, and so does every key that is `.` or `..` after one
+/// or more `~`, which keeps the escape a bijection between keys and segments:
+///
+/// | Key | Segment |
+/// |---|---|
+/// | `.`, `..` | `~.`, `~..` |
+/// | `~.`, `~..`, `~~.` | `~~.`, `~~..`, `~~~.` |
+/// | `USER0001`, `...`, `.a`, `~A`, `~` | unchanged |
+///
+/// The client percent-encodes the segment as it does any other; axum decodes
+/// it before this type reads it. Deserializing drops the first `~` of a
+/// segment that is `.` or `..` after one or more `~` and keeps every other
+/// segment as it is, so the key the handler's own checks and its rule
+/// receive is the stored key. A bare `.` or `..` segment is no key's segment:
+/// only a client that sends dot segments unnormalized can deliver one, and it
+/// is refused as a malformed path, 400 `INVALID`, through the
+/// [`crate::error::ApiPath`] rejection. The key `.` thus has one segment,
+/// `~.`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeySegment(pub String);
+
+impl KeySegment {
+    /// The key the percent-decoded `segment` carries.
+    ///
+    /// # Errors
+    ///
+    /// [`DOT_SEGMENT_REFUSED`] when `segment` is `.` or `..`.
+    fn decode(segment: String) -> Result<Self, &'static str> {
+        if matches!(segment.as_str(), "." | "..") {
+            return Err(DOT_SEGMENT_REFUSED);
+        }
+        match segment.strip_prefix(KEY_ESCAPE) {
+            Some(key) if is_dot_key(key) => Ok(Self(key.to_owned())),
+            _ => Ok(Self(segment)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeySegment {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let segment = String::deserialize(deserializer)?;
+        Self::decode(segment).map_err(D::Error::custom)
+    }
+}
+
 /// A BMS field a request DTO's errors can name: the variants of a
 /// `<Dto>Field` enum.
 ///
@@ -338,7 +413,10 @@ pub(crate) fn reject_invalid<F: BmsField>(
 mod tests {
     use std::borrow::Cow;
 
-    use axum::http::StatusCode;
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
     use carddemo_domain::error::ErrorKind;
     use carddemo_domain::messages;
     use carddemo_domain::numeric::{
@@ -348,14 +426,15 @@ mod tests {
     };
     use rust_decimal::Decimal;
     use serde::Serialize;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
     use validator::Validate;
 
     use super::{
-        BmsField, ascii_text, bms_errors, id_string, length_errors, money, reject_invalid,
-        storable_text, storable_text_of_width, text,
+        BmsField, DOT_SEGMENT_REFUSED, KeySegment, ascii_text, bms_errors, id_string,
+        length_errors, money, reject_invalid, storable_text, storable_text_of_width, text,
     };
-    use crate::error::ErrorFieldBody;
+    use crate::error::{ApiPath, ErrorFieldBody};
 
     /// A field enum shaped as the `<Dto>Field` enums are, with ranks that
     /// differ from both declaration and name order.
@@ -666,6 +745,79 @@ mod tests {
                         {"field": "CONFIRM", "message": message},
                     ],
                 })
+            );
+        }
+    }
+
+    /// Each path segment, as the request line carries it, and the key the
+    /// handler receives: the `~` escape of the keys that are `.` or `..` after
+    /// zero or more `~` is undone once, after percent-decoding, and every
+    /// other segment is the key as sent, so no two segments name one key.
+    const KEY_SEGMENTS: [(&str, &str); 15] = [
+        ("~.", "."),
+        ("~..", ".."),
+        ("~~.", "~."),
+        ("~~..", "~.."),
+        ("~~~~~~~~.", "~~~~~~~."),
+        ("~~~~~~~..", "~~~~~~.."),
+        ("%7E.", "."),
+        ("%7E%2E%2E", ".."),
+        ("USER0001", "USER0001"),
+        ("...", "..."),
+        (".a", ".a"),
+        ("~A", "~A"),
+        ("~", "~"),
+        ("~.~.", "~.~."),
+        ("%252e", "%2e"),
+    ];
+
+    /// The bare dot segments, literal and percent-encoded, which no key is
+    /// sent as.
+    const DOT_SEGMENTS: [&str; 4] = [".", "..", "%2E", "%2e%2E"];
+
+    /// One `GET /keys/{segment}` on a route that answers the key its
+    /// [`KeySegment`] carries, through the [`ApiPath`] rejection. The URI is
+    /// built as the request line holds it, with no dot-segment removal.
+    async fn key_of(segment: &str) -> (StatusCode, Vec<u8>) {
+        let app = Router::new().route(
+            "/keys/{id}",
+            get(|ApiPath(KeySegment(key)): ApiPath<KeySegment>| async move { key }),
+        );
+        let request = Request::builder()
+            .uri(format!("/keys/{segment}"))
+            .body(Body::empty())
+            .expect("a valid request");
+        assert_eq!(request.uri().path(), format!("/keys/{segment}"));
+        let response = app.oneshot(request).await.expect("the router answers");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body is read");
+        (status, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn a_key_segment_carries_the_stored_key() {
+        for (segment, key) in KEY_SEGMENTS {
+            let (status, body) = key_of(segment).await;
+            assert_eq!(status, StatusCode::OK, "{segment}");
+            assert_eq!(String::from_utf8_lossy(&body), key, "{segment}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bare_dot_segment_is_refused_as_a_malformed_path() {
+        for segment in DOT_SEGMENTS {
+            let (status, body) = key_of(segment).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{segment}");
+            let body: Value = serde_json::from_slice(&body).expect("an error body");
+            assert_eq!(
+                body,
+                json!({
+                    "code": ErrorKind::Invalid.code(),
+                    "message": format!("Invalid URL: {DOT_SEGMENT_REFUSED}"),
+                }),
+                "{segment}"
             );
         }
     }

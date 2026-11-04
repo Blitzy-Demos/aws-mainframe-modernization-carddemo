@@ -20,6 +20,11 @@
 //! (`IF SEC-USR-PWD = WS-USER-PWD` [app/cbl/COSGN00C.cbl:L223]); this record
 //! holds an argon2id hash in its place, a mandated deviation (E-20). Hashing
 //! and verification belong to `crate::auth::password`, never to this entity.
+//!
+//! [`UserProfile`] is the same record without `SEC-USR-PWD`: what a read
+//! returns where no credential is compared, so a hash is read only by the
+//! sign-on and by the `COUSR02C` password compare, the two reads that verify
+//! one.
 
 use core::fmt;
 
@@ -92,7 +97,63 @@ impl UserSecurity {
     /// the 403 gate on every `/admin/**` endpoint.
     #[must_use]
     pub fn is_admin(&self) -> bool {
-        self.sec_usr_type.as_bytes() == ADMIN_USER_TYPE
+        is_admin_type(self.sec_usr_type)
+    }
+}
+
+/// The 88-level `CDEMO-USRTYP-ADMIN VALUE 'A'` [app/cpy/COCOM01Y.cpy:L27] on
+/// a `SEC-USR-TYPE`, the one test [`UserSecurity::is_admin`] and
+/// [`UserProfile::is_admin`] share.
+fn is_admin_type(user_type: Alnum<1>) -> bool {
+    user_type.as_bytes() == ADMIN_USER_TYPE
+}
+
+/// A `USRSEC` user record without its password: `CSUSR01Y` `SEC-USER-DATA`
+/// [app/cpy/CSUSR01Y.cpy:L17-23] less `SEC-USR-PWD` (P-CSUSR01Y-004).
+///
+/// The record a read returns where no credential is compared: the `COUSR00C`
+/// user list, the `COUSR02C` and `COUSR03C` fetch, the `COUSR03C` delete and
+/// the bearer token's subject check. Only the `COSGN00C` sign-on and the
+/// `COUSR02C` password compare read a [`UserSecurity`], which carries the
+/// hash. This record holds no secret, so its `Debug` shows every field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserProfile {
+    /// `SEC-USR-ID PIC X(08)`, the record key — P-CSUSR01Y-001
+    /// [app/cpy/CSUSR01Y.cpy:L18]. SQL `VARCHAR(8)` column `user_id`, held as
+    /// stored, case kept (E-20).
+    pub sec_usr_id: UserId,
+    /// `SEC-USR-FNAME PIC X(20)`, the first name — P-CSUSR01Y-002
+    /// [app/cpy/CSUSR01Y.cpy:L19]. SQL `VARCHAR(20)` column `sec_usr_fname`,
+    /// right-trimmed.
+    pub sec_usr_fname: Alnum<20>,
+    /// `SEC-USR-LNAME PIC X(20)`, the last name — P-CSUSR01Y-003
+    /// [app/cpy/CSUSR01Y.cpy:L20]. SQL `VARCHAR(20)` column `sec_usr_lname`,
+    /// right-trimmed.
+    pub sec_usr_lname: Alnum<20>,
+    /// `SEC-USR-TYPE PIC X(01)`, the user type — P-CSUSR01Y-005
+    /// [app/cpy/CSUSR01Y.cpy:L22]. SQL `VARCHAR(1)` column `sec_usr_type`,
+    /// right-trimmed; see [`UserProfile::is_admin`].
+    pub sec_usr_type: Alnum<1>,
+}
+
+impl UserProfile {
+    /// Whether the user is an administrator: `SEC-USR-TYPE` is exactly `A`,
+    /// the test [`UserSecurity::is_admin`] applies (P-COSGN00C-009).
+    #[must_use]
+    pub fn is_admin(&self) -> bool {
+        is_admin_type(self.sec_usr_type)
+    }
+}
+
+impl From<&UserSecurity> for UserProfile {
+    /// Every field of `user` but its password hash.
+    fn from(user: &UserSecurity) -> Self {
+        Self {
+            sec_usr_id: user.sec_usr_id,
+            sec_usr_fname: user.sec_usr_fname,
+            sec_usr_lname: user.sec_usr_lname,
+            sec_usr_type: user.sec_usr_type,
+        }
     }
 }
 
@@ -112,7 +173,7 @@ impl fmt::Debug for UserSecurity {
 
 #[cfg(test)]
 mod tests {
-    use super::UserSecurity;
+    use super::{UserProfile, UserSecurity};
     use crate::numeric::{Alnum, UserId};
 
     /// A well-formed argon2id PHC string with a made-up salt and output.
@@ -141,8 +202,32 @@ mod tests {
             (*b"a", false),
         ];
         for (user_type, expected) in cases {
-            assert_eq!(admin001(user_type).is_admin(), expected, "{user_type:?}");
+            let user = admin001(user_type);
+            assert_eq!(user.is_admin(), expected, "{user_type:?}");
+            assert_eq!(
+                UserProfile::from(&user).is_admin(),
+                expected,
+                "profile {user_type:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_profile_keeps_every_field_but_the_hash() {
+        let profile = UserProfile::from(&admin001(*b"U"));
+        assert_eq!(
+            profile,
+            UserProfile {
+                sec_usr_id: UserId::move_from("ADMIN001"),
+                sec_usr_fname: Alnum::move_from("MARGARET"),
+                sec_usr_lname: Alnum::move_from("GOLD"),
+                sec_usr_type: Alnum::from_array(*b"U"),
+            }
+        );
+        let rendered = format!("{profile:?}");
+        assert!(!rendered.contains(HASH), "{rendered}");
+        assert!(!rendered.contains("password_hash"), "{rendered}");
+        assert!(rendered.contains("\"MARGARET            \""), "{rendered}");
     }
 
     #[test]

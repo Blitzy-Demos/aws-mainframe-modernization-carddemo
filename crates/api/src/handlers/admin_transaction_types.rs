@@ -75,6 +75,7 @@ use carddemo_persistence::tx::UnitOfWork;
 use tracing::{Instrument, Span};
 
 use crate::auth::AdminUser;
+use crate::dto::KeySegment;
 use crate::dto::admin_transaction_types::{
     TranTypeCreateRequest, TranTypeDeleteOrigin, TranTypeDeleteQuery, TranTypeListPageQuery,
     TranTypeListQuery, TranTypeMessageResponse, TranTypeOrigin, TranTypeResponse,
@@ -249,9 +250,10 @@ pub async fn create_tran_type(
 /// # Errors
 ///
 /// - 400 for a key or description longer than its BMS field, a malformed
-///   query or body, and the key and description edits: on `TRTYPCD` or
-///   `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,
-///   V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`
+///   query or body, a bare `.` or `..` path segment, which names no type, and
+///   the key and description edits: on `TRTYPCD` or `TRTYDSC` without
+///   `origin` (V-COTRTUPC-001 to V-COTRTUPC-003, V-COTRTUPC-007,
+///   V-COTRTUPC-008), on no field with `origin=list`
 ///   (V-COTRTLIC-013, V-COTRTLIC-014), where a key holding a character
 ///   outside ASCII is also refused with an empty message. A description
 ///   holding one gets the alphanumeric edit's text with either origin.
@@ -265,13 +267,13 @@ pub async fn create_tran_type(
     path = "/admin/transaction-types/{id}",
     tag = "admin-transaction-types",
     params(
-        ("id" = String, Path, description = "The type code, `TR_TYPE`: two ASCII characters", max_length = 2, pattern = "^[\\x00-\\x7F]*$"),
+        ("id" = String, Path, description = "The type code, `TR_TYPE`: two ASCII characters. A code that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other code is sent as stored", max_length = 3, pattern = "^[\\x00-\\x7F]*$"),
         TranTypeUpdateQuery,
     ),
     request_body = TranTypeUpdateRequest,
     responses(
         (status = 200, description = "The description was stored, or nothing changed; `message` is the COBOL text, and with `origin=list` `info` is the COTRTLIC info line", body = TranTypeMessageResponse),
-        (status = 400, description = "The type code or the description fails its edit", body = ErrorBody),
+        (status = 400, description = "The type code or the description fails its edit, or the path is a bare `.` or `..` segment", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an admin's", body = ErrorBody),
         (status = 404, description = "No transaction type has the code", body = ErrorBody),
@@ -282,7 +284,7 @@ pub async fn create_tran_type(
 pub async fn update_tran_type(
     State(state): State<AppState>,
     admin: AdminUser,
-    ApiPath(id): ApiPath<String>,
+    ApiPath(KeySegment(id)): ApiPath<KeySegment>,
     ApiQuery(query): ApiQuery<TranTypeUpdateQuery>,
     ApiJson(body): ApiJson<TranTypeUpdateRequest>,
 ) -> Result<Json<TranTypeMessageResponse>, ApiError> {
@@ -366,9 +368,9 @@ async fn update_via_ctli(
 /// # Errors
 ///
 /// - 400 for a key longer than the type code `X(2)`, a malformed path or
-///   query, and, without `origin`, a key holding a character outside ASCII;
-///   with `origin=form`, 400 for the key edits on `TRTYPCD`
-///   (V-COTRTUPC-022 to V-COTRTUPC-024).
+///   query, a bare `.` or `..` path segment among them, and, without
+///   `origin`, a key holding a character outside ASCII; with `origin=form`,
+///   400 for the key edits on `TRTYPCD` (V-COTRTUPC-022 to V-COTRTUPC-024).
 /// - 401 without a valid token; 403 for a token that is not an admin's.
 /// - 404 when no type has the code: with the delete-failed Db2 text without
 ///   `origin` (V-COTRTLIC-022), and with the not-found text on `TRTYPCD`
@@ -383,12 +385,12 @@ async fn update_via_ctli(
     path = "/admin/transaction-types/{id}",
     tag = "admin-transaction-types",
     params(
-        ("id" = String, Path, description = "The type code, `TR_TYPE`: two ASCII characters", max_length = 2, pattern = "^[\\x00-\\x7F]*$"),
+        ("id" = String, Path, description = "The type code, `TR_TYPE`: two ASCII characters. A code that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other code is sent as stored", max_length = 3, pattern = "^[\\x00-\\x7F]*$"),
         TranTypeDeleteQuery,
     ),
     responses(
         (status = 200, description = "The type was deleted; `message` is the COBOL text, and `transaction_type` is null without `origin` and the deleted type with `origin=form`", body = TranTypeMessageResponse),
-        (status = 400, description = "The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form`", body = ErrorBody),
+        (status = 400, description = "The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form`, or the path is a bare `.` or `..` segment", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an admin's", body = ErrorBody),
         (status = 404, description = "No transaction type has the code", body = ErrorBody),
@@ -400,7 +402,7 @@ async fn update_via_ctli(
 pub async fn delete_tran_type(
     State(state): State<AppState>,
     admin: AdminUser,
-    ApiPath(id): ApiPath<String>,
+    ApiPath(KeySegment(id)): ApiPath<KeySegment>,
     ApiQuery(query): ApiQuery<TranTypeDeleteQuery>,
 ) -> Result<Json<TranTypeMessageResponse>, ApiError> {
     let transaction = match query.origin {
@@ -797,13 +799,17 @@ mod tests {
             [("id", "path"), ("origin", "query")]
                 .map(|(name, place)| (name.to_owned(), place.to_owned()))
         );
-        // The {id} of both operations: two characters, in ASCII.
+        // The {id} of both operations, in ASCII: a two-character code, or
+        // three for a code that is `.` or `..` after a `~`, such as `~.`,
+        // which travels behind one more `~` (`KeySegment`).
         for operation in [update, delete] {
             let id = &operation["parameters"][0];
             assert_eq!(id["required"], true);
             assert_eq!(id["schema"]["type"], "string");
-            assert_eq!(id["schema"]["maxLength"], 2);
+            assert_eq!(id["schema"]["maxLength"], 3);
             assert_eq!(id["schema"]["pattern"], "^[\\x00-\\x7F]*$");
+            let description = id["description"].as_str().expect("a description");
+            assert!(description.contains("(`.` as `~.`)"), "{description}");
         }
         assert!(delete.get("requestBody").is_none());
         assert_eq!(

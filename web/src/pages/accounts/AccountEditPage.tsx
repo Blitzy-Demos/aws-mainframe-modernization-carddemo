@@ -10,7 +10,8 @@
 //   ACCTSID shows read-only, as COACTUPC protects it once the details are
 //   fetched (3300-SETUP-SCREEN-ATTRS). Customer id and Country stay read-only
 //   too (3320-UNPROTECT-FEW-ATTRS leaves ACSTNUM and ACSCTRY protected), and
-//   all three travel back as fetched.
+//   all three travel back as fetched. A route key the key edits reject is
+//   not read: the screen shows the edit's text instead of the form.
 // - ENTER's validation and the F5 write are one submit, "Save" (E-56).
 // - F12 "Cancel" re-reads the record and drops unsaved changes. Save and
 //   Cancel take turns: neither acts while the other's request runs.
@@ -18,6 +19,7 @@
 // - COACTUP's legend offers no F4, so the page has no "Reset" control.
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type JSX,
@@ -47,6 +49,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { applyApiError, showApiError, showSuccess } from "@/lib/api-errors";
 import {
+  accountKeyError,
   accountUpdateBmsFieldMap,
   accountUpdateSchema,
   toAccountUpdateRequest,
@@ -647,7 +650,17 @@ function LoadingAccount(): JSX.Element {
 
 export default function AccountEditPage(): JSX.Element {
   const { accountId = "" } = useParams();
-  const { data: account, error, refetch: reread } = useAccount(accountId);
+  // The key edits on the route key, with the texts `GET /accounts/{id}`
+  // answers them with: COACTUPC performs 9000-READ-ACCT only once the key
+  // passes [app/cbl/COACTUPC.cbl:L2568-2576], so a rejected key reaches the
+  // hook as a blank, which it never sends.
+  const keyError = useMemo(
+    () => (accountId === "" ? null : accountKeyError(accountId)),
+    [accountId],
+  );
+  const { data: account, error, refetch: reread } = useAccount(
+    keyError === null ? accountId : "",
+  );
   const loadMessage = useLoadErrorMessage(error);
   // A failed save is held here rather than in the form. The save settles
   // once its reload is in the cache, but TanStack Query tells this page about
@@ -656,7 +669,17 @@ export default function AccountEditPage(): JSX.Element {
   const [failure, setFailure] = useState<SaveFailure | null>(null);
 
   let body: ReactNode = null;
-  if (account !== undefined) {
+  if (keyError !== null) {
+    // The edit's text where a failed read's would stand. No request carried
+    // it, so there is no toast.
+    body = (
+      <Card>
+        <CardContent>
+          <FieldError>{keyError}</FieldError>
+        </CardContent>
+      </Card>
+    );
+  } else if (account !== undefined) {
     body = (
       <AccountEditForm
         key={accountId}

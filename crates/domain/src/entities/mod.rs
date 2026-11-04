@@ -104,4 +104,4 @@ pub use tran_cat_balance::{TranCatBalance, TranCatBalanceKey};
 pub use tran_category::{TRC_CAT_DATA_MAX_LEN, TranCategoryMaster, TranCategoryRecord};
 pub use tran_type::{TR_DESCRIPTION_MAX_LEN, TranTypeMaster, TranTypeRecord};
 pub use transaction::{NewTransaction, Transaction};
-pub use user_security::UserSecurity;
+pub use user_security::{UserProfile, UserSecurity};

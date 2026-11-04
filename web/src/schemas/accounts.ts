@@ -119,6 +119,24 @@ export const accountKeySchema = z.object({
 /** The values of the account number form. */
 export type AccountKeyValues = z.infer<typeof accountKeySchema>;
 
+/**
+ * The `accountKeySchema` text of an account number, or `null` when the number
+ * passes: the one text 2210-EDIT-ACCOUNT moves, as `GET /accounts/{id}`
+ * answers it at ACCTSID. The account pages check the key of their route with
+ * it, because COACTVWC and COACTUPC read the records only once the key edits
+ * pass [app/cbl/COACTVWC.cbl:L361-374] [app/cbl/COACTUPC.cbl:L2568-2576]: a
+ * key with a text here is shown it and never sent.
+ */
+export function accountKeyError(accountId: string): string | null {
+  const check = accountKeySchema.safeParse({ account_id: accountId });
+  if (check.success) {
+    return null;
+  }
+  // The edit sets one text per key, so a rejection carries exactly one issue.
+  const [issue] = check.error.issues;
+  return issue.message;
+}
+
 /** The form field of each BMS field a `GET /accounts/{id}` error names. */
 export const accountViewBmsFieldMap: Record<
   components["schemas"]["AccountViewField"],

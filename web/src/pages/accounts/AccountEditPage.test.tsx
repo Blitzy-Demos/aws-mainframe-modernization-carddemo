@@ -21,6 +21,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
+import { ACCOUNT_KEY_MESSAGES } from "@/schemas/accounts";
 
 import AccountEditPage from "./AccountEditPage";
 
@@ -261,10 +262,10 @@ async function contentOf(
 }
 
 /**
- * Renders the page at /accounts/00000000001/edit beside the account view it
- * links back to, and waits for the record to fill the form.
+ * Renders the page for the account `key` of the route beside the account
+ * view it links back to.
  */
-async function renderPage() {
+function renderEdit(key: string): void {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -284,9 +285,8 @@ async function renderPage() {
         handle: { crumb: "Account" },
       },
     ],
-    { initialEntries: [`/accounts/${ACCOUNT_ID}/edit`] },
+    { initialEntries: [`/accounts/${key}/edit`] },
   );
-  const user = userEvent.setup();
   render(
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
@@ -295,6 +295,15 @@ async function renderPage() {
       </QueryClientProvider>
     </ThemeProvider>,
   );
+}
+
+/**
+ * Renders the page at /accounts/00000000001/edit and waits for the record to
+ * fill the form.
+ */
+async function renderPage() {
+  const user = userEvent.setup();
+  renderEdit(ACCOUNT_ID);
   await screen.findByDisplayValue("Kessler");
   return user;
 }
@@ -369,6 +378,47 @@ describe("AccountEditPage (CAUP, COACTUPC)", () => {
     }
     expect(input("First Name").readOnly).toBe(false);
   });
+
+  // COACTUPC reads the record only once the key edits pass: a route key they
+  // reject gets the text `GET /accounts/{id}` would answer with, in place of
+  // the form, with no request and so no toast. `%20%20` is a key of two
+  // spaces.
+  it.each([
+    {
+      route: "ABC",
+      message: ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit,
+    },
+    {
+      route: "00000000000",
+      message: ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit,
+    },
+    {
+      route: "000000000012",
+      message: ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit,
+    },
+    { route: "%20%20", message: ACCOUNT_KEY_MESSAGES.noInputReceived },
+  ])(
+    "shows the key edit's text for the route key $route without a request",
+    async ({ route, message }) => {
+      const error = vi.spyOn(toast, "error");
+      stubNetwork({ reads: [ACCOUNT] });
+      renderEdit(route);
+
+      const alert = await screen.findByRole("alert");
+      // The text is compared as the schema holds it: its double spaces are
+      // part of it.
+      expect(alert.textContent).toBe(message);
+      expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+      expect(document.querySelector('[data-slot="skeleton"]')).toBeNull();
+      expect(
+        screen.getByRole("link", { name: "Back" }).getAttribute("href"),
+      ).toBe(`/accounts/${route}`);
+      await settle();
+      expect(fetch).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+    },
+  );
 
   it("saves the edited fields with the record's version and shows the COBOL text", async () => {
     const success = vi.spyOn(toast, "success");

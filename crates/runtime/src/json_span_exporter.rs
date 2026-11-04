@@ -36,17 +36,21 @@ const SERVICE_NAME_KEY: &str = "service.name";
 
 /// Span exporter that writes each finished span as one JSON line.
 ///
-/// `W` is any [`MakeWriter`]: `std::io::stdout` in the binaries, a capture buffer
-/// in tests. The `service` key of every line comes from the `service.name`
-/// attribute of the tracer provider's resource, which the SDK hands over through
-/// [`SpanExporter::set_resource`].
+/// `W` is any [`MakeWriter`]: in the binaries, the writer `telemetry::init`
+/// passes, which queues each line for a thread that writes it to standard
+/// output; a capture buffer in tests. The `service` key of every line comes from
+/// the `service.name` attribute of the tracer provider's resource, which the SDK
+/// hands over through [`SpanExporter::set_resource`].
 pub struct JsonSpanExporter<W = fn() -> Stdout> {
     writer: W,
     service_name: Option<String>,
 }
 
 impl JsonSpanExporter {
-    /// Exporter that writes to the process's standard output.
+    /// Exporter that writes to the process's standard output, synchronously, on
+    /// the thread that ends the span. `telemetry::init` does not use it: it hands
+    /// the exporter its queued writer instead, so that a slow standard output
+    /// does not hold that thread up.
     #[must_use]
     pub fn stdout() -> Self {
         let writer: fn() -> Stdout = std::io::stdout;
@@ -71,8 +75,11 @@ where
     W: for<'a> MakeWriter<'a>,
 {
     /// Serializes `span` and writes it, newline included, with a single
-    /// `write_all`. `Stdout` holds its lock for the whole call, so a span line never
-    /// interleaves with the lines the JSON formatter writes to the same stream.
+    /// `write_all`, then flushes the writer. The JSON formatter also writes each
+    /// line with one `write_all`, so on a writer that keeps every write whole, as
+    /// `Stdout` does under its lock and the queued writer of `telemetry::init`
+    /// does by queueing each write as one line, a span line never interleaves
+    /// with the formatter's lines.
     fn write_line(&self, span: &SpanData) -> ExportResult {
         let mut line = serde_json::to_string(&span_to_json(span, self.service_name.as_deref()))
             .map_err(|err| TraceError::from(err.to_string()))?;

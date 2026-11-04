@@ -298,9 +298,10 @@ export interface paths {
          *     # Errors
          *
          *     - 400 for a key or description longer than its BMS field, a malformed
-         *       query or body, and the key and description edits: on `TRTYPCD` or
-         *       `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,
-         *       V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`
+         *       query or body, a bare `.` or `..` path segment, which names no type, and
+         *       the key and description edits: on `TRTYPCD` or `TRTYDSC` without
+         *       `origin` (V-COTRTUPC-001 to V-COTRTUPC-003, V-COTRTUPC-007,
+         *       V-COTRTUPC-008), on no field with `origin=list`
          *       (V-COTRTLIC-013, V-COTRTLIC-014), where a key holding a character
          *       outside ASCII is also refused with an empty message. A description
          *       holding one gets the alphanumeric edit's text with either origin.
@@ -333,9 +334,9 @@ export interface paths {
          *     # Errors
          *
          *     - 400 for a key longer than the type code `X(2)`, a malformed path or
-         *       query, and, without `origin`, a key holding a character outside ASCII;
-         *       with `origin=form`, 400 for the key edits on `TRTYPCD`
-         *       (V-COTRTUPC-022 to V-COTRTUPC-024).
+         *       query, a bare `.` or `..` path segment among them, and, without
+         *       `origin`, a key holding a character outside ASCII; with `origin=form`,
+         *       400 for the key edits on `TRTYPCD` (V-COTRTUPC-022 to V-COTRTUPC-024).
          *     - 401 without a valid token; 403 for a token that is not an admin's.
          *     - 404 when no type has the code: with the delete-failed Db2 text without
          *       `origin` (V-COTRTLIC-022), and with the not-found text on `TRTYPCD`
@@ -448,7 +449,8 @@ export interface paths {
          *
          *     - 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank
          *       ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a
-         *       character outside ASCII.
+         *       character outside ASCII, and for a bare `.` or `..` segment, which
+         *       names no user.
          *     - 401 without a valid bearer token; 403 for a token that is not an
          *       administrator's.
          *     - 404 `User ID NOT found...`, field `USRIDIN` (V-COUSR02C-002).
@@ -479,7 +481,8 @@ export interface paths {
          *     - 400 `EMPTY` with the empty-field message of the first blank field
          *       (`USRIDIN`, `FNAME`, `LNAME`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for
          *       a field or ID longer than its BMS field or holding a character outside
-         *       ASCII, or a body that does not deserialize.
+         *       ASCII, a bare `.` or `..` segment, which names no user, or a body that
+         *       does not deserialize.
          *     - 401 without a valid bearer token; 403 for a token that is not an
          *       administrator's.
          *     - 404 `User ID NOT found...`, field `USRIDIN`, when the rewrite finds no
@@ -506,7 +509,8 @@ export interface paths {
          *
          *     - 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank
          *       ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a
-         *       character outside ASCII.
+         *       character outside ASCII, and for a bare `.` or `..` segment, which
+         *       names no user.
          *     - 401 without a valid bearer token; 403 for a token that is not an
          *       administrator's.
          *     - 404 `User ID NOT found...`, field `USRIDIN`, when the delete finds no
@@ -3342,7 +3346,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The type code, `TR_TYPE`: two ASCII characters */
+                /** @description The type code, `TR_TYPE`: two ASCII characters. A code that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other code is sent as stored */
                 id: string;
             };
             cookie?: never;
@@ -3362,7 +3366,7 @@ export interface operations {
                     "application/json": components["schemas"]["TranTypeMessageResponse"];
                 };
             };
-            /** @description The type code or the description fails its edit */
+            /** @description The type code or the description fails its edit, or the path is a bare `.` or `..` segment */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3420,7 +3424,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The type code, `TR_TYPE`: two ASCII characters */
+                /** @description The type code, `TR_TYPE`: two ASCII characters. A code that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other code is sent as stored */
                 id: string;
             };
             cookie?: never;
@@ -3436,7 +3440,7 @@ export interface operations {
                     "application/json": components["schemas"]["TranTypeMessageResponse"];
                 };
             };
-            /** @description The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form` */
+            /** @description The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form`, or the path is a bare `.` or `..` segment */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3641,7 +3645,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters */
+                /** @description The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored */
                 id: string;
             };
             cookie?: never;
@@ -3657,7 +3661,7 @@ export interface operations {
                     "application/json": components["schemas"]["UserSummary"];
                 };
             };
-            /** @description A blank, over-length or non-ASCII user ID */
+            /** @description A blank, over-length or non-ASCII user ID, or a bare `.` or `..` segment */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3709,7 +3713,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters */
+                /** @description The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored */
                 id: string;
             };
             cookie?: never;
@@ -3729,7 +3733,7 @@ export interface operations {
                     "application/json": components["schemas"]["UserMessageResponse"];
                 };
             };
-            /** @description A blank, over-length or non-ASCII field or user ID, or a malformed body */
+            /** @description A blank, over-length or non-ASCII field or user ID, a bare `.` or `..` segment, or a malformed body */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3781,7 +3785,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters */
+                /** @description The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored */
                 id: string;
             };
             cookie?: never;
@@ -3797,7 +3801,7 @@ export interface operations {
                     "application/json": components["schemas"]["UserMessageResponse"];
                 };
             };
-            /** @description A blank, over-length or non-ASCII user ID */
+            /** @description A blank, over-length or non-ASCII user ID, or a bare `.` or `..` segment */
             400: {
                 headers: {
                     [name: string]: unknown;

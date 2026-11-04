@@ -168,6 +168,27 @@ CREATE UNIQUE INDEX transactions_master_tran_id ON transactions (tran_id) WHERE 
 -- over the live file.
 CREATE INDEX transactions_master_proc_ts ON transactions (tran_proc_ts) WHERE in_master;
 
+-- TRANREPT STEP05R sorts the selected records by card number, then TRAN-ID
+-- [app/proc/TRANREPT.prc:L35-53], and CR00 reads that order through transactions_by_proc_date
+-- (crates/persistence/src/repos/transactions.rs) as keyset pages compared and ordered by
+-- rpad(tran_card_num, 16) and rpad(tran_id, 16) COLLATE "C", the space-padded X(16) bytes of
+-- both keys: the right-trimmed column alone sorts '1' before '1' followed by a byte below
+-- the space, where the padded key sorts it after. This expression index supplies that
+-- order and the keyset bound over the live rows, so a page of a wide date range is read in
+-- key order from its bound instead of sorting the range; transactions_master_proc_ts still
+-- serves a narrow range.
+CREATE INDEX transactions_master_padded_card_tran_id
+    ON transactions ((rpad(tran_card_num, 16)) COLLATE "C", (rpad(tran_id, 16)) COLLATE "C")
+    WHERE in_master;
+
+-- The CT00 account filter the REST resource adds to COTRN00C (E-17) reads each card that
+-- card_xref maps to the account in TRAN-ID order from the start key
+-- (crates/persistence/src/repos/transactions.rs select_forward, select_backward_from and
+-- select_backward_from_end), so a page reads at most its own size per card, however many
+-- live rows other cards hold. It also serves the CREASTMT STEP010 order, card number then
+-- TRAN-ID [app/jcl/CREASTMT.JCL:L44-55], of transactions_by_card.
+CREATE INDEX transactions_master_card_tran_id ON transactions (tran_card_num, tran_id) WHERE in_master;
+
 -- Serves the COMBTRAN revive lookup (crates/persistence/src/repos/transactions.rs revive) of
 -- the row outside the live master equal in tran_id and content, lowest transaction_id
 -- first, so each loaded record probes only the retained rows of its own TRAN-ID. It is not

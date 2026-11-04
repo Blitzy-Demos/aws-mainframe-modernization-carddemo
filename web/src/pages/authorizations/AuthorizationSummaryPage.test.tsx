@@ -584,3 +584,126 @@ describe("CPVS while a read of the list is in flight", () => {
     expect(new URL(lastRequest(fetchMock).url).searchParams.get("start_key")).toBe("3");
   });
 });
+
+/** Previous and Next, and every row of either page, are gone from the screen. */
+function expectNoListShown(): void {
+  expect(screen.queryByRole("table")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+  for (const item of [...firstPage.items, ...secondPage.items]) {
+    expect(screen.queryByText(item.pa_transaction_id)).toBeNull();
+  }
+}
+
+/**
+ * A page already shown, read again: ENTER on the account shown, or PF8 back
+ * to a page read before. `heldHeader` tells whether the Search that follows
+ * the failure holds a first page read earlier, busy, while it reads: only
+ * when the failure was another page's.
+ */
+const REREADS: ReadonlyArray<{
+  read: string;
+  before: readonly Press[];
+  failed: Press;
+  heldHeader: boolean;
+}> = [
+  {
+    read: "a Search of the account shown (ENTER again)",
+    before: ["Enter"],
+    failed: "Search",
+    heldHeader: false,
+  },
+  {
+    read: "Next back to a page already read (PF8 after PF7)",
+    before: ["Enter", "Next", "Previous"],
+    failed: "Next",
+    heldHeader: true,
+  },
+];
+
+/** The server's rejections of account 1 a read again can meet (V-COPAUS0C-004, V-COPAUS0C-005). */
+const REREAD_FAILURES: ReadonlyArray<{ row: string; status: number; code: string; message: string }> = [
+  {
+    row: "V-COPAUS0C-004",
+    status: 404,
+    code: "NOT_FOUND",
+    message: "Account:00000000001 not found in XREF file. Resp:000000013 Reas:000000080",
+  },
+  {
+    row: "V-COPAUS0C-005",
+    status: 500,
+    code: "UNEXPECTED",
+    message: "Account:00000000001 System error while reading XREF file. Resp:000000017 Reas:00",
+  },
+];
+
+// The answer to a read again is the screen's result, and a failed one is an
+// ErrorBody, not a refreshed page: the header, rows and paging of the page
+// read before are withheld, as on a failed first read, and the search form's
+// field and one toast carry the message, with PF3 Back still offered. A
+// Search then reads the account again, loading as a first read does, and its
+// page brings the header and list back.
+describe("CPVS when a read again of a page already shown fails", () => {
+  it.each(REREADS.flatMap((reread) => REREAD_FAILURES.map((failure) => ({ ...reread, ...failure }))))(
+    "$row ($status) on $read withholds the page read before until a Search succeeds",
+    async ({ before, failed, heldHeader, status, code, message }) => {
+      let failure: ErrorBody | null = null;
+      let held: Promise<void> | null = null;
+      const fetchMock = vi.fn(async (input: Request | string | URL, _init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input);
+        if (held !== null) {
+          await held;
+        }
+        return failure === null ? jsonResponse(200, pageAt(request)) : jsonResponse(status, failure);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const user = userEvent.setup();
+      renderPage();
+      for (const control of before) {
+        await press(user, control);
+        await expectSettledOn(READS[control]);
+      }
+
+      failure = { code, message, fields: [{ field: ACCTID, message }] };
+      await press(user, failed);
+
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(message));
+      await waitFor(() => expect(screen.queryByRole("table")).toBeNull());
+      await elapse(ANNOUNCE_WAIT_MS);
+      expectNoListShown();
+      expect(screen.queryByRole("heading", { name: `Account ${ACCOUNT_1}` })).toBeNull();
+      expect(document.querySelector('[data-slot="skeleton"]')).toBeNull();
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toBe(message);
+      expect(accountField().getAttribute("aria-invalid")).toBe("true");
+      expect(screen.getByRole("link", { name: "Back" }).getAttribute("href")).toBe("/");
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(before.length + 1);
+
+      failure = null;
+      let release = (): void => undefined;
+      held = new Promise<void>((resolve) => {
+        release = () => {
+          resolve();
+        };
+      });
+      await press(user, "Search");
+
+      await expectBusy(firstPage.items.length);
+      expect(screen.queryByRole("heading", { name: `Account ${ACCOUNT_1}` }) !== null).toBe(
+        heldHeader,
+      );
+      act(() => {
+        release();
+      });
+      await expectSettledOn(firstPage);
+      expect(screen.getByRole("heading", { name: `Account ${ACCOUNT_1}` }).tagName).toBe("H2");
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(before.length + 2);
+      const query = new URL(lastRequest(fetchMock).url).searchParams;
+      expect(query.get("account_id")).toBe(ACCOUNT_1);
+      expect(query.get("start_key")).toBeNull();
+    },
+  );
+});

@@ -50,8 +50,9 @@
 //! bytes, whose order is the code-point order, and the column `CHECK` admits
 //! only U+0001..U+00FF, each the one Latin-1 byte the key holds, so that order
 //! is exactly the byte order of the `(CardNumber, TranId)` pair, control
-//! characters included, which the report rule checks page by page. No index
-//! holds it: each page sorts the rows of the date range.
+//! characters included, which the report rule checks page by page. The partial
+//! index `transactions_master_padded_card_tran_id` holds that order over the
+//! live rows, so a page can be read in key order from its keyset bound.
 //!
 //! # Writes
 //!
@@ -238,12 +239,57 @@ const LOW_VALUES: &str = "";
 /// TRAN-ID holding it names no stored transaction.
 const LOW_VALUE: u8 = 0x00;
 
+/// `TRAN-PROC-TS PIC X(26)` [app/cpy/CVTRA05Y.cpy:L17], the most characters
+/// `tran_proc_ts` holds.
+const PROC_TS_LEN: usize = 26;
+
+/// `TRAN-PROC-DT`, the first 10 bytes of `TRAN-PROC-TS` that the TRANREPT
+/// `INCLUDE COND` compares (P-TRANREPT-002).
+const PROC_DATE_LEN: usize = 10;
+
+/// The highest character a stored text column holds: the column `CHECK` of
+/// `migrations/0003_transactions.sql` admits only U+0001..U+00FF.
+const HIGHEST_STORED_CHAR: char = '\u{ff}';
+
+/// The inclusive upper bound on the raw `tran_proc_ts` that keeps exactly the
+/// rows whose processing date, `substr(tran_proc_ts, 1, 10)`, is at most `end`
+/// under the right-trimmed `C` compare of
+/// [`TransactionReader::transactions_by_proc_date`]: the trimmed `end` itself
+/// when it is shorter than [`PROC_DATE_LEN`], and otherwise `end` followed by
+/// [`HIGHEST_STORED_CHAR`] up to [`PROC_TS_LEN`] characters, the highest value
+/// a timestamp of that date can hold. The method gives the proof.
+///
+/// Each byte of an `Alnum` is one character of its text, so the trimmed bytes
+/// count the characters of the trimmed text.
+fn proc_ts_upper_bound(end: &Alnum<PROC_DATE_LEN>) -> String {
+    let mut bound = end.trimmed().into_owned();
+    if end.trimmed_bytes().len() == PROC_DATE_LEN {
+        bound.extend(std::iter::repeat_n(
+            HIGHEST_STORED_CHAR,
+            PROC_TS_LEN - PROC_DATE_LEN,
+        ));
+    }
+    bound
+}
+
 /// `STARTBR` at `start` with `READNEXT`: live rows with a TRAN-ID of at least
 /// `start`, ascending, up to `limit`, read on `conn` by the static statement of
 /// the inputs present. Without `account` the statement reads only the view
 /// `transaction_master`, as `COTRN00C` reads only `TRANSACT`; with it, the
 /// statement keeps only rows whose card `card_xref` maps to that account
 /// (E-17).
+///
+/// The filtered statement starts from the account's cards in `card_xref` and
+/// reads each card through the partial index `transactions_master_card_tran_id`
+/// from `(card, start)`, at most `limit` rows: the card's own rows from the
+/// start key come first in that order, and the outer filter drops the rows of
+/// the cards after it. The `LIMIT` inside the lateral keeps the planner from
+/// pushing that filter into the read, where it would walk the TRAN-ID index
+/// and skip the other cards' rows one by one. Each card is read once, because
+/// `xref_card_num` is the key of `card_xref`, and the account's first `limit`
+/// rows in TRAN-ID order are among the rows read, so the page equals a filter
+/// of the whole master while its cost grows with `limit` per card, not with
+/// the master.
 async fn select_forward(
     conn: &mut PgConnection,
     start: &str,
@@ -274,18 +320,24 @@ LIMIT $2"#,
         Some(account) => {
             sqlx::query_as!(
                 TransactionRow,
-                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
-       tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
-       tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
-       tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
-       tran_merchant_city AS "tran_merchant_city!", tran_merchant_zip AS "tran_merchant_zip!",
-       tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
-       tran_proc_ts AS "tran_proc_ts!"
-FROM transaction_master m
-WHERE m.tran_id >= $1
-  AND EXISTS (
-      SELECT 1 FROM card_xref x
-      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $2)
+                r#"SELECT m.transaction_id AS "transaction_id!", m.tran_id AS "tran_id!",
+       m.tran_type_cd AS "tran_type_cd!", m.tran_cat_cd AS "tran_cat_cd!",
+       m.tran_source AS "tran_source!", m.tran_desc AS "tran_desc!", m.tran_amt AS "tran_amt!",
+       m.tran_merchant_id AS "tran_merchant_id!", m.tran_merchant_name AS "tran_merchant_name!",
+       m.tran_merchant_city AS "tran_merchant_city!", m.tran_merchant_zip AS "tran_merchant_zip!",
+       m.tran_card_num AS "tran_card_num!", m.tran_orig_ts AS "tran_orig_ts!",
+       m.tran_proc_ts AS "tran_proc_ts!"
+FROM card_xref x
+CROSS JOIN LATERAL (
+    SELECT t.transaction_id, t.tran_id, t.tran_type_cd, t.tran_cat_cd, t.tran_source,
+           t.tran_desc, t.tran_amt, t.tran_merchant_id, t.tran_merchant_name,
+           t.tran_merchant_city, t.tran_merchant_zip, t.tran_card_num, t.tran_orig_ts,
+           t.tran_proc_ts
+    FROM transaction_master t
+    WHERE (t.tran_card_num, t.tran_id) >= (x.xref_card_num, $1)
+    ORDER BY t.tran_card_num, t.tran_id
+    LIMIT $3) m
+WHERE x.xref_acct_id = $2 AND m.tran_card_num = x.xref_card_num
 ORDER BY m.tran_id
 LIMIT $3"#,
                 start,
@@ -301,7 +353,10 @@ LIMIT $3"#,
 /// `STARTBR` at `start` with `READPREV`: live rows with a TRAN-ID of at most
 /// `start`, descending, up to `limit`, read by the static statement of the
 /// inputs present as [`select_forward`] reads: `transaction_master` alone
-/// without `account`, and the `card_xref` filter with it.
+/// without `account`, and the `card_xref` filter with it. The filtered
+/// statement reads each of the account's cards backward from `(card, start)`
+/// through `transactions_master_card_tran_id`, at most `limit` rows, the
+/// card's own rows first, for the reasons [`select_forward`] gives.
 async fn select_backward_from(
     conn: &mut PgConnection,
     start: &str,
@@ -332,18 +387,24 @@ LIMIT $2"#,
         Some(account) => {
             sqlx::query_as!(
                 TransactionRow,
-                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
-       tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
-       tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
-       tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
-       tran_merchant_city AS "tran_merchant_city!", tran_merchant_zip AS "tran_merchant_zip!",
-       tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
-       tran_proc_ts AS "tran_proc_ts!"
-FROM transaction_master m
-WHERE m.tran_id <= $1
-  AND EXISTS (
-      SELECT 1 FROM card_xref x
-      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $2)
+                r#"SELECT m.transaction_id AS "transaction_id!", m.tran_id AS "tran_id!",
+       m.tran_type_cd AS "tran_type_cd!", m.tran_cat_cd AS "tran_cat_cd!",
+       m.tran_source AS "tran_source!", m.tran_desc AS "tran_desc!", m.tran_amt AS "tran_amt!",
+       m.tran_merchant_id AS "tran_merchant_id!", m.tran_merchant_name AS "tran_merchant_name!",
+       m.tran_merchant_city AS "tran_merchant_city!", m.tran_merchant_zip AS "tran_merchant_zip!",
+       m.tran_card_num AS "tran_card_num!", m.tran_orig_ts AS "tran_orig_ts!",
+       m.tran_proc_ts AS "tran_proc_ts!"
+FROM card_xref x
+CROSS JOIN LATERAL (
+    SELECT t.transaction_id, t.tran_id, t.tran_type_cd, t.tran_cat_cd, t.tran_source,
+           t.tran_desc, t.tran_amt, t.tran_merchant_id, t.tran_merchant_name,
+           t.tran_merchant_city, t.tran_merchant_zip, t.tran_card_num, t.tran_orig_ts,
+           t.tran_proc_ts
+    FROM transaction_master t
+    WHERE (t.tran_card_num, t.tran_id) <= (x.xref_card_num, $1)
+    ORDER BY t.tran_card_num DESC, t.tran_id DESC
+    LIMIT $3) m
+WHERE x.xref_acct_id = $2 AND m.tran_card_num = x.xref_card_num
 ORDER BY m.tran_id DESC
 LIMIT $3"#,
                 start,
@@ -359,7 +420,10 @@ LIMIT $3"#,
 /// `STARTBR` at `HIGH-VALUES` with `READPREV`: live rows from the highest
 /// TRAN-ID down, up to `limit`, read by the static statement of the inputs
 /// present as [`select_forward`] reads: `transaction_master` alone without
-/// `account`, and the `card_xref` filter with it.
+/// `account`, and the `card_xref` filter with it. The filtered statement reads
+/// each of the account's cards backward from its highest TRAN-ID through
+/// `transactions_master_card_tran_id`, at most `limit` rows, the card's own
+/// rows first, for the reasons [`select_forward`] gives.
 async fn select_backward_from_end(
     conn: &mut PgConnection,
     account: Option<i64>,
@@ -387,17 +451,24 @@ LIMIT $1"#,
         Some(account) => {
             sqlx::query_as!(
                 TransactionRow,
-                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
-       tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
-       tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
-       tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
-       tran_merchant_city AS "tran_merchant_city!", tran_merchant_zip AS "tran_merchant_zip!",
-       tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
-       tran_proc_ts AS "tran_proc_ts!"
-FROM transaction_master m
-WHERE EXISTS (
-      SELECT 1 FROM card_xref x
-      WHERE x.xref_card_num = m.tran_card_num AND x.xref_acct_id = $1)
+                r#"SELECT m.transaction_id AS "transaction_id!", m.tran_id AS "tran_id!",
+       m.tran_type_cd AS "tran_type_cd!", m.tran_cat_cd AS "tran_cat_cd!",
+       m.tran_source AS "tran_source!", m.tran_desc AS "tran_desc!", m.tran_amt AS "tran_amt!",
+       m.tran_merchant_id AS "tran_merchant_id!", m.tran_merchant_name AS "tran_merchant_name!",
+       m.tran_merchant_city AS "tran_merchant_city!", m.tran_merchant_zip AS "tran_merchant_zip!",
+       m.tran_card_num AS "tran_card_num!", m.tran_orig_ts AS "tran_orig_ts!",
+       m.tran_proc_ts AS "tran_proc_ts!"
+FROM card_xref x
+CROSS JOIN LATERAL (
+    SELECT t.transaction_id, t.tran_id, t.tran_type_cd, t.tran_cat_cd, t.tran_source,
+           t.tran_desc, t.tran_amt, t.tran_merchant_id, t.tran_merchant_name,
+           t.tran_merchant_city, t.tran_merchant_zip, t.tran_card_num, t.tran_orig_ts,
+           t.tran_proc_ts
+    FROM transaction_master t
+    WHERE t.tran_card_num <= x.xref_card_num
+    ORDER BY t.tran_card_num DESC, t.tran_id DESC
+    LIMIT $2) m
+WHERE x.xref_acct_id = $1 AND m.tran_card_num = x.xref_card_num
 ORDER BY m.tran_id DESC
 LIMIT $2"#,
                 account,
@@ -577,11 +648,13 @@ WHERE tran_id = $1"#,
     /// `select_backward_from_end`). Without it the statement reads only the
     /// view `transaction_master`, as `COTRN00C` reads only `TRANSACT`, so the
     /// unfiltered browse, the one parity is measured on, never waits on a lock
-    /// of `card_xref` nor fails with it. With it the statement adds the
-    /// `EXISTS` on `card_xref`. A single statement guarding the `EXISTS` with
-    /// `$n IS NULL OR` would name `card_xref` whatever the binding, and
-    /// `PostgreSQL` resolves and locks every relation a statement names before
-    /// it runs.
+    /// of `card_xref` nor fails with it. With it the statement starts from the
+    /// account's cards in `card_xref` and reads each card's rows in TRAN-ID
+    /// order from the start key, so its cost follows the page size rather than
+    /// the size of the master. A single statement guarding the `card_xref`
+    /// read with `$n IS NULL OR` would name `card_xref` whatever the binding,
+    /// and `PostgreSQL` resolves and locks every relation a statement names
+    /// before it runs.
     async fn browse_transactions(
         &mut self,
         browse: Browse<TranId>,
@@ -659,9 +732,13 @@ LIMIT $1"#,
     /// Up to `limit` rows whose padded card number and TRAN-ID follow `after`,
     /// the keyset of the page before, in the padded-key order of the module
     /// documentation, which is the `(CardNumber, TranId)` order the port
-    /// declares. The date range is bounded on the raw column as well, so the
-    /// partial index `transactions_master_proc_ts` limits the rows each page
-    /// reads to the range.
+    /// declares. The date range is bounded on the raw column alone, by bounds
+    /// that keep exactly the rows of the date compare, so the planner sees the
+    /// range's real selectivity. Each page is then read either in key order
+    /// from its keyset bound through the partial index
+    /// `transactions_master_padded_card_tran_id`, stopping after `limit` rows,
+    /// or as the rows of the range through `transactions_master_proc_ts`,
+    /// whichever the range makes cheaper.
     async fn transactions_by_proc_date(
         &mut self,
         start: Alnum<10>,
@@ -670,7 +747,28 @@ LIMIT $1"#,
         limit: u16,
     ) -> PortResult<Vec<Transaction>> {
         let limit = limit_i64(limit)?;
-        let (from, to) = (start.trimmed(), end.trimmed());
+        // The INCLUDE COND compares p = substr(tran_proc_ts, 1, 10) with the
+        // trimmed bounds. These bounds on the raw column keep exactly its rows,
+        // given |start| <= 10 and |end| <= 10 (a trimmed Alnum<10>), the C
+        // collation of the column, which in the UTF8 database is code-point
+        // order, and its CHECK, which admits at most 26 characters, each in
+        // U+0001..U+00FF. A value is never below its own prefix p.
+        // - tran_proc_ts >= start holds exactly when p >= start. A prefix below
+        //   start either differs from it at a character the value shares, or is
+        //   a proper prefix of start, shorter than 10 characters and so the
+        //   whole value.
+        // - With |end| < 10, tran_proc_ts <= end holds exactly when p <= end. A
+        //   prefix of 10 characters that is at most end is neither end itself,
+        //   which is shorter, nor an extension of it, which sorts above it, so
+        //   it is below end at a character the value shares; a shorter prefix
+        //   is the whole value.
+        // - With |end| = 10, tran_proc_ts <= end followed by 16 U+00FF holds
+        //   exactly when p <= end (proc_ts_upper_bound). A value whose prefix is
+        //   end carries at most 16 more characters, none above U+00FF; a prefix
+        //   below end keeps the value below it; and a prefix above end differs
+        //   from it within its 10 characters, which puts the value above the
+        //   bound.
+        let (from, to) = (start.trimmed(), proc_ts_upper_bound(&end));
         // The keyset as the space-padded X(16) text of both keys, the form
         // rpad(…, 16) gives the stored keys below; NULL reads from the first row.
         let (card, id) = after.map_or((None, None), |(card, id)| {
@@ -679,22 +777,25 @@ LIMIT $1"#,
                 Some(id.as_alnum().as_text().into_owned()),
             )
         });
-        // The substr() pair is the INCLUDE COND itself, the only test that
-        // decides which rows are selected. The raw-column pair adds index bounds
-        // that keep exactly those rows, given |$1| <= 10 and |$2| <= 10 (a
-        // trimmed Alnum<10>), the C collation of the column, and its CHECK, which
-        // admits only U+0001..U+00FF in at most 26 characters:
-        // - tran_proc_ts >= $1 holds exactly when substr(tran_proc_ts, 1, 10) >=
-        //   $1. A value is at least its own prefix; and a prefix below $1 that is
-        //   shorter than 10 characters is the whole value.
-        // - substr(tran_proc_ts, 1, 10) <= $2 implies tran_proc_ts <= $2 followed
-        //   by 16 U+00FF: a value whose prefix is $2 carries at most 16 more
-        //   characters, none above U+00FF, and a prefix below $2 keeps the value
-        //   below it.
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
-        let result = sqlx::query_as!(
-            TransactionRow,
-            r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+        let conn = &mut *sp;
+        let result = async {
+            // sqlx runs the select as a cached prepared statement, which
+            // PostgreSQL may switch to a generic plan after five executions. A
+            // generic plan is made without the bound values, so it can use
+            // neither the keyset comparison behind `$3 IS NULL OR` as an index
+            // condition nor the selectivity of the range, which decides between
+            // the two indexes. force_custom_plan has every page planned with
+            // its own bounds. SET LOCAL lasts until the caller's transaction
+            // ends: for CR00 that is the read-only report snapshot, which is
+            // always rolled back, so the setting never outlives the report on
+            // the pooled connection.
+            sqlx::query!("SET LOCAL plan_cache_mode = force_custom_plan")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query_as!(
+                TransactionRow,
+                r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
        tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
        tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
        tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
@@ -703,19 +804,19 @@ LIMIT $1"#,
        tran_proc_ts AS "tran_proc_ts!"
 FROM transaction_master
 WHERE tran_proc_ts >= $1
-  AND tran_proc_ts <= ($2 || repeat(chr(255), 16))
-  AND substr(tran_proc_ts, 1, 10) >= $1
-  AND substr(tran_proc_ts, 1, 10) <= $2
+  AND tran_proc_ts <= $2
   AND ($3::text IS NULL OR (rpad(tran_card_num, 16), rpad(tran_id, 16)) > ($3, $4))
 ORDER BY rpad(tran_card_num, 16), rpad(tran_id, 16)
 LIMIT $5"#,
-            from.as_ref(),
-            to.as_ref(),
-            card.as_deref(),
-            id.as_deref(),
-            limit
-        )
-        .fetch_all(&mut *sp)
+                from.as_ref(),
+                to.as_str(),
+                card.as_deref(),
+                id.as_deref(),
+                limit
+            )
+            .fetch_all(&mut *conn)
+            .await
+        }
         .await;
         into_transactions(settle(sp, result).await?)
     }
@@ -941,6 +1042,51 @@ LIMIT $2"#,
             // That is the same duplicate, and the savepoint undid the statement.
             Err(PortError::Duplicate) => Ok(LoadOutcome::DuplicateLive),
             outcome => outcome,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carddemo_domain::numeric::Alnum;
+
+    use super::{PROC_TS_LEN, proc_ts_upper_bound};
+
+    /// The highest 26-character timestamp of the 10-character date `date`: the
+    /// date, then 16 U+00FF.
+    fn highest_of(date: &str) -> String {
+        [date, &"\u{ff}".repeat(16)].concat()
+    }
+
+    /// An end of 10 characters, a Latin-1 byte and a control byte counting as
+    /// one character each, takes the 16 highest characters; a shorter end,
+    /// blank included, is its own bound, and trailing spaces never count.
+    #[test]
+    fn the_upper_bound_extends_only_an_end_of_ten_characters() {
+        let cases = [
+            (Alnum::move_from("2022-07-06"), highest_of("2022-07-06")),
+            (
+                Alnum::move_from_bytes(b"2022-07-0\xe9"),
+                highest_of("2022-07-0\u{e9}"),
+            ),
+            (
+                Alnum::move_from_bytes(b"2022-07-0\x01"),
+                highest_of("2022-07-0\u{1}"),
+            ),
+            (Alnum::move_from("2022 07 06"), highest_of("2022 07 06")),
+            (Alnum::move_from("2022-07-0"), "2022-07-0".to_owned()),
+            (Alnum::move_from("2022-07"), "2022-07".to_owned()),
+            (Alnum::move_from("2022-07   "), "2022-07".to_owned()),
+            (Alnum::move_from(""), String::new()),
+        ];
+        for (end, expected) in cases {
+            let bound = proc_ts_upper_bound(&end);
+            assert_eq!(bound, expected, "end {:?}", end.as_text());
+            assert!(
+                bound.chars().count() <= PROC_TS_LEN,
+                "end {:?}: the bound fits X(26)",
+                end.as_text()
+            );
         }
     }
 }

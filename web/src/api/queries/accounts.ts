@@ -32,7 +32,9 @@ export type AccountUpdateResult =
 
 /**
  * Account `id`, the account number as entered. An empty `id` sends no request,
- * because the dashboard and payment pages take it from user input. A COACTVWC
+ * because the dashboard and payment pages take it from user input, and the
+ * account pages pass `""` for a route key `accountKeySchema` rejects
+ * (`accountKeyError`), whose text they show without a read. A COACTVWC
  * rejection is the query's ApiError: 400 at `ACCTSID` for a blank, malformed
  * or zero number, 404 for a missing cross-reference, account or customer.
  */

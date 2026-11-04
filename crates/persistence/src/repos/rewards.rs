@@ -13,6 +13,7 @@
 //! |---|---|---|
 //! | `list_reward_rules` | `GET /admin/reward-rules` | every rule, `ORDER BY rule_id` |
 //! | `reward_rule` | the second step of a soft delete | `WHERE rule_id = $1` |
+//! | `lock_reward_rule` | `DELETE /admin/reward-rules/{id}`, before the clock is read | `WHERE rule_id = $1 FOR UPDATE` |
 //! | `insert_reward_rule` | `POST /admin/reward-rules` | `INSERT … RETURNING` |
 //! | `update_reward_rule` | `PUT /admin/reward-rules/{id}` | `UPDATE … WHERE rule_id = $1 RETURNING` |
 //! | `soft_delete_reward_rule` | `DELETE /admin/reward-rules/{id}` | conditional `UPDATE … SET active_to`, then a read |
@@ -216,6 +217,38 @@ impl PgStore<'_, '_> {
         row.map(rule_from_row).transpose()
     }
 
+    /// The rule `id`, locked until the unit of work ends, or `None` when no
+    /// rule has it: the first statement of `DELETE /admin/reward-rules/{id}`.
+    ///
+    /// `SELECT … FOR UPDATE` under its own savepoint. The row lock outlives the
+    /// released savepoint and is held until the unit of work commits or rolls
+    /// back, so concurrent deletes of one rule run one after another: a delete
+    /// that locks second waits until the first has ended, then reads the rule
+    /// as the first committed it. The handler reads its processing instant only
+    /// after this lock, so it judges the rule against the `active_to` a delete
+    /// committed before it, never against an older reading of the clock.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::Unavailable`] when the read fails, a lock wait the server
+    /// cancels included, or the stored rule does not fit its domain type.
+    pub async fn lock_reward_rule(&mut self, id: RuleId) -> PortResult<Option<RewardRule>> {
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
+        let result = sqlx::query_as!(
+            RewardRuleRow,
+            "SELECT rule_id, transaction_type_cd, transaction_category_cd, reward_rate, \
+                    min_transaction_amount, max_transaction_amount, active_from, active_to \
+             FROM reward_rules \
+             WHERE rule_id = $1 \
+             FOR UPDATE",
+            id.get(),
+        )
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?;
+        row.map(rule_from_row).transpose()
+    }
+
     /// Inserts `rule`, which `carddemo_domain::rewards::validate_rule` has
     /// already checked, and returns it as stored, with the `rule_id` the
     /// identity column assigned: the body of the 201 answer to
@@ -311,6 +344,13 @@ impl PgStore<'_, '_> {
     ///
     /// `at` is compared and stored as given: the processing clock reads whole
     /// microseconds, the resolution of `active_to`.
+    ///
+    /// The handler locks the rule first through
+    /// [`lock_reward_rule`](Self::lock_reward_rule) and reads `at` only after
+    /// that lock, so a concurrent delete that committed first is seen and `at`
+    /// is read after that delete's `active_to`. Without the lock, an instant
+    /// read earlier would still satisfy `active_to > at` once the other delete
+    /// committed, move the end earlier and answer `Deleted` a second time.
     ///
     /// # Errors
     ///

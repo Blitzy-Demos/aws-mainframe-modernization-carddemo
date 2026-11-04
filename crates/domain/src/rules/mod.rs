@@ -450,7 +450,7 @@ pub(crate) mod test_support {
         Account, AuthFraud, Card, CardXref, Customer, DisclosureGroup, DisclosureGroupKey,
         NewPendingAuthDetail, NewTransaction, PendingAuthDetail, PendingAuthSummary,
         TranCatBalance, TranCatBalanceKey, TranCategoryMaster, TranCategoryRecord, TranTypeMaster,
-        TranTypeRecord, Transaction, UserSecurity,
+        TranTypeRecord, Transaction, UserProfile, UserSecurity,
     };
     use crate::numeric::{
         AccountId, Alnum, AuthId, CardNumber, CustomerId, TranCategoryCode, TranId, TranTypeCode,
@@ -525,7 +525,7 @@ pub(crate) mod test_support {
     /// The name of every port method, in the order `crate::ports` declares
     /// them: the names [`FakeStore::fail_next`] accepts and
     /// [`FakeStore::calls`] records.
-    pub(crate) const PORT_METHODS: [&str; 55] = [
+    pub(crate) const PORT_METHODS: [&str; 58] = [
         "read_account",
         "read_account_for_update",
         "rewrite_account",
@@ -554,13 +554,16 @@ pub(crate) mod test_support {
         "read_tran_type",
         "browse_tran_types",
         "count_tran_types",
+        "count_tran_types_before",
         "insert_tran_type",
         "update_tran_type",
         "delete_tran_type",
         "read_tran_type_file",
         "read_tran_category_file",
         "read_user",
+        "read_user_key",
         "read_user_for_update",
+        "read_user_profile_for_update",
         "browse_users",
         "insert_user",
         "update_user",
@@ -1206,6 +1209,23 @@ pub(crate) mod test_support {
             Ok(u64::try_from(count).unwrap_or(u64::MAX))
         }
 
+        /// The types strictly below `key` that pass `filter`: the rows the
+        /// backward cursor of [`FakeStore::browse_tran_types`] fetches from
+        /// `key` with no limit.
+        async fn count_tran_types_before(
+            &mut self,
+            filter: TranTypeFilter,
+            key: TranTypeCode,
+        ) -> PortResult<u64> {
+            self.enter("count_tran_types_before").await?;
+            let count = self
+                .tran_types
+                .range(..key)
+                .filter(|(_, row)| passes(&filter, row))
+                .count();
+            Ok(u64::try_from(count).unwrap_or(u64::MAX))
+        }
+
         async fn insert_tran_type(&mut self, rec: TranTypeMaster) -> PortResult<()> {
             self.enter("insert_tran_type").await?;
             insert_new(&mut self.tran_types, rec.tr_type, rec)
@@ -1256,16 +1276,28 @@ pub(crate) mod test_support {
             found(self.users.get(&id))
         }
 
+        async fn read_user_key(&mut self, id: UserId) -> PortResult<UserId> {
+            self.enter("read_user_key").await?;
+            found(self.users.get(&id).map(|user| &user.sec_usr_id))
+        }
+
         async fn read_user_for_update(&mut self, id: UserId) -> PortResult<UserSecurity> {
             self.enter("read_user_for_update").await?;
             found(self.users.get(&id))
         }
 
-        async fn browse_users(&mut self, browse: Browse<UserId>) -> PortResult<Vec<UserSecurity>> {
+        async fn read_user_profile_for_update(&mut self, id: UserId) -> PortResult<UserProfile> {
+            self.enter("read_user_profile_for_update").await?;
+            self.users
+                .get(&id)
+                .map(UserProfile::from)
+                .ok_or(PortError::NotFound)
+        }
+
+        async fn browse_users(&mut self, browse: Browse<UserId>) -> PortResult<Vec<UserProfile>> {
             self.enter("browse_users").await?;
-            Ok(page(&self.users, &browse, BackwardStart::Including, |_| {
-                true
-            }))
+            let rows = page(&self.users, &browse, BackwardStart::Including, |_| true);
+            Ok(rows.iter().map(UserProfile::from).collect())
         }
 
         async fn insert_user(&mut self, user: UserSecurity) -> PortResult<()> {
@@ -1458,7 +1490,8 @@ mod tests {
         Account, AuthFraud, Card, CardXref, Customer, DisclosureGroup, DisclosureGroupKey,
         FraudFlag, MatchStatus, NewPendingAuthDetail, NewTransaction, PA_ACCOUNT_STATUS_OCCURS,
         PendingAuthDetail, PendingAuthSummary, TranCatBalance, TranCatBalanceKey,
-        TranCategoryMaster, TranCategoryRecord, TranTypeMaster, TranTypeRecord, UserSecurity,
+        TranCategoryMaster, TranCategoryRecord, TranTypeMaster, TranTypeRecord, UserProfile,
+        UserSecurity,
     };
     use crate::numeric::{
         AccountGroupId, AccountId, Alnum, AuthCount, AuthId, CardNumber, CustSsn, CustomerId, Cvv,
@@ -2114,6 +2147,11 @@ mod tests {
         );
         fails_as_injected!(
             store,
+            "count_tran_types_before",
+            store.count_tran_types_before(TranTypeFilter::default(), purchase)
+        );
+        fails_as_injected!(
+            store,
             "insert_tran_type",
             store.insert_tran_type(tran_type("04", "Authorization"))
         );
@@ -2138,10 +2176,16 @@ mod tests {
             store.read_tran_category_file(purchase, category(1))
         );
         fails_as_injected!(store, "read_user", store.read_user(admin));
+        fails_as_injected!(store, "read_user_key", store.read_user_key(admin));
         fails_as_injected!(
             store,
             "read_user_for_update",
             store.read_user_for_update(admin)
+        );
+        fails_as_injected!(
+            store,
+            "read_user_profile_for_update",
+            store.read_user_profile_for_update(admin)
         );
         fails_as_injected!(store, "browse_users", store.browse_users(all_users));
         fails_as_injected!(
@@ -2603,15 +2647,18 @@ mod tests {
             assert_eq!(texts(&rows, |row| row.tr_type), expected, "{page:?}");
         }
 
+        // (type filter, description filter, the types passing, how many of
+        // them are strictly below 03)
         let filters = [
-            (Some(code("02")), None, vec!["02"]),
-            (None, Some("%r%"), vec!["01", "03"]),
-            (None, Some("P_y%"), vec!["02"]),
-            (None, Some("%R%"), vec![]),
-            (None, Some("Credit"), vec!["03"]),
-            (None, Some("Credi"), vec![]),
+            (None, None, vec!["01", "02", "03"], 2),
+            (Some(code("02")), None, vec!["02"], 1),
+            (None, Some("%r%"), vec!["01", "03"], 1),
+            (None, Some("P_y%"), vec!["02"], 1),
+            (None, Some("%R%"), vec![], 0),
+            (None, Some("Credit"), vec!["03"], 0),
+            (None, Some("Credi"), vec![], 0),
         ];
-        for (type_code, description, expected) in filters {
+        for (type_code, description, expected, below_03) in filters {
             let filter = TranTypeFilter {
                 type_code,
                 description: description.map(str::to_owned),
@@ -2620,8 +2667,15 @@ mod tests {
             let rows = block_on(store.browse_tran_types(all, filter.clone()))
                 .expect("a cursor of the fake store");
             assert_eq!(texts(&rows, |row| row.tr_type), expected, "{filter:?}");
+            let before = block_on(store.count_tran_types_before(filter.clone(), code("03")));
+            assert_eq!(before, Ok(below_03), "{filter:?}");
             let count = block_on(store.count_tran_types(filter)).expect("a count");
             assert_eq!(count, u64::try_from(expected.len()).expect("a small count"));
+        }
+        for (key, below) in [("01", 0), ("  ", 0), ("99", 3)] {
+            let before =
+                block_on(store.count_tran_types_before(TranTypeFilter::default(), code(key)));
+            assert_eq!(before, Ok(below), "{key:?}");
         }
     }
 
@@ -2712,6 +2766,18 @@ mod tests {
             Err(PortError::NotFound)
         );
         assert_eq!(
+            block_on(store.read_user_key(id("USER0001"))),
+            Ok(id("USER0001"))
+        );
+        assert_eq!(
+            block_on(store.read_user_key(id("NOBODY"))),
+            Err(PortError::NotFound)
+        );
+        assert_eq!(
+            block_on(store.read_user_profile_for_update(id("NOBODY"))),
+            Err(PortError::NotFound)
+        );
+        assert_eq!(
             block_on(store.insert_user(user("USER0001", "U"))),
             Err(PortError::Duplicate)
         );
@@ -2723,6 +2789,10 @@ mod tests {
         assert_eq!(block_on(store.update_user(user("USER0003", "A"))), Ok(()));
         let promoted = block_on(store.read_user_for_update(id("USER0003"))).expect("a user");
         assert!(promoted.is_admin());
+        assert_eq!(
+            block_on(store.read_user_profile_for_update(id("USER0003"))),
+            Ok(UserProfile::from(&promoted))
+        );
         assert_eq!(
             block_on(store.delete_user(id("NOBODY"))),
             Err(PortError::NotFound)

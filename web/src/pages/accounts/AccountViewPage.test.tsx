@@ -1,12 +1,13 @@
 // FN tests of AccountViewPage (CAVW: COACTVWC, map COACTVW). The page's one
 // input, ACCTSID, accepts a valid account number and reads its records
-// (F-COACTVW-001, F-COACTVW-002); it rejects the numbers COACTVWC
-// 2210-EDIT-ACCOUNT refuses without sending a request (V-COACTVWC-001,
-// V-COACTVWC-002); and a server rejection is shown as a toast, as the ACCTSID
-// field error and with the cursor on ACCTSID, as 1300-SETUP-SCREEN-ATTRS
-// places it [app/cbl/COACTVWC.cbl:L545-552]. The page's status region
-// announces each read, a repeated lookup included, by its account number and
-// never by a detail value, and is empty after a failed read.
+// (F-COACTVW-001, F-COACTVW-002); the numbers COACTVWC 2210-EDIT-ACCOUNT
+// refuses, typed or in the route, are rejected at ACCTSID without a request
+// (V-COACTVWC-001, V-COACTVWC-002); and a server rejection is shown as a
+// toast, as the ACCTSID field error and with the cursor on ACCTSID, as
+// 1300-SETUP-SCREEN-ATTRS places it [app/cbl/COACTVWC.cbl:L545-552]. The
+// page's status region announces each read, a repeated lookup included, by
+// its account number and never by a detail value, and is empty after a
+// failed read.
 //
 // The API is the stubbed global the client calls for every request, so each
 // test sees the exact Request the page sent.
@@ -79,9 +80,6 @@ const account: AccountResponse = {
 /** V-COACTVWC-003: no cross-reference for the account, 404 at ACCTSID. */
 const XREF_NOT_FOUND =
   "Account:99999999999 not found in Cross ref file.  Resp:000000013  Reas:0000";
-
-/** V-COACTVWC-002 as the server answers a key that reached it through the URL. */
-const ZERO_KEY = ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit;
 
 /** The status region's texts while the account is read and once it is. */
 const ACCOUNT_LOADING = "Loading account";
@@ -300,80 +298,102 @@ describe("AccountViewPage", () => {
     },
   );
 
-  // `entered` is typed into ACCTSID and submitted; without it the key reaches
-  // the server through the route alone.
-  it.each<{
-    name: string;
-    initialEntry: string;
-    entered: string | null;
-    key: string;
-    status: number;
-    code: ErrorBody["code"];
-    message: string;
-  }>([
+  // A key in the route goes through the same edits and is not read either
+  // (COACTVWC skips 9000-READ-ACCT on a key error): ACCTSID shows it with
+  // the edit's text, the cursor is placed there, and nothing is toasted, as
+  // no request failed. The route keeps the key as given; `%20%20` is a key of
+  // two spaces.
+  it.each([
     {
-      name: "typed key, V-COACTVWC-003",
-      initialEntry: "/accounts",
-      entered: "99999999999",
-      key: "99999999999",
-      status: 404,
-      code: "NOT_FOUND",
-      message: XREF_NOT_FOUND,
+      route: "ABC",
+      key: "ABC",
+      message: ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit,
     },
     {
-      name: "route key, V-COACTVWC-002",
-      initialEntry: "/accounts/00000000000",
-      entered: null,
+      route: "00000000000",
       key: "00000000000",
-      status: 400,
-      code: "INVALID",
-      message: ZERO_KEY,
+      message: ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit,
+    },
+    {
+      route: "000000000012",
+      key: "000000000012",
+      message: ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit,
+    },
+    {
+      route: "%20%20",
+      key: "  ",
+      message: ACCOUNT_KEY_MESSAGES.noInputReceived,
     },
   ])(
-    "shows the server's rejection at ACCTSID: $name",
-    async ({ initialEntry, entered, key, status, code, message }) => {
+    "rejects the route key $route without a request",
+    async ({ route, key, message }) => {
       const toastError = vi.spyOn(toast, "error");
-      respondWith(status, {
-        code,
-        message,
-        fields: [{ field: "ACCTSID", message }],
-      });
-      const user = userEvent.setup();
-      const { router } = renderPage(initialEntry);
+      const { router } = renderPage(`/accounts/${route}`);
 
-      if (entered !== null) {
-        // Submitted with the button, so the cursor starts away from ACCTSID.
-        await user.type(accountInput(), entered);
-        await user.click(
-          screen.getByRole("button", { name: "Look up account" }),
-        );
-      }
       const fieldError = await screen.findByRole("alert");
 
-      // The text is compared as sent: its double spaces are part of it.
+      // The text is compared as the schema holds it: its double spaces are
+      // part of it.
       expect(fieldError.textContent).toBe(message);
-      expect(toastError).toHaveBeenCalledTimes(1);
-      expect(toastError).toHaveBeenCalledWith(message);
+      const input = accountInput();
+      if (!(input instanceof HTMLInputElement)) {
+        throw new Error("ACCTSID is not an input");
+      }
+      expect(input.getAttribute("aria-invalid")).toBe("true");
+      expect(input.value).toBe(key);
       await waitFor(() => {
-        expect(document.activeElement).toBe(accountInput());
+        expect(document.activeElement).toBe(input);
       });
-      expect(router.state.location.pathname).toBe(`/accounts/${key}`);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [request] = sentRequests();
-      expect(request.method).toBe("GET");
-      expect(new URL(request.url).pathname).toBe(`/api/accounts/${key}`);
+      expect(router.state.location.pathname).toBe(`/accounts/${route}`);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(toastError).not.toHaveBeenCalled();
+      expect(lookupStatus().textContent).toBe("");
+      // Neither the records nor their placeholder.
       expect(document.querySelector("dl")).toBeNull();
+      expect(document.querySelector('[data-slot="skeleton"]')).toBeNull();
     },
   );
+
+  it("shows the server's rejection at ACCTSID: typed key, V-COACTVWC-003", async () => {
+    const toastError = vi.spyOn(toast, "error");
+    respondWith(404, {
+      code: "NOT_FOUND",
+      message: XREF_NOT_FOUND,
+      fields: [{ field: "ACCTSID", message: XREF_NOT_FOUND }],
+    });
+    const user = userEvent.setup();
+    const { router } = renderPage("/accounts");
+
+    // Submitted with the button, so the cursor starts away from ACCTSID.
+    await user.type(accountInput(), "99999999999");
+    await user.click(screen.getByRole("button", { name: "Look up account" }));
+    const fieldError = await screen.findByRole("alert");
+
+    expect(fieldError.textContent).toBe(XREF_NOT_FOUND);
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(toastError).toHaveBeenCalledWith(XREF_NOT_FOUND);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(accountInput());
+    });
+    expect(router.state.location.pathname).toBe("/accounts/99999999999");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [request] = sentRequests();
+    expect(request.method).toBe("GET");
+    expect(new URL(request.url).pathname).toBe("/api/accounts/99999999999");
+    expect(document.querySelector("dl")).toBeNull();
+  });
 
   it("announces each read by its account, a repeated lookup included", async () => {
     const user = userEvent.setup();
     renderPage("/accounts");
 
     // Present and empty before any lookup, so assistive technology tracks the
-    // region before it first changes.
+    // region before it first changes. Without a route key ACCTSID is only
+    // awaiting entry, with no error.
     const region = lookupStatus();
     expect(region.textContent).toBe("");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(accountInput().getAttribute("aria-invalid")).toBe("false");
 
     await user.type(accountInput(), `${account.account_id}{Enter}`);
 
@@ -419,6 +439,12 @@ describe("AccountViewPage", () => {
     await waitFor(() => {
       expect(region.textContent).toBe(ACCOUNT_LOADED);
     });
+    // A valid route key is read, once.
+    expect(
+      sentRequests().map(
+        (request) => `${request.method} ${new URL(request.url).pathname}`,
+      ),
+    ).toEqual([`GET /api/accounts/${account.account_id}`]);
 
     // The rejection is held so that the lookup's progress is seen.
     const release = holdNextAnswer();

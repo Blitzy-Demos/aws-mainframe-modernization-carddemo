@@ -390,6 +390,81 @@ describe("TranTypeListPage delete (F-COTRTLI-008, F-COTRTLI-009)", () => {
   });
 });
 
+// Types `.` and `..`, which MNTTRDB2 can store and a URL drops as dot
+// segments: their row actions address the key segments `~.` and `~..`
+// (lib/key-segment.ts), each with the origin of its program.
+describe("TranTypeListPage dot-segment type codes (F-COTRTLI-006 to F-COTRTLI-009)", () => {
+  const DOT_TYPE = {
+    type_code: ".",
+    description: "DOT TYPE",
+  } satisfies Schemas["TranTypeResponse"];
+
+  const DOTS_TYPE = {
+    type_code: "..",
+    description: "DOTS TYPE",
+  } satisfies Schemas["TranTypeResponse"];
+
+  const DOT_TYPES_PAGE = {
+    items: [DOT_TYPE, DOTS_TYPE, PURCHASE],
+    next_key: null,
+    prev_key: null,
+  } satisfies Schemas["Page_TranTypeResponse"];
+
+  function respondWithDotTypes(request: Request): Response {
+    return request.method === "GET"
+      ? json(DOT_TYPES_PAGE)
+      : defaultRespond(request);
+  }
+
+  it("updates the type '.' inline with PUT ~.?origin=list", async () => {
+    respond = respondWithDotTypes;
+    const { user } = renderPage();
+    await screen.findByText(DOT_TYPE.description);
+
+    await user.click(rowButton("Edit", DOT_TYPE.type_code));
+    await user.clear(rowDescription());
+    await user.type(rowDescription(), "DOT RENAMED");
+    await user.click(within(rowForm()).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(requests("PUT")).toHaveLength(1);
+    });
+    const [request] = requests("PUT");
+    if (request === undefined) {
+      throw new Error("no update request was sent");
+    }
+    const url = new URL(request.url);
+    expect(url.pathname).toBe(`${API_PATH}/~.`);
+    expect([...url.searchParams]).toEqual([["origin", "list"]]);
+    expect(await request.clone().json()).toEqual({
+      description: "DOT RENAMED",
+    });
+  });
+
+  it("deletes the type '..' with DELETE ~.. and no origin", async () => {
+    respond = respondWithDotTypes;
+    const { user } = renderPage();
+    await screen.findByText(DOTS_TYPE.description);
+
+    await user.click(rowButton("Delete", DOTS_TYPE.type_code));
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Delete transaction type",
+    });
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => {
+      expect(requests("DELETE")).toHaveLength(1);
+    });
+    const [request] = requests("DELETE");
+    if (request === undefined) {
+      throw new Error("no delete request was sent");
+    }
+    const url = new URL(request.url);
+    expect(url.pathname).toBe(`${API_PATH}/~..`);
+    expect(url.search).toBe("");
+  });
+});
+
 describe("TranTypeListPage first page after a delete (F-COTRTLI-009)", () => {
   // The toasts are counted on screen. A new Toaster shows the ones an earlier
   // test left open, so those are dismissed first.

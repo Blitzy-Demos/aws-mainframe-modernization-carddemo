@@ -16,6 +16,7 @@ import { act, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { RequestTimeoutError } from "@/api/client";
 import type { components } from "@/api/schema";
 
 import { accountKeys } from "./accounts";
@@ -49,10 +50,20 @@ const USER = "USER0001";
 const OTHER_USER = "ADMIN001";
 const NEW_USER = "NEWUSR01";
 
-/** What the stubbed network answers the one write a test sends. */
+/**
+ * What the stubbed network answers the one write a test sends: a JSON body;
+ * a body sent as the raw `text`, for one the client cannot read as JSON; a
+ * network failure; or nothing before the client's deadline.
+ */
 type Reply =
   | { readonly status: number; readonly body: unknown }
-  | "network failure";
+  | {
+      readonly status: number;
+      readonly text: string;
+      readonly headers?: Readonly<Record<string, string>>;
+    }
+  | "network failure"
+  | "deadline";
 
 let queryClient: QueryClient;
 // Every request sent, as "METHOD /path".
@@ -73,6 +84,15 @@ beforeEach(() => {
       sent.push(`${request.method} ${new URL(request.url).pathname}`);
       if (reply === "network failure") {
         throw new TypeError("Failed to fetch");
+      }
+      if (reply === "deadline") {
+        throw new RequestTimeoutError();
+      }
+      if ("text" in reply) {
+        return new Response(reply.text, {
+          status: reply.status,
+          headers: reply.headers,
+        });
       }
       return Response.json(reply.body, { status: reply.status });
     }),
@@ -120,9 +140,12 @@ async function settle(mutate: () => Promise<unknown>): Promise<boolean> {
   return resolved;
 }
 
-/** Whether the hook resolves on `answer`: a 2xx does, a failure rejects. */
+/**
+ * Whether the hook resolves on `answer`: a 2xx JSON body does; a failure, a
+ * body the client cannot read and a request without an answer reject.
+ */
 function resolvesOn(answer: Reply): boolean {
-  return answer !== "network failure" && answer.status < 400;
+  return typeof answer === "object" && "body" in answer && answer.status < 400;
 }
 
 function refusal(code: string, message: string): Schemas["ErrorBody"] {
@@ -341,13 +364,75 @@ describe("useFraudToggleMutation (CPVD PF5)", () => {
         message: "AUTH MARKED FRAUD...",
       } satisfies Schemas["FraudToggleResponse"],
     };
-    const { result } = renderHook(() => useFraudToggleMutation(AUTH_ID), {
+    const { result } = renderHook(() => useFraudToggleMutation(), {
       wrapper,
     });
 
-    expect(await settle(() => result.current.mutateAsync())).toBe(true);
+    expect(await settle(() => result.current.mutateAsync(AUTH_ID))).toBe(true);
 
     expect(invalidated(seeded)).toEqual(own);
+    expect(sent).toEqual([`PUT /api/authorizations/${AUTH_ID}`]);
+  });
+
+  // The detail shown before the mark, with the PF8 neighbour its read found.
+  const shown: Schemas["AuthDetailResponse"] = {
+    ...detail,
+    pa_auth_fraud: "",
+    pa_fraud_rpt_date: "",
+    next_id: "6",
+  };
+
+  // The server's parse reads an optional `+` and leading zeros, so each key
+  // names authorization 7, the `auth_id` the PUT answers with: the replaced
+  // detail lands under the key the page reads, with the neighbour it showed.
+  it.each([AUTH_ID, `+000${AUTH_ID}`, `000${AUTH_ID}`])(
+    "writes the replaced detail under the requested key %s, keeping the shown next_id",
+    async (requested) => {
+      const key = authorizationKeys.detail(requested);
+      queryClient.setQueryData(key, shown);
+      reply = {
+        status: 200,
+        body: {
+          detail,
+          message: "AUTH MARKED FRAUD...",
+        } satisfies Schemas["FraudToggleResponse"],
+      };
+      const { result } = renderHook(() => useFraudToggleMutation(), {
+        wrapper,
+      });
+
+      expect(await settle(() => result.current.mutateAsync(requested))).toBe(true);
+
+      expect(queryClient.getQueryData(key)).toEqual({ ...detail, next_id: "6" });
+      expect(invalidated([key])).toEqual([]);
+      expect(sent).toEqual([
+        `PUT /api/authorizations/${encodeURIComponent(requested)}`,
+      ]);
+    },
+  );
+
+  it("never writes a detail of another authorization under the requested key", async () => {
+    const key = authorizationKeys.detail(AUTH_ID);
+    const answeredKey = authorizationKeys.detail("8");
+    queryClient.setQueryData(key, shown);
+    reply = {
+      status: 200,
+      body: {
+        detail: { ...detail, auth_id: "8" },
+        message: "AUTH MARKED FRAUD...",
+      } satisfies Schemas["FraudToggleResponse"],
+    };
+    const { result } = renderHook(() => useFraudToggleMutation(), {
+      wrapper,
+    });
+
+    expect(await settle(() => result.current.mutateAsync(AUTH_ID))).toBe(true);
+
+    // The shown detail stays, marked stale so it is read afresh; nothing is
+    // cached under the answer's own key either.
+    expect(queryClient.getQueryData(key)).toEqual(shown);
+    expect(invalidated([key])).toEqual([key]);
+    expect(queryClient.getQueryState(answeredKey)).toBeUndefined();
     expect(sent).toEqual([`PUT /api/authorizations/${AUTH_ID}`]);
   });
 });
@@ -390,6 +475,10 @@ describe("useTransactionAddMutation (CT02)", () => {
     rewardKeys.history(OTHER_ACCOUNT, {}),
   ];
   const SEEDED = [...TRANSACTION_CACHES, ...ACCOUNT_REWARDS, ...OTHER_REWARDS];
+  // What an account-keyed add that may have written reloads when no answer
+  // names its TRAN-ID: the lists that can show the new row and the account's
+  // reward balance and history.
+  const RELOADED = [...UNFILTERED_LISTS, ACCOUNT_LIST, ...ACCOUNT_REWARDS];
 
   const ENTRY: Schemas["TransactionAddRequest"] = {
     tran_type_cd: "01",
@@ -425,15 +514,19 @@ describe("useTransactionAddMutation (CT02)", () => {
     message: `Transaction added successfully.  Your Tran ID is ${NEW_TRAN_ID}.`,
   };
 
+  const BY_ACCOUNT = { account_id: ACCOUNT, card_number: "" };
+
   const CASES: readonly {
     entry: string;
     keys: Pick<Schemas["TransactionAddRequest"], "account_id" | "card_number">;
+    confirm: string;
     reply: Reply;
     stale: readonly QueryKey[];
   }[] = [
     {
       entry: "an account ID, added (201)",
-      keys: { account_id: ACCOUNT, card_number: "" },
+      keys: BY_ACCOUNT,
+      confirm: "Y",
       reply: { status: 201, body: added },
       stale: [...UNFILTERED_LISTS, ACCOUNT_LIST, NEW_DETAIL, ...ACCOUNT_REWARDS],
     },
@@ -441,6 +534,7 @@ describe("useTransactionAddMutation (CT02)", () => {
     {
       entry: "a card number alone, added (201)",
       keys: { account_id: "   ", card_number: CARD },
+      confirm: "Y",
       reply: { status: 201, body: added },
       stale: [
         ...UNFILTERED_LISTS,
@@ -451,20 +545,111 @@ describe("useTransactionAddMutation (CT02)", () => {
         ...OTHER_REWARDS,
       ],
     },
+    // The server's own 500, 'Unable to Add Transaction...' (V-COTRN02C-033),
+    // persists nothing.
     {
-      entry: "an account ID, refused with nothing persisted (500)",
-      keys: { account_id: ACCOUNT, card_number: "" },
+      entry:
+        "an account ID, refused with a 500 the client cannot tell from a proxy's after a commit",
+      keys: BY_ACCOUNT,
+      confirm: "Y",
       reply: {
         status: 500,
         body: refusal("UNEXPECTED", "Unable to Add Transaction..."),
       },
+      stale: RELOADED,
+    },
+    // What the Vite proxy answers when the API's connection ends before its
+    // answer, the add committed or not.
+    {
+      entry: "an account ID, answered by the proxy's empty 500",
+      keys: BY_ACCOUNT,
+      confirm: "Y",
+      reply: {
+        status: 500,
+        text: "",
+        headers: { "Content-Type": "text/plain" },
+      },
+      stale: RELOADED,
+    },
+    {
+      entry: "an account ID, added (201) without a body",
+      keys: BY_ACCOUNT,
+      confirm: "Y",
+      reply: {
+        status: 201,
+        text: "",
+        headers: { "Content-Type": "application/json" },
+      },
+      stale: RELOADED,
+    },
+    {
+      entry: "an account ID, added (201) with a truncated body",
+      keys: BY_ACCOUNT,
+      confirm: "Y",
+      reply: {
+        status: 201,
+        text: '{"transaction":',
+        headers: { "Content-Type": "application/json" },
+      },
+      stale: RELOADED,
+    },
+    {
+      entry: "an account ID, confirmed and sent without an answer",
+      keys: BY_ACCOUNT,
+      confirm: "Y",
+      reply: "network failure",
+      stale: RELOADED,
+    },
+    {
+      entry: "an account ID, confirmed with y and past the client's deadline",
+      keys: BY_ACCOUNT,
+      confirm: "y",
+      reply: "deadline",
+      stale: RELOADED,
+    },
+    {
+      entry: "an account ID, cancelled with N (400, V-COTRN02C-027)",
+      keys: BY_ACCOUNT,
+      confirm: "N",
+      reply: {
+        status: 400,
+        body: refusal("INVALID", "Confirm to add this transaction..."),
+      },
+      stale: [],
+    },
+    {
+      entry: "an account ID, refused by an empty master (404, V-COTRN02C-029, E-27)",
+      keys: BY_ACCOUNT,
+      confirm: "Y",
+      reply: {
+        status: 404,
+        body: refusal("NOT_FOUND", "Transaction ID NOT found..."),
+      },
+      stale: [],
+    },
+    {
+      entry: "an account ID, refused by a live TRAN-ID (409, V-COTRN02C-032)",
+      keys: BY_ACCOUNT,
+      confirm: "Y",
+      reply: {
+        status: 409,
+        body: refusal("DUPLICATE", "Tran ID already exist..."),
+      },
+      stale: [],
+    },
+    // PF5's check sends CONFIRM blank, which COTRN02C never adds on.
+    {
+      entry: "an account ID, checked with a blank confirm and no answer",
+      keys: BY_ACCOUNT,
+      confirm: "",
+      reply: "network failure",
       stale: [],
     },
   ];
 
   it.each(CASES)(
-    "after $entry marks only what the insert changed stale",
-    async ({ keys, reply: answer, stale }) => {
+    "after $entry marks only what the insert may have changed stale",
+    async ({ keys, confirm, reply: answer, stale }) => {
       seed(SEEDED);
       reply = answer;
       const { result } = renderHook(() => useTransactionAddMutation(), {
@@ -472,7 +657,9 @@ describe("useTransactionAddMutation (CT02)", () => {
       });
 
       expect(
-        await settle(() => result.current.mutateAsync({ ...ENTRY, ...keys })),
+        await settle(() =>
+          result.current.mutateAsync({ ...ENTRY, ...keys, confirm }),
+        ),
       ).toBe(resolvesOn(answer));
 
       expect(invalidated(SEEDED)).toEqual(stale);

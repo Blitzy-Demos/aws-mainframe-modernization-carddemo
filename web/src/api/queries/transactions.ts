@@ -22,7 +22,7 @@ import {
   type InvalidateQueryFilters,
 } from "@tanstack/react-query";
 
-import { api, unwrap, unwrapWithStatus } from "@/api/client";
+import { ApiError, api, unwrap, unwrapWithStatus } from "@/api/client";
 import { rewardKeys } from "@/api/queries/rewards";
 import type { components, paths } from "@/api/schema";
 import { isSpacesOrLowValues } from "@/schemas/primitives";
@@ -119,11 +119,47 @@ export function listsShowingAccount(
 // the transaction written and its reward accrual committed.
 const CREATED = 201;
 
-// The account a completed CT02 add was written to, when the request names it.
-// COTRN02C uses an entered ACTIDIN, blank being SPACES or LOW-VALUES, and
-// reads the card number only without one; on that path a 201 proves the
-// entry the account's 11 digits. A card-only add gives `undefined`: its
-// account comes from the cross-reference, which the answer does not carry.
+// The confirmations COTRN02C adds on. `N`, `n`, blank or LOW-VALUES asks for
+// confirmation (V-COTRN02C-027) and any other value is refused
+// (V-COTRN02C-028); both set WS-ERR-FLG and write nothing. The PF5 check
+// sends a blank one.
+const ADDING_CONFIRMATIONS: readonly string[] = ["Y", "y"];
+
+// Whether a settled CT02 request may have added a transaction. Only a
+// confirmed one can. Of its answers, a 201 added, and so may have:
+// - a 201 whose body did not arrive (an ApiError with that status) or could
+//   not be read (the parse or read failure itself);
+// - any 5xx. The server's own 500 rolls the add back, but the Vite proxy
+//   answers 500 when the API's answer is lost after the commit, and the
+//   client cannot tell the two apart;
+// - a request without a complete answer (the client's RequestTimeoutError, a
+//   network failure), which may have reached the server.
+// Every 4xx refuses the add before the commit: a field edit or an unconfirmed
+// add (400), no valid session (401), a missing cross-reference or an empty
+// master (404, E-27), a live TRAN-ID (409).
+function mayHaveAdded(
+  confirm: TransactionAddBody["confirm"],
+  result: { status: number } | undefined,
+  error: Error | null,
+): boolean {
+  if (typeof confirm !== "string" || !ADDING_CONFIRMATIONS.includes(confirm)) {
+    return false;
+  }
+  if (result !== undefined) {
+    return result.status === CREATED;
+  }
+  if (error instanceof ApiError) {
+    return error.status === CREATED || error.status >= 500;
+  }
+  return true;
+}
+
+// The account a CT02 add writes to, when the request names it. COTRN02C uses
+// an entered ACTIDIN, blank being SPACES or LOW-VALUES, and reads the card
+// number only without one; on that path a write proves the entry the
+// account's 11 digits, since a non-numeric account ID is refused first
+// (V-COTRN02C-001). A card-only add gives `undefined`: its account comes from
+// the cross-reference, which the answer does not carry.
 function accountOfAdd(body: TransactionAddBody): string | undefined {
   const entered = body.account_id;
   return typeof entered === "string" && !isSpacesOrLowValues(entered)
@@ -226,31 +262,40 @@ export function useCopyLastTransactionMutation() {
  * when a read, the write, the reward accrual or the commit fails, with nothing
  * persisted.
  *
- * Only a 201 wrote, so only a 201 refreshes, and only what the insert and
- * its accrual, committed in the same database transaction, changed:
+ * The caches are refreshed once a request that may have added settles
+ * (`mayHaveAdded`), failures included: a 201, a 201 whose body did not arrive
+ * or could not be read, a 5xx and a request without a complete answer, since
+ * the insert and its accrual may have committed before the answer was lost.
+ * A request that cannot have added refreshes nothing: a confirmation other
+ * than `Y` or `y`, the PF5 check's blank one included, whatever its answer,
+ * and every 4xx. What is reloaded is only what the insert and its accrual,
+ * committed in the same database transaction, change:
  * - the transaction lists that can show the new row (`listsShowingAccount`);
- * - the new TRAN-ID's detail, which may hold a 404, or another row's
- *   content, from before `batch tranbkp` let the TRAN-ID be issued again
- *   (E-09). Other transactions' details are left alone, since an insert
- *   changes no other record;
+ * - the new TRAN-ID's detail, once a 201 names it. It may hold a 404, or
+ *   another row's content, from before `batch tranbkp` let the TRAN-ID be
+ *   issued again (E-09). Other transactions' details are left alone, since
+ *   an insert changes no other record;
  * - the reward balance and history of the account written to.
  *
  * The account is known when the request entered it (`accountOfAdd`). A
  * card-only add takes its account from the cross-reference, which the answer
  * does not carry, so every transaction list and every account's reward
  * balance and history are refreshed then. The refreshes are returned, so the
- * mutation settles once the active queries they reach have reloaded.
+ * mutation settles once the active queries they reach have reloaded; a
+ * failure still rejects with its own error, and the request is never sent
+ * again.
  */
 export function useTransactionAddMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (body: TransactionAddBody) =>
       unwrapWithStatus(await api.POST("/transactions", { body })),
-    onSuccess: (result, body) => {
-      if (result.status !== CREATED) {
+    onSettled: (result, error, body) => {
+      if (!mayHaveAdded(body.confirm, result, error)) {
         return undefined;
       }
       const accountId = accountOfAdd(body);
+      const tranId = result?.data.transaction.tran_id;
       const rewards =
         accountId === undefined
           ? queryClient.invalidateQueries({ queryKey: rewardKeys.all })
@@ -265,10 +310,12 @@ export function useTransactionAddMutation() {
             ]);
       return Promise.all([
         queryClient.invalidateQueries(listsShowingAccount(accountId)),
-        queryClient.invalidateQueries({
-          queryKey: transactionKeys.detail(result.data.transaction.tran_id),
-          exact: true,
-        }),
+        tranId === undefined
+          ? undefined
+          : queryClient.invalidateQueries({
+              queryKey: transactionKeys.detail(tranId),
+              exact: true,
+            }),
         rewards,
       ]);
     },

@@ -723,17 +723,17 @@
           "admin-transaction-types"
         ],
         "summary": "Updates the description of the type `{id}`: without `origin` the\n`COTRTUP` maintenance screen (CTTU), with `origin=list` the inline update\nof a listed row (CTLI).",
-        "description": "Without `origin`: COTRTUPC 9000-READ-TRANTYPE, 1200-EDIT-MAP-INPUTS,\n1205-COMPARE-OLD-NEW, 9600-WRITE-PROCESSING — P-COTRTUPC-007,\nP-COTRTUPC-008, P-COTRTUPC-015 to P-COTRTUPC-021, V-COTRTUPC-001 to\nV-COTRTUPC-011. A request that repeats the stored values writes nothing\nand is 200 with `No change detected with respect to values fetched.`\n(V-COTRTUPC-006); a change is committed with `Changes committed to\ndatabase`.\n\nWith `origin=list`: COTRTLIC 1211-EDIT-ARRAY-DESC, 1240-EDIT-ALPHANUM-REQD,\n9200-UPDATE-RECORD — P-COTRTLIC-009, P-COTRTLIC-010, P-COTRTLIC-013,\nP-COTRTLIC-017, P-COTRTLIC-021, V-COTRTLIC-012 to V-COTRTLIC-014,\nV-COTRTLIC-016 to V-COTRTLIC-018. The update is committed with\n`HIGHLIGHTED row was updated`, or with `No change detected with respect to\ndatabase values.` when only the case changed, which `COTRTLIC` still\nwrites (V-COTRTLIC-012, E-73). Either answer also carries `info`, the info\nline `HIGHLIGHTED row was updated` that `9200-UPDATE-RECORD` sets once the\nupdate is stored (P-COTRTLIC-009); without `origin` there is no `info`.\n\n# Errors\n\n- 400 for a key or description longer than its BMS field, a malformed\n  query or body, and the key and description edits: on `TRTYPCD` or\n  `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,\n  V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`\n  (V-COTRTLIC-013, V-COTRTLIC-014), where a key holding a character\n  outside ASCII is also refused with an empty message. A description\n  holding one gets the alphanumeric edit's text with either origin.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).\n- 500 with the Db2 or lock text when the read or the update fails\n  (V-COTRTUPC-005, V-COTRTUPC-009 to V-COTRTUPC-011, V-COTRTLIC-017,\n  V-COTRTLIC-018); nothing is written.",
+        "description": "Without `origin`: COTRTUPC 9000-READ-TRANTYPE, 1200-EDIT-MAP-INPUTS,\n1205-COMPARE-OLD-NEW, 9600-WRITE-PROCESSING — P-COTRTUPC-007,\nP-COTRTUPC-008, P-COTRTUPC-015 to P-COTRTUPC-021, V-COTRTUPC-001 to\nV-COTRTUPC-011. A request that repeats the stored values writes nothing\nand is 200 with `No change detected with respect to values fetched.`\n(V-COTRTUPC-006); a change is committed with `Changes committed to\ndatabase`.\n\nWith `origin=list`: COTRTLIC 1211-EDIT-ARRAY-DESC, 1240-EDIT-ALPHANUM-REQD,\n9200-UPDATE-RECORD — P-COTRTLIC-009, P-COTRTLIC-010, P-COTRTLIC-013,\nP-COTRTLIC-017, P-COTRTLIC-021, V-COTRTLIC-012 to V-COTRTLIC-014,\nV-COTRTLIC-016 to V-COTRTLIC-018. The update is committed with\n`HIGHLIGHTED row was updated`, or with `No change detected with respect to\ndatabase values.` when only the case changed, which `COTRTLIC` still\nwrites (V-COTRTLIC-012, E-73). Either answer also carries `info`, the info\nline `HIGHLIGHTED row was updated` that `9200-UPDATE-RECORD` sets once the\nupdate is stored (P-COTRTLIC-009); without `origin` there is no `info`.\n\n# Errors\n\n- 400 for a key or description longer than its BMS field, a malformed\n  query or body, a bare `.` or `..` path segment, which names no type, and\n  the key and description edits: on `TRTYPCD` or `TRTYDSC` without\n  `origin` (V-COTRTUPC-001 to V-COTRTUPC-003, V-COTRTUPC-007,\n  V-COTRTUPC-008), on no field with `origin=list`\n  (V-COTRTLIC-013, V-COTRTLIC-014), where a key holding a character\n  outside ASCII is also refused with an empty message. A description\n  holding one gets the alphanumeric edit's text with either origin.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).\n- 500 with the Db2 or lock text when the read or the update fails\n  (V-COTRTUPC-005, V-COTRTUPC-009 to V-COTRTUPC-011, V-COTRTLIC-017,\n  V-COTRTLIC-018); nothing is written.",
         "operationId": "update_tran_type",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The type code, `TR_TYPE`: two ASCII characters",
+            "description": "The type code, `TR_TYPE`: two ASCII characters. A code that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other code is sent as stored",
             "required": true,
             "schema": {
               "type": "string",
-              "maxLength": 2,
+              "maxLength": 3,
               "pattern": "^[\\x00-\\x7F]*$"
             }
           },
@@ -773,7 +773,7 @@
             }
           },
           "400": {
-            "description": "The type code or the description fails its edit",
+            "description": "The type code or the description fails its edit, or the path is a bare `.` or `..` segment",
             "content": {
               "application/json": {
                 "schema": {
@@ -834,17 +834,17 @@
           "admin-transaction-types"
         ],
         "summary": "Deletes the type `{id}`: without `origin` the `D` selector of the\n`COTRTLI` list, confirmed with F10 (CTLI); with `origin=form` the F4 of\nthe `COTRTUP` maintenance screen, confirmed with F4 (CTTU).",
-        "description": "Without `origin`: COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007,\nP-COTRTLIC-008, V-COTRTLIC-021 to V-COTRTLIC-023. A deleted type is\ncommitted and answered with `HIGHLIGHTED row deleted.Hit Enter to\ncontinue` and no type.\n\nWith `origin=form`: COTRTUPC 1210-EDIT-TRANTYPE, 9000-READ-TRANTYPE,\n9800-DELETE-PROCESSING — P-COTRTUPC-004, P-COTRTUPC-005, V-COTRTUPC-022\nto V-COTRTUPC-028 (E-23). The key is edited and the type read before the\ndelete; a deleted type is committed and answered with `Delete\nsuccessful.` and the type as read, which the delete-done screen shows\n(P-COTRTUPC-023).\n\nEither confirmation is the dialog of the SPA.\n\n# Errors\n\n- 400 for a key longer than the type code `X(2)`, a malformed path or\n  query, and, without `origin`, a key holding a character outside ASCII;\n  with `origin=form`, 400 for the key edits on `TRTYPCD`\n  (V-COTRTUPC-022 to V-COTRTUPC-024).\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code: with the delete-failed Db2 text without\n  `origin` (V-COTRTLIC-022), and with the not-found text on `TRTYPCD`\n  with `origin=form` (V-COTRTUPC-025).\n- 409 with the child-records Db2 text of the program when categories\n  still reference the type (SQLCODE -532, V-COTRTLIC-021,\n  V-COTRTUPC-027); the type stays.\n- 500 with the program's Db2 text when the read (`origin=form`,\n  V-COTRTUPC-026) or the delete fails (V-COTRTLIC-023, V-COTRTUPC-028).",
+        "description": "Without `origin`: COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007,\nP-COTRTLIC-008, V-COTRTLIC-021 to V-COTRTLIC-023. A deleted type is\ncommitted and answered with `HIGHLIGHTED row deleted.Hit Enter to\ncontinue` and no type.\n\nWith `origin=form`: COTRTUPC 1210-EDIT-TRANTYPE, 9000-READ-TRANTYPE,\n9800-DELETE-PROCESSING — P-COTRTUPC-004, P-COTRTUPC-005, V-COTRTUPC-022\nto V-COTRTUPC-028 (E-23). The key is edited and the type read before the\ndelete; a deleted type is committed and answered with `Delete\nsuccessful.` and the type as read, which the delete-done screen shows\n(P-COTRTUPC-023).\n\nEither confirmation is the dialog of the SPA.\n\n# Errors\n\n- 400 for a key longer than the type code `X(2)`, a malformed path or\n  query, a bare `.` or `..` path segment among them, and, without\n  `origin`, a key holding a character outside ASCII; with `origin=form`,\n  400 for the key edits on `TRTYPCD` (V-COTRTUPC-022 to V-COTRTUPC-024).\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code: with the delete-failed Db2 text without\n  `origin` (V-COTRTLIC-022), and with the not-found text on `TRTYPCD`\n  with `origin=form` (V-COTRTUPC-025).\n- 409 with the child-records Db2 text of the program when categories\n  still reference the type (SQLCODE -532, V-COTRTLIC-021,\n  V-COTRTUPC-027); the type stays.\n- 500 with the program's Db2 text when the read (`origin=form`,\n  V-COTRTUPC-026) or the delete fails (V-COTRTLIC-023, V-COTRTUPC-028).",
         "operationId": "delete_tran_type",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The type code, `TR_TYPE`: two ASCII characters",
+            "description": "The type code, `TR_TYPE`: two ASCII characters. A code that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other code is sent as stored",
             "required": true,
             "schema": {
               "type": "string",
-              "maxLength": 2,
+              "maxLength": 3,
               "pattern": "^[\\x00-\\x7F]*$"
             }
           },
@@ -874,7 +874,7 @@
             }
           },
           "400": {
-            "description": "The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form`",
+            "description": "The type code is longer than two characters, not ASCII without `origin`, or fails the COTRTUPC key edit with `origin=form`, or the path is a bare `.` or `..` segment",
             "content": {
               "application/json": {
                 "schema": {
@@ -1138,17 +1138,17 @@
           "admin-users"
         ],
         "summary": "CU02 and CU03 ENTER: fetches one user for the edit form or the delete\ndialog.",
-        "description": "COUSR02C PROCESS-ENTER-KEY, READ-USER-SEC-FILE — P-COUSR02C-002,\nP-COUSR02C-003, P-COUSR02C-007; V-COUSR02C-001 to V-COUSR02C-003, and the\nidentical `COUSR03C` fetch rows V-COUSR03C-001 to V-COUSR03C-003 (E-21,\nE-58).\nCOUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces\nthe `COUSR2A` map.\nCOUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog, filled\nfrom the response body, replaces the `COUSR3A` map.\n\nThe body is the user's ID, names and type. `COUSR02C` also moves the\nstored password into its edit field; a stored argon2id hash cannot be\nshown, so no password is ever returned (E-21, a known difference).\n\n# Errors\n\n- 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank\n  ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a\n  character outside ASCII.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN` (V-COUSR02C-002).\n- 500 `Unable to lookup User...`, field `FNAME`, when the read fails\n  (V-COUSR02C-003).",
+        "description": "COUSR02C PROCESS-ENTER-KEY, READ-USER-SEC-FILE — P-COUSR02C-002,\nP-COUSR02C-003, P-COUSR02C-007; V-COUSR02C-001 to V-COUSR02C-003, and the\nidentical `COUSR03C` fetch rows V-COUSR03C-001 to V-COUSR03C-003 (E-21,\nE-58).\nCOUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces\nthe `COUSR2A` map.\nCOUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog, filled\nfrom the response body, replaces the `COUSR3A` map.\n\nThe body is the user's ID, names and type. `COUSR02C` also moves the\nstored password into its edit field; a stored argon2id hash cannot be\nshown, so no password is ever returned (E-21, a known difference).\n\n# Errors\n\n- 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank\n  ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a\n  character outside ASCII, and for a bare `.` or `..` segment, which\n  names no user.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN` (V-COUSR02C-002).\n- 500 `Unable to lookup User...`, field `FNAME`, when the read fails\n  (V-COUSR02C-003).",
         "operationId": "get_user",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters",
+            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored",
             "required": true,
             "schema": {
               "type": "string",
-              "maxLength": 8,
+              "maxLength": 9,
               "pattern": "^[\\x00-\\x7F]*$"
             }
           }
@@ -1165,7 +1165,7 @@
             }
           },
           "400": {
-            "description": "A blank, over-length or non-ASCII user ID",
+            "description": "A blank, over-length or non-ASCII user ID, or a bare `.` or `..` segment",
             "content": {
               "application/json": {
                 "schema": {
@@ -1226,17 +1226,17 @@
           "admin-users"
         ],
         "summary": "CU02 PF5: updates a user's names, password and type.",
-        "description": "COUSR02C UPDATE-USER-INFO, READ-USER-SEC-FILE, UPDATE-USER-SEC-FILE —\nP-COUSR02C-004 to P-COUSR02C-007; V-COUSR02C-004 to V-COUSR02C-012 (E-21,\nE-46).\nCOUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces\nthe `COUSR2A` map.\n\nThe fields are edited for emptiness in screen order (user ID, first name,\nlast name, password, user type); the user is then read for update and\neach entered field compared with the stored value. An absent `password`\nstands for the current one: unchanged and never re-hashed. A present one\nis compared by argon2 verification, case kept, and re-hashed when it\ndiffers (E-21). When a field differs the record is rewritten and the body\ncarries `User <id> has been updated ...`. When none does, nothing is\nwritten and the answer is still 200, with `Please modify to update ...`:\n`COUSR02C` sets that text without its error flag (V-COUSR02C-010).\n\n# Errors\n\n- 400 `EMPTY` with the empty-field message of the first blank field\n  (`USRIDIN`, `FNAME`, `LNAME`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for\n  a field or ID longer than its BMS field or holding a character outside\n  ASCII, or a body that does not deserialize.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN`, when the rewrite finds no\n  user (V-COUSR02C-011).\n- 500 `Unable to Update User...`, field `FNAME`, for an unknown user, whose\n  failed read the COBOL follows with a failing rewrite (V-COUSR02C-009,\n  E-46), for a failed rewrite (V-COUSR02C-012), and when the password\n  cannot be verified or hashed. Nothing is written on any error.",
+        "description": "COUSR02C UPDATE-USER-INFO, READ-USER-SEC-FILE, UPDATE-USER-SEC-FILE —\nP-COUSR02C-004 to P-COUSR02C-007; V-COUSR02C-004 to V-COUSR02C-012 (E-21,\nE-46).\nCOUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces\nthe `COUSR2A` map.\n\nThe fields are edited for emptiness in screen order (user ID, first name,\nlast name, password, user type); the user is then read for update and\neach entered field compared with the stored value. An absent `password`\nstands for the current one: unchanged and never re-hashed. A present one\nis compared by argon2 verification, case kept, and re-hashed when it\ndiffers (E-21). When a field differs the record is rewritten and the body\ncarries `User <id> has been updated ...`. When none does, nothing is\nwritten and the answer is still 200, with `Please modify to update ...`:\n`COUSR02C` sets that text without its error flag (V-COUSR02C-010).\n\n# Errors\n\n- 400 `EMPTY` with the empty-field message of the first blank field\n  (`USRIDIN`, `FNAME`, `LNAME`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for\n  a field or ID longer than its BMS field or holding a character outside\n  ASCII, a bare `.` or `..` segment, which names no user, or a body that\n  does not deserialize.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN`, when the rewrite finds no\n  user (V-COUSR02C-011).\n- 500 `Unable to Update User...`, field `FNAME`, for an unknown user, whose\n  failed read the COBOL follows with a failing rewrite (V-COUSR02C-009,\n  E-46), for a failed rewrite (V-COUSR02C-012), and when the password\n  cannot be verified or hashed. Nothing is written on any error.",
         "operationId": "update_user",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters",
+            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored",
             "required": true,
             "schema": {
               "type": "string",
-              "maxLength": 8,
+              "maxLength": 9,
               "pattern": "^[\\x00-\\x7F]*$"
             }
           }
@@ -1263,7 +1263,7 @@
             }
           },
           "400": {
-            "description": "A blank, over-length or non-ASCII field or user ID, or a malformed body",
+            "description": "A blank, over-length or non-ASCII field or user ID, a bare `.` or `..` segment, or a malformed body",
             "content": {
               "application/json": {
                 "schema": {
@@ -1324,17 +1324,17 @@
           "admin-users"
         ],
         "summary": "CU03 PF5: deletes a user, the Confirm of the delete dialog.",
-        "description": "COUSR03C DELETE-USER-INFO, READ-USER-SEC-FILE, DELETE-USER-SEC-FILE —\nP-COUSR03C-004, P-COUSR03C-005, P-COUSR03C-011; V-COUSR03C-004 to\nV-COUSR03C-007 (E-46, E-58).\nCOUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog and the\n`DELETE` response replace the `COUSR3A` map.\n\nThe user is read for update and deleted. The body carries the user as\nread before the delete and `User <id> has been deleted ...`.\n\n# Errors\n\n- 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank\n  ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a\n  character outside ASCII.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN`, when the delete finds no\n  user after the read found it (V-COUSR03C-006).\n- 500 `Unable to Update User...`, field `FNAME` (the COBOL's own text,\n  reproduced): for an unknown user, whose failed read the COBOL follows\n  with a failing delete (V-COUSR03C-005, E-46), and for a failed delete\n  (V-COUSR03C-007). Nothing is deleted on any error.",
+        "description": "COUSR03C DELETE-USER-INFO, READ-USER-SEC-FILE, DELETE-USER-SEC-FILE —\nP-COUSR03C-004, P-COUSR03C-005, P-COUSR03C-011; V-COUSR03C-004 to\nV-COUSR03C-007 (E-46, E-58).\nCOUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog and the\n`DELETE` response replace the `COUSR3A` map.\n\nThe user is read for update and deleted. The body carries the user as\nread before the delete and `User <id> has been deleted ...`.\n\n# Errors\n\n- 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank\n  ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a\n  character outside ASCII, and for a bare `.` or `..` segment, which\n  names no user.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN`, when the delete finds no\n  user after the read found it (V-COUSR03C-006).\n- 500 `Unable to Update User...`, field `FNAME` (the COBOL's own text,\n  reproduced): for an unknown user, whose failed read the COBOL follows\n  with a failing delete (V-COUSR03C-005, E-46), and for a failed delete\n  (V-COUSR03C-007). Nothing is deleted on any error.",
         "operationId": "delete_user",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters",
+            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored",
             "required": true,
             "schema": {
               "type": "string",
-              "maxLength": 8,
+              "maxLength": 9,
               "pattern": "^[\\x00-\\x7F]*$"
             }
           }
@@ -1351,7 +1351,7 @@
             }
           },
           "400": {
-            "description": "A blank, over-length or non-ASCII user ID",
+            "description": "A blank, over-length or non-ASCII user ID, or a bare `.` or `..` segment",
             "content": {
               "application/json": {
                 "schema": {

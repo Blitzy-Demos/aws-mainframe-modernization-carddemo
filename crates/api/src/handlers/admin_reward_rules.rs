@@ -17,7 +17,10 @@
 //! - A delete is soft: it ends the rule's active window at the processing
 //!   clock's instant (`CARDDEMO_CLOCK_OVERRIDE` pins it, AAP 0.6.4) and never
 //!   removes the row, because reward accruals reference its `rule_id`. Its
-//!   answer names the `outcome`, `deleted` or `unchanged`.
+//!   answer names the `outcome`, `deleted` or `unchanged`. The delete locks
+//!   the rule before it reads that instant, so concurrent deletes of one rule
+//!   run one after another and each judges the end the one before committed:
+//!   exactly one answers `deleted`, and no later one moves the end earlier.
 //! - Every rule answered carries its `status` (`scheduled`, `active` or
 //!   `ended`) at the processing clock's instant, which each handler reads once
 //!   per request, so the client never judges a rule by its own clock.
@@ -365,8 +368,21 @@ pub async fn delete_reward_rule(
     traced(request_span("delete", &admin), async move {
         let rule_id = parse_rule_id(&id)?;
         record_rule_id(rule_id);
-        let now = state.clock().now();
         let mut uow = state.db().begin().await?;
+        // Lock the rule before reading the clock: a concurrent delete of the
+        // same rule waits here until the one ahead of it ends, then reads its
+        // instant and finds the end that delete committed. An instant read
+        // before the wait would be older than that end, move it earlier and
+        // answer `deleted` a second time.
+        match uow.store().lock_reward_rule(rule_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                uow.rollback().await?;
+                return Err(rule_not_found());
+            }
+            Err(error) => return roll_back(uow, error).await,
+        }
+        let now = state.clock().now();
         let deleted = match uow.store().soft_delete_reward_rule(rule_id, now).await {
             Ok(deleted) => deleted,
             Err(error) => return roll_back(uow, error).await,

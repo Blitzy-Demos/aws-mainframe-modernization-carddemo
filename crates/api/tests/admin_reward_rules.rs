@@ -19,6 +19,12 @@
 //!   ended unchanged, and its answer names that `outcome` (`deleted` or
 //!   `unchanged`). The clock is pinned to [`PINNED_CLOCK`] through
 //!   `CARDDEMO_CLOCK_OVERRIDE`, so the stored instant is known.
+//! - Concurrent deletes of one rule end it once: exactly one answers `deleted`
+//!   and the others `unchanged`, all with the one `active_to` stored, and a
+//!   delete that waited for another unit of work's lock on the rule answers
+//!   `unchanged` with the end that unit committed. That test runs on the
+//!   system clock, because a pinned clock gives every request the same
+//!   instant and so cannot show a later request moving the end earlier.
 //! - Every rule answered carries its `status` at the pinned clock, not at the
 //!   wall clock: a rule starting after it is `scheduled`, one ending
 //!   2022-07-02 is still `active`, and a soft-deleted rule is `ended`.
@@ -35,19 +41,26 @@
 
 pub mod common;
 
+use std::time::{Duration, Instant};
+
 use carddemo_api::dto::admin_reward_rules::RewardRuleField;
+use carddemo_domain::clock::{Clock, SystemClock};
 use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages::{
     REWARD_ACTIVE_TO_BEFORE_FROM, REWARD_MIN_EXCEEDS_MAX, REWARD_RATE_NEGATIVE,
     REWARD_RULE_NOT_FOUND,
 };
+use carddemo_domain::numeric::RuleId;
+use carddemo_persistence::Db;
+use carddemo_persistence::repos::SoftDeleteOutcome;
 use carddemo_testkit::block_on;
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
+use tokio::task::JoinHandle;
 
-use common::{Resp, TestApp, assert_error};
+use common::{Resp, TestApp, assert_error, send};
 
 /// The list and create route.
 const RULES: &str = "/admin/reward-rules";
@@ -78,6 +91,31 @@ const RATE_SCALE: u32 = 4;
 
 /// The fraction digits of an amount bound in a response (`S9(09)V99`).
 const AMOUNT_SCALE: u32 = 2;
+
+/// Every stored rule's `rule_id` and `active_to`, the end as an RFC 3339 UTC
+/// instant with its microseconds, in `rule_id` order.
+const RULE_ENDS: &str = r#"SELECT rule_id,
+       to_char(active_to AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+  FROM reward_rules ORDER BY rule_id"#;
+
+/// The `DELETE` requests of one rule the concurrency test sends at once.
+const CONCURRENT_DELETES: usize = 8;
+
+/// The rules the concurrency test deletes, one round of
+/// [`CONCURRENT_DELETES`] each: whether two requests overlap is a matter of
+/// timing, so one round alone could miss a race.
+const CONCURRENT_ROUNDS: usize = 10;
+
+/// The sessions waiting for a heavyweight lock: a delete waiting for the row
+/// lock on a rule, which it waits for as the transaction ID of its holder.
+const LOCK_WAITERS: &str =
+    "SELECT count(*)::text FROM pg_stat_activity WHERE wait_event_type = 'Lock'";
+
+/// How long a delete may take to reach its lock wait.
+const LOCK_WAIT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The pause between two reads of [`LOCK_WAITERS`].
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// One reward rule as a response carries it, with its decimals and instants
 /// parsed, so that two rules compare by value.
@@ -376,6 +414,62 @@ fn assert_rule_not_found(resp: &Resp) {
     );
 }
 
+/// The `active_to` stored for the rule `rule_id`, `None` when it is null.
+///
+/// # Panics
+///
+/// Panics, showing every stored end, when no rule has the ID.
+async fn stored_end(app: &TestApp, rule_id: &str) -> Option<DateTime<Utc>> {
+    let rows = app.stack().fetch_text_rows(RULE_ENDS).await;
+    let row = rows
+        .iter()
+        .find(|row| row.first().cloned().flatten().as_deref() == Some(rule_id))
+        .unwrap_or_else(|| panic!("no stored rule has `rule_id` {rule_id}: {rows:?}"));
+    row.get(1).cloned().flatten().map(|end| at(&end))
+}
+
+/// Sends `DELETE path` with `token` as the bearer token on a task of its own,
+/// so that requests overlap, and one can wait for a lock while the test goes
+/// on.
+fn spawn_delete(app: &TestApp, path: &str, token: &str) -> JoinHandle<Resp> {
+    let request = app.client().delete(app.url(path));
+    let token = token.to_owned();
+    tokio::spawn(async move { send(request, Some(&token)).await })
+}
+
+/// The response of the delete task `handle`.
+async fn joined(handle: JoinHandle<Resp>) -> Resp {
+    handle
+        .await
+        .unwrap_or_else(|error| panic!("a delete request task failed: {error}"))
+}
+
+/// Waits until exactly one session waits for a lock, panicking when that does
+/// not happen within [`LOCK_WAIT_DEADLINE`].
+async fn wait_for_one_lock_waiter(app: &TestApp) {
+    let expected = vec![vec![Some("1".to_owned())]];
+    let until = Instant::now() + LOCK_WAIT_DEADLINE;
+    loop {
+        let waiting = app.stack().fetch_text_rows(LOCK_WAITERS).await;
+        if waiting == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "no delete waited for the rule's lock within {LOCK_WAIT_DEADLINE:?}, last saw {waiting:?}"
+        );
+        pause(POLL_INTERVAL).await;
+    }
+}
+
+/// Sleeps for `period` on a blocking thread, leaving the runtime's workers to
+/// the server and the request tasks.
+async fn pause(period: Duration) {
+    tokio::task::spawn_blocking(move || std::thread::sleep(period))
+        .await
+        .unwrap_or_else(|error| panic!("the pause task failed: {error}"));
+}
+
 /// The list answers the two seed rules; a create answers 201 with the rule
 /// as stored under a new `rule_id`, and the boundary of each strict check is
 /// accepted: a minimum equal to the maximum, and an `active_to` equal to
@@ -578,6 +672,119 @@ fn delete_ends_the_window_at_the_pinned_clock_and_keeps_every_rule() {
             list(&app, &token).await,
             expected,
             "the list after the deletes"
+        );
+    });
+}
+
+/// Concurrent deletes of one open-ended rule, on the system clock, end it
+/// once and never move its end earlier:
+///
+/// - [`CONCURRENT_DELETES`] deletes sent at once: exactly one answers
+///   `deleted`, every other `unchanged`, all 200 with the same ended rule,
+///   whose `active_to` is the one stored. Each of [`CONCURRENT_ROUNDS`] rounds
+///   deletes a rule of its own.
+/// - A delete that waits while another unit of work holds the rule's lock,
+///   ends it at an instant read after the request began to wait, and commits,
+///   answers `unchanged` with that end, which stays stored: the request reads
+///   its clock only once it holds the lock.
+#[test]
+fn concurrent_deletes_end_a_rule_once_on_the_system_clock() {
+    let app = TestApp::start();
+    block_on(async {
+        let token = app.admin_token().await;
+        for round in 1..=CONCURRENT_ROUNDS {
+            let created = create(&app, &token, &new_rule_body()).await;
+            let path = rule_path(&created.rule_id);
+            let requests: Vec<JoinHandle<Resp>> = (0..CONCURRENT_DELETES)
+                .map(|_| spawn_delete(&app, &path, &token))
+                .collect();
+            let mut answers = Vec::with_capacity(CONCURRENT_DELETES);
+            for request in requests {
+                answers.push(deletion_of(&joined(request).await));
+            }
+
+            let deleted: Vec<&StoredRule> = answers
+                .iter()
+                .filter(|(_, outcome)| outcome == "deleted")
+                .map(|(rule, _)| rule)
+                .collect();
+            let [ended] = deleted[..] else {
+                panic!("round {round}: not exactly one `deleted` answer: {answers:?}");
+            };
+            assert!(
+                ended.active_to.is_some(),
+                "round {round}: the deleted rule has an end: {ended:?}"
+            );
+            let expected = StoredRule {
+                active_to: ended.active_to,
+                status: ENDED.to_owned(),
+                ..created.clone()
+            };
+            assert_eq!(
+                *ended, expected,
+                "round {round}: the delete changed only the end"
+            );
+            let unchanged = answers
+                .iter()
+                .filter(|(rule, outcome)| outcome == "unchanged" && *rule == expected)
+                .count();
+            assert_eq!(
+                unchanged,
+                CONCURRENT_DELETES - 1,
+                "round {round}: every other answer is `unchanged` with the one end: {answers:?}"
+            );
+            assert_eq!(
+                stored_end(&app, &created.rule_id).await,
+                expected.active_to,
+                "round {round}: the stored end is the `deleted` answer's"
+            );
+        }
+
+        let held = create(&app, &token, &new_rule_body()).await;
+        let rule_id = RuleId::from(id_number(&held.rule_id));
+        let db = Db::from_pool(app.stack().pool().clone());
+        let mut holder = db
+            .begin()
+            .await
+            .unwrap_or_else(|error| panic!("opening the holding unit of work failed: {error}"));
+        let locked = holder
+            .store()
+            .lock_reward_rule(rule_id)
+            .await
+            .unwrap_or_else(|error| panic!("locking the rule failed: {error}"));
+        assert!(locked.is_some(), "the created rule {rule_id:?} is locked");
+        let waiting = spawn_delete(&app, &rule_path(&held.rule_id), &token);
+        wait_for_one_lock_waiter(&app).await;
+        // Read after the request began to wait, so later than any instant it
+        // could have read before its lock.
+        let ended_at = SystemClock.now();
+        let ended = holder
+            .store()
+            .soft_delete_reward_rule(rule_id, ended_at)
+            .await
+            .unwrap_or_else(|error| panic!("the holding unit's delete failed: {error}"));
+        assert!(
+            matches!(ended, SoftDeleteOutcome::Deleted(_)),
+            "the holding unit ends the open rule: {ended:?}"
+        );
+        holder
+            .commit()
+            .await
+            .unwrap_or_else(|error| panic!("committing the holding unit failed: {error}"));
+        let expected = StoredRule {
+            active_to: Some(ended_at),
+            status: ENDED.to_owned(),
+            ..held
+        };
+        assert_eq!(
+            deletion_of(&joined(waiting).await),
+            (expected.clone(), "unchanged".to_owned()),
+            "the delete that waited for the lock"
+        );
+        assert_eq!(
+            stored_end(&app, &expected.rule_id).await,
+            Some(ended_at),
+            "the end committed first stays stored"
         );
     });
 }

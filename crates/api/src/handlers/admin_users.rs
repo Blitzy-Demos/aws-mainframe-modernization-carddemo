@@ -37,9 +37,13 @@
 //! argon2id hashing and verification are memory-hard, CPU-bound and never
 //! yield, so `user_add::prepare` (before the unit of work opens) and
 //! `UserUpdateCheck::compare` (while the row read for update stays locked)
-//! run on tokio's blocking pool, never on an executor thread. No response
-//! type and no span field carries a password or its hash, and the request
-//! bodies' `Debug` leaves the password out.
+//! run on tokio's blocking pool, never on an executor thread. Each runs under
+//! a permit of the per-process argon2 limit (`AppState::admit_argon2`), shared
+//! with sign-on and waited for before the unit of work opens. Only the
+//! update's `READ … UPDATE` reads the stored hash, for its compare; the list,
+//! the fetch and the delete read the record without it. No response type and
+//! no span field carries a password or its hash, and the request bodies'
+//! `Debug` leaves the password out.
 
 use std::future::Future;
 
@@ -49,21 +53,22 @@ use axum::http::StatusCode;
 use carddemo_domain::error::DomainError;
 use carddemo_domain::rules::user_add::{self, UserAdded};
 use carddemo_domain::rules::user_delete;
-use carddemo_domain::rules::user_list::{self, UserListInput};
+use carddemo_domain::rules::user_list::{self, UserListInput, UserProfile};
 use carddemo_domain::rules::user_update::{self, UserUpdateOutcome};
 use carddemo_persistence::tx::UnitOfWork;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
 use crate::auth::AdminUser;
-use crate::dto::BmsField;
 use crate::dto::admin_users::{
     UserAddField, UserAddRequest, UserDeleteField, UserListQuery, UserMessageResponse, UserSummary,
     UserUpdateField, UserUpdateRequest, check_user_id_key, check_user_list_start_key,
 };
+use crate::dto::{BmsField, KeySegment};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
 use crate::pagination::{Page, PageQuery};
-use crate::state::AppState;
+use crate::state::{AppState, run_argon2};
 
 /// The transaction ID of the user list, `COUSR00C`.
 const CU00: &str = "CU00";
@@ -193,7 +198,13 @@ async fn traced<T>(
     }
 }
 
-/// Runs an argon2 step of a rule on tokio's blocking pool.
+/// Runs an argon2 step of a rule on tokio's blocking pool under `permit`, an
+/// `AppState::admit_argon2` permit the caller waited for.
+///
+/// The permit moves into the blocking task through
+/// `crate::state::run_argon2` and is released when the step returns, so the
+/// step stays counted against the per-process argon2 limit even when the
+/// request is dropped while it runs.
 ///
 /// # Errors
 ///
@@ -201,12 +212,12 @@ async fn traced<T>(
 /// - [`ApiError::unexpected`] when the blocking task does not complete (it
 ///   panicked, or the runtime is shutting down); no COBOL path has such a
 ///   failure, so no program message applies. The detail is logged.
-async fn off_executor<T, F>(step: F) -> Result<T, ApiError>
+async fn off_executor<T, F>(permit: OwnedSemaphorePermit, step: F) -> Result<T, ApiError>
 where
     F: FnOnce() -> Result<T, DomainError> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(step).await {
+    match run_argon2(permit, step).await {
         Ok(result) => result.map_err(ApiError::from),
         Err(error) => {
             tracing::error!(error = %error, "argon2 step did not complete");
@@ -347,8 +358,9 @@ pub async fn create_user(
 }
 
 /// The CU01 add: the width and encoding check, `user_add::prepare` on the
-/// blocking pool, then the single `WRITE` of `user_add::add`, committed when
-/// it succeeds.
+/// blocking pool once the argon2 limit admits it, then the single `WRITE` of
+/// `user_add::add`, committed when it succeeds. The permit is waited for and
+/// released before the unit of work opens.
 async fn add(
     state: &AppState,
     span: &Span,
@@ -357,13 +369,14 @@ async fn add(
     record_new_user_id(span, body.user_id.as_deref());
     body.check()?;
     let input = body.into_input();
-    let prepared = off_executor(move || user_add::prepare(input)).await?;
+    let argon2 = state.admit_argon2().await?;
+    let prepared = off_executor(argon2, move || user_add::prepare(input)).await?;
     let mut uow = state.db().begin().await?;
     let written = user_add::add(&mut uow.store(), prepared).await;
     match written {
         Ok(UserAdded { user, message }) => {
             uow.commit().await?;
-            let response = Json(UserMessageResponse::new(&user, message));
+            let response = Json(UserMessageResponse::new(&UserProfile::from(&user), message));
             Ok(((StatusCode::CREATED, response), "added"))
         }
         Err(error) => {
@@ -393,7 +406,8 @@ async fn add(
 ///
 /// - 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank
 ///   ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a
-///   character outside ASCII.
+///   character outside ASCII, and for a bare `.` or `..` segment, which
+///   names no user.
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
 /// - 404 `User ID NOT found...`, field `USRIDIN` (V-COUSR02C-002).
@@ -403,11 +417,11 @@ async fn add(
     get,
     path = "/admin/users/{id}",
     tag = "admin-users",
-    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters", max_length = 8, pattern = "^[\\x00-\\x7F]*$")),
+    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored", max_length = 9, pattern = "^[\\x00-\\x7F]*$")),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The user, without its password", body = UserSummary),
-        (status = 400, description = "A blank, over-length or non-ASCII user ID", body = ErrorBody),
+        (status = 400, description = "A blank, over-length or non-ASCII user ID, or a bare `.` or `..` segment", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 404, description = "No user has the ID", body = ErrorBody),
@@ -417,7 +431,7 @@ async fn add(
 pub async fn get_user(
     State(state): State<AppState>,
     admin: AdminUser,
-    ApiPath(id): ApiPath<String>,
+    ApiPath(KeySegment(id)): ApiPath<KeySegment>,
 ) -> Result<Json<UserSummary>, ApiError> {
     let span = user_span(CU02, &admin);
     traced(&span, fetch(&state, &span, id)).await
@@ -461,7 +475,8 @@ async fn fetch(
 /// - 400 `EMPTY` with the empty-field message of the first blank field
 ///   (`USRIDIN`, `FNAME`, `LNAME`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for
 ///   a field or ID longer than its BMS field or holding a character outside
-///   ASCII, or a body that does not deserialize.
+///   ASCII, a bare `.` or `..` segment, which names no user, or a body that
+///   does not deserialize.
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
 /// - 404 `User ID NOT found...`, field `USRIDIN`, when the rewrite finds no
@@ -474,12 +489,12 @@ async fn fetch(
     put,
     path = "/admin/users/{id}",
     tag = "admin-users",
-    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters", max_length = 8, pattern = "^[\\x00-\\x7F]*$")),
+    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored", max_length = 9, pattern = "^[\\x00-\\x7F]*$")),
     request_body = UserUpdateRequest,
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The user was updated, or no field differed and nothing was written", body = UserMessageResponse),
-        (status = 400, description = "A blank, over-length or non-ASCII field or user ID, or a malformed body", body = ErrorBody),
+        (status = 400, description = "A blank, over-length or non-ASCII field or user ID, a bare `.` or `..` segment, or a malformed body", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 404, description = "The rewrite found no user", body = ErrorBody),
@@ -489,7 +504,7 @@ async fn fetch(
 pub async fn update_user(
     State(state): State<AppState>,
     admin: AdminUser,
-    ApiPath(id): ApiPath<String>,
+    ApiPath(KeySegment(id)): ApiPath<KeySegment>,
     ApiJson(body): ApiJson<UserUpdateRequest>,
 ) -> Result<Json<UserMessageResponse>, ApiError> {
     let span = user_span(CU02, &admin);
@@ -501,6 +516,10 @@ pub async fn update_user(
 /// the blocking pool with the row still locked, then `user_update::rewrite`,
 /// committed when it rewrote the record. The ID width check before them is
 /// recorded on `span`.
+///
+/// The argon2 permit `compare` runs under is waited for before the unit of
+/// work opens, so an update queued behind other argon2 work holds neither a
+/// pooled connection nor the `USRSEC` row lock.
 async fn update(
     state: &AppState,
     span: &Span,
@@ -510,6 +529,7 @@ async fn update(
     checked_key(span, TARGET_USER_ID, &id, UserUpdateField::UsrIdIn)?;
     body.check()?;
     let input = body.into_input(id.clone());
+    let argon2 = state.admit_argon2().await?;
     let mut uow = state.db().begin().await?;
     let read = user_update::update(&mut uow.store(), input).await;
     let check = match read {
@@ -519,7 +539,7 @@ async fn update(
             return Err(error.into());
         }
     };
-    let rewrite = match off_executor(move || check.compare()).await {
+    let rewrite = match off_executor(argon2, move || check.compare()).await {
         Ok(rewrite) => rewrite,
         Err(error) => {
             roll_back(uow).await;
@@ -530,7 +550,8 @@ async fn update(
     match written {
         Ok(UserUpdateOutcome::Updated { user, message }) => {
             uow.commit().await?;
-            Ok((Json(UserMessageResponse::new(&user, message)), "updated"))
+            let response = Json(UserMessageResponse::new(&UserProfile::from(&user), message));
+            Ok((response, "updated"))
         }
         Ok(UserUpdateOutcome::NotModified { message }) => {
             // The outcome carries no record, and the response shows the user
@@ -568,7 +589,8 @@ async fn update(
 ///
 /// - 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank
 ///   ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a
-///   character outside ASCII.
+///   character outside ASCII, and for a bare `.` or `..` segment, which
+///   names no user.
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
 /// - 404 `User ID NOT found...`, field `USRIDIN`, when the delete finds no
@@ -581,11 +603,11 @@ async fn update(
     delete,
     path = "/admin/users/{id}",
     tag = "admin-users",
-    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters", max_length = 8, pattern = "^[\\x00-\\x7F]*$")),
+    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters. A user ID that is `.` or `..` after zero or more `~` is sent with one more leading `~` (`.` as `~.`), because URLs drop dot segments; every other ID is sent as stored", max_length = 9, pattern = "^[\\x00-\\x7F]*$")),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The user was deleted", body = UserMessageResponse),
-        (status = 400, description = "A blank, over-length or non-ASCII user ID", body = ErrorBody),
+        (status = 400, description = "A blank, over-length or non-ASCII user ID, or a bare `.` or `..` segment", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 404, description = "The delete found no user", body = ErrorBody),
@@ -595,7 +617,7 @@ async fn update(
 pub async fn delete_user(
     State(state): State<AppState>,
     admin: AdminUser,
-    ApiPath(id): ApiPath<String>,
+    ApiPath(KeySegment(id)): ApiPath<KeySegment>,
 ) -> Result<Json<UserMessageResponse>, ApiError> {
     let span = user_span(CU03, &admin);
     traced(&span, delete(&state, &span, id)).await
@@ -703,8 +725,13 @@ mod tests {
             .collect()
     }
 
+    /// The longest `{id}` segment: an 8-character user ID that is `.` or `..`
+    /// after `~`s, such as `~~~~~~~.`, travels behind one more `~`
+    /// (`KeySegment`).
+    const ESCAPED_KEY_LEN: u8 = 9;
+
     #[test]
-    fn every_user_key_publishes_the_eight_character_ascii_limit() {
+    fn every_user_key_publishes_the_ascii_limit_of_its_escaped_segment() {
         let document = document();
         for method in ["get", "put", "delete"] {
             let parameters = parameters(&document, "/admin/users/{id}", method);
@@ -712,8 +739,14 @@ mod tests {
             let id = &parameters[0];
             assert_eq!(id["required"], json!(true), "{method}");
             assert_eq!(id["schema"]["type"], json!("string"), "{method}");
-            assert_eq!(id["schema"]["maxLength"], json!(8), "{method}");
+            assert_eq!(
+                id["schema"]["maxLength"],
+                json!(ESCAPED_KEY_LEN),
+                "{method}"
+            );
             assert_eq!(id["schema"]["pattern"], json!(ASCII), "{method}");
+            let description = id["description"].as_str().expect("a description");
+            assert!(description.contains("(`.` as `~.`)"), "{method}");
         }
 
         let list = parameters(&document, "/admin/users", "get");

@@ -470,8 +470,21 @@ function AuthorizationResults({
     setReread(true);
   }
 
-  const { data, error, isFetching, isPlaceholderData, dataUpdatedAt, refetch } =
-    useAuthorizationSummary({ account_id: accountId, ...cursor });
+  const {
+    data,
+    error,
+    isError,
+    isFetching,
+    fetchStatus,
+    isPlaceholderData,
+    dataUpdatedAt,
+    refetch,
+  } = useAuthorizationSummary({ account_id: accountId, ...cursor });
+  // A failed read sends COPAU00 without the header and list GATHER-DETAILS
+  // would have filled, so a page read earlier under this key (a same-account
+  // Search, or Previous or Next back to a page already read) is not presented
+  // as the answer: no header, no rows and no paging until a read succeeds.
+  const current = isError ? undefined : data;
 
   // ENTER always reads again. Moving back to the first page starts a read of
   // its own when its cached copy is stale (isFetching is already true then);
@@ -501,15 +514,18 @@ function AuthorizationResults({
     showMessage(data.message);
   }, [data, dataUpdatedAt, isPlaceholderData]);
 
-  // Each failed read is shown once: every failure is a new error object.
+  // Each failed read is shown once: every failure is a new error object. A
+  // failure a read again already supersedes, such as the cached one a return
+  // to the page reads again, is not shown again.
+  const failed = isError && fetchStatus === "idle" ? error : null;
   const shownError = useRef<unknown>(null);
   useEffect(() => {
-    if (error === null || error === shownError.current) {
+    if (failed === null || failed === shownError.current) {
       return;
     }
-    shownError.current = error;
-    onError(error);
-  }, [error, onError]);
+    shownError.current = failed;
+    onError(failed);
+  }, [failed, onError]);
 
   const idPrefix = useId();
   const detailSearch = `?${new URLSearchParams({ account_id: accountId }).toString()}`;
@@ -518,10 +534,12 @@ function AuthorizationResults({
     [detailSearch, idPrefix],
   );
 
-  if (data === undefined) {
-    // A failed first read leaves the screen to the search form, whose field
-    // and toast carry the server's message.
-    if (error !== null) {
+  if (current === undefined) {
+    // A failed read leaves the screen to the search form, whose field and
+    // toast carry the server's message, the first read's and a read again's
+    // alike. Read again (a new Search), in flight or waiting offline, it
+    // loads as the first read does.
+    if (failed !== null) {
       return null;
     }
     return (
@@ -545,14 +563,14 @@ function AuthorizationResults({
   // same-account Search reading the first page again, or a page already read,
   // shown from the cache and read again when Previous or Next returns to it.
   const reading = isFetching || isPlaceholderData;
-  const prevKey = data.prev_key;
-  const nextKey = data.next_key;
+  const prevKey = current.prev_key;
+  const nextKey = current.next_key;
   return (
     <>
-      <AccountHeader summary={data} />
+      <AccountHeader summary={current} />
       <DataTable
         columns={columns}
-        data={data.items}
+        data={current.items}
         prevKey={prevKey}
         nextKey={nextKey}
         onPrevious={() => {
@@ -565,7 +583,7 @@ function AuthorizationResults({
             setCursor({ start_key: nextKey, direction: "forward" });
           }
         }}
-        emptyMessage={data.message}
+        emptyMessage={current.message}
         caption="Pending authorizations"
         loading={reading}
       />
