@@ -128,8 +128,10 @@ The `api`, `mq` and `batch` binaries read their settings only from environment v
 | `CARDDEMO_FIXTURE_DIR` | `app/data/ASCII` | The fixture files `batch seed` loads |
 | `CARDDEMO_CORS_ORIGIN` | `http://localhost:5173` | The one browser origin `api` admits through CORS |
 | `CARDDEMO_API_PROXY_TARGET` | `http://127.0.0.1:8080` | Read by `web/vite.config.ts`: where the dev server proxies `/api/*` |
-| `CARDDEMO_CLOCK_OVERRIDE` | unset (the system clock) | An optional RFC 3339 instant, such as `2022-07-01T12:00:00Z`, that pins every time-dependent output: processing timestamps, CDRD date and time, reward accrual time and soft-delete time |
+| `CARDDEMO_CLOCK_OVERRIDE` | unset (the system clock) | An optional RFC 3339 instant, such as `2022-07-01T12:00:00Z`, that pins every time-dependent output: processing timestamps, CDRD date and time, reward accrual time and soft-delete time. The values it accepts are listed under this table |
 | `RUST_LOG` | `info` | Filter of the JSON log lines |
+
+`CARDDEMO_CLOCK_OVERRIDE` accepts only an instant that a database timestamp holds exactly. Its precision is at most a microsecond, so every fraction digit after the sixth must be `0`: `2022-07-01T12:00:00.000001000Z` is accepted, and `2022-07-01T12:00:00.0000001Z` is refused. Second `60`, a leap second such as `2016-12-31T23:59:60Z`, is refused. Whitespace around the instant is ignored. An empty value counts as unset and selects the system clock. Any other value, whitespace-only included, stops `api`, `mq` and `batch` at start; section 3.1 describes how each reports it.
 
 These tool variables are not in `.env.example`:
 
@@ -163,7 +165,12 @@ To change a value, copy the template, edit the copy, and load the settings again
 cp .env.example .env
 ```
 
-Every binary checks every setting when it starts. An unusable value makes `batch` exit with status 16 and makes `api` or `mq` print `api: configuration: …` or `mq: configuration: …` and exit with status 1.
+At start-up every binary reads all the settings through the shared reader, so it also rejects an unusable value of a setting it does not use: a `CARDDEMO_JWT_TTL_SECS` that is not a positive 64-bit integer, a `CARDDEMO_HTTP_ADDR` that is not an IP socket address, a blank URL, secret, queue name or directory, or a `CARDDEMO_*` value that is not valid Unicode. A `RUST_LOG` value that is not valid Unicode instead counts as unset and gives `info`. Each binary then checks the settings only it uses, still before any connection opens. A failure ends the process as follows:
+
+- `api` and `mq` print one line on standard error, `<process>: <stage>: <error>`, and exit with status 1. Both begin with the stages `configuration` (the shared reader) and `telemetry` (for example an invalid `RUST_LOG`).
+- `api` continues with `state` (`CARDDEMO_CLOCK_OVERRIDE`, `CARDDEMO_CORS_ORIGIN`, and the token lifetime and secret), `database`, `bind <addr>`, `signals` and, once serving, `serve`. An invalid clock override prints `api: state: invalid CARDDEMO_CLOCK_OVERRIDE: …`.
+- `mq` continues with `clock` (`CARDDEMO_CLOCK_OVERRIDE`), `database` and `serve` (the broker connection and the consumers). An invalid clock override prints `mq: clock: invalid clock override: …`.
+- `batch` parses its arguments before it reads any setting: `--help` and `--version` print plain text on standard output and exit 0, and a usage error exits with status 2. It then installs telemetry, reads the settings and checks `CARDDEMO_CLOCK_OVERRIDE`. A failure there, or a failed database connection when the job starts, is one standard error line, `SETUP FAILURE: <error>`, and exit status 16.
 
 ### 3.2 Overrides in the Compose `app` profile
 
@@ -177,9 +184,16 @@ The defaults above serve processes started on the host. The `app` profile of `do
 
 ### 3.3 Credentials and logs
 
-All credentials are local configuration for a development machine: the PostgreSQL and RabbitMQ user `carddemo` with password `carddemo`, and the JWT secret above. Nothing outside this machine is needed to build, test or run the system. `infra/rabbitmq/definitions.json` stores the RabbitMQ password only as a hash.
+All credentials are local configuration for a development machine: the PostgreSQL and RabbitMQ user `carddemo` with the password that `${CARDDEMO_DATABASE_URL}` and `${CARDDEMO_AMQP_URL}` carry, and the JWT secret `${CARDDEMO_JWT_SECRET}`. Their local defaults are in the configuration table at the start of section 3. Nothing outside this machine is needed to build, test or run the system. `infra/rabbitmq/definitions.json` stores the RabbitMQ password only as a hash.
 
-`api`, `mq` and `batch` write only JSON lines to standard output: log events and finished tracing spans (`"type": "span"`). `RUST_LOG` filters them, for example `RUST_LOG=debug`. `batch` writes to standard error only the lines that report an abend, a halt or a setup failure.
+While `api` serves, `mq` consumes and a `batch` job runs, standard output carries only JSON lines: log events and finished tracing spans (`"type": "span"`). `RUST_LOG` filters them, for example `RUST_LOG=debug`. The exceptions are `batch --help`, `batch <subcommand> --help` and `batch --version`, which print plain text. `api` and `mq` write to standard error only the failure line of section 3.1, and report a failed telemetry shutdown as a JSON `telemetry shutdown failed` event on standard output. `batch` writes to standard error only these lines:
+
+- a usage error (exit status 2);
+- an abend: the COBOL `DISPLAY` lines, then `ABEND <code>` where the COBOL passes a code;
+- the `posttran` reward-engine halt, `REWARD ENGINE HALT: …`;
+- the `creastmt` capacity stop, ending `CAPACITY STOP: …`, and the `combtran` equivalence halt, ending `EQUIVALENCE HALT: …`;
+- `SETUP FAILURE: …`;
+- `TELEMETRY SHUTDOWN FAILURE: <error>` when the telemetry shutdown after a job fails; the exit status stays the job's.
 
 ## 4. Services: PostgreSQL and RabbitMQ
 
@@ -627,7 +641,8 @@ Success: the migration step reports each new migration as applied, `prepare` rew
 | Domain rules, newtype compile-fail cases, reward engine, manifest boundary | `cargo test -p carddemo-domain --locked` | Rust and a C linker |
 | ASCII and EBCDIC codec round trips | `cargo test -p carddemo-codec --locked` | Rust and a C linker |
 | JSON log and span output | `cargo test -p carddemo-runtime --locked` | Rust and a C linker |
-| Hygiene scans and Compose tags | `cargo test -p carddemo-testkit --locked` | Rust and a C linker |
+| Hygiene scans and Compose tags | `cargo test -p carddemo-testkit --test hygiene --test compose_tags --locked` | Rust and a C linker |
+| Test-stack container helpers, with the hygiene scans and Compose tags | `cargo test -p carddemo-testkit --locked` | Docker: testcontainers starts `postgres:16.15`, and `rabbitmq:3.13.7-management` with `infra/rabbitmq/*` mounted |
 | Persistence | `cargo test -p carddemo-persistence --locked` | Docker: testcontainers starts `postgres:16.15` |
 | REST API (`openapi_spec` needs only Rust) | `cargo test -p carddemo-api --locked` | Docker: `postgres:16.15` |
 | Batch jobs and parity expectations | `cargo test -p carddemo-batch --locked` | Docker: `postgres:16.15` |
@@ -707,9 +722,11 @@ cargo run --bin batch -- posttran
 echo $?
 ```
 
-Success: exit status **4**, the correct result: 38 of the 300 records are rejected and 262 are posted (section 5.3). Do not chain the command with `&&`, because 4 is not a failure. A count above `0` means the prerequisite is already met: do not run `posttran` again, because on a master that holds transactions it abends with exit 16 and changes nothing.
+Success: exit status **4**, the correct result: 38 of the 300 records are rejected and 262 are posted (section 5.3). Do not chain the command with `&&`, because 4 is not a failure.
 
-To return a database that earlier runs or manual changes have altered to the seeded and posted state, refresh the seed, empty the live master and post the fixture day again, one command at a time:
+With any other count, the database is ready only in a known seeded and posted state: it was seeded and posted once as in sections 5.2 and 5.3, or reset with the three commands below, and has changed since only through completed end-to-end runs, whose fixtures restore what they change. That state counts `262`, but the count does not prove it: changes to other rows, such as account balances or reward points, leave the count as it is. A master that merely holds transactions is not enough either, because the specs page through more than one screen of them and nothing in the specs creates that population.
+
+Reset the database when the count is neither `0` nor `262`, and whatever the count when you cannot vouch for the database's history: manual changes, an interrupted or failed run, or an earlier partial reset. `seed --if-empty` does not repair such a database, because it does nothing once the `accounts` table holds rows. Do not run `posttran` alone either: on a master that holds transactions it abends with exit 16 and changes nothing. Refresh the seed, empty the live master and post the fixture day again, one command at a time:
 
 ```bash
 cargo run --bin batch -- seed
@@ -758,7 +775,7 @@ Record each check, the command that ran it and its result in `docs/parity/signof
 ## 12. Pitfalls
 
 - **No C linker.** Every Rust build fails with ``linker `cc` not found``. Install `build-essential` (section 2.2).
-- **No Docker daemon.** The persistence, API, batch and messaging tests fail when they start their containers. Start Docker and check it with `docker info`.
+- **No Docker daemon.** The persistence, API, batch and messaging tests, and the package-wide testkit run `cargo test -p carddemo-testkit --locked`, fail when they start their containers. The testkit hygiene and Compose-tag targets of section 11.1 need no Docker. Start Docker and check it with `docker info`.
 - **sqlx and the database.** With `DATABASE_URL` set and `SQLX_OFFLINE` unset, the `query!` macros check every query against the live schema at compile time, and fail when the database is down or not migrated. The macros also read `DATABASE_URL` from a `.env` file in the repository root on their own, even when it is not exported. Use `SQLX_OFFLINE=true` when no migrated database is up.
 - **Edited migration.** Once a migration is applied, editing its file makes `batch migrate` and `sqlx migrate run` fail with `was previously applied but has been modified`. Stop `api` and `mq`, recreate the development database with `sqlx database drop -y && sqlx database create && sqlx migrate run --source migrations` (it acts on the database `DATABASE_URL` names), then repeat sections 5.2 and 5.3.
 - **Settings not exported.** The binaries read only the environment, never `.env` itself. Load the settings into every new shell (section 3.1).

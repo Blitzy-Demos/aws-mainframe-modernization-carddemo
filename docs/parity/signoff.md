@@ -123,7 +123,7 @@ The host ran at a load average of 26 to 90 on 12 CPUs, on a Docker daemon shared
 
 Two observations for the owners of the end-to-end setup:
 
-- `forms.spec.ts:544` and `forms.spec.ts:557` (CT00 browse and paging) need a non-empty live transaction master. In a first end-to-end run, on a database that had only been migrated and seeded as RUNBOOK §11.4 names (sections 5.1 and 5.2), both failed; that run was stopped, the database rebuilt and `posttran` (section 5.3) run, and in the run recorded above both passed.
+- `forms.spec.ts:544` and `forms.spec.ts:557` (CT00 browse and paging) need the posted fixture day, the known seeded and posted state RUNBOOK §11.4 requires: the browse spec needs existing transactions and the paging spec more than one screen of them, so a master that merely holds transactions is not enough. In a first end-to-end run, on a database that had only been migrated and seeded as RUNBOOK §11.4 then named (sections 5.1 and 5.2), both failed; that run was stopped, the database rebuilt and `posttran` (section 5.3) run, and in the run recorded above both passed.
 - The `navigation.spec.ts` "with seeded keys" hook allows 240 s for up to 52 `docker compose exec` calls, about 3 s each by its own comment; at the 7 to 10 s measured here it cannot finish.
 
 ## Open and halt escalations
