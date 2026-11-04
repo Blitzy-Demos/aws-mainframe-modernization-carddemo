@@ -45,7 +45,7 @@ use carddemo_domain::rules::transaction_report::{self, ReportAbend, ReportRun, U
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
-use super::{JobContext, JobCounts, backup_live_master, count_of, setup_failure};
+use super::{JobContext, JobCounts, backup_live_master, count_of, setup_failure, span_count};
 use crate::cli::TranreptArgs;
 use crate::exit::{ExitStatus, one_line};
 use crate::generations::{
@@ -157,7 +157,7 @@ fn sort_step(
         .catalog()
         .map_err(|err| setup_failure("TRANSACT.DALY(+1) catalog failed", err))?;
     let written = selected.len();
-    Span::current().record("written", written);
+    Span::current().record("written", span_count(written));
     tracing::info!(
         generation = %daly,
         read,

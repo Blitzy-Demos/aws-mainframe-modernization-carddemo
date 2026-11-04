@@ -31,7 +31,7 @@ use carddemo_domain::rules::auth_purge::{
 use carddemo_persistence::Db;
 use tracing::Span;
 
-use super::{JobContext, setup_failure};
+use super::{JobContext, setup_failure, span_count};
 use crate::cli::Cbpaup0jArgs;
 use crate::exit::ExitStatus;
 
@@ -99,7 +99,7 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Cbpaup0jArgs) -> ExitS
     if let Err(err) = uow.commit().await {
         return setup_failure("pending authorization purge commit failed", err);
     }
-    Span::current().record("deleted", deleted);
+    Span::current().record("deleted", span_count(deleted));
     match outcome {
         Ok(counts) => {
             log_counts(counts);
@@ -220,6 +220,7 @@ mod tests {
     use super::{BoundedSysin, log_parameters, totals};
     use crate::cli::{Cli, Command};
     use crate::jobs::job_span;
+    use crate::jobs::tests::has_member;
 
     /// The `SYSIN` card of `CBPAUP0J` [app/app-authorization-ims-db2-mq/jcl/CBPAUP0J.jcl:L36-37].
     const JCL_SYSIN: &str = "00,00001,00001,Y";
@@ -325,18 +326,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("no line with {marker}: {text}"))
         };
         // The span attributes, then the event fields and its span context. The length is a
-        // number in the event and may be its decimal text among the span attributes.
+        // JSON integer in both.
         for line in [line_with(r#""type":"span""#), line_with("PARM RECEIVED")] {
             for field in [
                 r#""sysin":"00,00001,00001,YX""#,
+                r#""sysin_len":5016"#,
                 r#""sysin_truncated":true"#,
             ] {
-                assert!(line.contains(field), "{field} missing from {line}");
+                assert!(has_member(line, field), "{field} missing from {line}");
             }
-            assert!(
-                line.contains(r#""sysin_len":5016"#) || line.contains(r#""sysin_len":"5016""#),
-                "sysin_len 5016 missing from {line}"
-            );
         }
     }
 

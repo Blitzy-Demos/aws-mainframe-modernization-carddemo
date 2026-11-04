@@ -52,7 +52,7 @@ use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
 use carddemo_domain::clock::AnyClock;
 use carddemo_persistence::{Db, UnitOfWork};
 use carddemo_runtime::config::Settings;
-use tracing::field::{Empty, display};
+use tracing::field::{Empty, debug, display};
 use tracing::{Instrument, Span};
 
 use crate::cli::Command;
@@ -152,13 +152,13 @@ impl JobCounts {
         self.rejected.load(Ordering::Relaxed)
     }
 
-    /// Records `read`, `posted` and `rejected` on `span`, each once. Every setter ran before the
-    /// job's future completed, and blocking work before the job awaited its result, so the
-    /// counts read here are the job's last.
+    /// Records `read`, `posted` and `rejected` on `span`, each once and as an `i64`
+    /// ([`span_count`]). Every setter ran before the job's future completed, and blocking work
+    /// before the job awaited its result, so the counts read here are the job's last.
     fn record_on(&self, span: &Span) {
-        span.record("read", self.read());
-        span.record("posted", self.posted());
-        span.record("rejected", self.rejected());
+        span.record("read", span_count(self.read()));
+        span.record("posted", span_count(self.posted()));
+        span.record("rejected", span_count(self.rejected()));
     }
 }
 
@@ -170,18 +170,30 @@ pub(super) fn count_of(records: usize) -> u64 {
     u64::try_from(records).unwrap_or(u64::MAX)
 }
 
+/// `count`, a count recorded on the job span, as the `i64` the span records. tracing-opentelemetry
+/// exports an unsigned span field through its `Debug` text, a JSON string, and an `i64` as a JSON
+/// integer, the type `exit_code` has. No count reaches `i64::MAX`; the conversion saturates there
+/// rather than fail.
+#[must_use]
+pub(super) fn span_count(count: impl TryInto<i64>) -> i64 {
+    count.try_into().unwrap_or(i64::MAX)
+}
+
 /// Runs `command` inside its job span and returns how it ended.
 ///
-/// The span `job` is opened first and carries the subcommand name in `job` and the job's
-/// inputs (`input`, `parm_date`, `start_date`, `end_date`): `input` is the `--input` file of
-/// `posttran` and `mnttrdb2`, and [`LIVE_MASTER`] for `tranbkp`, `creastmt` and `tranrept`,
-/// which read the live transaction master; `combtran` records its two SORTIN generations in
-/// `input` once it has resolved them. The `cbpaup0j` card is not recorded whole: `sysin` holds
+/// The span `job` is opened first and carries the subcommand name in `job`, the `seed` run's
+/// `SeedMode` in `mode` (`Full`, `IfEmpty` or `OnlyTranextr`, as the `seed finished` event
+/// names it), and the job's inputs (`input`, `parm_date`, `start_date`, `end_date`): `input` is
+/// the `--input` file of `posttran` and `mnttrdb2`, and [`LIVE_MASTER`] for `tranbkp`,
+/// `creastmt` and `tranrept`, which read the live transaction master; `combtran` records its two
+/// SORTIN generations in `input` once it has resolved them, and `seed` the sources its mode reads
+/// once it has resolved them. The `cbpaup0j` card is not recorded whole: `sysin` holds
 /// the 17-byte `PRM-INFO` receiver it fills, `sysin_len` the card's length in bytes and
 /// `sysin_truncated` whether the receiver left any of the card out (`cbpaup0j::BoundedSysin`).
 /// Inside the span the database pool is opened and the job runs. Jobs record `written` and
-/// `deleted` on it with `tracing::Span::current().record("<field>", value)`, and set `read`,
-/// `posted` and `rejected` in `ctx.counts` ([`JobCounts`]) as their work completes:
+/// `deleted` on it as integers with `tracing::Span::current().record("<field>",
+/// span_count(value))` ([`span_count`]), and set `read`, `posted` and `rejected` in `ctx.counts`
+/// ([`JobCounts`]) as their work completes:
 ///
 /// | Job | `read` | `posted` | `rejected` |
 /// |---|---|---|---|
@@ -197,10 +209,10 @@ pub(super) fn count_of(records: usize) -> u64 {
 /// | `mnttrdb2` | the records read | the types inserted, updated or deleted, 0 when the commit fails | the failed records |
 ///
 /// When the job returns, on every exit path, a failure to open the pool included, the three
-/// counts are recorded on the span once each: the totals of the work the job completed, and 0
-/// for what it did not count. Then `exit_code` is recorded and one job-end event is emitted
-/// inside the span: `info` for exit 0, `warn` for 4, `error` for every other code. The database
-/// URL carries the password and is never a span field.
+/// counts are recorded on the span once each, as integers like `exit_code`: the totals of the
+/// work the job completed, and 0 for what it did not count. Then `exit_code` is recorded and
+/// one job-end event is emitted inside the span: `info` for exit 0, `warn` for 4, `error` for
+/// every other code. The database URL carries the password and is never a span field.
 ///
 /// The caller reports the returned status on stderr and exits with its code.
 pub(crate) async fn dispatch(command: Command, ctx: &JobContext) -> ExitStatus {
@@ -234,12 +246,13 @@ const fn job_name(command: &Command) -> &'static str {
     }
 }
 
-/// The span of one job run, with the inputs of `command` recorded and every count and the exit
-/// code still empty, for the job and [`dispatch`] to record.
+/// The span of one job run, with the inputs of `command` and the seed mode recorded and every
+/// count and the exit code still empty, for the job and [`dispatch`] to record.
 fn job_span(job: &'static str, command: &Command) -> Span {
     let span = tracing::info_span!(
         "job",
         job,
+        mode = Empty,
         input = Empty,
         parm_date = Empty,
         start_date = Empty,
@@ -275,10 +288,13 @@ fn job_span(job: &'static str, command: &Command) -> Span {
         Command::Cbpaup0j(args) => {
             let sysin = cbpaup0j::BoundedSysin::of(&args.sysin);
             span.record("sysin", display(sysin.prm_info));
-            span.record("sysin_len", sysin.len);
+            span.record("sysin_len", span_count(sysin.len));
             span.record("sysin_truncated", sysin.truncated);
         }
-        Command::Migrate | Command::Seed(_) | Command::Combtran => {}
+        Command::Seed(args) => {
+            span.record("mode", debug(args.mode()));
+        }
+        Command::Migrate | Command::Combtran => {}
     }
     span
 }
@@ -485,7 +501,7 @@ async fn catalog_backup(pending: PendingGeneration, records: usize) -> Result<Ba
         generation,
         records,
     };
-    Span::current().record("written", backup.records);
+    Span::current().record("written", span_count(backup.records));
     let condition_code = backup.status().code();
     if backup.records == 0 {
         tracing::warn!(
@@ -564,6 +580,12 @@ mod tests {
         })
     }
 
+    /// Whether the JSON `line` holds `member`, a `"key":value` fragment, whole: followed by the
+    /// `,` or `}` that ends it, so that `"read":3` does not match `"read":30`.
+    pub(super) fn has_member(line: &str, member: &str) -> bool {
+        line.contains(&format!("{member},")) || line.contains(&format!("{member}}}"))
+    }
+
     /// The command line of every subcommand with the arguments it requires.
     fn every_subcommand() -> Vec<Vec<String>> {
         Cli::command()
@@ -608,16 +630,15 @@ mod tests {
                     matches!(status, ExitStatus::SetupFailure(_)),
                     "{args:?} on {url:?}: {status:?}"
                 );
-                // The exporter writes an unsigned count as a decimal string and the exit code
-                // as a number.
+                // The counts and the exit code are JSON integers alike.
                 for fragment in [
-                    r#""read":"0""#,
-                    r#""posted":"0""#,
-                    r#""rejected":"0""#,
+                    r#""read":0"#,
+                    r#""posted":0"#,
+                    r#""rejected":0"#,
                     r#""exit_code":16"#,
                 ] {
                     assert!(
-                        span.contains(fragment),
+                        has_member(&span, fragment),
                         "{args:?} on {url:?}: {fragment} in {span}"
                     );
                 }
@@ -629,7 +650,7 @@ mod tests {
     fn job_spans_record_the_inputs_of_the_job() {
         let live_master = r#""input":"transaction_master""#;
         // (command line, span fragments present, span fragments absent)
-        let cases: [(&[&str], &[&str], &[&str]); 9] = [
+        let cases: [(&[&str], &[&str], &[&str]); 11] = [
             (
                 &["posttran", "--input", "daily.txt"],
                 &[r#""input":"daily.txt""#],
@@ -664,8 +685,23 @@ mod tests {
             ),
             // COMBTRAN records its SORTIN generations once it has resolved them.
             (&["combtran"], &[r#""job":"combtran""#], &[r#""input""#]),
-            (&["migrate"], &[r#""job":"migrate""#], &[r#""input""#]),
-            (&["seed"], &[r#""job":"seed""#], &[r#""input""#]),
+            (
+                &["migrate"],
+                &[r#""job":"migrate""#],
+                &[r#""input""#, r#""mode""#],
+            ),
+            // SEED records its mode here and its sources once it has resolved them.
+            (&["seed"], &[r#""mode":"Full""#], &[r#""input""#]),
+            (
+                &["seed", "--if-empty"],
+                &[r#""mode":"IfEmpty""#],
+                &[r#""input""#],
+            ),
+            (
+                &["seed", "--only", "tranextr"],
+                &[r#""mode":"OnlyTranextr""#],
+                &[r#""input""#],
+            ),
         ];
         for (args, present, absent) in cases {
             let cli = Cli::try_parse_from(["batch"].iter().chain(args))

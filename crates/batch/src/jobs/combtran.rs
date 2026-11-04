@@ -58,7 +58,7 @@ use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 use tracing::field::display;
 
-use super::{JobContext, JobCounts, count_of, setup_failure};
+use super::{JobContext, JobCounts, count_of, setup_failure, span_count};
 use crate::exit::ExitStatus;
 use crate::generations::{
     Dataset, Generation, Generations, blocking, read_records, read_records_async,
@@ -177,7 +177,7 @@ fn write_combined(
     let combined = pending
         .catalog()
         .map_err(|err| setup_failure("TRANSACT.COMBINED(+1) catalog failed", err))?;
-    Span::current().record("written", sorted.len());
+    Span::current().record("written", span_count(sorted.len()));
     tracing::info!(
         backup = %backup.generation,
         systran = %systran.generation,
@@ -533,7 +533,7 @@ mod tests {
     use crate::cli::Command;
     use crate::exit::ExitStatus;
     use crate::generations::{Dataset, Generation, read_records};
-    use crate::jobs::tests::job_span_line;
+    use crate::jobs::tests::{has_member, job_span_line};
     use crate::jobs::{JobContext, JobCounts, count_of};
 
     /// A 350-byte `CVTRA05Y` record with `tran_id` and `desc`, the other fields fixed and
@@ -852,27 +852,27 @@ mod tests {
         let input = r#""input":"TRANSACT.BKUP.G0002V00,SYSTRAN.G0001V00""#;
         // STEP05R alone loads and rejects nothing, so `posted` and `rejected` are 0 on every
         // path; STEP10 sets them once it has loaded the combined file.
-        let unloaded = [r#""posted":"0""#, r#""rejected":"0""#];
+        let unloaded = [r#""posted":0"#, r#""rejected":0"#];
         // (case, the SYSTRAN(0) record, span fragments present, span fragments absent). The
-        // exporter writes an unsigned count as a decimal string.
+        // counts are JSON integers, as `exit_code` is.
         let cases: [(&str, String, &[&str], &[&str]); 3] = [
             // The two TRANSACT.BKUP(0) records were read before SYSTRAN(0) failed.
             (
                 "SYSTRAN does not decode",
                 bad_amount("0000000000000005", "INTEREST 5"),
-                &[input, r#""read":"2""#],
+                &[input, r#""read":2"#],
                 &[r#""written""#],
             ),
             (
                 "E-38 halt",
                 record("0000000000000009", "INTEREST 9"),
-                &[input, r#""read":"3""#],
+                &[input, r#""read":3"#],
                 &[r#""written""#],
             ),
             (
                 "sorted",
                 record("0000000000000005", "INTEREST 5"),
-                &[input, r#""read":"3""#, r#""written":"3""#],
+                &[input, r#""read":3"#, r#""written":3"#],
                 &[],
             ),
         ];
@@ -889,7 +889,7 @@ mod tests {
 
             assert_eq!(outcome.is_ok(), case == "sorted", "{case}: {outcome:?}");
             for fragment in present.iter().chain(&unloaded) {
-                assert!(span.contains(fragment), "{case}: {fragment} in {span}");
+                assert!(has_member(&span, fragment), "{case}: {fragment} in {span}");
             }
             for fragment in absent {
                 assert!(!span.contains(fragment), "{case}: no {fragment} in {span}");

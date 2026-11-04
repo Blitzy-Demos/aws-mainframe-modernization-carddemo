@@ -17,11 +17,11 @@
 use std::path::Path;
 
 use carddemo_persistence::Db;
-use carddemo_persistence::seed::{self, SeedReport, SeedSources};
+use carddemo_persistence::seed::{self, SeedMode, SeedReport, SeedSources};
 use carddemo_runtime::config::Settings;
 use tracing::Span;
 
-use super::{JobContext, count_of, setup_failure};
+use super::{JobContext, count_of, setup_failure, span_count};
 use crate::cli::SeedArgs;
 use crate::exit::ExitStatus;
 use crate::generations::blocking;
@@ -35,7 +35,9 @@ use crate::generations::blocking;
 /// The sources resolve against the current directory, the repository root the runbook runs
 /// every command from: the fixture directory is `CARDDEMO_FIXTURE_DIR` (default
 /// `app/data/ASCII`), and the `DUSRSECJ` job and the `CREADB21` load statements stay at their
-/// repository paths. `--if-empty` on a seeded database writes nothing and ends normally.
+/// repository paths. `--if-empty` on a seeded database writes nothing and ends normally. Once
+/// the sources are resolved, and before any is read, what the run's mode reads is recorded in
+/// `input` on the job span ([`span_input`]); the mode itself is the span's `mode`.
 ///
 /// The sources are prepared on Tokio's blocking pool, inside the job span, and only then is the
 /// seed's transaction opened, so no worker thread and no connection is held while the files are
@@ -54,6 +56,7 @@ pub(crate) async fn run(ctx: &JobContext, db: &Db, args: &SeedArgs) -> ExitStatu
     };
     let sources = seed_sources(&repo_root, &ctx.settings);
     let mode = args.mode();
+    Span::current().record("input", span_input(mode, &repo_root, &sources));
     let prepared = match blocking(move || seed::prepare(mode, &sources)).await {
         Ok(prepared) => prepared,
         Err(err) => return setup_failure("seed preparation did not complete", err),
@@ -66,7 +69,7 @@ pub(crate) async fn run(ctx: &JobContext, db: &Db, args: &SeedArgs) -> ExitStatu
             let rows = rows_written(&report);
             ctx.counts.set_read(count_of(rows));
             ctx.counts.set_posted(count_of(rows));
-            Span::current().record("written", rows);
+            Span::current().record("written", span_count(rows));
             ExitStatus::Success
         }
         Err(err) => setup_failure("seed failed", err),
@@ -80,6 +83,42 @@ fn seed_sources(repo_root: &Path, settings: &Settings) -> SeedSources {
     SeedSources {
         fixture_dir: repo_root.join(&settings.fixture_dir),
         ..SeedSources::with_defaults(repo_root)
+    }
+}
+
+/// The `input` of a [`SeedMode::OnlyTranextr`] run, which reads no file: the Db2 masters it
+/// copies, the tables that hold what `TRANEXTR` STEP40 and STEP50 unload from
+/// `TRANSACTION_TYPE` and `TRANSACTION_TYPE_CATEGORY`
+/// [app/app-transaction-type-db2/jcl/TRANEXTR.jcl:L65-84, L95-115].
+const TRANEXTR_INPUT: &str = "transaction_types,transaction_categories";
+
+/// The `input` the job span records for a run in `mode` on `sources`, its parts comma-joined.
+///
+/// [`SeedMode::Full`] and [`SeedMode::IfEmpty`] read the fixture directory, the `DUSRSECJ` job
+/// and the `CREADB21` load statement directory, whether or not `--if-empty` then writes, so the
+/// input is those three paths, each relative to `repo_root` when it lies under it and as given
+/// otherwise: `app/data/ASCII,app/jcl/DUSRSECJ.jcl,app/app-transaction-type-db2/ctl` by default.
+/// [`SeedMode::OnlyTranextr`] reads only the database, so its input is [`TRANEXTR_INPUT`]. Only
+/// paths are recorded, never what a source holds.
+fn span_input(mode: SeedMode, repo_root: &Path, sources: &SeedSources) -> String {
+    match mode {
+        SeedMode::OnlyTranextr => TRANEXTR_INPUT.to_owned(),
+        SeedMode::Full | SeedMode::IfEmpty => format!(
+            "{},{},{}",
+            shown(repo_root, &sources.fixture_dir).display(),
+            shown(repo_root, &sources.dusrsecj_jcl).display(),
+            shown(repo_root, &sources.db2_ctl_dir).display(),
+        ),
+    }
+}
+
+/// `path` as [`span_input`] shows it: relative to `repo_root` when it lies under it, `.` when it
+/// is `repo_root` itself (such as `CARDDEMO_FIXTURE_DIR=.`), and as given otherwise.
+fn shown<'a>(repo_root: &Path, path: &'a Path) -> &'a Path {
+    match path.strip_prefix(repo_root) {
+        Ok(relative) if relative.as_os_str().is_empty() => Path::new("."),
+        Ok(relative) => relative,
+        Err(_) => path,
     }
 }
 
@@ -125,10 +164,10 @@ fn rows_written(report: &SeedReport) -> usize {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use carddemo_persistence::seed::{SeedReport, SeedSources};
+    use carddemo_persistence::seed::{SeedMode, SeedReport, SeedSources};
     use carddemo_runtime::config::Settings;
 
-    use super::{rows_written, seed_sources};
+    use super::{rows_written, seed_sources, span_input};
 
     #[test]
     fn fixture_dir_comes_from_the_settings_and_the_rest_from_the_repository() {
@@ -147,6 +186,48 @@ mod tests {
             assert_eq!(sources.fixture_dir, expected, "{}", configured.display());
             assert_eq!(sources.dusrsecj_jcl, defaults.dusrsecj_jcl);
             assert_eq!(sources.db2_ctl_dir, defaults.db2_ctl_dir);
+        }
+    }
+
+    #[test]
+    fn the_span_input_names_what_the_mode_reads_relative_to_the_repository() {
+        let root = Path::new("/repo");
+        let jcl_and_ctl = "app/jcl/DUSRSECJ.jcl,app/app-transaction-type-db2/ctl";
+        let default_input = format!("app/data/ASCII,{jcl_and_ctl}");
+        let tranextr = "transaction_types,transaction_categories";
+        // (mode, CARDDEMO_FIXTURE_DIR, input)
+        let cases = [
+            (SeedMode::Full, "app/data/ASCII", default_input.clone()),
+            (SeedMode::IfEmpty, "app/data/ASCII", default_input),
+            (
+                SeedMode::OnlyTranextr,
+                "app/data/ASCII",
+                tranextr.to_owned(),
+            ),
+            (
+                SeedMode::Full,
+                "/data/ascii",
+                format!("/data/ascii,{jcl_and_ctl}"),
+            ),
+            (
+                SeedMode::IfEmpty,
+                "../shared/ascii",
+                format!("../shared/ascii,{jcl_and_ctl}"),
+            ),
+            (SeedMode::Full, ".", format!(".,{jcl_and_ctl}")),
+            (SeedMode::OnlyTranextr, "/data/ascii", tranextr.to_owned()),
+        ];
+        for (mode, fixture_dir, expected) in cases {
+            let settings = Settings {
+                fixture_dir: PathBuf::from(fixture_dir),
+                ..Settings::default()
+            };
+            let sources = seed_sources(root, &settings);
+            assert_eq!(
+                span_input(mode, root, &sources),
+                expected,
+                "{mode:?} with {fixture_dir}"
+            );
         }
     }
 

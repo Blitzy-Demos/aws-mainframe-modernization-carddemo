@@ -75,7 +75,7 @@ use chrono::{DateTime, Utc};
 use printpdf::lopdf;
 use tracing::Span;
 
-use super::{JobContext, JobCounts, count_of, setup_failure};
+use super::{JobContext, JobCounts, count_of, setup_failure, span_count};
 use crate::exit::ExitStatus;
 use crate::generations::{LockFile, blocking, encode_fixed_lines, write_replacing};
 use crate::pdf::render_statement;
@@ -236,7 +236,7 @@ async fn write_statement_files(ctx: &JobContext, db: &Db) -> Result<(), ExitStat
             cancelled,
         ))
     })?;
-    Span::current().record("written", stmt_records);
+    Span::current().record("written", span_count(stmt_records));
     tracing::info!(
         cards,
         stmt_records,

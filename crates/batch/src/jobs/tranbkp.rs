@@ -28,7 +28,7 @@
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
-use super::{Backup, JobContext, backup_live_master_in, count_of, setup_failure};
+use super::{Backup, JobContext, backup_live_master_in, count_of, setup_failure, span_count};
 use crate::exit::ExitStatus;
 
 /// The highest condition code of the earlier steps at which `STEP10` still runs: `COND=(4,LT)`
@@ -163,7 +163,7 @@ async fn step05_step10_empty_master(
     uow.commit()
         .await
         .map_err(|err| setup_failure(EMPTYING_FAILED, err))?;
-    Span::current().record("deleted", deleted);
+    Span::current().record("deleted", span_count(deleted));
     tracing::info!(
         step = "STEP05",
         demoted,

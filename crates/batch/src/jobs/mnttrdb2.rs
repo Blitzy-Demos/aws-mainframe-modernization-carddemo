@@ -45,7 +45,7 @@ use carddemo_domain::rules::tran_type_batch::{
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
-use super::{JobContext, count_of, setup_failure};
+use super::{JobContext, count_of, setup_failure, span_count};
 use crate::cli::Mnttrdb2Args;
 use crate::exit::ExitStatus;
 use crate::generations::blocking;
@@ -127,8 +127,8 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> ExitS
     let span = Span::current();
     if let Err(err) = uow.commit().await {
         let status = setup_failure("MNTTRDB2 STOP RUN commit failed", err);
-        span.record("written", 0_usize);
-        span.record("deleted", 0_usize);
+        span.record("written", 0_i64);
+        span.record("deleted", 0_i64);
         tracing::warn!(
             undone_written = counts.written,
             undone_deleted = counts.deleted,
@@ -139,8 +139,8 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> ExitS
         return status;
     }
     ctx.counts.set_posted(count_of(counts.applied()));
-    span.record("written", counts.written);
-    span.record("deleted", counts.deleted);
+    span.record("written", span_count(counts.written));
+    span.record("deleted", span_count(counts.deleted));
     ExitStatus::ReturnCode(run.return_code())
 }
 

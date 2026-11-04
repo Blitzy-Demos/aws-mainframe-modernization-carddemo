@@ -88,7 +88,7 @@ use carddemo_domain::rules::interest::{InterestAbend, InterestFile, InterestRun}
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
 
-use super::{JobContext, setup_failure};
+use super::{JobContext, setup_failure, span_count};
 use crate::cli::IntcalcArgs;
 use crate::exit::ExitStatus;
 use crate::generations::{Dataset, PendingGeneration};
@@ -561,7 +561,7 @@ impl IntcalcJob<'_> {
         let counts = &self.ctx.counts;
         counts.set_read(self.read);
         counts.set_posted(self.posted);
-        Span::current().record("written", self.written);
+        Span::current().record("written", span_count(self.written));
     }
 
     /// CBACT04C end of file and closes [app/cbl/CBACT04C.cbl:L188-230] — P-CBACT04C-003,
