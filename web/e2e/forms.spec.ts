@@ -19,7 +19,9 @@
 //   reopened and answered.
 // - Every write the forms confirm records its request and response on the
 //   map row's endpoint under /api (AAP 0.3.1: 201 for POST, 200 for PUT and
-//   DELETE).
+//   DELETE), except a write held at `halt`, whose 500 is asserted instead.
+// - Keys this spec creates (a user ID, a type code) are chosen per run so no
+//   seeded row and no row of an interrupted earlier run holds them.
 import type { Locator, Page, Request, Response } from "@playwright/test";
 
 import {
@@ -62,10 +64,36 @@ import {
   type SeededAuthorization,
 } from "./fixtures";
 
-/** A user ID no seeded user holds (X(8)), created and removed by this spec. */
-const NEW_USER_ID = "E2EUSR01";
-/** A type code no seeded type holds, created and removed by this spec. */
-const NEW_TYPE_CODE = "99";
+const SUFFIX_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/** `length` random upper-case letters and digits. */
+function uniqueSuffix(length: number): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(length)), (byte) =>
+    SUFFIX_ALPHABET.charAt(byte % SUFFIX_ALPHABET.length),
+  ).join("");
+}
+
+/**
+ * The user ID (SEC-USR-ID X(08)) this spec creates and deletes: `E2E` and a
+ * per-run suffix, so no seeded user and no user an interrupted run left
+ * behind holds it.
+ */
+const NEW_USER_ID = `E2E${uniqueSuffix(5)}`;
+
+/**
+ * The highest type code from 99 down to 10 that no TRANSACTION_TYPE row
+ * holds, for the type this spec creates and deletes.
+ */
+async function freeTypeCode(): Promise<string> {
+  const taken = new Set((await psql("SELECT tr_type FROM transaction_types")).split("\n"));
+  for (let code = 99; code >= 10; code -= 1) {
+    const candidate = String(code);
+    if (!taken.has(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error("every type code from 10 to 99 is taken: re-seed the database with `batch seed`");
+}
 
 // ---------------------------------------------------------------------------
 // Keyboard helpers
@@ -191,15 +219,20 @@ async function expectDialogTrapsFocus(page: Page, dialog: Locator, write: Endpoi
 
 /**
  * Runs `action`, which sends one `endpoint` request, and returns its
- * response after asserting the success status AAP 0.3.1 gives a write: 201
- * for POST, 200 for PUT and DELETE.
+ * response after asserting its `status`, by default the success status AAP
+ * 0.3.1 gives a write: 201 for POST, 200 for PUT and DELETE.
  */
-async function expectWrite(page: Page, endpoint: Endpoint, action: () => Promise<void>): Promise<Response> {
+async function expectWrite(
+  page: Page,
+  endpoint: Endpoint,
+  action: () => Promise<void>,
+  status: number = endpoint.method === "POST" ? 201 : 200,
+): Promise<Response> {
   const [response] = await Promise.all([
     page.waitForResponse((r) => isRequestTo(r.request(), endpoint)),
     action(),
   ]);
-  expect(response.status(), `${endpoint.method} ${endpoint.path}`).toBe(endpoint.method === "POST" ? 201 : 200);
+  expect(response.status(), `${endpoint.method} ${endpoint.path}`).toBe(status);
   return response;
 }
 
@@ -372,15 +405,18 @@ test.describe("account update (F-COACTUP-002, F-COACTUP-004, F-COACTUP-005, F-CO
     await expect(creditLimit(page)).toHaveValue(fetched);
   });
 
-  test("saves a new credit limit", async ({ page }) => {
+  // A change that passes every edit is not saved: its Open Date then reaches
+  // CSUTLDTC through CSUTLDPY EDIT-DATE-LE, an outcome E-26 holds at `halt`,
+  // so the save answers 500 with the unexpected-error text and writes
+  // nothing, as crates/api/tests/caup_account_update.rs pins. The
+  // 'Changes committed to database' save is therefore not asserted here.
+  test("a valid new credit limit is held at halt (E-26): 500, nothing written", async ({ page }) => {
+    const stored = `SELECT acct_credit_limit FROM accounts WHERE account_id = ${sqlLiteral(FIXTURE_KEYS.account)}::bigint`;
+    const before = await psql(stored);
     await typeInto(page, creditLimit(page), "2500.00");
-    await expectWrite(page, rowEndpoint("F-COACTUP-005"), () => enterOn(page, "F-COACTUP-005"));
-    await expectMessage(page, MESSAGES.CHANGES_COMMITTED_TO_DATABASE);
-    expect(
-      await psql(
-        `SELECT acct_credit_limit FROM accounts WHERE account_id = ${sqlLiteral(FIXTURE_KEYS.account)}::bigint`,
-      ),
-    ).toBe("2500.00");
+    await expectWrite(page, rowEndpoint("F-COACTUP-005"), () => enterOn(page, "F-COACTUP-005"), 500);
+    await expectMessage(page, MESSAGES.UNEXPECTED_ERROR);
+    expect(await psql(stored)).toBe(before);
   });
 
   test("Back returns to the account view", async ({ page }) => {
@@ -508,11 +544,37 @@ test.describe("transaction list (F-COTRN00-001, F-COTRN00-003, F-COTRN00-004, F-
 });
 
 test.describe("transaction add (F-COTRN02-001, F-COTRN02-002, F-COTRN02-003, F-COTRN02-004, F-COTRN02-005, F-COTRN02-006)", () => {
-  const accountId = (page: Page): Locator => textbox(page, UNMAPPED_LABELS.transactionAdd.accountId);
+  const labels = UNMAPPED_LABELS.transactionAdd;
+  const accountId = (page: Page): Locator => textbox(page, labels.accountId);
+  const amount = (page: Page): Locator => textbox(page, labels.amount);
   let saved: Checkpoint | undefined;
 
   test.beforeAll(async () => {
     saved = await transactionWriteCheckpoint([FIXTURE_KEYS.rewardAccount]);
+  });
+
+  // PF5 for `account`: the highest-keyed transaction, read by the map row's
+  // backward browse of one row, fills the data fields, and the server's
+  // blank-confirm check moves the cursor to the confirmation, whose place the
+  // form's submit takes (MOVE -1 TO CONFIRML).
+  async function copyLastTransaction(page: Page, account: string): Promise<void> {
+    await typeInto(page, accountId(page), account);
+    const [read] = await Promise.all([
+      page.waitForRequest((request) => isRequestTo(request, rowEndpoint("F-COTRN02-006"))),
+      enterOn(page, "F-COTRN02-006"),
+    ]);
+    const query = new URL(read.url()).searchParams;
+    expect([query.get("direction"), query.get("page_size")]).toEqual(["backward", "1"]);
+    await expect(control(page, "F-COTRN02-001")).toBeFocused();
+    await expect(amount(page)).not.toHaveValue("");
+  }
+
+  test("rejects an amount not in the -99999999.99 form (V-COTRN02C-021, TRNAMT)", async ({ page }) => {
+    await copyLastTransaction(page, FIXTURE_KEYS.rewardAccount);
+    await typeInto(page, amount(page), "12.50");
+    await enterOn(page, "F-COTRN02-001");
+    await expectFieldError(page, amount(page), MESSAGES.AMOUNT_SHOULD_BE_IN_FORMAT);
+    await expect(confirmDialog(page)).toBeHidden();
   });
 
   test.afterAll(async () => {
@@ -541,11 +603,12 @@ test.describe("transaction add (F-COTRN02-001, F-COTRN02-002, F-COTRN02-003, F-C
     await expect(accountId(page)).toHaveValue("");
   });
 
-  test("copies the last transaction; the dialog traps focus, Cancel writes nothing, Confirm adds it", async ({ page }) => {
+  test("copies the last transaction as a 01/0001 purchase; the dialog traps focus, Cancel writes nothing, Confirm adds it", async ({ page }) => {
     const count = "SELECT count(*) FROM transaction_master";
     const before = await psql(count);
-    await typeInto(page, accountId(page), FIXTURE_KEYS.rewardAccount);
-    await enterOn(page, "F-COTRN02-006");
+    await copyLastTransaction(page, FIXTURE_KEYS.rewardAccount);
+    await typeInto(page, textbox(page, labels.typeCode), FIXTURE_KEYS.tranType);
+    await typeInto(page, textbox(page, labels.categoryCode), FIXTURE_KEYS.tranCategory);
     await enterOn(page, "F-COTRN02-001");
     await expectDialogTrapsFocus(page, confirmDialog(page), rowEndpoint("F-COTRN02-002"));
     await enterOn(page, "F-COTRN02-001");
@@ -556,6 +619,8 @@ test.describe("transaction add (F-COTRN02-001, F-COTRN02-002, F-COTRN02-003, F-C
     const added = await expectWrite(page, rowEndpoint("F-COTRN02-002"), () => answerDialog(page, "F-COTRN02-002"));
     expect(added.request().postDataJSON()).toMatchObject({
       account_id: FIXTURE_KEYS.rewardAccount,
+      tran_type_cd: FIXTURE_KEYS.tranType,
+      tran_cat_cd: FIXTURE_KEYS.tranCategory,
       confirm: "Y",
     });
     await expectMessage(
@@ -668,6 +733,9 @@ test.describe("bill payment (F-COBIL00-001, F-COBIL00-002, F-COBIL00-003, F-COBI
     expect(await psql(balance)).toBe(before);
     const tranId = await nextTranId();
     await submitFrom(page, accountId(page), FIXTURE_KEYS.account);
+    // The dialog opens once the blank-confirm POST /payments has answered,
+    // so the write awaited next is the confirmed one.
+    await expect(confirmDialog(page)).toBeVisible();
     const paid = await expectWrite(page, rowEndpoint("F-COBIL00-002"), () => answerDialog(page, "F-COBIL00-002"));
     expect(paid.request().postDataJSON()).toMatchObject({ confirm: "Y" });
     await expectMessage(page, `${MESSAGES.PAYMENT_SUCCESSFUL}${MESSAGES.YOUR_TRANSACTION_ID_IS}${tranId}.`);
@@ -823,6 +891,23 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
     expect(await psql(`SELECT sec_usr_lname FROM users WHERE user_id = ${sqlLiteral(NEW_USER_ID)}`)).toBe("Retested");
   });
 
+  test("update: Change password, checked with Space, needs a password (V-COUSR02C-007, PASSWD)", async ({ page }) => {
+    await openEdit(page);
+    const changePassword = content(page).getByRole("checkbox", { name: labels.changePassword, exact: true });
+    await expect(newUserPassword(page)).toBeDisabled();
+    await tabTo(page, changePassword);
+    await page.keyboard.press("Space");
+    await expect(changePassword).toBeChecked();
+    await expect(newUserPassword(page)).toBeEnabled();
+    await expect(newUserPassword(page)).toHaveValue("");
+    await enterOn(page, "F-COUSR02-004");
+    await expectFieldError(page, newUserPassword(page), MESSAGES.PASSWORD_CAN_NOT_BE_EMPTY);
+    await tabTo(page, changePassword);
+    await page.keyboard.press("Space");
+    await expect(changePassword).not.toBeChecked();
+    await expect(newUserPassword(page)).toBeDisabled();
+  });
+
   test("update: Reset clears the fields, Cancel and Save and exit return to the list", async ({ page }) => {
     await openEdit(page);
     await typeInto(page, textbox(page, labels.firstName), "Changed");
@@ -863,18 +948,21 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
   const typeCode = (page: Page): Locator => input(page, "F-COTRTUP-001", 0);
   const description = (scope: Page | Locator): Locator => textbox(scope, UNMAPPED_LABELS.tranType.description);
   const storedDescription = (): Promise<string> =>
-    psql(`SELECT coalesce((SELECT tr_description FROM transaction_types WHERE tr_type = ${sqlLiteral(NEW_TYPE_CODE)}), '<none>')`);
+    psql(`SELECT coalesce((SELECT tr_description FROM transaction_types WHERE tr_type = ${sqlLiteral(newTypeCode)}), '<none>')`);
   /** PUT (F-COTRTUP-002, F-COTRTLI-007) or DELETE (F-COTRTUP-007, F-COTRTLI-009) of the new type. */
   const typeEndpoint = (method: "PUT" | "DELETE"): Endpoint => ({
     method,
-    path: `/admin/transaction-types/${NEW_TYPE_CODE}`,
+    path: `/admin/transaction-types/${newTypeCode}`,
   });
   let saved: Checkpoint | undefined;
+  /** The type this describe creates and deletes, chosen by freeTypeCode. */
+  let newTypeCode = "";
 
   test.beforeAll(async () => {
+    newTypeCode = await freeTypeCode();
     saved = await checkpoint([
-      { table: "transaction_types", where: `tr_type = ${sqlLiteral(NEW_TYPE_CODE)}` },
-      { table: "transaction_categories", where: `trc_type_code = ${sqlLiteral(NEW_TYPE_CODE)}` },
+      { table: "transaction_types", where: `tr_type = ${sqlLiteral(newTypeCode)}` },
+      { table: "transaction_categories", where: `trc_type_code = ${sqlLiteral(newTypeCode)}` },
     ]);
   });
 
@@ -888,7 +976,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
 
   async function addNewType(page: Page, text: string): Promise<void> {
     await page.goto(mapControl("F-COTRTUP-001").route);
-    await submitFrom(page, typeCode(page), NEW_TYPE_CODE);
+    await submitFrom(page, typeCode(page), newTypeCode);
     await typeInto(page, description(page), text);
     await expectWrite(page, rowEndpoint("F-COTRTUP-003"), () => enterOn(page, "F-COTRTUP-003"));
     await expect.poll(storedDescription).toBe(text);
@@ -904,16 +992,26 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
 
   test("Cancel abandons the add path of a code not on file", async ({ page }) => {
     await page.goto(mapControl("F-COTRTUP-001").route);
-    await submitFrom(page, typeCode(page), NEW_TYPE_CODE);
+    await submitFrom(page, typeCode(page), newTypeCode);
     await expect(control(page, "F-COTRTUP-003")).toBeVisible();
     await enterOn(page, "F-COTRTUP-015");
     await expect(control(page, "F-COTRTUP-003")).toBeHidden();
     expect(await storedDescription()).toBe("<none>");
   });
 
+  test("add rejects a blank description (V-COTRTUPC-017, TRTYDSC)", async ({ page }) => {
+    await page.goto(mapControl("F-COTRTUP-001").route);
+    await submitFrom(page, typeCode(page), newTypeCode);
+    await expect(control(page, "F-COTRTUP-003")).toBeVisible();
+    await typeInto(page, description(page), "");
+    await enterOn(page, "F-COTRTUP-003");
+    await expectFieldError(page, description(page), `${MESSAGES.FIELD_TRANSACTION_DESC}${MESSAGES.MUST_BE_SUPPLIED}`);
+    expect(await storedDescription()).toBe("<none>");
+  });
+
   test("adds the type, then the edit rejects and saves descriptions (V-COTRTUPC-008, TRTYDSC)", async ({ page }) => {
     await addNewType(page, "E2E TEST TYPE");
-    await page.goto(`/admin/transaction-types/${NEW_TYPE_CODE}/edit`);
+    await page.goto(`/admin/transaction-types/${newTypeCode}/edit`);
     await typeInto(page, description(page), "E2E#TYPE");
     await enterOn(page, "F-COTRTUP-002");
     await expectFieldError(
@@ -927,7 +1025,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
   });
 
   test("edit: the Delete dialog traps focus, Cancel keeps it, Cancel leaves for key entry, Confirm removes it", async ({ page }) => {
-    await page.goto(`/admin/transaction-types/${NEW_TYPE_CODE}/edit`);
+    await page.goto(`/admin/transaction-types/${newTypeCode}/edit`);
     await enterOn(page, "F-COTRTUP-006");
     await expectDialogTrapsFocus(page, confirmDialog(page), typeEndpoint("DELETE"));
     await enterOn(page, "F-COTRTUP-006");
@@ -935,29 +1033,35 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
     expect(await storedDescription()).not.toBe("<none>");
     await enterOn(page, "F-COTRTUP-014");
     await expect(page).toHaveURL(urlPath(mapControl("F-COTRTUP-014").target ?? "/admin/transaction-types/new"));
-    await page.goto(`/admin/transaction-types/${NEW_TYPE_CODE}/edit`);
+    await page.goto(`/admin/transaction-types/${newTypeCode}/edit`);
     await enterOn(page, "F-COTRTUP-006");
     await expectWrite(page, typeEndpoint("DELETE"), () => answerDialog(page, "F-COTRTUP-007"));
     await expect(page).toHaveURL(urlPath(mapControl("F-COTRTUP-007").target ?? "/admin/transaction-types/new"));
     await expect.poll(storedDescription).toBe("<none>");
   });
 
-  test("list: rejects a bad type filter (V-COTRTLIC-001, TRTYPE), updates a row in place and deletes it", async ({ page }) => {
+  test("list: rejects a bad type filter (V-COTRTLIC-001, TRTYPE) and a blank row description (V-COTRTLIC-013), updates the row in place and deletes it", async ({ page }) => {
     await addNewType(page, "E2E LIST TYPE");
     await page.goto(mapControl("F-COTRTLI-001").route);
     await submitFrom(page, input(page, "F-COTRTLI-001", 0), "AB");
     await expectFieldError(page, input(page, "F-COTRTLI-001", 0), MESSAGES.TYPE_CODE_FILTER_IF_SUPPLIED_MUST_BE_2_DIGIT);
-    await submitFrom(page, input(page, "F-COTRTLI-001", 0), NEW_TYPE_CODE);
-    const row = rowsWith(page, NEW_TYPE_CODE);
+    await submitFrom(page, input(page, "F-COTRTLI-001", 0), newTypeCode);
+    const row = rowsWith(page, newTypeCode);
     await expect(row).toHaveCount(1);
     await pressControl(page, row.getByRole("button", { name: mapControl("F-COTRTLI-006").name, exact: true }));
+    // V-COTRTLIC-013 names no BMS field: the row's own description input
+    // carries the error and the cursor, as COTRTLIC places it on TRTYPDn.
+    await typeInto(page, description(row), "");
+    await enterOn(page, "F-COTRTLI-007");
+    await expectFieldError(page, description(row), `${MESSAGES.FIELD_TRANSACTION_DESC}${MESSAGES.MUST_BE_SUPPLIED}`);
+    expect(await storedDescription()).toBe("E2E LIST TYPE");
     await typeInto(page, description(row), "E2E LIST TYPE TWO");
     const updated = await expectWrite(page, typeEndpoint("PUT"), () => enterOn(page, "F-COTRTLI-007"));
     expect(new URL(updated.url()).searchParams.get("origin"), "the inline update is the list's").toBe("list");
     await expectMessage(page, MESSAGES.HIGHLIGHTED_ROW_WAS_UPDATED);
     await expect.poll(storedDescription).toBe("E2E LIST TYPE TWO");
     const deleteButton = (): Locator =>
-      rowsWith(page, NEW_TYPE_CODE).getByRole("button", { name: mapControl("F-COTRTLI-008").name, exact: true });
+      rowsWith(page, newTypeCode).getByRole("button", { name: mapControl("F-COTRTLI-008").name, exact: true });
     await pressControl(page, deleteButton());
     await expectDialogTrapsFocus(page, confirmDialog(page), typeEndpoint("DELETE"));
     await pressControl(page, deleteButton());

@@ -409,6 +409,7 @@ export const MESSAGES = {
   TRAN_ID_MUST_BE_NUMERIC: "Tran ID must be Numeric ...",
   ACCOUNT_OR_CARD_NUMBER_MUST_BE_ENTERED: "Account or Card Number must be entered...",
   ACCOUNT_ID_NOT_FOUND: "Account ID NOT found...",
+  AMOUNT_SHOULD_BE_IN_FORMAT: "Amount should be in format -99999999.99",
   TRANSACTION_ADDED_SUCCESSFULLY: "Transaction added successfully. ",
   YOUR_TRAN_ID_IS: " Your Tran ID is ",
   SELECT_A_REPORT_TYPE_TO_PRINT_REPORT: "Select a report type to print report...",
@@ -426,6 +427,7 @@ export const MESSAGES = {
   AUTH_FRAUD_REMOVED: "AUTH FRAUD REMOVED...",
   FIRST_NAME_CAN_NOT_BE_EMPTY: "First Name can NOT be empty...",
   USER_ID_ALREADY_EXIST: "User ID already exist...",
+  PASSWORD_CAN_NOT_BE_EMPTY: "Password can NOT be empty...",
   PLEASE_MODIFY_TO_UPDATE: "Please modify to update ...",
   USER_LABEL: "User ",
   HAS_BEEN_ADDED: " has been added ...",
@@ -438,6 +440,7 @@ export const MESSAGES = {
   TYPE_CODE_FILTER_IF_SUPPLIED_MUST_BE_2_DIGIT: "TYPE CODE FILTER,IF SUPPLIED MUST BE A 2 DIGIT NUMBER",
   HIGHLIGHTED_ROW_WAS_UPDATED: "HIGHLIGHTED row was updated",
   HIGHLIGHTED_ROW_DELETED_HIT_ENTER_TO_CONTINUE: "HIGHLIGHTED row deleted.Hit Enter to continue",
+  UNEXPECTED_ERROR: "Unexpected error",
   AUTHENTICATION_REQUIRED: "Authentication required",
   ADMIN_ACCESS_REQUIRED: "Admin access required",
   REWARD_RATE_NEGATIVE: "reward_rate must not be negative",
@@ -1318,13 +1321,17 @@ export const UNMAPPED_LABELS = {
   accountEdit: { creditLimit: "Credit Limit" },
   /** COCRDUP CRDNAME 'Name on card :'. */
   cardEdit: { nameOnCard: "Name on card" },
-  /** COUSR01 and COUSR02 FNAME, LNAME, USERID, PASSWD, USRTYPE captions. */
+  /**
+   * COUSR01 and COUSR02 FNAME, LNAME, USERID, PASSWD, USRTYPE captions, and
+   * the edit page's "Change password" switch in front of PASSWD (E-21).
+   */
   userForm: {
     firstName: "First Name",
     lastName: "Last Name",
     userId: "User ID",
     password: "Password",
     userType: "User Type",
+    changePassword: "Change password",
   },
   /** COTRTUP TRTYDSC 'Description :' and the COTRTLI row TRTYPD. */
   tranType: { description: "Description" },
