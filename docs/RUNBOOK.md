@@ -659,7 +659,7 @@ cargo deny check
 cargo llvm-cov --workspace --lcov --output-path target/lcov.info
 ```
 
-Success: every command exits 0 and prints no warning. `cargo deny check` prints `advisories ok, bans ok, licenses ok, sources ok`; add `--disable-fetch` to reuse the local advisory database when GitHub is unreachable. `cargo llvm-cov` writes `target/lcov.info`; no coverage threshold applies.
+Success: every command exits 0 and prints no warning. `cargo deny check` prints `advisories ok, bans ok, licenses ok, sources ok`; when GitHub is unreachable, run `cargo deny --offline check` instead to use the local advisory database. The `--offline` flag goes before `check`; placed after `check`, it is rejected. `cargo llvm-cov` writes `target/lcov.info`; no coverage threshold applies.
 
 Also run the drift check of section 10.2 (`cargo sqlx prepare --workspace --check -- --all-targets`, with `SQLX_OFFLINE` unset and `DATABASE_URL` naming a migrated database), and confirm the domain crate pulls in no database library:
 
