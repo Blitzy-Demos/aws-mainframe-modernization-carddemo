@@ -9,7 +9,12 @@
 //   link without a target) whose endpoint is a GET sends that GET, a dialog
 //   Cancel closes its dialog without a request, and the PF3 sign-off item
 //   ends the session; a row without a control is asserted to have none, with
-//   its escalation;
+//   its escalation. A menu option is a link of the sidebar and of its menu
+//   screen (the dashboard for CM00, /admin for CA00). Each row test carries
+//   its F-ID as an `F-ID` annotation;
+// - the rows of user functions run as both USER0001 and ADMIN001, because
+//   the COBOL user programs check no user type; admin rows run as ADMIN001
+//   and the sign-on screen signed out;
 // - every route opens for both roles, an admin route turns a regular user
 //   back, and the sidebar shows each role its menu sections;
 // - every crumb of a nested route's breadcrumb trail (the PF3 replacement)
@@ -48,6 +53,7 @@ import {
   mapInput,
   MESSAGES,
   nameMatcher,
+  nextTranId,
   psql,
   repoPath,
   resolveRoute,
@@ -62,6 +68,7 @@ import {
   signOut,
   sqlLiteral,
   test,
+  transactionWriteCheckpoint,
   UNMAPPED_LABELS,
   urlPath,
   USERS,
@@ -158,6 +165,10 @@ function openCardWith(rowActionId: string): Reveal {
     await press(page, "F-COCRDLI-001");
     await press(page, rowActionId);
     await expect(page).toHaveURL(routePattern(mapControl(rowActionId).target ?? "/cards"));
+    // The URL changes as the navigation starts, while the router keeps the
+    // list on screen until the lazily loaded card page renders; the list's
+    // Back would otherwise be found in place of the card page's.
+    await expect(controlLocator(page, mapControl("F-COCRDLI-001"))).toHaveCount(0);
   };
 }
 
@@ -451,32 +462,65 @@ function nextRowOf(row: MapRow): MapRow & { control: MapControl } {
 
 // Presses a GET control and asserts its request. A Previous that is disabled
 // on the first page is asserted disabled, then pressed after Next has paged
-// on (and sent its own GET).
+// on (and sent its own GET). The data table also disables both paging
+// controls while a page loads, marking itself aria-busy, so the first-page
+// state is read once no table is busy.
 async function exerciseRequest(page: Page, row: MapRow, element: Locator): Promise<void> {
-  if (row.control?.name === "Previous" && (await element.isDisabled())) {
-    await expect(element, `${row.id} on the first page`).toBeDisabled();
-    const next = nextRowOf(row);
-    await expectRequest(page, rowEndpoint(next.id), () => controlLocator(page, next.control).click());
-    await expect(element, `${row.id} after ${next.id}`).toBeEnabled();
+  if (row.control?.name === "Previous") {
+    await expect(content(page).locator('table[aria-busy="true"]')).toHaveCount(0);
+    if (await element.isDisabled()) {
+      await expect(element, `${row.id} on the first page`).toBeDisabled();
+      const next = nextRowOf(row);
+      await expectRequest(page, rowEndpoint(next.id), () => controlLocator(page, next.control).click());
+      await expect(element, `${row.id} after ${next.id}`).toBeEnabled();
+    }
   }
   await expectRequest(page, rowEndpoint(row.id), () => element.click());
 }
 
-// Who signs on for a row: nobody for the sign-on screen, an administrator
-// for /admin routes, a regular user otherwise.
-function roleOf(route: string): Role | null {
-  if (route === "/login") {
-    return null;
+// Who signs on for a row: nobody for the sign-on screen and for a row without
+// a control, an administrator for /admin routes, and both roles for the user
+// functions, which the COBOL opens to either user type.
+function rolesOf(row: MapRow): readonly (Role | null)[] {
+  const route = row.control?.route;
+  if (route === undefined || route === "/login") {
+    return [null];
   }
-  return route === "/admin" || route.startsWith("/admin/") ? "admin" : "user";
+  return route === "/admin" || route.startsWith("/admin/") ? ["admin"] : ["user", "admin"];
 }
 
-async function exercise(page: Page, row: MapRow, nav: Extract<NavCase, { kind: "control" }>, params: NavParams): Promise<void> {
+// The menu screen of an `option <n>` row's map: the route of that map's
+// sign-off row, the dashboard for COMEN01 and /admin for COADM01.
+function menuScreenOf(row: MapRow): string {
+  const signOff = functionMap().rows.find(
+    (candidate) => candidate.map === row.map && candidate.control?.role === "menuitem",
+  );
+  if (signOff?.control === undefined || signOff.control === null) {
+    throw new Error(`${row.map} has no sign-off row naming its menu screen`);
+  }
+  return signOff.control.route;
+}
+
+// The option list of the menu screen on the current page: the navigation
+// landmark of the page content named by the screen's heading, the BMS map
+// title.
+async function menuScreenList(page: Page): Promise<Locator> {
+  await expectScreen(page);
+  const title = (await content(page).getByRole("heading", { level: 1 }).innerText()).trim();
+  return content(page).getByRole("navigation", { name: title, exact: true });
+}
+
+async function exercise(
+  page: Page,
+  row: MapRow,
+  nav: Extract<NavCase, { kind: "control" }>,
+  params: NavParams,
+  role: Role | null,
+): Promise<void> {
   const control = row.control;
   if (control === null) {
     throw new Error(`${row.id} has no UI control, so its case must be none(…)`);
   }
-  const role = roleOf(control.route);
   if (role !== null) {
     await signIn(page, role);
   }
@@ -490,6 +534,13 @@ async function exercise(page: Page, row: MapRow, nav: Extract<NavCase, { kind: "
     await expect(sidebarLink(page, control.name)).toBeVisible();
     await sidebarLink(page, control.name).click();
     await expect(page).toHaveURL(urlPath(control.route));
+    await expectScreen(page);
+    await page.goto(menuScreenOf(row));
+    const option = (await menuScreenList(page)).getByRole("link", { name: control.name, exact: true });
+    await expect(option).toBeVisible();
+    await option.click();
+    await expect(page).toHaveURL(urlPath(control.route));
+    await expectScreen(page);
     return;
   }
   await page.goto(resolveRoute(nav.start?.(params) ?? control.route, params));
@@ -568,12 +619,15 @@ test.describe("function map coverage", () => {
 });
 
 test("ADMIN001 signs on and loads the dashboard", { tag: "@smoke" }, async ({ page }) => {
+  test.info().annotations.push({ type: "F-ID", description: "F-COACTVW-001" });
+  // signIn waits for ADMIN001's landing route, /admin.
   await signIn(page, "admin");
   await expectScreen(page);
   await page.goto("/");
+  await expectScreen(page);
+  await expect(mapInput(content(page), rowInput("F-COACTVW-001", 0))).toBeEditable();
   const lookup = controlLocator(page, mapControl("F-COACTVW-001"));
   await expect(lookup).toBeVisible();
-  await expectScreen(page);
   // The session lives in sessionStorage, so a reload of the tab keeps it.
   await page.reload();
   await expect(page).toHaveURL(urlPath("/"));
@@ -650,6 +704,33 @@ test.describe("with seeded keys", () => {
   let params: NavParams | undefined;
   let seeded: SeededAuthorization[] = [];
   let extraRows: Checkpoint | undefined;
+  let seededTransaction: Checkpoint | undefined;
+
+  // A TRAN-ID for /transactions/:tranId: the highest of the live master. The
+  // master is empty when no `batch posttran` ran after the seed, or after
+  // `batch tranbkp`, and CT02 then refuses every add (STARTBR NOTFND,
+  // P-COTRN02C-021, E-27), so no API call can supply one. One live purchase
+  // of account 1's card is then written as COTRN02C would store it, with the
+  // first TRAN-ID of an empty file, and afterAll removes it again.
+  async function routeTranId(): Promise<string> {
+    if ((await psql("SELECT count(*) FROM transaction_master")) !== "0") {
+      return latestTranId();
+    }
+    const tranId = await nextTranId();
+    seededTransaction = await transactionWriteCheckpoint([FIXTURE_KEYS.account]);
+    await psql(
+      `INSERT INTO transactions
+         (tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt, tran_merchant_id,
+          tran_merchant_name, tran_merchant_city, tran_merchant_zip, tran_card_num, tran_orig_ts,
+          tran_proc_ts)
+       VALUES (${sqlLiteral(tranId)}, ${sqlLiteral(FIXTURE_KEYS.tranType)},
+               ${sqlLiteral(FIXTURE_KEYS.tranCategory)}::integer, 'POS TERM', 'E2E NAV PURCHASE',
+               12.34, 800000001, 'E2E FIXTURE MERCHANT', 'SEATTLE', '98101',
+               ${sqlLiteral(FIXTURE_KEYS.card)}, '2022-07-01 12:00:00.000000',
+               '2022-07-01-12.00.00.000000')`,
+    );
+    return latestTranId();
+  }
 
   test.beforeAll(async () => {
     // A second page on the user and transaction-type lists: one row more
@@ -690,7 +771,7 @@ test.describe("with seeded keys", () => {
     params = {
       accountId: FIXTURE_KEYS.account,
       cardNumber: FIXTURE_KEYS.card,
-      tranId: await latestTranId(),
+      tranId: await routeTranId(),
       authId: unreported.authId,
       reportedAuthId: reported.authId,
       userId: USERS.user.userId,
@@ -704,6 +785,7 @@ test.describe("with seeded keys", () => {
       await authorization.restore();
     }
     await extraRows?.restore();
+    await seededTransaction?.restore();
   });
 
   function keys(): NavParams {
@@ -746,18 +828,23 @@ test.describe("with seeded keys", () => {
   test.describe("every function map row", () => {
     for (const row of functionMap().rows) {
       const nav = CASES[row.id];
-      test(`${row.id} ${row.map} ${row.key.split(" [")[0] ?? row.key}`, async ({ page }) => {
-        if (nav === undefined) {
-          throw new Error(`${row.id} has no navigation case`);
-        }
-        if (nav.kind === "none") {
-          expect(row.control, `${row.id} has no control`).toBeNull();
-          expect(row.endpoint).toBe("—");
-          expect(row.action).toContain(nav.escalation);
-          return;
-        }
-        await exercise(page, row, nav, keys());
-      });
+      const key = row.key.split(" [")[0] ?? row.key;
+      for (const role of rolesOf(row)) {
+        const who = role === null ? "" : ` as ${USERS[role].userId}`;
+        test(`${row.id} ${row.map} ${key}${who}`, async ({ page }) => {
+          test.info().annotations.push({ type: "F-ID", description: row.id });
+          if (nav === undefined) {
+            throw new Error(`${row.id} has no navigation case`);
+          }
+          if (nav.kind === "none") {
+            expect(row.control, `${row.id} has no control`).toBeNull();
+            expect(row.endpoint).toBe("—");
+            expect(row.action).toContain(nav.escalation);
+            return;
+          }
+          await exercise(page, row, nav, keys(), role);
+        });
+      }
     }
   });
 });

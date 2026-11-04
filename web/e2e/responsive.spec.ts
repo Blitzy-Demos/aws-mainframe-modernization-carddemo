@@ -32,6 +32,7 @@ import {
   sidebar,
   sidebarLink,
   signIn,
+  tabTo,
   test,
   urlPath,
   USERS,
@@ -142,18 +143,29 @@ test.describe("app shell", () => {
     }
   });
 
-  test("a focused sidebar link shows its label as a tooltip only in the icon rail", async ({ page }) => {
+  test("a sidebar link shows its label as a tooltip on keyboard focus and on hover only in the icon rail", async ({
+    page,
+  }) => {
     const entry = userMenu[0];
     if (entry === undefined) {
       throw new Error("menu.ts holds no user entry");
     }
-    await sidebarLink(page, entry.label).focus();
+    const link = sidebarLink(page, entry.label);
     const tooltip = page.getByRole("tooltip", { name: entry.label, exact: true });
-    if (isLg(page)) {
-      await expect(tooltip).toBeHidden();
-    } else {
-      await expect(tooltip).toBeVisible();
-    }
+    const expectTooltip = async (): Promise<void> => {
+      if (isLg(page)) {
+        await expect(tooltip).toBeHidden();
+      } else {
+        await expect(tooltip).toBeVisible();
+      }
+    };
+    await tabTo(page, link);
+    await expectTooltip();
+    // Escape dismisses the focus tooltip, so the hover below opens it afresh.
+    await page.keyboard.press("Escape");
+    await expect(tooltip).toBeHidden();
+    await link.hover();
+    await expectTooltip();
   });
 
   test("Ctrl/Cmd+B and the sidebar trigger toggle the sidebar", async ({ page }) => {
@@ -169,6 +181,10 @@ test.describe("app shell", () => {
 
   test("the skip link shows when it takes focus, and Enter moves focus to the page content", async ({ page }) => {
     await page.goto("/");
+    // Tab is pressed only once the screen has rendered, from a document in
+    // which nothing has focus yet, so it starts at the top of the page.
+    await expectScreen(page);
+    await expect.poll(() => page.evaluate(() => document.activeElement === document.body)).toBe(true);
     await page.keyboard.press("Tab");
     const skip = page.getByRole("link", { name: "Skip to content", exact: true });
     await expect(skip).toBeFocused();
@@ -263,7 +279,11 @@ test.describe("every route at this viewport", () => {
       }
       await page.goto(path);
       await expect(page).toHaveURL(urlPath(path));
-      if (route.access !== "public") {
+      // The sign-on screen renders outside the app shell, so its h1 is not
+      // inside #main-content.
+      if (route.access === "public") {
+        await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
+      } else {
         await expectScreen(page);
       }
       await expectNoHorizontalOverflow(page);
