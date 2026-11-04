@@ -5,12 +5,21 @@
 //! session, the screen header, the edited balance and the emptied form.
 //!
 //! Each test runs on its own seeded database ([`TestApp`]): the 50 fixture
-//! accounts and an empty live transaction master (E-07). Expected messages
-//! come from `carddemo_domain::messages`; statuses, error codes and BMS fields
-//! come from the `V-COBIL00C` rows of `docs/parity/validation-audit.md`, and
-//! the writes that persist from the `P-COBIL00C` rows of
-//! `docs/parity/parity-oracle-audit.md`. Every case names the audit rows it
-//! proves in a string literal, which the coverage gates read.
+//! accounts and an empty live transaction master (E-07). Every refusal, fault
+//! and prompt answers as one primary `V-COBIL00C` row of
+//! `docs/parity/validation-audit.md`, read once its review passed: the status
+//! and the exact text come from the row, and for a refusal also the error
+//! code of the row's `kind=` (from a wire-code table of this file, not the
+//! domain's error kinds) and the BMS field; the `carddemo_domain::messages`
+//! constant a case names is asserted equal to that text. A `no-message` row
+//! answers with no text, or, for the non-digit key of E-47, with the text of
+//! the account `NOTFND` row its proposal names. The reviewed rows of
+//! `docs/parity/parity-oracle-audit.md` give the success text, joined from the
+//! quoted pieces of P-COBIL00C-016; the literals of the payment record,
+//! P-COBIL00C-015; and which write persists when the other fails,
+//! P-COBIL00C-016 to P-COBIL00C-019 and P-COBIL00C-024 (E-19). Every case
+//! names the audit rows it proves in a string literal, which the coverage
+//! gates read.
 //!
 //! A seeded balance or card is never copied into a case: it is decoded from
 //! `acctdata.txt` and `cardxref.txt` at the reviewed section A offsets
@@ -31,7 +40,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use carddemo_audit::Document;
-use carddemo_domain::error::ErrorKind;
 use carddemo_domain::format::{PIC_BILL_CURR_BAL, edit};
 use carddemo_domain::messages;
 use reqwest::StatusCode;
@@ -51,16 +59,29 @@ const PAYMENT_TS: &str = "2022-07-01 12:00:00.000000";
 /// The route under test.
 const PAYMENTS: &str = "/payments";
 
-/// The account-ID field of `COBIL0A` [app/cpy-bms/COBIL00.CPY], the BMS
-/// field of every `V-COBIL00C` row but two.
-const ACTIDIN: &str = "ACTIDIN";
-
-/// The confirmation field of `COBIL0A` [app/cpy-bms/COBIL00.CPY].
-const CONFIRM: &str = "CONFIRM";
+/// The program whose validation rows this file proves.
+const PROGRAM: &str = "COBIL00C";
 
 /// The text of the cancelled payment: `CLEAR-CURRENT-SCREEN` sets none, and
 /// the audit records the path as `no-message (E-49)`.
 const NO_MESSAGE: &str = "";
+
+/// The escalation of a `9(11)` key moved from an entry holding a non-digit,
+/// whose halt proposal answers as the account `NOTFND` row.
+const NON_DIGIT_KEY: &str = "E-47";
+
+/// What the trigger of a row under [`NON_DIGIT_KEY`] records of its proposal.
+const NOTFND_PROPOSAL: &str = "answers as the account NOTFND row";
+
+/// The account `NOTFND` row of `READ-ACCTDAT-FILE`, whose answer the
+/// [`NON_DIGIT_KEY`] proposal gives.
+const ACCOUNT_NOTFND_ROW: &str = "V-COBIL00C-004";
+
+/// What the trigger of [`ACCOUNT_NOTFND_ROW`] records of its read.
+const ACCOUNT_NOTFND: &str = "no account master record (RESP NOTFND)";
+
+/// The TRAN-ID of [`LIVE_ROW`], the highest live key before any payment.
+const LIVE_TRAN_ID: &str = "0000000000000300";
 
 /// The one live row the allocations count from, TRAN-ID `0000000000000300`,
 /// so payments are allocated `…301` onwards. The seeded live master is empty
@@ -150,20 +171,18 @@ const DROP_REWRITE_FAULT: &str = "DROP TRIGGER cb00_rewrite_fault ON accounts";
 /// A request the program refuses with an error body, its one `fields` entry
 /// carrying the top-level message.
 struct Refusal {
+    /// The primary validation row, whose status, error code, BMS field and
+    /// text the answer carries.
+    row: &'static str,
     /// The audit rows the case proves.
     rows: &'static str,
     /// `account_id` of the body; `None` leaves the field out.
     account_id: Option<&'static str>,
     /// `confirm` of the body; `None` leaves the field out.
     confirm: Option<&'static str>,
-    /// The audited status.
-    status: StatusCode,
-    /// The error code of the audited kind.
-    code: &'static str,
-    /// The audited message.
+    /// The messages constant of the row's text, [`NO_MESSAGE`] for a path
+    /// that sets none.
     message: &'static str,
-    /// The audited BMS field.
-    field: &'static str,
 }
 
 /// The entry edits and the refusals of `PROCESS-ENTER-KEY` before any write,
@@ -171,181 +190,143 @@ struct Refusal {
 /// [`REFUSAL_SETUP`]. None of them writes.
 const REFUSALS: [Refusal; 19] = [
     Refusal {
+        row: "V-COBIL00C-001",
         rows: "V-COBIL00C-001, P-COBIL00C-004",
         account_id: Some(""),
         confirm: Some("Y"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Empty.code(),
         message: messages::ACCT_ID_CAN_NOT_BE_EMPTY,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-001",
         rows: "V-COBIL00C-001, P-COBIL00C-004: a missing field is a blank one",
         account_id: None,
         confirm: Some(""),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Empty.code(),
         message: messages::ACCT_ID_CAN_NOT_BE_EMPTY,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-001",
         rows: "V-COBIL00C-001, P-COBIL00C-004: LOW-VALUES are blank",
         account_id: Some("\u{0}\u{0}\u{0}"),
         confirm: Some("Y"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Empty.code(),
         message: messages::ACCT_ID_CAN_NOT_BE_EMPTY,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-001",
         rows: "V-COBIL00C-001: the account edit (order 1) precedes the confirmation edit",
         account_id: Some("   "),
         confirm: Some("X"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Empty.code(),
         message: messages::ACCT_ID_CAN_NOT_BE_EMPTY,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-002",
         rows: "V-COBIL00C-002, P-COBIL00C-006",
         account_id: Some("00000000001"),
         confirm: Some("N"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: NO_MESSAGE,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-002",
         rows: "V-COBIL00C-002, P-COBIL00C-006: lower-case n",
         account_id: Some("00000000001"),
         confirm: Some("n"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: NO_MESSAGE,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-002",
         rows: "V-COBIL00C-002, P-COBIL00C-006: N reads no account",
         account_id: Some("99999999999"),
         confirm: Some("N"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: NO_MESSAGE,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-003",
         rows: "V-COBIL00C-003, P-COBIL00C-008",
         account_id: Some("00000000001"),
         confirm: Some("X"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: messages::INVALID_VALUE_VALID_VALUES_ARE_Y_N,
-        field: CONFIRM,
     },
     Refusal {
+        row: "V-COBIL00C-003",
         rows: "V-COBIL00C-003, P-COBIL00C-008: an invalid confirmation reads no account",
         account_id: Some("99999999999"),
         confirm: Some("?"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: messages::INVALID_VALUE_VALID_VALUES_ARE_Y_N,
-        field: CONFIRM,
     },
     Refusal {
+        row: "V-COBIL00C-004",
         rows: "V-COBIL00C-004, P-COBIL00C-009",
         account_id: Some("99999999999"),
         confirm: Some(""),
-        status: StatusCode::NOT_FOUND,
-        code: ErrorKind::NotFound.code(),
         message: messages::ACCOUNT_ID_NOT_FOUND,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-004",
         rows: "V-COBIL00C-004, P-COBIL00C-005, P-COBIL00C-009: confirmed",
         account_id: Some("99999999999"),
         confirm: Some("Y"),
-        status: StatusCode::NOT_FOUND,
-        code: ErrorKind::NotFound.code(),
         message: messages::ACCOUNT_ID_NOT_FOUND,
-        field: ACTIDIN,
     },
     // A non-digit leaves the `9(11)` key unpinned (E-47, halt); the answer is
     // the escalation's proposal, the account `NOTFND` row without a read.
     Refusal {
+        row: "V-COBIL00C-006",
         rows: "V-COBIL00C-006",
         account_id: Some("0000000000A"),
         confirm: Some(""),
-        status: StatusCode::NOT_FOUND,
-        code: ErrorKind::NotFound.code(),
         message: messages::ACCOUNT_ID_NOT_FOUND,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-007",
         rows: "V-COBIL00C-007, P-COBIL00C-010, P-COBIL00C-020: zero balance, blank confirm",
         account_id: Some("00000000004"),
         confirm: Some(""),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: messages::YOU_HAVE_NOTHING_TO_PAY,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-007",
         rows: "V-COBIL00C-007, P-COBIL00C-010, P-COBIL00C-020: zero balance, confirmed",
         account_id: Some("00000000004"),
         confirm: Some("Y"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: messages::YOU_HAVE_NOTHING_TO_PAY,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-007",
         rows: "V-COBIL00C-007, P-COBIL00C-020: a negative balance compares algebraically",
         account_id: Some("00000000005"),
         confirm: Some(""),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: messages::YOU_HAVE_NOTHING_TO_PAY,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-007",
         rows: "V-COBIL00C-007, P-COBIL00C-020: negative balance, confirmed",
         account_id: Some("00000000005"),
         confirm: Some("Y"),
-        status: StatusCode::BAD_REQUEST,
-        code: ErrorKind::Invalid.code(),
         message: messages::YOU_HAVE_NOTHING_TO_PAY,
-        field: ACTIDIN,
     },
     // The COBOL goes on to write the payment with the card number left in
     // `CARD-XREF-RECORD` (E-29, halt); the answer is the escalation's
     // proposal: the `NOTFND` message and no write (P-COBIL00C-025).
     Refusal {
+        row: "V-COBIL00C-009",
         rows: "V-COBIL00C-009, P-COBIL00C-011, P-COBIL00C-025",
         account_id: Some("00000000006"),
         confirm: Some("Y"),
-        status: StatusCode::NOT_FOUND,
-        code: ErrorKind::NotFound.code(),
         message: messages::ACCOUNT_ID_NOT_FOUND,
-        field: ACTIDIN,
     },
     // The seeded live master is empty: no TRAN-ID can be allocated (E-27).
     Refusal {
+        row: "V-COBIL00C-011",
         rows: "V-COBIL00C-011, P-COBIL00C-005, P-COBIL00C-013",
         account_id: Some("00000000001"),
         confirm: Some("Y"),
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: ErrorKind::Unexpected.code(),
         message: messages::UNABLE_TO_LOOKUP_TRANSACTION,
-        field: ACTIDIN,
     },
     Refusal {
+        row: "V-COBIL00C-011",
         rows: "V-COBIL00C-011, P-COBIL00C-005, P-COBIL00C-013: lower-case y confirms",
         account_id: Some("00000000001"),
         confirm: Some("y"),
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: ErrorKind::Unexpected.code(),
         message: messages::UNABLE_TO_LOOKUP_TRANSACTION,
-        field: ACTIDIN,
     },
 ];
 
@@ -369,9 +350,12 @@ impl Balance {
     }
 }
 
-/// A blank confirmation on an account with a positive balance: 200 with the
-/// balance and `Confirm to make a bill payment...`, no TRAN-ID, no write.
+/// A blank confirmation on an account with a positive balance: the status
+/// and text of its message-only row, with the balance, no TRAN-ID and no
+/// write.
 struct Prompt {
+    /// The primary validation row, whose status and text the answer carries.
+    row: &'static str,
     /// The audit rows the case proves.
     rows: &'static str,
     /// `account_id` of the body.
@@ -386,30 +370,35 @@ struct Prompt {
 /// leaves the seeded balances of accounts 1 and 6.
 const PROMPTS: [Prompt; 5] = [
     Prompt {
+        row: "V-COBIL00C-008",
         rows: "V-COBIL00C-008, P-COBIL00C-007",
         account_id: "00000000001",
         confirm: Some(""),
         balance: Balance::Seeded,
     },
     Prompt {
+        row: "V-COBIL00C-008",
         rows: "V-COBIL00C-008, P-COBIL00C-007: a missing confirmation is blank",
         account_id: "00000000001",
         confirm: None,
         balance: Balance::Seeded,
     },
     Prompt {
+        row: "V-COBIL00C-008",
         rows: "V-COBIL00C-008, P-COBIL00C-007: LOW-VALUES are blank",
         account_id: "00000000001",
         confirm: Some("\u{0}"),
         balance: Balance::Seeded,
     },
     Prompt {
+        row: "V-COBIL00C-008",
         rows: "V-COBIL00C-008, P-COBIL00C-020: one cent is more than zero",
         account_id: "00000000007",
         confirm: Some(" "),
         balance: Balance::Set("0.01"),
     },
     Prompt {
+        row: "V-COBIL00C-008",
         rows: "V-COBIL00C-008, P-COBIL00C-011: only a confirmed payment reads the cross-reference",
         account_id: "00000000006",
         confirm: Some(""),
@@ -419,6 +408,9 @@ const PROMPTS: [Prompt; 5] = [
 
 /// A confirmed payment with one or both of its writes made to fail.
 struct WriteFault {
+    /// The primary validation row: that of the last write that fails, whose
+    /// message replaces any earlier one (P-COBIL00C-019).
+    row: &'static str,
     /// The audit rows the case proves.
     rows: &'static str,
     /// The account paid; each case pays another, so no earlier case masks it.
@@ -427,18 +419,24 @@ struct WriteFault {
     faults: &'static [&'static str],
     /// The statements that remove it.
     repairs: &'static [&'static str],
-    /// The audited status.
-    status: StatusCode,
-    /// The error code of the audited kind.
-    code: &'static str,
-    /// The audited message, the last one the program set.
+    /// The messages constant of the row's text, the last one the program set.
     message: &'static str,
-    /// `acct_curr_bal` afterwards.
-    balance: After,
-    /// The TRAN-ID of the payment row that persists, which holds the
-    /// account's [`Payment::record`]; `None` when the transaction write
-    /// failed.
-    persisted: Option<&'static str>,
+}
+
+impl WriteFault {
+    /// Whether the fault fails write 1 of 2, the transaction `WRITE`.
+    fn fails_write(&self) -> bool {
+        self.faults
+            .iter()
+            .any(|fault| [INSERT_DUPLICATE, INSERT_FAILURE].contains(fault))
+    }
+
+    /// Whether the fault fails write 2 of 2, the account `REWRITE`.
+    fn fails_rewrite(&self) -> bool {
+        self.faults
+            .iter()
+            .any(|fault| [REWRITE_FAILURE, REWRITE_NOT_FOUND].contains(fault))
+    }
 }
 
 /// The `acct_curr_bal` of a paid account after its payment's writes.
@@ -461,73 +459,62 @@ impl After {
 }
 
 /// The E-19 cases in run order, after [`LIVE_ROW`], each paying a seeded
-/// balance ([`Payment::of`]). A failed `WRITE` still reduces and rewrites the
+/// balance ([`Payment::of`]). What each leaves follows from the reviewed E-19
+/// rows ([`e19_outcome`]): a failed `WRITE` still reduces and rewrites the
 /// balance; a failed `REWRITE` keeps the written transaction; both files are
 /// `RECOVERY(NONE)` [app/csd/CARDDEMO.CSD:L1-96]. A TRAN-ID whose insert
 /// failed is allocated again by the next case.
 const WRITE_FAULTS: [WriteFault; 5] = [
     WriteFault {
+        row: "V-COBIL00C-014",
         rows: "V-COBIL00C-014, P-COBIL00C-017, P-COBIL00C-018, P-COBIL00C-024",
         account_id: "00000000002",
         faults: &[INSERT_DUPLICATE],
         repairs: &[DROP_INSERT_FAULT],
-        status: StatusCode::CONFLICT,
-        code: ErrorKind::Duplicate.code(),
         message: messages::TRAN_ID_ALREADY_EXIST,
-        balance: After::Paid,
-        persisted: None,
     },
     WriteFault {
+        row: "V-COBIL00C-015",
         rows: "V-COBIL00C-015, P-COBIL00C-017, P-COBIL00C-018, P-COBIL00C-024",
         account_id: "00000000005",
         faults: &[INSERT_FAILURE],
         repairs: &[DROP_INSERT_FAULT],
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: ErrorKind::Unexpected.code(),
         message: messages::UNABLE_TO_ADD_BILL_PAY_TRANSACTION,
-        balance: After::Paid,
-        persisted: None,
     },
     WriteFault {
+        row: "V-COBIL00C-017",
         rows: "V-COBIL00C-017, P-COBIL00C-016, P-COBIL00C-019, P-COBIL00C-024",
         account_id: "00000000008",
         faults: &[REWRITE_FAILURE],
         repairs: &[DROP_REWRITE_FAULT],
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: ErrorKind::Unexpected.code(),
         message: messages::UNABLE_TO_UPDATE_ACCOUNT,
-        balance: After::Unchanged,
-        persisted: Some("0000000000000301"),
     },
     WriteFault {
+        row: "V-COBIL00C-016",
         rows: "V-COBIL00C-016, P-COBIL00C-016, P-COBIL00C-019, P-COBIL00C-024",
         account_id: "00000000009",
         faults: &[REWRITE_NOT_FOUND],
         repairs: &[DROP_REWRITE_FAULT],
-        status: StatusCode::NOT_FOUND,
-        code: ErrorKind::NotFound.code(),
         message: messages::ACCOUNT_ID_NOT_FOUND,
-        balance: After::Unchanged,
-        persisted: Some("0000000000000302"),
     },
     // `SEND-BILLPAY-SCREEN` does not end the task, so the rewrite's message
     // replaces the write's, and neither write persists.
     WriteFault {
+        row: "V-COBIL00C-017",
         rows: "V-COBIL00C-017, P-COBIL00C-003, P-COBIL00C-019: both writes fail",
         account_id: "00000000010",
         faults: &[INSERT_FAILURE, REWRITE_FAILURE],
         repairs: &[DROP_INSERT_FAULT, DROP_REWRITE_FAULT],
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: ErrorKind::Unexpected.code(),
         message: messages::UNABLE_TO_UPDATE_ACCOUNT,
-        balance: After::Unchanged,
-        persisted: None,
     },
 ];
 
 /// A confirmed payment on account 1 with one of its reads made to fail by
 /// renaming the relation it reads.
 struct ReadFault {
+    /// The primary validation row, whose status, error code, BMS field and
+    /// text the answer carries.
+    row: &'static str,
     /// The audit rows the case proves.
     rows: &'static str,
     /// The rename that hides the relation.
@@ -536,13 +523,14 @@ struct ReadFault {
     repair: &'static str,
     /// `confirm` of the body.
     confirm: &'static str,
-    /// The audited message, a 500 on `ACTIDIN`.
+    /// The messages constant of the row's text.
     message: &'static str,
 }
 
 /// The read failures, in the order of the reads.
-const READ_FAULTS: [ReadFault; 4] = [
+const READ_FAULTS: [ReadFault; 5] = [
     ReadFault {
+        row: "V-COBIL00C-005",
         rows: "V-COBIL00C-005, P-COBIL00C-009",
         fault: "ALTER TABLE accounts RENAME TO accounts_cb00_hidden",
         repair: "ALTER TABLE accounts_cb00_hidden RENAME TO accounts",
@@ -550,6 +538,7 @@ const READ_FAULTS: [ReadFault; 4] = [
         message: messages::UNABLE_TO_LOOKUP_ACCOUNT,
     },
     ReadFault {
+        row: "V-COBIL00C-005",
         rows: "V-COBIL00C-005, P-COBIL00C-007, P-COBIL00C-009: the prompt reads the account too",
         fault: "ALTER TABLE accounts RENAME TO accounts_cb00_hidden",
         repair: "ALTER TABLE accounts_cb00_hidden RENAME TO accounts",
@@ -559,6 +548,7 @@ const READ_FAULTS: [ReadFault; 4] = [
     // The COBOL goes on with the payment after this read too (E-29, halt);
     // the escalation's proposal stops with the message and writes nothing.
     ReadFault {
+        row: "V-COBIL00C-010",
         rows: "V-COBIL00C-010, P-COBIL00C-011, P-COBIL00C-025",
         fault: "ALTER TABLE card_xref RENAME TO card_xref_cb00_hidden",
         repair: "ALTER TABLE card_xref_cb00_hidden RENAME TO card_xref",
@@ -566,10 +556,20 @@ const READ_FAULTS: [ReadFault; 4] = [
         message: messages::UNABLE_TO_LOOKUP_XREF_AIX_FILE,
     },
     // The replacement reads the highest live key in one statement, in place
-    // of both the `STARTBR` and the `READPREV` of the browse; the `READPREV`
-    // `ENDFILE` path is unreachable after a successful `STARTBR`.
+    // of both the `STARTBR` and the `READPREV` of the browse, so a failure of
+    // that read answers as each of their rows; the `READPREV` `ENDFILE` path
+    // is unreachable after a successful `STARTBR`.
     ReadFault {
-        rows: "V-COBIL00C-012, V-COBIL00C-013, P-COBIL00C-014",
+        row: "V-COBIL00C-012",
+        rows: "V-COBIL00C-012, P-COBIL00C-014: the one read stands for the STARTBR",
+        fault: "ALTER VIEW transaction_master RENAME TO transaction_master_cb00_hidden",
+        repair: "ALTER VIEW transaction_master_cb00_hidden RENAME TO transaction_master",
+        confirm: "Y",
+        message: messages::UNABLE_TO_LOOKUP_TRANSACTION,
+    },
+    ReadFault {
+        row: "V-COBIL00C-013",
+        rows: "V-COBIL00C-013, P-COBIL00C-014: and for the READPREV",
         fault: "ALTER VIEW transaction_master RENAME TO transaction_master_cb00_hidden",
         repair: "ALTER VIEW transaction_master_cb00_hidden RENAME TO transaction_master",
         confirm: "Y",
@@ -608,54 +608,239 @@ fn request(account_id: Option<&str>, confirm: Option<&str>) -> Value {
     Value::Object(body)
 }
 
-/// Asserts that `resp` is the error answer `status` with `code` and
-/// `message`, its one `fields` entry `field` carrying `message` too. A status,
-/// code or message that differs names `rows`, the audit rows of the case.
-fn assert_refused(
-    resp: &Resp,
-    rows: &str,
+/// The `code` of the error body for each `kind=` a validation row names: the
+/// `ErrorBody::code` values `carddemo_api::error` publishes. The table is
+/// written out here, not taken from the domain's error kinds, so the test
+/// checks the published wire codes independently of the mapping it tests.
+const KIND_CODES: [(&str, &str); 5] = [
+    ("Invalid", "INVALID"),
+    ("Empty", "EMPTY"),
+    ("NotFound", "NOT_FOUND"),
+    ("Duplicate", "DUPLICATE"),
+    ("Unexpected", "UNEXPECTED"),
+];
+
+/// The `kind=` of a message-only row: no error flag, no error body.
+const NO_KIND: &str = "none";
+
+/// The error-body `code` of the audit kind `kind`.
+fn kind_code(kind: &str) -> &'static str {
+    let Some((_, code)) = KIND_CODES.iter().find(|(name, _)| *name == kind) else {
+        panic!("no error code is published for the audit kind {kind:?}");
+    };
+    code
+}
+
+/// The HTTP status `text` names in the cell of audit row `id`.
+fn parse_status(text: &str, id: &str) -> StatusCode {
+    text.parse::<u16>()
+        .ok()
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or_else(|| panic!("{id} assigns no HTTP status: {text:?}"))
+}
+
+/// The trimmed cell `name` of the data row `id` of `doc`, an audit.
+fn cell<'d>(doc: &'d Document, id: &str, name: &str) -> &'d str {
+    let Some((table, row)) = doc.find_row(id) else {
+        panic!("the audit defines no {id} row");
+    };
+    table
+        .cell(row, name)
+        .unwrap_or_else(|| panic!("{id} has no `{name}` cell"))
+        .trim()
+}
+
+/// The answer a validation row gives.
+#[derive(Debug)]
+struct Audited {
+    /// The HTTP status of its `Status` cell.
     status: StatusCode,
-    code: &str,
-    message: &str,
-    field: &str,
-) {
+    /// The error code of its `kind=`; `None` for [`NO_KIND`].
+    code: Option<&'static str>,
+    /// Its `BMS field`, the `fields[].field` of an error body.
+    field: String,
+    /// The exact text the answer carries ([`audited_text`]).
+    message: String,
+}
+
+/// The answer of the validation row `id` of `validation`, once its review
+/// passed and its text is `message`, the messages constant a case names.
+fn audited(validation: &Document, id: &str, message: &str) -> Audited {
+    assert_reviewed(validation, &[id]);
+    let text = audited_text(validation, id);
+    assert_eq!(
+        text, message,
+        "{id}: the messages constant is the audited text"
+    );
+    let trigger = cell(validation, id, "Trigger condition");
+    let Some(kind) = carddemo_audit::key_values(trigger)
+        .into_iter()
+        .rev()
+        .find(|pair| pair.key == "kind")
+    else {
+        panic!("{id} names no kind: {trigger}");
+    };
+    Audited {
+        status: parse_status(cell(validation, id, "Status"), id),
+        code: (kind.value != NO_KIND).then(|| kind_code(&kind.value)),
+        field: cell(validation, id, "BMS field").to_owned(),
+        message: text,
+    }
+}
+
+/// The text the answer of the validation row `id` carries: the first code
+/// span of its `Message text`, unquoted, which a note may follow. A
+/// `no-message` row sets none and answers with no text, except a row under
+/// [`NON_DIGIT_KEY`], whose trigger records that its proposal answers as the
+/// account `NOTFND` row, [`ACCOUNT_NOTFND_ROW`], and so carries that row's
+/// text.
+fn audited_text(validation: &Document, id: &str) -> String {
+    let text = cell(validation, id, "Message text");
+    if !carddemo_audit::is_no_message(text) {
+        let Some(span) = carddemo_audit::code_span(text) else {
+            panic!("{id} quotes no message text: {text}");
+        };
+        return unquote(&span.text, id);
+    }
+    let Some(escalation) = carddemo_audit::no_message_escalation(text) else {
+        panic!("{id}: {text:?} links no escalation");
+    };
+    if escalation != NON_DIGIT_KEY {
+        return String::new();
+    }
+    let trigger = cell(validation, id, "Trigger condition");
+    assert!(
+        trigger.contains(NOTFND_PROPOSAL),
+        "{id}: the {escalation} proposal {NOTFND_PROPOSAL:?}: {trigger}"
+    );
+    assert_reviewed(validation, &[ACCOUNT_NOTFND_ROW]);
+    let notfnd = cell(validation, ACCOUNT_NOTFND_ROW, "Trigger condition");
+    assert!(
+        notfnd.contains(ACCOUNT_NOTFND),
+        "{ACCOUNT_NOTFND_ROW} is the account NOTFND row: {notfnd}"
+    );
+    audited_text(validation, ACCOUNT_NOTFND_ROW)
+}
+
+/// Asserts that `resp` is the error answer of the validation row `id` of
+/// `validation`, whose text the messages constant `message` holds: the row's
+/// status, the error code of its kind, `message`, and one `fields` entry, the
+/// row's BMS field, carrying `message` too. A status, code or message that
+/// differs names `rows`, the audit rows of the case.
+fn assert_refused(resp: &Resp, validation: &Document, id: &str, rows: &str, message: &str) {
+    let answer = audited(validation, id, message);
+    let Some(code) = answer.code else {
+        panic!("{rows}: {id} records no error kind, so it refuses nothing");
+    };
     let (actual, body, raw) = resp;
     assert_eq!(
         (*actual, body["code"].as_str(), body["message"].as_str()),
-        (status, Some(code), Some(message)),
-        "{rows}: status, code and message: {raw}"
+        (answer.status, Some(code), Some(message)),
+        "{rows}: status, code and message of {id}: {raw}"
     );
-    assert_error(resp, status, code, message, &[(field, message)]);
+    assert_error(
+        resp,
+        answer.status,
+        code,
+        message,
+        &[(answer.field.as_str(), message)],
+    );
 }
 
-/// Asserts that `resp` is the 200 confirmation prompt `expected`: exactly the
-/// account, its balance, a seeded one decoded through `parity`, and
-/// `Confirm to make a bill payment...`, with no TRAN-ID.
-fn assert_prompt(resp: &Resp, expected: &Prompt, parity: &Document) {
+/// Asserts that `resp` is the confirmation prompt `expected`: the status of
+/// its message-only row in `validation`, and exactly the account, its
+/// balance, a seeded one decoded through `parity`, and the row's text, which
+/// [`messages::CONFIRM_TO_MAKE_A_BILL_PAYMENT`] holds, with no TRAN-ID.
+fn assert_prompt(resp: &Resp, expected: &Prompt, parity: &Document, validation: &Document) {
+    let answer = audited(
+        validation,
+        expected.row,
+        messages::CONFIRM_TO_MAKE_A_BILL_PAYMENT,
+    );
+    assert_eq!(
+        answer.code, None,
+        "{}: {} sets no error kind",
+        expected.rows, expected.row
+    );
     let (status, body, raw) = resp;
     let prompt = json!({
         "account_id": expected.account_id,
         "current_balance": expected.balance.of(parity, expected.account_id),
-        "message": messages::CONFIRM_TO_MAKE_A_BILL_PAYMENT,
+        "message": answer.message,
     });
     assert_eq!(
         (*status, body),
-        (StatusCode::OK, &prompt),
+        (answer.status, &prompt),
         "{}: the prompt: {raw}",
         expected.rows
     );
 }
 
+/// The success text of P-COBIL00C-016: the quoted pieces `STRING` joins
+/// around the TRAN-ID.
+struct Success {
+    /// The first piece, `"Payment successful. "`.
+    head: String,
+    /// The piece before the TRAN-ID, `" Your Transaction ID is "`.
+    middle: String,
+    /// The piece after the TRAN-ID, `"."`.
+    tail: String,
+}
+
+impl Success {
+    /// The success text of the payment given `tran_id`. The TRAN-ID holds no
+    /// space, so `DELIMITED BY SPACE` takes all 16 digits.
+    fn text(&self, tran_id: &str) -> String {
+        [self.head.as_str(), &self.middle, tran_id, &self.tail].concat()
+    }
+}
+
+/// The success text the reviewed P-COBIL00C-016 of `parity` records: the
+/// three quoted pieces of its `message=`.
+fn success_answer(parity: &Document) -> Success {
+    let id = "P-COBIL00C-016";
+    assert_reviewed(parity, &[id]);
+    let result = expected_cell(parity, id);
+    let Some(message) = carddemo_audit::key_values(result)
+        .into_iter()
+        .find(|pair| pair.key == "message")
+    else {
+        panic!("{id} gives no message=: {result}");
+    };
+    let pieces: Vec<String> = carddemo_audit::cell_code_spans(&message.value)
+        .iter()
+        .map(|span| unquote(&span.text, id))
+        .collect();
+    let Ok([head, middle, tail]) = <[String; 3]>::try_from(pieces) else {
+        panic!("{id} builds its message from three quoted pieces: {result}");
+    };
+    Success { head, middle, tail }
+}
+
 /// Asserts that `resp` is the 201 answer of a payment on `account_id` under
-/// `tran_id`: exactly the balance after it, the TRAN-ID and the composed
-/// `Payment successful.  Your Transaction ID is <tran-id>.` text.
-fn assert_paid(resp: &Resp, rows: &str, account_id: &str, balance: &str, tran_id: &str) {
+/// `tran_id`: exactly the balance after it, the TRAN-ID and the text
+/// `success` joins around it, which the catalog's
+/// [`messages::payment_successful_message`] composes too.
+fn assert_paid(
+    resp: &Resp,
+    success: &Success,
+    rows: &str,
+    account_id: &str,
+    balance: &str,
+    tran_id: &str,
+) {
+    let text = success.text(tran_id);
+    assert_eq!(
+        messages::payment_successful_message(tran_id),
+        text,
+        "P-COBIL00C-016: the catalog composes the audited success text of {tran_id}"
+    );
     let (status, body, raw) = resp;
     let paid = json!({
         "account_id": account_id,
         "current_balance": balance,
         "tran_id": tran_id,
-        "message": messages::payment_successful_message(tran_id),
+        "message": text,
     });
     assert_eq!(
         (*status, body),
@@ -664,22 +849,101 @@ fn assert_paid(resp: &Resp, rows: &str, account_id: &str, balance: &str, tran_id
     );
 }
 
+/// The literals `PROCESS-ENTER-KEY` moves into the payment record, as the
+/// reviewed P-COBIL00C-015 records them, each as [`ADDED_ROWS`] reads its
+/// column.
+struct RecordLiterals {
+    /// `TRAN-TYPE-CD`.
+    type_cd: String,
+    /// `TRAN-CAT-CD`.
+    cat_cd: String,
+    /// `TRAN-SOURCE`.
+    source: String,
+    /// `TRAN-DESC`.
+    desc: String,
+    /// `TRAN-MERCHANT-ID`.
+    merchant_id: String,
+    /// `TRAN-MERCHANT-NAME`.
+    merchant_name: String,
+    /// `TRAN-MERCHANT-CITY`.
+    merchant_city: String,
+    /// `TRAN-MERCHANT-ZIP`.
+    merchant_zip: String,
+}
+
+/// The [`RecordLiterals`] of the reviewed P-COBIL00C-015 of `parity`: the
+/// comma-separated `fields=` of its expected result, each a label and its
+/// value, a single-quoted code, a number or a quoted text. No literal holds a
+/// comma.
+fn record_literals(parity: &Document) -> RecordLiterals {
+    let id = "P-COBIL00C-015";
+    assert_reviewed(parity, &[id]);
+    let result = expected_cell(parity, id);
+    let Some(fields) = carddemo_audit::key_values(result)
+        .into_iter()
+        .find(|pair| pair.key == "fields")
+    else {
+        panic!("{id} gives no fields=: {result}");
+    };
+    let items: Vec<&str> = fields.value.split(", ").collect();
+    let value = |label: &str| {
+        let Some(value) = items.iter().find_map(|item| item.strip_prefix(label)) else {
+            panic!("{id} records no {label:?}: {}", fields.value);
+        };
+        value.trim()
+    };
+    let number = |label: &str| {
+        let text = value(label).split_whitespace().next().unwrap_or_default();
+        let number: u64 = text
+            .parse()
+            .unwrap_or_else(|error| panic!("{id}: {label:?} {text:?} is no number: {error}"));
+        number.to_string()
+    };
+    let quoted = |label: &str| {
+        let Some(span) = carddemo_audit::code_span(value(label)) else {
+            panic!("{id} quotes no text after {label:?}: {}", fields.value);
+        };
+        unquote(&span.text, id)
+    };
+    let code = value("TRAN-TYPE-CD ");
+    let Some(type_cd) = code
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    else {
+        panic!("{id}: TRAN-TYPE-CD {code:?} is no single-quoted code");
+    };
+    RecordLiterals {
+        type_cd: type_cd.to_owned(),
+        cat_cd: number("TRAN-CAT-CD "),
+        source: quoted("TRAN-SOURCE "),
+        desc: quoted("TRAN-DESC "),
+        merchant_id: number("merchant id "),
+        merchant_name: quoted("name "),
+        merchant_city: quoted("city "),
+        merchant_zip: quoted("zip "),
+    }
+}
+
 /// The payment record under `tran_id` for `amount` on the card `card`, as
-/// [`ADDED_ROWS`] reads it: type `02`, category 0002, source `POS TERM`,
-/// description `BILL PAYMENT - ONLINE`, merchant 999999999 `BILL PAYMENT`
-/// in `N/A`, `N/A`, and both timestamps [`PAYMENT_TS`].
-fn payment_row(tran_id: &str, amount: &str, card: &str) -> Vec<Option<String>> {
+/// [`ADDED_ROWS`] reads it: the `literals` of P-COBIL00C-015 and both
+/// timestamps [`PAYMENT_TS`].
+fn payment_row(
+    literals: &RecordLiterals,
+    tran_id: &str,
+    amount: &str,
+    card: &str,
+) -> Vec<Option<String>> {
     [
         tran_id,
-        "02",
-        "2",
-        "POS TERM",
-        "BILL PAYMENT - ONLINE",
+        &literals.type_cd,
+        &literals.cat_cd,
+        &literals.source,
+        &literals.desc,
         amount,
-        "999999999",
-        "BILL PAYMENT",
-        "N/A",
-        "N/A",
+        &literals.merchant_id,
+        &literals.merchant_name,
+        &literals.merchant_city,
+        &literals.merchant_zip,
         card,
         PAYMENT_TS,
         PAYMENT_TS,
@@ -687,6 +951,87 @@ fn payment_row(tran_id: &str, amount: &str, card: &str) -> Vec<Option<String>> {
     .into_iter()
     .map(|value| Some(value.to_owned()))
     .collect()
+}
+
+/// Asserts that the reviewed parity row `id` of `parity` records `text` in
+/// its cell `name`.
+fn assert_records(parity: &Document, id: &str, name: &str, text: &str) {
+    assert_reviewed(parity, &[id]);
+    let recorded = cell(parity, id, name);
+    assert!(
+        recorded.contains(text),
+        "{id}: its {name} records no {text:?}: {recorded}"
+    );
+}
+
+/// What a confirmed payment leaves when `fault` fails one or both of its
+/// writes, as the reviewed E-19 rows of `parity` record it: the balance the
+/// account ends with, and whether the payment's transaction row persists.
+///
+/// A completed transaction `WRITE` persists when the `REWRITE` then fails
+/// (P-COBIL00C-016, `RECOVERY(NONE)`); a failed `WRITE` still has the balance
+/// reduced and rewritten (P-COBIL00C-017, P-COBIL00C-018, P-COBIL00C-024),
+/// each write under its own savepoint (P-COBIL00C-024); and the `REWRITE`'s
+/// message replaces any earlier one (P-COBIL00C-019), so the case's primary
+/// row in `validation` is that of the last write that fails.
+fn e19_outcome(parity: &Document, validation: &Document, fault: &WriteFault) -> (After, bool) {
+    assert_reviewed(parity, &["P-COBIL00C-016"]);
+    let persists = cell(parity, "P-COBIL00C-016", "Persists on later failure");
+    assert!(
+        persists.starts_with("persists") && persists.contains("RECOVERY(NONE)"),
+        "P-COBIL00C-016: the transaction write persists on a later failure: {persists}"
+    );
+    assert_records(
+        parity,
+        "P-COBIL00C-017",
+        "Expected result",
+        "the balance update below still runs (E-19)",
+    );
+    assert_records(
+        parity,
+        "P-COBIL00C-018",
+        "Input condition",
+        "whatever its outcome",
+    );
+    assert_records(
+        parity,
+        "P-COBIL00C-019",
+        "Expected result",
+        "this message replaces any earlier one",
+    );
+    assert_records(
+        parity,
+        "P-COBIL00C-024",
+        "Expected result",
+        "the balance rewrite still runs; each write under its own savepoint",
+    );
+    let last = if fault.fails_rewrite() {
+        "UPDATE-ACCTDAT-FILE"
+    } else {
+        "WRITE-TRANSACT-FILE"
+    };
+    let paragraph = cell(validation, fault.row, "Validation paragraph");
+    assert!(
+        paragraph.starts_with(last),
+        "{}: {} is the row of the last failing write, {last}: {paragraph}",
+        fault.rows,
+        fault.row
+    );
+    let balance = if fault.fails_rewrite() {
+        After::Unchanged
+    } else {
+        After::Paid
+    };
+    (balance, !fault.fails_write())
+}
+
+/// `WS-TRAN-ID-NUM + 1`: the TRAN-ID after `tran_id`, the highest key, in the
+/// `9(16)` working field, zero-padded to 16 digits (P-COBIL00C-012).
+fn next_tran_id(tran_id: &str) -> String {
+    let number: u64 = tran_id
+        .parse()
+        .unwrap_or_else(|error| panic!("{tran_id:?} is no TRAN-ID: {error}"));
+    format!("{:016}", number + 1)
 }
 
 /// Sets the balance of `account_id`, an 11-digit entry, in `balances`, a
@@ -741,6 +1086,9 @@ struct Payment {
     /// The card of the payment record, the account's `XREF-CARD-NUM`
     /// ([`seeded_card`], P-COBIL00C-015).
     card: String,
+    /// The literals of the payment record ([`record_literals`],
+    /// P-COBIL00C-015).
+    literals: RecordLiterals,
 }
 
 impl Payment {
@@ -751,7 +1099,8 @@ impl Payment {
     /// Panics if the seeded balance is no decimal, is not above zero, which
     /// the guard of P-COBIL00C-020 refuses, or reaches [`TRAN_AMT_OVERFLOW`],
     /// which the `MOVE` of P-COBIL00C-021 truncates; and as
-    /// [`fixture_records::account`] and [`fixture_records::account_xref`] do.
+    /// [`fixture_records::account`], [`fixture_records::account_xref`] and
+    /// [`record_literals`] do.
     fn of(parity: &Document, account_id: &str) -> Self {
         let balance = seeded_balance(parity, account_id);
         let seeded = Decimal::from_str(&balance).unwrap_or_else(|error| {
@@ -771,13 +1120,14 @@ impl Payment {
             amount: amount.to_string(),
             after: (seeded - amount).to_string(),
             card: seeded_card(parity, account_id),
+            literals: record_literals(parity),
             balance,
         }
     }
 
     /// The payment record under `tran_id`, as [`ADDED_ROWS`] reads it.
     fn record(&self, tran_id: &str) -> Vec<Option<String>> {
-        payment_row(tran_id, &self.amount, &self.card)
+        payment_row(&self.literals, tran_id, &self.amount, &self.card)
     }
 }
 
@@ -796,11 +1146,68 @@ fn assert_reviewed_seed(parity: &Document, account_id: &str, balance: &str) {
     );
 }
 
+/// Every `V-COBIL00C` row is the primary row of a case of this file, and each
+/// case agrees with its row: the row's review passed, the messages constant
+/// the case names is the row's text, a refusal's row is an error with a kind
+/// and a prompt's row a success without one, and a write fault's row is that
+/// of its last failing write. Needs no container.
+#[test]
+fn every_cobil00c_row_is_a_case_with_its_audited_answer() {
+    let validation = common::validation_audit();
+    let parity = common::parity_audit();
+    let mut primary = BTreeSet::new();
+    let refusals = REFUSALS
+        .iter()
+        .map(|case| (case.row, case.rows, case.message))
+        .chain(
+            WRITE_FAULTS
+                .iter()
+                .map(|case| (case.row, case.rows, case.message)),
+        )
+        .chain(
+            READ_FAULTS
+                .iter()
+                .map(|case| (case.row, case.rows, case.message)),
+        );
+    for (row, rows, message) in refusals {
+        let answer = audited(&validation, row, message);
+        assert!(
+            answer.code.is_some()
+                && (answer.status.is_client_error() || answer.status.is_server_error()),
+            "{rows}: {row} refuses with an error kind: {answer:?}"
+        );
+        primary.insert(row.to_owned());
+    }
+    for prompt in &PROMPTS {
+        let answer = audited(
+            &validation,
+            prompt.row,
+            messages::CONFIRM_TO_MAKE_A_BILL_PAYMENT,
+        );
+        assert!(
+            answer.code.is_none() && answer.status.is_success(),
+            "{}: {} answers without an error kind: {answer:?}",
+            prompt.rows,
+            prompt.row
+        );
+        primary.insert(prompt.row.to_owned());
+    }
+    for case in &WRITE_FAULTS {
+        e19_outcome(&parity, &validation, case);
+    }
+    let defined: BTreeSet<String> = common::validation_ids(PROGRAM).into_iter().collect();
+    assert_eq!(
+        primary, defined,
+        "the primary rows of this file's cases are the {PROGRAM} rows of the audit"
+    );
+}
+
 /// `PROCESS-ENTER-KEY` up to the TRAN-ID allocation: every entry edit, read
 /// refusal and confirmation prompt answers as audited, and none writes.
 #[test]
 fn entry_edits_refusals_and_prompts_write_nothing() {
     let parity = common::parity_audit();
+    let validation = common::validation_audit();
     let app = TestApp::start_with_clock(CLOCK);
     carddemo_testkit::block_on(async {
         app.stack().exec_sql(REFUSAL_SETUP).await;
@@ -811,17 +1218,16 @@ fn entry_edits_refusals_and_prompts_write_nothing() {
             let resp = app.post(PAYMENTS, Some(&token), &body).await;
             assert_refused(
                 &resp,
+                &validation,
+                refusal.row,
                 refusal.rows,
-                refusal.status,
-                refusal.code,
                 refusal.message,
-                refusal.field,
             );
         }
         for prompt in &PROMPTS {
             let body = request(Some(prompt.account_id), prompt.confirm);
             let resp = app.post(PAYMENTS, Some(&token), &body).await;
-            assert_prompt(&resp, prompt, &parity);
+            assert_prompt(&resp, prompt, &parity, &validation);
         }
         assert_eq!(
             written(&app).await,
@@ -839,6 +1245,8 @@ fn entry_edits_refusals_and_prompts_write_nothing() {
 #[test]
 fn a_confirmed_payment_pays_the_whole_balance() {
     let parity = common::parity_audit();
+    let validation = common::validation_audit();
+    let success = success_answer(&parity);
     let payment = Payment::of(&parity, "00000000001");
     assert_reviewed_seed(&parity, "00000000001", &payment.balance);
     let oversized_card = seeded_card(&parity, "00000000003");
@@ -857,6 +1265,7 @@ fn a_confirmed_payment_pays_the_whole_balance() {
             "P-COBIL00C-012, P-COBIL00C-016, P-COBIL00C-022: highest key + 1, whole balance paid";
         assert_paid(
             &paid,
+            &success,
             rows,
             "00000000001",
             &payment.after,
@@ -872,11 +1281,10 @@ fn a_confirmed_payment_pays_the_whole_balance() {
         let again = app.post(PAYMENTS, Some(&token), &body).await;
         assert_refused(
             &again,
+            &validation,
+            "V-COBIL00C-007",
             "V-COBIL00C-007, P-COBIL00C-010: the account just paid",
-            StatusCode::BAD_REQUEST,
-            ErrorKind::Invalid.code(),
             messages::YOU_HAVE_NOTHING_TO_PAY,
-            ACTIDIN,
         );
 
         // 1234567890.12 loses its high-order digit in the `S9(09)V99`
@@ -887,12 +1295,18 @@ fn a_confirmed_payment_pays_the_whole_balance() {
             "P-COBIL00C-005, P-COBIL00C-021, P-COBIL00C-022: 1234567890.12 pays 234567890.12";
         assert_paid(
             &truncated,
+            &success,
             rows,
             "00000000003",
             "1000000000.00",
             "0000000000000302",
         );
-        let second = payment_row("0000000000000302", "234567890.12", &oversized_card);
+        let second = payment_row(
+            &payment.literals,
+            "0000000000000302",
+            "234567890.12",
+            &oversized_card,
+        );
         assert_eq!(
             stack.fetch_text_rows(ADDED_ROWS).await,
             [first, second],
@@ -925,10 +1339,13 @@ fn a_confirmed_payment_pays_the_whole_balance() {
 }
 
 /// E-19: each write of a confirmed payment keeps its outcome when the other
-/// fails, and the answer is the last message the program set.
+/// fails, as the reviewed E-19 rows record it ([`e19_outcome`]), and the
+/// answer is the last message the program set. A persisting payment row
+/// takes the TRAN-ID after the highest persisted key (P-COBIL00C-012).
 #[test]
 fn a_failed_write_keeps_the_other_write() {
     let parity = common::parity_audit();
+    let validation = common::validation_audit();
     let app = TestApp::start_with_clock(CLOCK);
     carddemo_testkit::block_on(async {
         let stack = app.stack();
@@ -936,9 +1353,11 @@ fn a_failed_write_keeps_the_other_write() {
         stack.exec_sql(FAULT_FUNCTIONS).await;
         let mut balances = stack.fetch_text_rows(BALANCES).await;
         let mut persisted = Vec::new();
+        let mut highest = LIVE_TRAN_ID.to_owned();
         let token = app.user_token().await;
         for case in &WRITE_FAULTS {
             let payment = Payment::of(&parity, case.account_id);
+            let (after, persists) = e19_outcome(&parity, &validation, case);
             for fault in case.faults {
                 stack.exec_sql(fault).await;
             }
@@ -947,23 +1366,18 @@ fn a_failed_write_keeps_the_other_write() {
             for repair in case.repairs {
                 stack.exec_sql(repair).await;
             }
-            assert_refused(
-                &resp,
-                case.rows,
-                case.status,
-                case.code,
-                case.message,
-                ACTIDIN,
-            );
-            set_balance(&mut balances, case.account_id, case.balance.of(&payment));
+            assert_refused(&resp, &validation, case.row, case.rows, case.message);
+            set_balance(&mut balances, case.account_id, after.of(&payment));
             assert_eq!(
                 stack.fetch_text_rows(BALANCES).await,
                 balances,
                 "{}: the balances",
                 case.rows
             );
-            if let Some(tran_id) = case.persisted {
-                persisted.push(payment.record(tran_id));
+            if persists {
+                let tran_id = next_tran_id(&highest);
+                persisted.push(payment.record(&tran_id));
+                highest = tran_id;
             }
             assert_eq!(
                 stack.fetch_text_rows(ADDED_ROWS).await,
@@ -987,7 +1401,10 @@ fn a_failed_write_keeps_the_other_write() {
 /// same payment goes through.
 #[test]
 fn a_failed_read_writes_nothing() {
-    let payment = Payment::of(&common::parity_audit(), "00000000001");
+    let parity = common::parity_audit();
+    let validation = common::validation_audit();
+    let success = success_answer(&parity);
+    let payment = Payment::of(&parity, "00000000001");
     let app = TestApp::start_with_clock(CLOCK);
     carddemo_testkit::block_on(async {
         let stack = app.stack();
@@ -999,14 +1416,7 @@ fn a_failed_read_writes_nothing() {
             let body = request(Some("00000000001"), Some(case.confirm));
             let resp = app.post(PAYMENTS, Some(&token), &body).await;
             stack.exec_sql(case.repair).await;
-            assert_refused(
-                &resp,
-                case.rows,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorKind::Unexpected.code(),
-                case.message,
-                ACTIDIN,
-            );
+            assert_refused(&resp, &validation, case.row, case.rows, case.message);
         }
         assert_eq!(
             written(&app).await,
@@ -1018,6 +1428,7 @@ fn a_failed_read_writes_nothing() {
         let rows = "P-COBIL00C-012, P-COBIL00C-016: the restored relations serve the payment";
         assert_paid(
             &paid,
+            &success,
             rows,
             "00000000001",
             &payment.after,
@@ -1207,6 +1618,7 @@ fn cb00_screen_mechanics_answer_through_the_one_post() {
         "a successful payment is 201 with that text in message",
     );
     let examples = edited_examples(&doc, "P-COBIL00C-023");
+    let validation = common::validation_audit();
     let app = TestApp::start_with_clock(CLOCK);
     carddemo_testkit::block_on(async {
         let stack = app.stack();
@@ -1214,15 +1626,15 @@ fn cb00_screen_mechanics_answer_through_the_one_post() {
         stack.exec_sql(MECHANICS_SETUP).await;
         let token = app.user_token().await;
         let before = written(&app).await;
-        preselected_account(&app, &token, &doc, &examples).await;
-        received_map_and_keys(&app, &token).await;
+        preselected_account(&app, &token, &doc, &validation, &examples).await;
+        received_map_and_keys(&app, &token, &validation).await;
         without_a_session(&app).await;
         assert_eq!(
             written(&app).await,
             before,
             "P-COBIL00C-001, P-COBIL00C-002, P-COBIL00C-027, P-COBIL00C-028: nothing written"
         );
-        initialized_form(&app, &token, &doc).await;
+        initialized_form(&app, &token, &doc, &validation).await;
     });
 }
 
@@ -1230,14 +1642,16 @@ fn cb00_screen_mechanics_answer_through_the_one_post() {
 /// `ACTIDINI` and runs `PROCESS-ENTER-KEY` with `CONFIRMI` still
 /// `LOW-VALUES`, so the body holding the account alone answers the prompt,
 /// with the balance the `GET /accounts/{id}` preview shows, or the
-/// nothing-to-pay refusal: account 1 at its seeded balance, decoded through
-/// `parity`, and account 3 at the balance [`MECHANICS_SETUP`] sets.
-/// P-COBIL00C-023: the prompt carries `ACCT-CURR-BAL` exactly, and
-/// `WS-CURR-BAL` edits it to the audited screen text.
+/// nothing-to-pay refusal, each as its row of `validation` answers: account
+/// 1 at its seeded balance, decoded through `parity`, and account 3 at the
+/// balance [`MECHANICS_SETUP`] sets. P-COBIL00C-023: the prompt carries
+/// `ACCT-CURR-BAL` exactly, and `WS-CURR-BAL` edits it to the audited screen
+/// text.
 async fn preselected_account(
     app: &TestApp,
     token: &str,
     parity: &Document,
+    validation: &Document,
     examples: &[(Decimal, String)],
 ) {
     for (account_id, balance) in [
@@ -1248,12 +1662,13 @@ async fn preselected_account(
             .post(PAYMENTS, Some(token), &request(Some(account_id), None))
             .await;
         let prompt = Prompt {
+            row: "V-COBIL00C-008",
             rows: "P-COBIL00C-001: the preselected account alone",
             account_id,
             confirm: None,
             balance,
         };
-        assert_prompt(&resp, &prompt, parity);
+        assert_prompt(&resp, &prompt, parity, validation);
         let view = app
             .get(&format!("/accounts/{account_id}"), Some(token))
             .await;
@@ -1282,29 +1697,28 @@ async fn preselected_account(
         .await;
     assert_refused(
         &resp,
+        validation,
+        "V-COBIL00C-007",
         "P-COBIL00C-001: a preselected account with nothing to pay",
-        StatusCode::BAD_REQUEST,
-        ErrorKind::Invalid.code(),
         messages::YOU_HAVE_NOTHING_TO_PAY,
-        ACTIDIN,
     );
 }
 
 /// P-COBIL00C-028: an empty body, the received map of a MAPFAIL, still runs
-/// `PROCESS-ENTER-KEY`, whose account edit answers. P-COBIL00C-002: a body
+/// `PROCESS-ENTER-KEY`, whose account edit answers as its row of
+/// `validation`. P-COBIL00C-002: a body
 /// member naming an AID key is no input, so every key answers as ENTER does
 /// with the same body, never with the invalid-key text, and PF4 clears
 /// nothing on the server. P-COBIL00C-029: the error body carries no header
 /// field.
-async fn received_map_and_keys(app: &TestApp, token: &str) {
+async fn received_map_and_keys(app: &TestApp, token: &str, validation: &Document) {
     let empty = app.post(PAYMENTS, Some(token), &json!({})).await;
     assert_refused(
         &empty,
+        validation,
+        "V-COBIL00C-001",
         "P-COBIL00C-028: an empty body",
-        StatusCode::BAD_REQUEST,
-        ErrorKind::Empty.code(),
         messages::ACCT_ID_CAN_NOT_BE_EMPTY,
-        ACTIDIN,
     );
     assert_eq!(
         members(&empty.1),
@@ -1351,27 +1765,33 @@ async fn without_a_session(app: &TestApp) {
 /// and reads no account; after the payment's write it runs before the success
 /// text is built, so the 201 message holds that text alone, not the prompt the
 /// same account answered before; it pays account 1's seeded balance, decoded
-/// through `parity`. P-COBIL00C-029: the payment carries no header field.
-async fn initialized_form(app: &TestApp, token: &str, parity: &Document) {
+/// through `parity`. The refusal and the prompt answer as their rows of
+/// `validation`. P-COBIL00C-029: the payment carries no header field.
+async fn initialized_form(app: &TestApp, token: &str, parity: &Document, validation: &Document) {
     let payment = Payment::of(parity, "00000000001");
+    let success = success_answer(parity);
     for account_id in ["00000000001", "99999999999"] {
         let resp = app
             .post(PAYMENTS, Some(token), &request(Some(account_id), Some("N")))
             .await;
         assert_refused(
             &resp,
+            validation,
+            "V-COBIL00C-002",
             "P-COBIL00C-031: N clears the form",
-            StatusCode::BAD_REQUEST,
-            ErrorKind::Invalid.code(),
             NO_MESSAGE,
-            ACTIDIN,
         );
     }
     let body = request(Some("00000000001"), Some(""));
     let prompt = app.post(PAYMENTS, Some(token), &body).await;
+    let shown = audited(
+        validation,
+        "V-COBIL00C-008",
+        messages::CONFIRM_TO_MAKE_A_BILL_PAYMENT,
+    );
     assert_eq!(
-        prompt.1["message"],
-        Value::from(messages::CONFIRM_TO_MAKE_A_BILL_PAYMENT),
+        (prompt.0, &prompt.1["message"]),
+        (shown.status, &Value::from(shown.message)),
         "P-COBIL00C-031: the prompt before the payment: {}",
         prompt.2
     );
@@ -1379,6 +1799,7 @@ async fn initialized_form(app: &TestApp, token: &str, parity: &Document) {
     let paid = app.post(PAYMENTS, Some(token), &body).await;
     assert_paid(
         &paid,
+        &success,
         "P-COBIL00C-031: the success text alone",
         "00000000001",
         &payment.after,

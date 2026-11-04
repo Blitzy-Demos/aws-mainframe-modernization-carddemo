@@ -31,7 +31,12 @@
 //!
 //! The I/O failure rows have no fixture input, so they are proven by fault
 //! injection: a hidden cross-reference table or live-master view, and
-//! test-only insert triggers. Docker must be running; each Docker-backed test
+//! test-only insert triggers. The reward atomicity of the CT02 call site
+//! (AAP 0.3.5) is proven the same way at each of its three failure points:
+//! before the accrual insert, at the balance upsert after it, and at a
+//! deferred `COMMIT` once every statement has succeeded. Each answers 500,
+//! leaves every transaction, accrual and balance as it was, and leaves its
+//! TRAN-ID to the retry. Docker must be running; each Docker-backed test
 //! function starts its own seeded `postgres:16.15` container, and the harness
 //! conventions are those of `common`.
 
@@ -529,14 +534,17 @@ const HEADER_KEYS: [&str; 4] = ["title01", "title02", "trnname", "pgmname"];
 const UNAUTHENTICATED: &str = "UNAUTHENTICATED";
 
 /// One date of each class CT02 reaches `CSUTLDTC` with, in the `YYYY-MM-DD`
-/// form it passes: valid, before the supported range, a day beyond its month,
-/// a month above 12 and a non-digit month.
-const CSUTLDTC_DATES: [&str; 5] = [
-    "2022-07-18",
-    "1500-01-01",
-    "2022-02-30",
-    "2022-13-01",
-    "2022-0A-18",
+/// form it passes, the reviewed row that pins its feedback, and the `CEEDAYS`
+/// token of its class where that row records alternatives: valid
+/// (P-CSUTLDTC-002), before the supported range (P-CSUTLDTC-004), a day beyond
+/// its month (the `CEE2EC` alternative of P-CSUTLDTC-003), a month above 12
+/// (P-CSUTLDTC-005) and a non-digit month (P-CSUTLDTC-006).
+const CSUTLDTC_DATES: [(&str, &str, Option<&str>); 5] = [
+    ("2022-07-18", "P-CSUTLDTC-002", None),
+    ("1500-01-01", "P-CSUTLDTC-004", None),
+    ("2022-02-30", "P-CSUTLDTC-003", Some("CEE2EC")),
+    ("2022-13-01", "P-CSUTLDTC-005", None),
+    ("2022-0A-18", "P-CSUTLDTC-006", None),
 ];
 
 /// Dates `CEEDAYS` finds non-numeric or not matching the picture
@@ -631,6 +639,71 @@ const FAIL_ACCRUAL_TRIGGER: &str = "CREATE TRIGGER test_fail_accrual \
 
 /// Removes [`FAIL_ACCRUAL_TRIGGER`].
 const DROP_FAIL_ACCRUAL: &str = "DROP TRIGGER test_fail_accrual ON reward_accruals";
+
+/// The test-only trigger function that fails the balance upsert of an add
+/// whose accrual is already inserted: it raises only when the account's
+/// accruals, the one this add inserted included, already total the earned
+/// points the update writes. Were the balance credited before the accrual
+/// insert, the update would pass and the add would not fail.
+const FAIL_BALANCE_FUNCTION: &str = "CREATE FUNCTION test_fail_balance() RETURNS trigger \
+     LANGUAGE plpgsql AS $$ BEGIN \
+     IF NEW.total_points_earned = (SELECT sum(points_earned) FROM reward_accruals \
+         WHERE account_id = NEW.account_id) THEN \
+     RAISE EXCEPTION 'test-only balance failure after the accrual insert'; \
+     END IF; RETURN NEW; END $$";
+
+/// Installs [`FAIL_BALANCE_FUNCTION`] on every update of a reward balance,
+/// the path the upsert takes for an account that already has a balance row.
+const FAIL_BALANCE_TRIGGER: &str = "CREATE TRIGGER test_fail_balance \
+     BEFORE UPDATE ON reward_balances FOR EACH ROW EXECUTE FUNCTION test_fail_balance()";
+
+/// Removes [`FAIL_BALANCE_TRIGGER`] and its function.
+const DROP_FAIL_BALANCE: [&str; 2] = [
+    "DROP TRIGGER test_fail_balance ON reward_balances",
+    "DROP FUNCTION test_fail_balance()",
+];
+
+/// The test-only trigger function that fails the `COMMIT` of an add once
+/// every statement of it has succeeded: it raises only when the account's
+/// balance already holds the earned points of all its accruals, the one this
+/// add inserted included. Were the balance not yet credited when the
+/// transaction commits, the trigger would pass and the add would not fail.
+const FAIL_COMMIT_FUNCTION: &str = "CREATE FUNCTION test_fail_commit() RETURNS trigger \
+     LANGUAGE plpgsql AS $$ BEGIN \
+     IF (SELECT total_points_earned FROM reward_balances \
+         WHERE account_id = NEW.account_id) \
+         = (SELECT sum(points_earned) FROM reward_accruals \
+         WHERE account_id = NEW.account_id) THEN \
+     RAISE EXCEPTION 'test-only failure at COMMIT'; \
+     END IF; RETURN NULL; END $$";
+
+/// Installs [`FAIL_COMMIT_FUNCTION`] as a constraint trigger on every accrual
+/// insert, deferred to the end of the transaction, so it runs only at
+/// `COMMIT`.
+const FAIL_COMMIT_TRIGGER: &str = "CREATE CONSTRAINT TRIGGER test_fail_commit \
+     AFTER INSERT ON reward_accruals DEFERRABLE INITIALLY DEFERRED \
+     FOR EACH ROW EXECUTE FUNCTION test_fail_commit()";
+
+/// Removes [`FAIL_COMMIT_TRIGGER`] and its function.
+const DROP_FAIL_COMMIT: [&str; 2] = [
+    "DROP TRIGGER test_fail_commit ON reward_accruals",
+    "DROP FUNCTION test_fail_commit()",
+];
+
+/// The reward failures after the accrual insert, in the order an add reaches
+/// them: the failure point, and the statements that inject and remove it.
+const LATE_FAULTS: [(&str, &[&str], &[&str]); 2] = [
+    (
+        "the balance upsert after the accrual insert",
+        &[FAIL_BALANCE_FUNCTION, FAIL_BALANCE_TRIGGER],
+        &DROP_FAIL_BALANCE,
+    ),
+    (
+        "the deferred COMMIT",
+        &[FAIL_COMMIT_FUNCTION, FAIL_COMMIT_TRIGGER],
+        &DROP_FAIL_COMMIT,
+    ),
+];
 
 /// One injected I/O failure: the rows it proves and the message they share,
 /// the statements that inject and remove it, and the changes from
@@ -1849,9 +1922,12 @@ fn ct02_adds_the_next_tran_id_and_accrues_its_points_with_the_insert() {
     });
 }
 
-/// A failed accrual rolls the whole add back: the insert, the accrual and the
-/// balance update, and the TRAN-ID allocation with them (AAP 0.3.5). The 500
-/// carries the unexpected-error text and no internal detail.
+/// A reward failure before the accrual is inserted, the first of the three
+/// failure points of the CT02 call site (AAP 0.3.5), rolls the whole add back:
+/// the insert, the accrual and the balance update, and the TRAN-ID allocation
+/// with them. The 500 carries the unexpected-error text and no internal
+/// detail. [`a_late_reward_failure_rolls_the_ct02_add_back_whole`] covers the
+/// other two.
 #[test]
 fn a_failed_accrual_rolls_the_ct02_add_back_whole() {
     let parity = common::parity_audit();
@@ -1892,6 +1968,106 @@ fn a_failed_accrual_rolls_the_ct02_add_back_whole() {
             vec![accrual_row(&tran_id, &rule_id, points_of(QUALIFYING, rate))],
             "the retried add accrues"
         );
+    });
+}
+
+/// The two later failure points of the CT02 call site (AAP 0.3.5): the
+/// balance upsert after the accrual is inserted, and a deferred `COMMIT` once
+/// every statement has succeeded ([`LATE_FAULTS`]). Each starts from an
+/// account whose balance is already nonzero, rolls the whole add back, its
+/// inserted accrual and its TRAN-ID included, and answers the 500 with the
+/// unexpected-error text and no internal detail; the retry without the fault
+/// is given the TRAN-ID the failed add would have had and credits exactly its
+/// points.
+#[test]
+fn a_late_reward_failure_rolls_the_ct02_add_back_whole() {
+    let parity = common::parity_audit();
+    let success = success_answer(&parity);
+    let app = TestApp::start_with_clock(CLOCK);
+    block_on(async {
+        let stack = app.stack();
+        stack.exec_sql(LIVE_ROWS).await;
+        let token = app.user_token().await;
+        let (rule_id, rate) = retail_rule(&app).await;
+        let points = points_of(QUALIFYING, rate);
+        assert!(points > Decimal::ZERO, "{QUALIFYING:?} earns points");
+        let [earned, redeemed, available] = account_rewards(&app).await;
+
+        let mut tran_id = next_tran_id(HIGHEST_LIVE);
+        add(&app, &token, &success, QUALIFYING, &tran_id, &parity).await;
+        let mut accrued = vec![accrual_row(&tran_id, &rule_id, points)];
+        assert_eq!(
+            stack.fetch_text_rows(ACCRUALS).await,
+            accrued,
+            "one accrual for {tran_id}"
+        );
+        let mut rewards = [earned + points, redeemed, available + points];
+        assert_eq!(
+            account_rewards(&app).await,
+            rewards,
+            "account 1 is credited"
+        );
+        assert!(
+            available + points > Decimal::ZERO,
+            "account 1 has a nonzero balance row for the faults to start from"
+        );
+
+        for (point, inject, restore) in LATE_FAULTS {
+            let before = write_state(&app).await;
+            for statement in inject {
+                stack.exec_sql(statement).await;
+            }
+            let resp = app.post(ROUTE, Some(&token), &body(QUALIFYING)).await;
+            for statement in restore {
+                stack.exec_sql(statement).await;
+            }
+            assert_error(
+                &resp,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                kind_code("Unexpected"),
+                messages::UNEXPECTED_ERROR,
+                &[],
+            );
+            assert_eq!(
+                member_names(&resp.1),
+                ["code", "message"],
+                "a failure at {point} answers only `code` and `message`: {}",
+                resp.2
+            );
+            assert_eq!(
+                write_state(&app).await,
+                before,
+                "a failure at {point} persisted nothing"
+            );
+            assert_eq!(
+                stack.fetch_text_rows(ACCRUALS).await,
+                accrued,
+                "a failure at {point} left the accruals as they were"
+            );
+            assert_eq!(
+                account_rewards(&app).await,
+                rewards,
+                "a failure at {point} left the totals of account 1 as they were"
+            );
+
+            // Without the fault, the same body is given the TRAN-ID the failed
+            // add would have had, and its points accrue.
+            tran_id = next_tran_id(&tran_id);
+            add(&app, &token, &success, QUALIFYING, &tran_id, &parity).await;
+            accrued.push(accrual_row(&tran_id, &rule_id, points));
+            assert_eq!(
+                stack.fetch_text_rows(ACCRUALS).await,
+                accrued,
+                "the retry after a failure at {point} accrues once"
+            );
+            let [earned, redeemed, _] = rewards;
+            rewards = [earned + points, redeemed, earned + points - redeemed];
+            assert_eq!(
+                account_rewards(&app).await,
+                rewards,
+                "the retry after a failure at {point} credits exactly its points"
+            );
+        }
     });
 }
 
@@ -1966,24 +2142,102 @@ fn result_value<'a>(result: &'a str, id: &str, key: &str) -> &'a str {
         .unwrap_or_default()
 }
 
-/// The 80-byte `LS-RESULT` P-CSUTLDTC-008 lays out for the call that
-/// answered `result` for `date`: severity, `Mesg Code:` and a space, message
-/// number, space, the 15-byte text, space, `TstDate:` and a space, the ten
-/// bytes X'000A' and the first eight date bytes (E-76), space, `Mask used:`,
-/// the picture, four spaces.
-fn expected_result_line(result: &CsutldtcResult, date: &str) -> String {
-    let feedback = result.feedback();
+/// The feedback a reviewed `CSUTLDTC` row pins for one date class: the
+/// four-digit severity and message number, and the result text padded to its
+/// audited width.
+struct PinnedFeedback {
+    severity: String,
+    msg_no: String,
+    text: String,
+}
+
+/// Whether `value` is the four digits a severity or message number fills.
+fn four_digits(value: &str) -> bool {
+    value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The feedback the reviewed parity row `id` of `parity` pins for the class
+/// `class` names. A row that records alternatives separates them with ` / `
+/// in both its `Input condition` and its `Expected result`, and `class` is the
+/// `CEEDAYS` token the wanted condition starts with; a row read without one
+/// records exactly one class. The severity is the row's one `sev=`, which
+/// applies to each alternative; the message number and the quoted text are
+/// the alternative's own, the text padded to its `width=`, which must be
+/// `text_width`, the width of the result field.
+fn pinned_feedback(
+    parity: &Document,
+    id: &str,
+    class: Option<&str>,
+    text_width: usize,
+) -> PinnedFeedback {
+    let result = reviewed_result(parity, id, &["sev=", "msg=", "width="]);
+    let condition = reviewed_cell(parity, id, "Input condition");
+    let conditions: Vec<&str> = condition.split(" / ").map(str::trim).collect();
+    let results: Vec<&str> = result.split(" / ").map(str::trim).collect();
+    assert_eq!(
+        conditions.len(),
+        results.len(),
+        "{id} gives one result per input condition: {condition} | {result}"
+    );
+    let index = if let Some(token) = class {
+        conditions
+            .iter()
+            .position(|part| part.starts_with(token))
+            .unwrap_or_else(|| panic!("{id} records no {token} class: {condition}"))
+    } else {
+        assert_eq!(conditions.len(), 1, "{id} records one class: {condition}");
+        0
+    };
+    assert_eq!(
+        result.matches("sev=").count(),
+        1,
+        "{id} records one severity for each of its classes: {result}"
+    );
+    let severity = result_value(&result, id, "sev");
+    let part = results[index];
+    let msg_no = result_value(part, id, "msg");
+    for value in [severity, msg_no] {
+        assert!(
+            four_digits(value),
+            "{id} records {value:?}, not four digits: {result}"
+        );
+    }
+    let spans = cell_code_spans(part);
+    let [span] = spans.as_slice() else {
+        panic!("{id} quotes one result text for the class: {part}");
+    };
+    let quoted =
+        unquote(&span.text).unwrap_or_else(|| panic!("{id} quotes no text in {:?}", span.text));
+    assert_eq!(
+        span.width,
+        Some(text_width),
+        "{id} pads its text to the {text_width}-byte result field: {part}"
+    );
+    assert!(
+        quoted.len() <= text_width,
+        "{id} quotes a text wider than the result field: {part}"
+    );
+    PinnedFeedback {
+        severity: severity.to_owned(),
+        msg_no: msg_no.to_owned(),
+        text: format!("{quoted:<text_width$}"),
+    }
+}
+
+/// The 80-byte `LS-RESULT` P-CSUTLDTC-008 lays out for `date` with the
+/// feedback `pinned`, built from the audit alone: the severity, the first of
+/// the row's `labels` and a space, the message number, a space, the padded
+/// text, a space, the second label and a space, the ten bytes X'000A' and the
+/// first eight date bytes (E-76), a space, the third label, the CT02 picture,
+/// four spaces.
+fn expected_result_line(pinned: &PinnedFeedback, labels: [&str; 3], date: &str) -> String {
+    let [mesg_code, tst_date, mask_used] = labels;
     let head = date
         .get(..8)
         .unwrap_or_else(|| panic!("{date:?} is no date"));
     format!(
-        "{:04}{} {:04} {:<15} {} \0\n{head} {}YYYY-MM-DD    ",
-        feedback.severity(),
-        messages::MESG_CODE,
-        feedback.msg_no(),
-        feedback.result_text(),
-        messages::TST_DATE,
-        messages::MASK_USED,
+        "{}{mesg_code} {} {} {tst_date} \0\n{head} {mask_used}YYYY-MM-DD    ",
+        pinned.severity, pinned.msg_no, pinned.text,
     )
 }
 
@@ -1992,8 +2246,12 @@ fn expected_result_line(result: &CsutldtcResult, date: &str) -> String {
 /// - P-CSUTLDTC-001: both arguments are ten-byte vstrings, the CT02 picture is
 ///   `YYYY-MM-DD` and the result is the 80-byte `WS-MESSAGE`.
 /// - P-CSUTLDTC-008: the result is laid out field by field as the row writes
-///   it; CT02 reads its severity at bytes 1-4 and its message number at bytes
-///   16-19, and the severity is the `RETURN-CODE`.
+///   it, with its quoted labels; CT02 reads its severity at bytes 1-4 and its
+///   message number at bytes 16-19, and the severity is the `RETURN-CODE`.
+/// - P-CSUTLDTC-002 to P-CSUTLDTC-006: each date of [`CSUTLDTC_DATES`] gets
+///   the severity, message number and text its class row pins, so the whole
+///   expected line comes from the audit and the date, never from the result
+///   under test.
 /// - P-CSUTLDTC-010 (E-76): bytes 46-55 hold X'000A' and the first eight date
 ///   bytes, not the date moved there before the call.
 ///
@@ -2031,26 +2289,47 @@ fn csutldtc_returns_the_80_byte_result_ct02_reads() {
         [messages::MESG_CODE, messages::TST_DATE, messages::MASK_USED],
         "the labels of the P-CSUTLDTC-008 layout: {layout}"
     );
+    let [mesg_code, tst_label, mask_used] = labels.as_slice() else {
+        panic!("P-CSUTLDTC-008 quotes three labels: {layout}");
+    };
+    let labels = [mesg_code.as_str(), tst_label.as_str(), mask_used.as_str()];
+    let widths = numbers_after(&layout, "+result(");
+    let [text_width] = widths.as_slice() else {
+        panic!("P-CSUTLDTC-008 gives one width of the result text: {layout}");
+    };
     reviewed_result(
         &parity,
         "P-CSUTLDTC-010",
         &["escalation=E-76", "disposition=reproduced"],
     );
-    for date in CSUTLDTC_DATES {
+    for (date, id, class) in CSUTLDTC_DATES {
+        let pinned = pinned_feedback(&parity, id, class, *text_width);
+        let expected = expected_result_line(&pinned, labels, date);
+        assert_eq!(
+            expected.len(),
+            date_validation::RESULT_LEN,
+            "the {id} line of {date} fills the result: {expected:?}"
+        );
         let result = csutldtc(date);
         let line = result.result_line();
         assert_eq!(line.len(), date_validation::RESULT_LEN, "{date}");
-        assert_eq!(line, expected_result_line(&result, date), "{date}");
+        assert_eq!(line, expected, "the result of {date} is the {id} line");
         assert_eq!(
             line.get(..4),
-            Some(result.severity_code().as_str()),
-            "{date}"
+            Some(pinned.severity.as_str()),
+            "the severity CT02 reads for {date} ({id})"
         );
-        assert_eq!(line.get(15..19), Some(result.msg_num().as_str()), "{date}");
         assert_eq!(
-            result.severity_code().parse::<u16>().ok(),
+            line.get(15..19),
+            Some(pinned.msg_no.as_str()),
+            "the message number CT02 reads for {date} ({id})"
+        );
+        assert_eq!(result.severity_code(), pinned.severity, "{date} ({id})");
+        assert_eq!(result.msg_num(), pinned.msg_no, "{date} ({id})");
+        assert_eq!(
+            pinned.severity.parse::<u16>().ok(),
             Some(result.feedback().severity()),
-            "the RETURN-CODE of {date}"
+            "the RETURN-CODE of {date} is the {id} severity"
         );
         let tst_date = line.as_bytes().get(45..55);
         assert_eq!(
