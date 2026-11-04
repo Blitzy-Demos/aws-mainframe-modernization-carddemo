@@ -25,7 +25,10 @@
 //! Expected message texts come from `carddemo_domain::messages` in the
 //! calling test. The harness names only the seed credentials and route
 //! paths, and reaches SQL only through [`TestApp::stack`], whose
-//! `exec_sql` and `fetch_text_rows` run text-typed statements.
+//! `exec_sql` and `fetch_text_rows` run text-typed statements. Seeded
+//! fixture values come from its [`fixture_records`] submodule, which reads
+//! them from the parity audit or decodes them at its reviewed section A
+//! offsets.
 //!
 //! Every request is bounded, so a handler stalled on SQL or a lock fails its
 //! test instead of hanging the suite: connecting may take at most
@@ -38,15 +41,21 @@
 //! naming the stage, the URL and the bound.
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::time::Duration;
 
-use carddemo_audit::{Document, IdKind, PARITY_AUDIT_PATH, Repo, VALIDATION_AUDIT_PATH};
+use carddemo_audit::{
+    Document, IdKind, PARITY_AUDIT_PATH, Repo, Row, Table, VALIDATION_AUDIT_PATH, citations,
+    code_span, key_values,
+};
 use carddemo_runtime::config::Settings;
 use carddemo_testkit::{TestStack, block_on, fixtures};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+pub mod fixture_records;
 
 /// The admin user of the seed: `ADMIN001`, type `A`, first `SYSUT1` row of
 /// `DUSRSECJ` [app/jcl/DUSRSECJ.jcl:L35].
@@ -487,4 +496,318 @@ pub fn validation_ids(program: &str) -> Vec<String> {
         "{VALIDATION_AUDIT_PATH} defines no {prefix}nnn row"
     );
     ids
+}
+
+/// The table the seeded-user count rows of the parity audit count.
+const USERS_TABLE: &str = "users";
+
+/// The `column=` a section A row gives a field that is not stored.
+const NOT_STORED: &str = "—";
+
+/// One user of the seeded `USRSEC` file: the `CSUSR01Y` `SEC-USER-DATA`
+/// fields [app/cpy/CSUSR01Y.cpy:L17-23] as the parity audit records them,
+/// each right-trimmed of the spaces that pad it to its `PIC X(n)` width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeededUser {
+    /// `SEC-USR-ID X(08)`, the user ID.
+    pub user_id: String,
+    /// `SEC-USR-FNAME X(20)`, the first name.
+    pub first_name: String,
+    /// `SEC-USR-LNAME X(20)`, the last name.
+    pub last_name: String,
+    /// `SEC-USR-PWD X(08)`, the password as stored, which sign-on compares
+    /// with the upper-cased typed password.
+    pub password: String,
+    /// `SEC-USR-TYPE X(01)`, the user type.
+    pub usr_type: String,
+}
+
+/// The seeded user the parity row `id` records, for example
+/// `P-CSUSR01Y-009`: the texts its expected result quotes for `value=` (the
+/// user ID), `first_name=`, `last_name=` and `password_as_stored=`, each
+/// without its double quotes and with `\"` and `\\` unescaped, and its bare
+/// `usr_type=`.
+///
+/// # Panics
+///
+/// Panics, naming the row, if the parity audit defines no row `id` or the
+/// last review-log verdict on it is not `pass`, and, naming the row and the
+/// key, if its expected result lacks one of those keys, quotes one of the
+/// texts in another form or a text longer than its `width=`, or gives a
+/// `usr_type=` that is not one bare token.
+#[must_use]
+pub fn seeded_user(parity: &Document, id: &str) -> SeededUser {
+    let (table, row) = reviewed_row(parity, id);
+    let text = |key: &str| result_text(table, row, id, key);
+    let usr_type = result_value(table, row, id, "usr_type");
+    assert!(
+        !usr_type.is_empty() && !usr_type.contains(['`', '"', ' ']),
+        "{PARITY_AUDIT_PATH}: row {id} gives `usr_type={usr_type}`, not one bare token"
+    );
+    SeededUser {
+        user_id: text("value"),
+        first_name: text("first_name"),
+        last_name: text("last_name"),
+        password: text("password_as_stored"),
+        usr_type,
+    }
+}
+
+/// The number of seeded users the parity row `id` records, for example
+/// `P-CSUSR01Y-007`: the `rows=` of its `table=users` expected result.
+///
+/// # Panics
+///
+/// Panics, naming the row, if the parity audit defines no row `id`, if the
+/// last review-log verdict on it is not `pass`, if its expected result counts
+/// a table other than `users`, or if its `rows=` is missing or not a count.
+#[must_use]
+pub fn seeded_user_count(parity: &Document, id: &str) -> usize {
+    let (table, row) = reviewed_row(parity, id);
+    user_count_of(table, row, id)
+}
+
+/// The seeded users the parity count row `id` cites, for example
+/// `P-CSUSR01Y-007`, in file order.
+///
+/// The one line citation of the row's `Paragraph` cell names the instream
+/// `SYSUT1` records the seed loads, such as [app/jcl/DUSRSECJ.jcl:L35-44].
+/// Each cited line is one `SEC-USER-DATA` record, decoded with the section A
+/// layout whose subsection the row's `Program` cell names: every field the
+/// layout maps to a `column=` is read at its `Offset` for its `Length`, a
+/// line shorter than the record reading as spaces past its end, and
+/// right-trimmed. The `password_hash` column receives the hash of the
+/// `SEC-USR-PWD` bytes, so those bytes are [`SeededUser::password`].
+///
+/// # Panics
+///
+/// Panics, naming the row, if row `id` or any row of the layout is missing
+/// or has not passed its review, if row `id` does not count `users` or its
+/// count differs from the number of cited lines, if its `Paragraph` cell
+/// holds other than one line citation or the cited file or lines cannot be
+/// read, or if the layout lacks a [`SeededUser`] column or a cited line is
+/// not ASCII.
+#[must_use]
+pub fn seeded_users(parity: &Document, id: &str) -> Vec<SeededUser> {
+    let (table, row) = reviewed_row(parity, id);
+    let count = user_count_of(table, row, id);
+    let layout = reviewed_layout(parity, row_cell(table, row, id, "Program"));
+    let users: Vec<SeededUser> = cited_lines(id, row_cell(table, row, id, "Paragraph"))
+        .iter()
+        .map(|line| decode_user(id, &layout, line))
+        .collect();
+    assert_eq!(
+        users.len(),
+        count,
+        "{PARITY_AUDIT_PATH}: row {id} cites {} user records, not its rows={count}",
+        users.len()
+    );
+    users
+}
+
+/// The verdict of the last review-log row on `id` in `doc`, if any.
+fn last_verdict<'d>(doc: &'d Document, id: &str) -> Option<&'d str> {
+    doc.tables()
+        .iter()
+        .filter(|table| table.is_review_log())
+        .flat_map(|table| table.rows.iter().map(move |row| (table, row)))
+        .filter(|(table, row)| table.cell(row, "Row ID").map(str::trim) == Some(id))
+        .filter_map(|(table, row)| table.cell(row, "Verdict").map(str::trim))
+        .next_back()
+}
+
+/// The parity row `id` with its table, once the last review-log verdict on
+/// it is asserted to be `pass`: a seeded value is read from reviewed rows
+/// only.
+fn reviewed_row<'d>(parity: &'d Document, id: &str) -> (&'d Table, &'d Row) {
+    let found = parity
+        .find_row(id)
+        .unwrap_or_else(|| panic!("{PARITY_AUDIT_PATH} defines no row {id}"));
+    assert_eq!(
+        last_verdict(parity, id),
+        Some("pass"),
+        "{PARITY_AUDIT_PATH}: row {id} has not passed its review"
+    );
+    found
+}
+
+/// The cell `name` of the parity row `id`.
+fn row_cell<'d>(table: &'d Table, row: &'d Row, id: &str, name: &str) -> &'d str {
+    table
+        .cell(row, name)
+        .unwrap_or_else(|| panic!("{PARITY_AUDIT_PATH}: row {id} has no `{name}` cell"))
+}
+
+/// The value of the `key=` pair of the expected result of the parity row
+/// `id`, its backticks kept.
+fn result_value(table: &Table, row: &Row, id: &str, key: &str) -> String {
+    key_values(row_cell(table, row, id, "Expected result"))
+        .into_iter()
+        .find(|pair| pair.key == key)
+        .unwrap_or_else(|| panic!("{PARITY_AUDIT_PATH}: row {id} gives no `{key}=`"))
+        .value
+}
+
+/// The exact text the `key=` pair of the parity row `id` quotes: the
+/// double-quoted code span, unquoted, with `\"` and `\\` unescaped, within
+/// its `width=` when it gives one, and right-trimmed of that padding.
+fn result_text(table: &Table, row: &Row, id: &str, key: &str) -> String {
+    let value = result_value(table, row, id, key);
+    let span = code_span(&value)
+        .unwrap_or_else(|| panic!("{PARITY_AUDIT_PATH}: row {id} quotes no `{key}=` text"));
+    let quoted = span
+        .text
+        .strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{id}: `{key}=` is not a double-quoted text: {}", span.text));
+    let mut text = String::with_capacity(quoted.len());
+    let mut chars = quoted.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some(escaped @ ('"' | '\\')) => text.push(escaped),
+                _ => panic!("{id}: `{key}=` holds an escape other than \\\" or \\\\: {quoted}"),
+            }
+        } else {
+            text.push(ch);
+        }
+    }
+    if let Some(width) = span.width {
+        assert!(
+            text.len() <= width,
+            "{id}: the `{key}=` text is longer than its width={width}"
+        );
+    }
+    text.trim_end_matches(' ').to_owned()
+}
+
+/// The `rows=` of the parity row `id`, whose expected result must count the
+/// `users` table.
+fn user_count_of(table: &Table, row: &Row, id: &str) -> usize {
+    let counted = result_value(table, row, id, "table");
+    assert_eq!(
+        counted, USERS_TABLE,
+        "{PARITY_AUDIT_PATH}: row {id} counts `{counted}`, not `{USERS_TABLE}`"
+    );
+    let rows = result_value(table, row, id, "rows");
+    rows.parse()
+        .unwrap_or_else(|error| panic!("{id}: `rows={rows}` is not a count: {error}"))
+}
+
+/// One stored field of a section A record layout.
+struct LayoutField {
+    /// The `column=` the field maps to.
+    column: String,
+    /// The 0-based offset of the field in the record.
+    offset: usize,
+    /// The length of the field in bytes.
+    length: usize,
+}
+
+/// The stored fields of the section A layout of `program`, for example
+/// `CSUSR01Y`, in record order: the rows of the data tables whose subsection
+/// names `program` first, each of which must have passed review, without the
+/// fields that are not stored.
+fn reviewed_layout(parity: &Document, program: &str) -> Vec<LayoutField> {
+    let fields: Vec<LayoutField> = parity
+        .section_tables("A.")
+        .filter(|table| {
+            table.is_data_table()
+                && table
+                    .subsection
+                    .as_deref()
+                    .and_then(|subsection| subsection.split_whitespace().next())
+                    == Some(program)
+        })
+        .flat_map(|table| table.rows.iter().map(move |row| (table, row)))
+        .filter_map(|(table, row)| layout_field(parity, table, row))
+        .collect();
+    assert!(
+        !fields.is_empty(),
+        "{PARITY_AUDIT_PATH}: section A records no {program} layout"
+    );
+    fields
+}
+
+/// The stored field the reviewed section A row `row` records, `None` for one
+/// whose `column=` is [`NOT_STORED`].
+fn layout_field(parity: &Document, table: &Table, row: &Row) -> Option<LayoutField> {
+    let id = table.cell(row, "ID").unwrap_or_else(|| {
+        panic!(
+            "{PARITY_AUDIT_PATH}: the section A row at line {} has no `ID` cell",
+            row.line
+        )
+    });
+    assert_eq!(
+        last_verdict(parity, id),
+        Some("pass"),
+        "{PARITY_AUDIT_PATH}: layout row {id} has not passed its review"
+    );
+    let column = result_value(table, row, id, "column");
+    if column == NOT_STORED {
+        return None;
+    }
+    let number = |name: &str| {
+        let cell = row_cell(table, row, id, name);
+        cell.parse::<usize>()
+            .unwrap_or_else(|error| panic!("{id}: `{name}` {cell:?} is not a number: {error}"))
+    };
+    Some(LayoutField {
+        column,
+        offset: number("Offset"),
+        length: number("Length"),
+    })
+}
+
+/// The lines the one line citation of `paragraph`, the `Paragraph` cell of
+/// the parity row `id`, names, in file order.
+fn cited_lines(id: &str, paragraph: &str) -> Vec<String> {
+    let cited = citations(paragraph);
+    let [citation] = cited.as_slice() else {
+        panic!(
+            "{id}: the Paragraph cell holds {} line citations, not one: {paragraph}",
+            cited.len()
+        );
+    };
+    let path = repo()
+        .resolve(&citation.path)
+        .unwrap_or_else(|| panic!("{id}: the cited {} does not resolve", citation.path));
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{} cannot be read: {error}", path.display()));
+    let (start, end) = (citation.start, citation.end);
+    assert!(
+        start >= 1 && start <= end && end <= text.lines().count(),
+        "{id}: L{start}-{end} is not a line range of {}",
+        citation.path
+    );
+    text.lines()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The [`SeededUser`] of the `SEC-USER-DATA` record `line` cited by the
+/// parity row `id`, read with `layout`.
+fn decode_user(id: &str, layout: &[LayoutField], line: &str) -> SeededUser {
+    assert!(
+        line.is_ascii(),
+        "{id}: the cited record {line:?} is not ASCII"
+    );
+    let field = |column: &str| {
+        let field = layout
+            .iter()
+            .find(|field| field.column == column)
+            .unwrap_or_else(|| panic!("{id}: the layout has no `column={column}`"));
+        let end = field.offset + field.length;
+        let record = format!("{line:<end$}");
+        record[field.offset..end].trim_end_matches(' ').to_owned()
+    };
+    SeededUser {
+        user_id: field("user_id"),
+        first_name: field("sec_usr_fname"),
+        last_name: field("sec_usr_lname"),
+        password: field("password_hash"),
+        usr_type: field("sec_usr_type"),
+    }
 }

@@ -27,6 +27,7 @@ import {
   apiToken,
   APP_ROUTES,
   bearer,
+  errorBodySchema,
   expect,
   expectScreen,
   FIXTURE_KEYS,
@@ -119,7 +120,7 @@ async function send(
           ? await request.put(url, options)
           : await request.delete(url, options);
   const status = response.status();
-  return { status, body: status >= 400 ? await readJson<ErrorBody>(response) : null };
+  return { status, body: status >= 400 ? await readJson(response, errorBodySchema) : null };
 }
 
 // A digest of every row the admin endpoints write, read before and after the

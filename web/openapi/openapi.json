@@ -192,7 +192,7 @@
           "admin-reward-rules"
         ],
         "summary": "`GET /admin/reward-rules`: every reward rule, active, future and\nsoft-deleted alike, in `rule_id` order (Request › Rewards system › Admin\nendpoints, AAP 0.3.5).",
-        "description": "No rules is 200 with an empty list. A soft-deleted rule shows the\n`active_to` its delete set.\n\n# Errors\n\n- 401 without a valid bearer token, 403 for a non-admin token.\n- 500 `Unexpected error` when the read fails or a stored rule does not\n  fit its domain type.",
+        "description": "No rules is 200 with an empty list. A soft-deleted rule shows the\n`active_to` its delete set. Every rule's `status` is taken at one reading\nof the processing clock.\n\n# Errors\n\n- 401 without a valid bearer token, 403 for a non-admin token.\n- 500 `Unexpected error` when the read fails or a stored rule does not\n  fit its domain type.",
         "operationId": "list_reward_rules",
         "responses": {
           "200": {
@@ -422,8 +422,8 @@
         "tags": [
           "admin-reward-rules"
         ],
-        "summary": "`DELETE /admin/reward-rules/{id}`: soft-deletes the rule and answers 200\nwith it (Request › Rewards system › Admin endpoints, AAP 0.3.5).",
-        "description": "The rule's `active_to` becomes the processing clock's instant when it is\nabsent or later; a rule that has already ended is answered unchanged. The\nrow is never removed, because accruals reference its `rule_id`.\n\n# Errors\n\n- 404 `NOT_FOUND` (`Reward rule not found`) when `{id}` is not an integer\n  or names no rule.\n- 401 without a valid bearer token, 403 for a non-admin token.\n- 500 `Unexpected error` when the update, the read or the commit fails.",
+        "summary": "`DELETE /admin/reward-rules/{id}`: soft-deletes the rule and answers 200\nwith it and the `outcome` (Request › Rewards system › Admin endpoints,\nAAP 0.3.5).",
+        "description": "The rule's `active_to` becomes the processing clock's instant when it is\nabsent or later (`outcome` `deleted`); a rule that has already ended is\nanswered unchanged (`outcome` `unchanged`). Either way the rule's `status`\nat that instant is `ended`. The row is never removed, because accruals\nreference its `rule_id`.\n\n# Errors\n\n- 404 `NOT_FOUND` (`Reward rule not found`) when `{id}` is not an integer\n  or names no rule.\n- 401 without a valid bearer token, 403 for a non-admin token.\n- 500 `Unexpected error` when the update, the read or the commit fails.",
         "operationId": "delete_reward_rule",
         "parameters": [
           {
@@ -438,11 +438,11 @@
         ],
         "responses": {
           "200": {
-            "description": "The rule after the soft delete, or unchanged when it had already ended",
+            "description": "The rule after the soft delete, or unchanged when it had already ended, with the outcome",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RewardRuleResponse"
+                  "$ref": "#/components/schemas/RewardRuleDeleteResponse"
                 }
               }
             }
@@ -1476,7 +1476,7 @@
           "auth"
         ],
         "summary": "CSMSG01Y CCDA-MSG-THANK-YOU — P-COSGN00C-003, P-COSGN00C-016.",
-        "description": "`POST /auth/logout`: PF3 on the sign-on screen, answered with the\n`CCDA-MSG-THANK-YOU` text of `CSMSG01Y` byte for byte, trailing spaces\nincluded [app/cpy/CSMSG01Y.cpy:L18-19]. Public and stateless: no token is\nread and no session ends, because none exists on the server; the SPA\ndiscards its token and shows `/login`.",
+        "description": "`POST /auth/logout`: PF3 on the sign-on screen, answered with the\n`CCDA-MSG-THANK-YOU` text of `CSMSG01Y` byte for byte, trailing spaces\nincluded [app/cpy/CSMSG01Y.cpy:L18-19]. Public and stateless: no token is\nrequired and no session ends, because none exists on the server; the SPA\ndiscards its token and shows `/login`. The answer is the same with or\nwithout a bearer token, valid or not: a token that verifies only names\nits user in the server's trace span, and none is refused.",
         "operationId": "logout",
         "responses": {
           "200": {
@@ -4526,6 +4526,35 @@
           }
         }
       },
+      "RewardRuleDeleteOutcome": {
+        "type": "string",
+        "description": "What a `DELETE /admin/reward-rules/{id}` of an existing rule did.",
+        "enum": [
+          "deleted",
+          "unchanged"
+        ]
+      },
+      "RewardRuleDeleteResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/RewardRuleResponse",
+            "description": "The rule as stored after the delete, its `status` at the delete\ninstant: always `ended`."
+          },
+          {
+            "type": "object",
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "$ref": "#/components/schemas/RewardRuleDeleteOutcome",
+                "description": "Whether the delete ended the rule or found it already ended."
+              }
+            }
+          }
+        ],
+        "description": "The 200 answer of `DELETE /admin/reward-rules/{id}`: the rule after the\nsoft delete, under the same top-level keys as `RewardRuleResponse`, with\n`outcome` beside them, so a client reports what the server did rather than\nguess it from the rule it showed before."
+      },
       "RewardRuleField": {
         "type": "string",
         "description": "A field a reward-rule rejection names in `fields[].field`: exactly the\nfields `carddemo_domain::rewards::validate_rule` reports, under the\nrequest's own JSON names.",
@@ -4603,7 +4632,7 @@
       },
       "RewardRuleResponse": {
         "type": "object",
-        "description": "One stored reward rule: every column of a `reward_rules` row, as the list,\ncreate, update and soft-delete endpoints answer it.\n\nThe list returns active and soft-deleted rules alike, ordered by\n`rule_id`; a soft-deleted rule shows the `active_to` its delete set.",
+        "description": "One stored reward rule: every column of a `reward_rules` row, plus its\n`status` at the processing clock's instant of the answer, as the list,\ncreate, update and soft-delete endpoints answer it.\n\nThe list returns active and soft-deleted rules alike, ordered by\n`rule_id`; a soft-deleted rule shows the `active_to` its delete set.",
         "required": [
           "rule_id",
           "transaction_type_cd",
@@ -4612,7 +4641,8 @@
           "min_transaction_amount",
           "max_transaction_amount",
           "active_from",
-          "active_to"
+          "active_to",
+          "status"
         ],
         "properties": {
           "active_from": {
@@ -4655,6 +4685,10 @@
             "example": "1",
             "pattern": "^[0-9]+$"
           },
+          "status": {
+            "$ref": "#/components/schemas/RewardRuleStatus",
+            "description": "The rule's state at the processing clock's instant of this answer:\n`scheduled`, `active` or `ended`. The instant is the server's, never\nthe client's."
+          },
           "transaction_category_cd": {
             "type": "string",
             "description": "The transaction category code the rule matches, zero-padded to the\nfour digits of `TRAN-CAT-CD PIC 9(04)`.",
@@ -4667,6 +4701,15 @@
             "example": "01"
           }
         }
+      },
+      "RewardRuleStatus": {
+        "type": "string",
+        "description": "Where the processing clock's instant of an answer lies against a rule's\nactive window, from `active_from` (inclusive) to `active_to` (exclusive)\n(AAP 0.3.5).\n\nThe instant is the server's processing clock (`CARDDEMO_CLOCK_OVERRIDE`\npins it, AAP 0.6.4), the one the reward engine matches transactions\nagainst, so a client never has to judge a rule by a clock of its own.",
+        "enum": [
+          "scheduled",
+          "active",
+          "ended"
+        ]
       },
       "TranTypeCreateRequest": {
         "type": "object",

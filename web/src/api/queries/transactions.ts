@@ -19,11 +19,13 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type InvalidateQueryFilters,
 } from "@tanstack/react-query";
 
 import { api, unwrap, unwrapWithStatus } from "@/api/client";
 import { rewardKeys } from "@/api/queries/rewards";
 import type { components, paths } from "@/api/schema";
+import { isSpacesOrLowValues } from "@/schemas/primitives";
 
 /**
  * The CT00 browse:
@@ -62,9 +64,9 @@ const all = ["transactions"] as const;
 
 /**
  * Query keys of the transaction caches; a prefix invalidates every key below
- * it. payments.ts invalidates `transactionKeys.all` after a bill payment,
- * whose transaction joins the master, so these shapes are a contract between
- * the query modules.
+ * it. payments.ts refreshes the lists `listsShowingAccount` selects and the
+ * new TRAN-ID's detail after a bill payment, whose transaction joins the
+ * master, so these shapes are a contract between the query modules.
  */
 export const transactionKeys = {
   all,
@@ -73,9 +75,61 @@ export const transactionKeys = {
   detail: (tranId: string) => [...all, "detail", tranId] as const,
 } as const;
 
+/**
+ * The transaction lists a new live transaction of `accountId` can appear in:
+ * every list without an account filter, a blank filter included, since the
+ * server reads `SPACES` or `LOW-VALUES` as none, and every list filtered by
+ * that account. A list filtered by another account cannot show it. The
+ * account is its 11 digits, the only form the filter and the CT02 and CB00
+ * writes accept. With `undefined`, an account the client cannot name, every
+ * list is selected.
+ *
+ * Existing transaction details are never selected: an insert changes no
+ * other record.
+ */
+export function listsShowingAccount(
+  accountId: string | undefined,
+): InvalidateQueryFilters {
+  if (accountId === undefined) {
+    return { queryKey: transactionKeys.lists() };
+  }
+  return {
+    queryKey: transactionKeys.lists(),
+    predicate: (query) => {
+      const params = query.queryKey[2];
+      if (
+        typeof params !== "object" ||
+        params === null ||
+        !("account_id" in params)
+      ) {
+        return true;
+      }
+      const filter = params.account_id;
+      return (
+        filter === undefined ||
+        filter === null ||
+        (typeof filter === "string" &&
+          (isSpacesOrLowValues(filter) || filter === accountId))
+      );
+    },
+  };
+}
+
 // The status of a completed add: the handler answers StatusCode::CREATED with
 // the transaction written and its reward accrual committed.
 const CREATED = 201;
+
+// The account a completed CT02 add was written to, when the request names it.
+// COTRN02C uses an entered ACTIDIN, blank being SPACES or LOW-VALUES, and
+// reads the card number only without one; on that path a 201 proves the
+// entry the account's 11 digits. A card-only add gives `undefined`: its
+// account comes from the cross-reference, which the answer does not carry.
+function accountOfAdd(body: TransactionAddBody): string | undefined {
+  const entered = body.account_id;
+  return typeof entered === "string" && !isSpacesOrLowValues(entered)
+    ? entered
+    : undefined;
+}
 
 /**
  * One page of the live transaction master in TRAN-ID order (CT00), as
@@ -172,22 +226,51 @@ export function useCopyLastTransactionMutation() {
  * when a read, the write, the reward accrual or the commit fails, with nothing
  * persisted.
  *
- * Only a 201 wrote, so only a 201 refreshes: every transaction query, and
- * every reward balance and history, because the accrual commits in the same
- * database transaction as the insert. Both refreshes are returned, so the
- * mutation settles once the active queries have reloaded.
+ * Only a 201 wrote, so only a 201 refreshes, and only what the insert and
+ * its accrual, committed in the same database transaction, changed:
+ * - the transaction lists that can show the new row (`listsShowingAccount`);
+ * - the new TRAN-ID's detail, which may hold a 404, or another row's
+ *   content, from before `batch tranbkp` let the TRAN-ID be issued again
+ *   (E-09). Other transactions' details are left alone, since an insert
+ *   changes no other record;
+ * - the reward balance and history of the account written to.
+ *
+ * The account is known when the request entered it (`accountOfAdd`). A
+ * card-only add takes its account from the cross-reference, which the answer
+ * does not carry, so every transaction list and every account's reward
+ * balance and history are refreshed then. The refreshes are returned, so the
+ * mutation settles once the active queries they reach have reloaded.
  */
 export function useTransactionAddMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (body: TransactionAddBody) =>
       unwrapWithStatus(await api.POST("/transactions", { body })),
-    onSuccess: (result) =>
-      result.status === CREATED
-        ? Promise.all([
-            queryClient.invalidateQueries({ queryKey: transactionKeys.all }),
-            queryClient.invalidateQueries({ queryKey: rewardKeys.all }),
-          ])
-        : undefined,
+    onSuccess: (result, body) => {
+      if (result.status !== CREATED) {
+        return undefined;
+      }
+      const accountId = accountOfAdd(body);
+      const rewards =
+        accountId === undefined
+          ? queryClient.invalidateQueries({ queryKey: rewardKeys.all })
+          : Promise.all([
+              queryClient.invalidateQueries({
+                queryKey: rewardKeys.balance(accountId),
+                exact: true,
+              }),
+              queryClient.invalidateQueries({
+                queryKey: rewardKeys.histories(accountId),
+              }),
+            ]);
+      return Promise.all([
+        queryClient.invalidateQueries(listsShowingAccount(accountId)),
+        queryClient.invalidateQueries({
+          queryKey: transactionKeys.detail(result.data.transaction.tran_id),
+          exact: true,
+        }),
+        rewards,
+      ]);
+    },
   });
 }

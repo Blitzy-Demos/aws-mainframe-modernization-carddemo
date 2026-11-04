@@ -35,7 +35,11 @@
 //! `carddemo_domain::messages` item, checked equal to the row's quoted text.
 //! Only rows with a `pass` review verdict are used, and
 //! [`every_cousr02c_validation_row_is_exercised`] fails when the audit holds a
-//! `COUSR02C` row no test here sends.
+//! `COUSR02C` row no test here sends. The seeded users' IDs, names, types and
+//! stored password are read through `carddemo_audit` from the reviewed
+//! `CSUSR01Y` rows of `docs/parity/parity-oracle-audit.md`: the record of
+//! `USER0001`, and the `DUSRSECJ` records the users' count row cites, decoded
+//! with the section A layout.
 //!
 //! Docker must be running: each test that starts a [`TestApp`] starts one
 //! `postgres:16.15` container. The two audit checks need none.
@@ -51,7 +55,10 @@ use carddemo_audit::{
 use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages;
 use carddemo_testkit::{block_on, fixtures};
-use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
+use common::{
+    Resp, SeededUser, TestApp, assert_error, parity_audit, seeded_user, seeded_users,
+    validation_audit, validation_ids,
+};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -229,25 +236,17 @@ const BLANK_SETS: [(bool, &[&str]); 5] = [
     (true, &["usr_type"]),
 ];
 
-/// The regular user of the seed, `USER0001` [app/jcl/DUSRSECJ.jcl:L40].
-const USER0001: &str = "USER0001";
+/// The regular user of the seed, `USER0001` [app/jcl/DUSRSECJ.jcl:L40]: the
+/// user ID, names, type and stored password the fetch, the edits, the E-21
+/// cases and the screen keys act on and expect.
+const REGULAR_USER_ROW: &str = "P-CSUSR01Y-009";
 
-/// The fetch and update route of [`USER0001`].
-const USER0001_PATH: &str = "/admin/users/USER0001";
+/// The count row of the `DUSRSECJ` users [app/jcl/DUSRSECJ.jcl:L35-44],
+/// whose cited records, decoded with the reviewed `CSUSR01Y` layout, give
+/// the seeded users the failure cases act on and expect.
+const SEEDED_USERS_ROW: &str = "P-CSUSR01Y-007";
 
-/// `SEC-USR-FNAME` of [`USER0001`] as seeded.
-const SEED_FIRST_NAME: &str = "LAWRENCE";
-
-/// `SEC-USR-LNAME` of [`USER0001`] as seeded.
-const SEED_LAST_NAME: &str = "THOMAS";
-
-/// `SEC-USR-TYPE` of every seeded `USER000n`: a regular user.
-const SEED_USER_TYPE: &str = "U";
-
-/// The password every seeded user stores [app/jcl/DUSRSECJ.jcl:L35-44].
-const SEED_PASSWORD: &str = "PASSWORD";
-
-/// The first name the E-21 cases change [`USER0001`] to.
+/// The first name the E-21 cases change `USER0001` to.
 const CHANGED_FIRST_NAME: &str = "LARRY";
 
 /// The password the last E-21 case sets, upper case as sign-on compares it.
@@ -259,19 +258,19 @@ const UNKNOWN_USER: &str = "NOSUCHUS";
 /// The fetch and update route of [`UNKNOWN_USER`].
 const UNKNOWN_PATH: &str = "/admin/users/NOSUCHUS";
 
-/// The user whose stored row the read failure corrupts, seeded as `AJITH
-/// KUMAR` [app/jcl/DUSRSECJ.jcl:L41].
+/// The seeded user whose stored row the read failure corrupts
+/// [app/jcl/DUSRSECJ.jcl:L41]. [`CORRUPT_USER0002`] names the same ID.
+const USER0002: &str = "USER0002";
+
+/// The fetch route of [`USER0002`].
 const USER0002_PATH: &str = "/admin/users/USER0002";
 
-/// The user whose rewrite the trigger skips or fails, seeded as `LAURITZ
-/// ALME` [app/jcl/DUSRSECJ.jcl:L42].
+/// The seeded user whose rewrite the trigger skips or fails
+/// [app/jcl/DUSRSECJ.jcl:L42]. [`SKIP_REWRITE`] names the same ID.
 const USER0003: &str = "USER0003";
 
 /// The fetch and update route of [`USER0003`].
 const USER0003_PATH: &str = "/admin/users/USER0003";
-
-/// `SEC-USR-LNAME` of [`USER0003`] as seeded.
-const USER0003_LAST_NAME: &str = "ALME";
 
 /// The first name the rewrite failures try to give [`USER0003`].
 const RENAMED_USER0003: &str = "LAURA";
@@ -541,9 +540,28 @@ fn form(first_name: &str, last_name: &str, usr_type: &str, password: Option<&str
     body
 }
 
-/// The `PUT` body of [`USER0001`] with its seeded last name and type.
-fn user0001_form(first_name: &str, password: Option<&str>) -> Value {
-    form(first_name, SEED_LAST_NAME, SEED_USER_TYPE, password)
+/// The `PUT` body of the seeded `user` with its seeded last name and type.
+fn user0001_form(user: &SeededUser, first_name: &str, password: Option<&str>) -> Value {
+    form(first_name, &user.last_name, &user.usr_type, password)
+}
+
+/// The seeded `user` as the fetch and the update answers show it, with the
+/// first name `first_name`.
+fn seeded_summary(user: &SeededUser, first_name: &str) -> Value {
+    summary(&user.user_id, first_name, &user.last_name, &user.usr_type)
+}
+
+/// The fetch and update route of the user `user_id`.
+fn user_path(user_id: &str) -> String {
+    format!("/admin/users/{user_id}")
+}
+
+/// The seeded user `user_id` among the decoded `users`.
+fn seeded_record<'u>(users: &'u [SeededUser], user_id: &str) -> &'u SeededUser {
+    users
+        .iter()
+        .find(|user| user.user_id == user_id)
+        .unwrap_or_else(|| panic!("{SEEDED_USERS_ROW}: no seeded user {user_id}"))
 }
 
 /// `body` with `member` set to `value`, or removed when `value` is `None`.
@@ -616,8 +634,8 @@ fn assert_updated(resp: &Resp, user: &Value) {
 }
 
 /// Asserts the message-only answer of `audited` (V-COUSR02C-010): its status and
-/// text, and [`USER0001`] as stored with the first name `first_name`.
-fn assert_not_modified(resp: &Resp, audited: &Audited, first_name: &str) {
+/// text, and the seeded `user` as stored with the first name `first_name`.
+fn assert_not_modified(resp: &Resp, audited: &Audited, user: &SeededUser, first_name: &str) {
     let id = audited.id;
     assert!(audited.kind.is_none(), "{id} must be a message-only row");
     let (status, body, raw) = resp;
@@ -629,7 +647,7 @@ fn assert_not_modified(resp: &Resp, audited: &Audited, first_name: &str) {
     );
     assert_eq!(
         body["user"],
-        summary(USER0001, first_name, SEED_LAST_NAME, SEED_USER_TYPE),
+        seeded_summary(user, first_name),
         "{id}: the user as stored: {raw}"
     );
     assert_no_password(resp);
@@ -639,17 +657,18 @@ fn assert_not_modified(resp: &Resp, audited: &Audited, first_name: &str) {
 /// type, which is the empty field too, get the member's row; a blank `{id}`
 /// gets [`UPDATE_EMPTY_ID`]. An absent password is not blank: it stands for
 /// the current one (E-21), which the E-21 test covers.
-async fn edit_each_field(app: &TestApp, token: &str, doc: &Document) {
-    let seeded = user0001_form(SEED_FIRST_NAME, None);
+async fn edit_each_field(app: &TestApp, token: &str, doc: &Document, user: &SeededUser) {
+    let path = user_path(&user.user_id);
+    let seeded = user0001_form(user, &user.first_name, None);
     for (member, id) in MEMBER_EDITS {
         let row = Audited::cousr02c(doc, id);
         for blank in BLANKS {
             let body = with_member(&seeded, member, Some(blank));
-            row.assert_answer(&app.put(USER0001_PATH, Some(token), &body).await);
+            row.assert_answer(&app.put(&path, Some(token), &body).await);
         }
         if member != "password" {
             let body = with_member(&seeded, member, None);
-            row.assert_answer(&app.put(USER0001_PATH, Some(token), &body).await);
+            row.assert_answer(&app.put(&path, Some(token), &body).await);
         }
     }
     let empty_id = Audited::cousr02c(doc, UPDATE_EMPTY_ID);
@@ -660,22 +679,22 @@ async fn edit_each_field(app: &TestApp, token: &str, doc: &Document) {
 
 /// Several blank fields in one `PUT`: the row with the lowest (Order, ID)
 /// among them answers (P-COUSR02C-004).
-async fn edit_blank_sets(app: &TestApp, token: &str, doc: &Document) {
+async fn edit_blank_sets(app: &TestApp, token: &str, doc: &Document, user: &SeededUser) {
+    let user0001_path = user_path(&user.user_id);
     for (blank_id, members) in BLANK_SETS {
         let mut rows: Vec<Audited> = members
             .iter()
             .map(|member| Audited::cousr02c(doc, member_row(member)))
             .collect();
-        let body = members
-            .iter()
-            .fold(user0001_form(SEED_FIRST_NAME, None), |body, member| {
-                with_member(&body, member, Some(""))
-            });
+        let body = members.iter().fold(
+            user0001_form(user, &user.first_name, None),
+            |body, member| with_member(&body, member, Some("")),
+        );
         let path = if blank_id {
             rows.push(Audited::cousr02c(doc, UPDATE_EMPTY_ID));
             BLANK_ID_PATHS[0]
         } else {
-            USER0001_PATH
+            user0001_path.as_str()
         };
         let first = rows
             .iter()
@@ -685,11 +704,20 @@ async fn edit_blank_sets(app: &TestApp, token: &str, doc: &Document) {
     }
 }
 
-/// The ENTER fetch: [`USER0001`] as seeded, without its password, then the
-/// unknown and the blank IDs.
+/// The ENTER fetch: `USER0001` as seeded, without its password, then the
+/// unknown and the blank IDs. The user its reviewed row records is the one
+/// its `DUSRSECJ` record decodes to.
 #[test]
 fn the_fetch_shows_the_user_without_its_password() {
     let doc = validation_audit();
+    let parity = parity_audit();
+    let user0001 = seeded_user(&parity, REGULAR_USER_ROW);
+    let decoded = seeded_users(&parity, SEEDED_USERS_ROW);
+    assert_eq!(
+        seeded_record(&decoded, &user0001.user_id),
+        &user0001,
+        "{REGULAR_USER_ROW} records the user its {SEEDED_USERS_ROW} record decodes to"
+    );
     let not_found = Audited::cousr02c(&doc, FETCH_NOT_FOUND);
     let empty_id = Audited::cousr02c(&doc, FETCH_EMPTY_ID);
     let app = TestApp::start();
@@ -697,11 +725,12 @@ fn the_fetch_shows_the_user_without_its_password() {
         let token = app.admin_token().await;
         // P-COUSR02C-002, P-COUSR02C-003: READ UPDATE NORMAL moves the names
         // and type to the screen; P-COUSR02C-007: never the password.
-        let fetched = app.get(USER0001_PATH, Some(&token)).await;
+        let path = user_path(&user0001.user_id);
+        let fetched = app.get(&path, Some(&token)).await;
         assert_eq!(fetched.0, StatusCode::OK, "the fetch: {}", fetched.2);
         assert_eq!(
             fetched.1,
-            summary(USER0001, SEED_FIRST_NAME, SEED_LAST_NAME, SEED_USER_TYPE),
+            seeded_summary(&user0001, &user0001.first_name),
             "the fetched user: {}",
             fetched.2
         );
@@ -719,24 +748,20 @@ fn the_fetch_shows_the_user_without_its_password() {
 #[test]
 fn the_update_edits_each_field_in_screen_order() {
     let doc = validation_audit();
+    let user0001 = seeded_user(&parity_audit(), REGULAR_USER_ROW);
     let unknown = Audited::cousr02c(&doc, UPDATE_UNKNOWN_USER);
     let app = TestApp::start();
     block_on(async {
         let token = app.admin_token().await;
-        let before = stored_user(&app, USER0001).await;
-        edit_each_field(&app, &token, &doc).await;
-        edit_blank_sets(&app, &token, &doc).await;
+        let before = stored_user(&app, &user0001.user_id).await;
+        edit_each_field(&app, &token, &doc, &user0001).await;
+        edit_blank_sets(&app, &token, &doc, &user0001).await;
         assert_eq!(
-            stored_user(&app, USER0001).await,
+            stored_user(&app, &user0001.user_id).await,
             before,
             "a rejected update must write nothing"
         );
-        let body = form(
-            SEED_FIRST_NAME,
-            SEED_LAST_NAME,
-            SEED_USER_TYPE,
-            Some(SEED_PASSWORD),
-        );
+        let body = user0001_form(&user0001, &user0001.first_name, Some(&user0001.password));
         unknown.assert_answer(&app.put(UNKNOWN_PATH, Some(&token), &body).await);
         assert_eq!(
             stored(&app, UNKNOWN_USER).await,
@@ -748,17 +773,18 @@ fn the_update_edits_each_field_in_screen_order() {
 
 /// E-21 case 1: no password and the stored names and type: the message-only
 /// answer, nothing written.
-async fn no_password_and_no_change(app: &TestApp, token: &str, doc: &Document) {
-    let before = stored_user(app, USER0001).await;
-    let body = user0001_form(SEED_FIRST_NAME, None);
-    let resp = app.put(USER0001_PATH, Some(token), &body).await;
+async fn no_password_and_no_change(app: &TestApp, token: &str, doc: &Document, user: &SeededUser) {
+    let before = stored_user(app, &user.user_id).await;
+    let body = user0001_form(user, &user.first_name, None);
+    let resp = app.put(&user_path(&user.user_id), Some(token), &body).await;
     assert_not_modified(
         &resp,
         &Audited::cousr02c(doc, UPDATE_NOT_MODIFIED),
-        SEED_FIRST_NAME,
+        user,
+        &user.first_name,
     );
     assert_eq!(
-        stored_user(app, USER0001).await,
+        stored_user(app, &user.user_id).await,
         before,
         "an update that changes nothing must write nothing"
     );
@@ -766,12 +792,18 @@ async fn no_password_and_no_change(app: &TestApp, token: &str, doc: &Document) {
 
 /// E-21 case 2: no password and a changed first name: rewritten, with the
 /// stored hash kept, never re-hashed (P-COUSR02C-005).
-async fn no_password_and_a_new_name(app: &TestApp, token: &str, seeded_hash: &str) {
-    let body = user0001_form(CHANGED_FIRST_NAME, None);
-    let resp = app.put(USER0001_PATH, Some(token), &body).await;
-    let renamed = summary(USER0001, CHANGED_FIRST_NAME, SEED_LAST_NAME, SEED_USER_TYPE);
+async fn no_password_and_a_new_name(
+    app: &TestApp,
+    token: &str,
+    user: &SeededUser,
+    seeded_hash: &str,
+) {
+    let path = user_path(&user.user_id);
+    let body = user0001_form(user, CHANGED_FIRST_NAME, None);
+    let resp = app.put(&path, Some(token), &body).await;
+    let renamed = seeded_summary(user, CHANGED_FIRST_NAME);
     assert_updated(&resp, &renamed);
-    let after = stored_user(app, USER0001).await;
+    let after = stored_user(app, &user.user_id).await;
     assert_eq!(
         after.first_name, CHANGED_FIRST_NAME,
         "the rewritten first name"
@@ -780,7 +812,7 @@ async fn no_password_and_a_new_name(app: &TestApp, token: &str, seeded_hash: &st
         after.password_hash, seeded_hash,
         "an absent password must leave the stored hash as it was"
     );
-    let fetched = app.get(USER0001_PATH, Some(token)).await;
+    let fetched = app.get(&path, Some(token)).await;
     assert_eq!(
         fetched.1, renamed,
         "the fetch after the rewrite: {}",
@@ -789,12 +821,18 @@ async fn no_password_and_a_new_name(app: &TestApp, token: &str, seeded_hash: &st
 }
 
 /// E-21 case 3: a present, empty password is the blank field.
-async fn an_empty_password(app: &TestApp, token: &str, doc: &Document, seeded_hash: &str) {
-    let body = user0001_form(CHANGED_FIRST_NAME, Some(""));
-    let resp = app.put(USER0001_PATH, Some(token), &body).await;
+async fn an_empty_password(
+    app: &TestApp,
+    token: &str,
+    doc: &Document,
+    user: &SeededUser,
+    seeded_hash: &str,
+) {
+    let body = user0001_form(user, CHANGED_FIRST_NAME, Some(""));
+    let resp = app.put(&user_path(&user.user_id), Some(token), &body).await;
     Audited::cousr02c(doc, UPDATE_EMPTY_PASSWORD).assert_answer(&resp);
     assert_eq!(
-        hash_of(app, USER0001).await,
+        hash_of(app, &user.user_id).await,
         seeded_hash,
         "a rejected password must leave the stored hash as it was"
     );
@@ -803,16 +841,23 @@ async fn an_empty_password(app: &TestApp, token: &str, doc: &Document, seeded_ha
 /// E-21 case 4: the stored password entered again, nothing else changed: the
 /// argon2 verification finds it equal, so the answer is message-only and
 /// nothing is written.
-async fn the_same_password(app: &TestApp, token: &str, doc: &Document, seeded_hash: &str) {
-    let before = stored_user(app, USER0001).await;
-    let body = user0001_form(CHANGED_FIRST_NAME, Some(SEED_PASSWORD));
-    let resp = app.put(USER0001_PATH, Some(token), &body).await;
+async fn the_same_password(
+    app: &TestApp,
+    token: &str,
+    doc: &Document,
+    user: &SeededUser,
+    seeded_hash: &str,
+) {
+    let before = stored_user(app, &user.user_id).await;
+    let body = user0001_form(user, CHANGED_FIRST_NAME, Some(&user.password));
+    let resp = app.put(&user_path(&user.user_id), Some(token), &body).await;
     assert_not_modified(
         &resp,
         &Audited::cousr02c(doc, UPDATE_NOT_MODIFIED),
+        user,
         CHANGED_FIRST_NAME,
     );
-    let after = stored_user(app, USER0001).await;
+    let after = stored_user(app, &user.user_id).await;
     assert_eq!(
         after.password_hash, seeded_hash,
         "an equal password must not be re-hashed"
@@ -822,20 +867,26 @@ async fn the_same_password(app: &TestApp, token: &str, doc: &Document, seeded_ha
 
 /// E-21 case 5: a new password is re-hashed and rewritten; sign-on then takes
 /// it and refuses the replaced one (E-20).
-async fn a_new_password(app: &TestApp, token: &str, doc: &Document, seeded_hash: &str) {
-    let body = user0001_form(CHANGED_FIRST_NAME, Some(NEW_PASSWORD));
-    let resp = app.put(USER0001_PATH, Some(token), &body).await;
-    let renamed = summary(USER0001, CHANGED_FIRST_NAME, SEED_LAST_NAME, SEED_USER_TYPE);
+async fn a_new_password(
+    app: &TestApp,
+    token: &str,
+    doc: &Document,
+    user: &SeededUser,
+    seeded_hash: &str,
+) {
+    let body = user0001_form(user, CHANGED_FIRST_NAME, Some(NEW_PASSWORD));
+    let resp = app.put(&user_path(&user.user_id), Some(token), &body).await;
+    let renamed = seeded_summary(user, CHANGED_FIRST_NAME);
     assert_updated(&resp, &renamed);
-    let hash = hash_of(app, USER0001).await;
+    let hash = hash_of(app, &user.user_id).await;
     assert_ne!(hash, seeded_hash, "a changed password must be re-hashed");
     assert!(
         hash.starts_with(ARGON2_MARK),
         "the new hash is an argon2 PHC string"
     );
-    let new_token = app.login(USER0001, NEW_PASSWORD).await;
+    let new_token = app.login(&user.user_id, NEW_PASSWORD).await;
     assert!(!new_token.is_empty(), "the new password signs on");
-    let old = json!({ "user_id": USER0001, "password": SEED_PASSWORD });
+    let old = json!({ "user_id": user.user_id, "password": user.password });
     let refused = app.post(LOGIN_PATH, None, &old).await;
     Audited::read(
         doc,
@@ -845,29 +896,34 @@ async fn a_new_password(app: &TestApp, token: &str, doc: &Document, seeded_hash:
     .assert_answer(&refused);
 }
 
-/// The five E-21 cases of PF5, in order, on [`USER0001`]: its seeded hash is
+/// The five E-21 cases of PF5, in order, on `USER0001`: its seeded hash is
 /// recorded first and compared after each.
 #[test]
 fn the_password_follows_the_e21_rules() {
     let doc = validation_audit();
+    let user = seeded_user(&parity_audit(), REGULAR_USER_ROW);
     let app = TestApp::start();
     block_on(async {
         let token = app.admin_token().await;
-        let seeded_hash = hash_of(&app, USER0001).await;
-        no_password_and_no_change(&app, &token, &doc).await;
-        no_password_and_a_new_name(&app, &token, &seeded_hash).await;
-        an_empty_password(&app, &token, &doc, &seeded_hash).await;
-        the_same_password(&app, &token, &doc, &seeded_hash).await;
-        a_new_password(&app, &token, &doc, &seeded_hash).await;
+        let seeded_hash = hash_of(&app, &user.user_id).await;
+        no_password_and_no_change(&app, &token, &doc, &user).await;
+        no_password_and_a_new_name(&app, &token, &user, &seeded_hash).await;
+        an_empty_password(&app, &token, &doc, &user, &seeded_hash).await;
+        the_same_password(&app, &token, &doc, &user, &seeded_hash).await;
+        a_new_password(&app, &token, &doc, &user, &seeded_hash).await;
     });
 }
 
 /// The read failure of the fetch, then the `REWRITE` `NOTFND` and the
 /// `REWRITE` failure, each injected through SQL and each writing nothing; the
-/// same update succeeds once the fault is removed.
+/// same update succeeds once the fault is removed. The two users are those
+/// their `DUSRSECJ` records decode to.
 #[test]
 fn read_and_rewrite_failures_answer_with_their_audited_texts() {
     let doc = validation_audit();
+    let seeded = seeded_users(&parity_audit(), SEEDED_USERS_ROW);
+    let user0002 = seeded_record(&seeded, USER0002);
+    let user0003 = seeded_record(&seeded, USER0003);
     let read_failed = Audited::cousr02c(&doc, FETCH_READ_FAILED);
     let rewrite_not_found = Audited::cousr02c(&doc, REWRITE_NOT_FOUND);
     let rewrite_failed = Audited::cousr02c(&doc, REWRITE_FAILED);
@@ -885,10 +941,21 @@ fn read_and_rewrite_failures_answer_with_their_audited_texts() {
             "the fetch once repaired: {}",
             repaired.2
         );
+        assert_eq!(
+            repaired.1,
+            seeded_summary(user0002, &user0002.first_name),
+            "{SEEDED_USERS_ROW}: the repair restores {USER0002} as seeded: {}",
+            repaired.2
+        );
 
         // P-COUSR02C-006, the NOTFND and `other` responses of the REWRITE.
         let before = stored_user(&app, USER0003).await;
-        let body = form(RENAMED_USER0003, USER0003_LAST_NAME, SEED_USER_TYPE, None);
+        let body = form(
+            RENAMED_USER0003,
+            &user0003.last_name,
+            &user0003.usr_type,
+            None,
+        );
         app.stack().exec_sql(SKIP_REWRITE).await;
         rewrite_not_found.assert_answer(&app.put(USER0003_PATH, Some(&token), &body).await);
         assert_eq!(
@@ -905,12 +972,7 @@ fn read_and_rewrite_failures_answer_with_their_audited_texts() {
         );
         app.stack().exec_sql(CLEAR_REWRITE_FAULT).await;
         let written = app.put(USER0003_PATH, Some(&token), &body).await;
-        let renamed = summary(
-            USER0003,
-            RENAMED_USER0003,
-            USER0003_LAST_NAME,
-            SEED_USER_TYPE,
-        );
+        let renamed = seeded_summary(user0003, RENAMED_USER0003);
         assert_updated(&written, &renamed);
         assert_eq!(
             stored_user(&app, USER0003).await.first_name,
@@ -1236,6 +1298,7 @@ async fn received_map(
     token: &str,
     validation: &Document,
     parity: &Document,
+    user: &SeededUser,
     bodies: &mut Vec<String>,
 ) {
     let read = parity_cell(parity, RECEIVE_ROW, "Expected result");
@@ -1267,7 +1330,9 @@ async fn received_map(
         members,
         "{RECEIVE_ROW}: the update body holds the four COUSR2A inputs after USRIDINI"
     );
-    let resp = app.put(USER0001_PATH, Some(token), &json!({})).await;
+    let resp = app
+        .put(&user_path(&user.user_id), Some(token), &json!({}))
+        .await;
     bodies.push(resp.2.clone());
     Audited::cousr02c(validation, UPDATE_EMPTY_FIRST_NAME).assert_answer(&resp);
 }
@@ -1280,11 +1345,13 @@ async fn received_map(
 /// answers, and PF12's sends no request; the rows the clear row names (PF4)
 /// send none either. The entry without a COMMAREA (`EIBCALEN = 0`) is a
 /// request without a session: the fetch and the update answer 401
-/// `Authentication required` with no field, and the user stays as stored.
+/// `Authentication required` with no field, and the seeded `user` stays as
+/// stored.
 async fn return_and_clear_keys(
     app: &TestApp,
     parity: &Document,
     map_doc: &Document,
+    user: &SeededUser,
     bodies: &mut Vec<String>,
 ) {
     let update = Endpoint {
@@ -1303,11 +1370,12 @@ async fn return_and_clear_keys(
     for (id, request) in named_requests(parity, map_doc, CLEAR_ROW) {
         assert_eq!(request, None, "{CLEAR_ROW}: {id} sends no request");
     }
-    let before = stored_user(app, USER0001).await;
-    let renamed = user0001_form(CHANGED_FIRST_NAME, None);
+    let path = user_path(&user.user_id);
+    let before = stored_user(app, &user.user_id).await;
+    let renamed = user0001_form(user, CHANGED_FIRST_NAME, None);
     for token in NO_SESSION {
-        let fetched = common::send(app.client().get(app.url(USER0001_PATH)), token).await;
-        let request = app.client().put(app.url(USER0001_PATH)).json(&renamed);
+        let fetched = common::send(app.client().get(app.url(&path)), token).await;
+        let request = app.client().put(app.url(&path)).json(&renamed);
         let updated = common::send(request, token).await;
         for resp in [fetched, updated] {
             bodies.push(resp.2.clone());
@@ -1321,9 +1389,10 @@ async fn return_and_clear_keys(
         }
     }
     assert_eq!(
-        stored_user(app, USER0001).await,
+        stored_user(app, &user.user_id).await,
         before,
-        "{RETURN_ROW}: a request without a session wrote {USER0001}"
+        "{RETURN_ROW}: a request without a session wrote {}",
+        user.user_id
     );
 }
 
@@ -1334,10 +1403,12 @@ async fn return_and_clear_keys(
 /// invalid-key error send no request. Neither operation takes key input, so
 /// a fetch or an update naming any other AID key answers as without it, and
 /// never with the invalid-key text, whose audited 49 bytes fit its `X(50)`.
+/// The requests act on the seeded `user`.
 async fn aid_keys_map_to_requests(
     app: &TestApp,
     token: &str,
     (validation, parity, map_doc): (&Document, &Document, &Document),
+    user: &SeededUser,
     bodies: &mut Vec<String>,
 ) {
     let spec = spec();
@@ -1369,14 +1440,15 @@ async fn aid_keys_map_to_requests(
     );
     assert!(invalid.width >= Some(messages::CCDA_MSG_INVALID_KEY.len()));
 
-    let unchanged = user0001_form(SEED_FIRST_NAME, None);
-    let fetched = app.get(USER0001_PATH, Some(token)).await;
-    let kept = app.put(USER0001_PATH, Some(token), &unchanged).await;
+    let user0001_path = user_path(&user.user_id);
+    let unchanged = user0001_form(user, &user.first_name, None);
+    let fetched = app.get(&user0001_path, Some(token)).await;
+    let kept = app.put(&user0001_path, Some(token), &unchanged).await;
     let not_modified = Audited::cousr02c(validation, UPDATE_NOT_MODIFIED);
-    assert_not_modified(&kept, &not_modified, SEED_FIRST_NAME);
+    assert_not_modified(&kept, &not_modified, user, &user.first_name);
     let mut answers = vec![fetched.clone(), kept.clone()];
     for aid in OTHER_KEYS {
-        let path = format!("{USER0001_PATH}?{AID_MEMBER}={aid}");
+        let path = format!("{user0001_path}?{AID_MEMBER}={aid}");
         let fetch = app.get(&path, Some(token)).await;
         assert_eq!(
             (fetch.0, &fetch.1),
@@ -1384,15 +1456,14 @@ async fn aid_keys_map_to_requests(
             "{AID_ROW} {aid}"
         );
         let body = with_member(&unchanged, AID_MEMBER, Some(aid));
-        let update = app.put(USER0001_PATH, Some(token), &body).await;
+        let update = app.put(&user0001_path, Some(token), &body).await;
         assert_eq!((update.0, &update.1), (kept.0, &kept.1), "{AID_ROW} {aid}");
         answers.extend([fetch, update]);
     }
-    let renamed = user0001_form(CHANGED_FIRST_NAME, None);
+    let renamed = user0001_form(user, CHANGED_FIRST_NAME, None);
     let body = with_member(&renamed, AID_MEMBER, Some(OTHER_KEYS[0]));
-    let updated = app.put(USER0001_PATH, Some(token), &body).await;
-    let user = summary(USER0001, CHANGED_FIRST_NAME, SEED_LAST_NAME, SEED_USER_TYPE);
-    assert_updated(&updated, &user);
+    let updated = app.put(&user0001_path, Some(token), &body).await;
+    assert_updated(&updated, &seeded_summary(user, CHANGED_FIRST_NAME));
     answers.push(updated);
     for (_, _, raw) in answers {
         let text = messages::CCDA_MSG_INVALID_KEY.trim_end();
@@ -1427,15 +1498,16 @@ fn assert_no_header(bodies: &[String], parity: &Document) {
 fn the_screen_keys_and_the_header_have_their_rest_replacements() {
     let validation = validation_audit();
     let parity = parity_audit();
+    let user = seeded_user(&parity, REGULAR_USER_ROW);
     let map_doc = function_map();
     let app = TestApp::start();
     let bodies = block_on(async {
         let token = app.admin_token().await;
         let mut bodies = Vec::new();
-        received_map(&app, &token, &validation, &parity, &mut bodies).await;
-        return_and_clear_keys(&app, &parity, &map_doc, &mut bodies).await;
+        received_map(&app, &token, &validation, &parity, &user, &mut bodies).await;
+        return_and_clear_keys(&app, &parity, &map_doc, &user, &mut bodies).await;
         let docs = (&validation, &parity, &map_doc);
-        aid_keys_map_to_requests(&app, &token, docs, &mut bodies).await;
+        aid_keys_map_to_requests(&app, &token, docs, &user, &mut bodies).await;
         bodies
     });
     assert_no_header(&bodies, &parity);

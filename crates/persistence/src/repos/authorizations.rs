@@ -58,19 +58,43 @@
 //!
 //! # Locks
 //!
-//! One read locks: the CPVD fraud mark's detail read,
-//! [`AuthorizationStore::read_detail_for_update`], a `SELECT … FOR UPDATE`
-//! under its own savepoint whose row lock lasts until the caller's
-//! transaction commits or rolls back. Two overlapping fraud marks of one
-//! authorization therefore serialize: the second reads the flag the first
-//! committed, and no toggle is lost. `COPAUS1C` takes no lock of its own;
-//! this one is the concurrency safeguard of the replacement. Every other read,
-//! the CPVD view and its PF8 step included, takes no lock.
+//! Three reads lock, each a `SELECT … FOR UPDATE` under its own savepoint
+//! whose row locks last until the caller's transaction commits or rolls back:
 //!
-//! The purge has a safeguard of its own: `batch cbpaup0j` takes the advisory
-//! lock of [`PgStore::exclude_other_purges`] before its sweep, so two purges
-//! run one after the other and neither deletes a detail the other has already
-//! deleted. The sweep's reads still take no lock.
+//! - The CPVD fraud mark's detail read,
+//!   [`AuthorizationStore::read_detail_for_update`]. Two overlapping fraud
+//!   marks of one authorization serialize: the second reads the flag the
+//!   first committed, and no toggle is lost. `COPAUS1C` takes no lock of its
+//!   own; this one is the concurrency safeguard of the replacement.
+//! - The `CBPAUP0C` sweep, [`AuthorizationStore::summaries_after`], which
+//!   row-locks each summary it reads until the purge commits.
+//! - CP00's summary read, [`AuthorizationStore::read_summary_for_update`],
+//!   in the read unit of work that decides the request and again as the first
+//!   statement of the unit of work that writes it.
+//!
+//! The last two reproduce IMS program isolation: `COPAUA0C` and the
+//! `CBPAUP0C` BMP both run under the PSB `PSBPAUTB` with `PROCOPT=AP`
+//! [app/app-authorization-ims-db2-mq/ims/PSBPAUTB.psb:L17], so the two
+//! programs reach one summary one after the other. A CP00 write either
+//! commits before the sweep reads its summary, which the sweep then sees with
+//! the count and the detail that write left, or waits until the purge commits
+//! and then reads what the purge left. No authorization CP00 commits is
+//! deleted by a purge that never read it (P-CBPAUP0C-004, P-CBPAUP0C-006).
+//! Every other read, the CPVS summary read and list and the CPVD view and its
+//! PF8 step included, takes no lock.
+//!
+//! The purge has a second safeguard: `batch cbpaup0j` takes the advisory lock
+//! of [`PgStore::exclude_other_purges`] before its sweep, so two purges run
+//! one after the other and neither deletes a detail the other has already
+//! deleted.
+//!
+//! No two of these units of work wait for each other in a cycle. CP00 takes
+//! at most one summary lock per unit of work, as its first locking statement:
+//! in the read unit after the unlocked cross-reference, account and customer
+//! reads, in the write unit before anything else. Once it holds the summary,
+//! its replace or insert of that summary and its detail insert under it wait
+//! for no lock a purge or a fraud mark holds, so CP00 never waits on either
+//! while it holds a lock. The fraud mark locks one detail and never a summary.
 
 use carddemo_domain::entities::{
     AuthFraud, FraudFlag, MatchStatus, NewPendingAuthDetail, PA_ACCOUNT_STATUS_OCCURS,
@@ -337,6 +361,46 @@ impl AuthorizationStore for PgStore<'_, '_> {
         Ok(summary_from_row(row)?)
     }
 
+    /// COPAUA0C 5500-READ-AUTH-SUMMRY — P-COPAUA0C-008
+    /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L616-640];
+    /// COPAUA0C 8400-UPDATE-SUMMARY — P-COPAUA0C-013
+    /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L801-834]:
+    /// `GU PAUTSUM0 WHERE (ACCNTID = PA-ACCT-ID)` under the update intent of
+    /// `PSBPAUTB` (`PROCOPT=AP`)
+    /// [app/app-authorization-ims-db2-mq/ims/PSBPAUTB.psb:L17], read with
+    /// `SELECT … FOR UPDATE`.
+    ///
+    /// A summary a running purge sweep holds ([`Self::summaries_after`]) is
+    /// waited for; at `READ COMMITTED` the statement then returns the row as
+    /// that unit of work committed it, or no row when it deleted it. The row
+    /// lock lasts until the caller's transaction commits or rolls back. The
+    /// statement runs under its own savepoint, so a lock timeout
+    /// ([`PortError::Contention`]) or any other failure leaves the
+    /// transaction usable; a released savepoint keeps the lock in the
+    /// transaction. No row is the `GE` status.
+    async fn read_summary_for_update(&mut self, id: AccountId) -> PortResult<PendingAuthSummary> {
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
+        let result = sqlx::query_as!(
+            SummaryRow,
+            r#"SELECT pa_acct_id AS acct_id, pa_cust_id AS cust_id,
+                      pa_auth_status AS auth_status, pa_account_status AS account_status,
+                      pa_credit_limit AS credit_limit, pa_cash_limit AS cash_limit,
+                      pa_credit_balance AS credit_balance, pa_cash_balance AS cash_balance,
+                      pa_approved_auth_cnt AS approved_auth_cnt,
+                      pa_declined_auth_cnt AS declined_auth_cnt,
+                      pa_approved_auth_amt AS approved_auth_amt,
+                      pa_declined_auth_amt AS declined_auth_amt
+                 FROM pending_auth_summaries
+                WHERE pa_acct_id = $1
+                  FOR UPDATE"#,
+            id.to_i64()
+        )
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?.ok_or(PortError::NotFound)?;
+        Ok(summary_from_row(row)?)
+    }
+
     /// COPAUS1C READ-AUTH-RECORD — P-COPAUS1C-003, P-COPAUS1C-004
     /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L436-462]:
     /// `GU PAUTSUM0 WHERE (ACCNTID = PA-ACCT-ID)` for the account of the
@@ -479,6 +543,19 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// The two cases are separate statements, so each page is a range scan of
     /// the primary key, under custom and generic prepared plans alike, rather
     /// than a filtered scan from the first summary.
+    ///
+    /// Each statement reads `FOR UPDATE`, the update intent of the BMP's `GN`
+    /// under `PSBPAUTB` (`PROCOPT=AP`)
+    /// [app/app-authorization-ims-db2-mq/ims/PSBPAUTB.psb:L17]: every summary
+    /// of the page stays row-locked until the purge's unit of work commits or
+    /// rolls back. A summary a CP00 unit of work holds
+    /// ([`Self::read_summary_for_update`]) is waited for, and at
+    /// `READ COMMITTED` the page then carries it as that unit committed it,
+    /// with the approved count its write left, and the detail reads that
+    /// follow see the detail it inserted. The page is therefore the state a
+    /// serial run of the two programs gives, and the rule's in-memory counts
+    /// and its summary delete (P-CBPAUP0C-004, P-CBPAUP0C-006) never act on a
+    /// summary a later CP00 write changed.
     async fn summaries_after(
         &mut self,
         after: Option<AccountId>,
@@ -500,7 +577,8 @@ impl AuthorizationStore for PgStore<'_, '_> {
                               pa_declined_auth_amt AS declined_auth_amt
                          FROM pending_auth_summaries
                         ORDER BY pa_acct_id
-                        LIMIT $1"#,
+                        LIMIT $1
+                          FOR UPDATE"#,
                     limit
                 )
                 .fetch_all(&mut *sp)
@@ -520,7 +598,8 @@ impl AuthorizationStore for PgStore<'_, '_> {
                          FROM pending_auth_summaries
                         WHERE pa_acct_id > $1
                         ORDER BY pa_acct_id
-                        LIMIT $2"#,
+                        LIMIT $2
+                          FOR UPDATE"#,
                     after.to_i64(),
                     limit
                 )
@@ -1015,8 +1094,15 @@ impl PgStore<'_, '_> {
     /// rows the first one left.
     ///
     /// The purge takes the lock before any row lock, and only the purge takes
-    /// it. A purge waiting for it holds nothing that CP00's writes or the CPVD
-    /// fraud marking wait for, so it cannot deadlock with them.
+    /// it, so a purge waiting for it holds no row lock. Once it holds it, its
+    /// sweep row-locks each summary it reads ([`Self::summaries_after`]) and
+    /// may wait for a summary a CP00 unit of work holds, or for a detail a
+    /// CPVD fraud mark holds. Neither then waits for the purge: CP00 takes its
+    /// one summary lock as its first locking statement
+    /// ([`Self::read_summary_for_update`]) and afterwards waits for nothing
+    /// the purge holds, and the fraud mark locks one detail, never a summary,
+    /// and afterwards writes only that detail and its fraud report. No cycle
+    /// of waits forms, so the purge cannot deadlock with them.
     ///
     /// # Errors
     ///

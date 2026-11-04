@@ -43,11 +43,14 @@ use std::fmt;
 
 use super::card_update::{CardKeys, record_version};
 use super::{ReturnMsg, VersionKey, VersionToken};
-use crate::entities::Card;
 use crate::error::{DomainError, ErrorKind};
 use crate::messages;
 use crate::numeric::{AccountId, Alnum, CardNumber};
 use crate::ports::{CardReader, PortError};
+
+/// The card record [`CardView::card`] carries, re-exported from
+/// [`crate::entities`] for the API adapter, which maps it to its response.
+pub use crate::entities::Card;
 
 /// `ACCTSID`, the account number of the `COCRDSL` map
 /// [app/cpy-bms/COCRDSL.CPY:L55-60].

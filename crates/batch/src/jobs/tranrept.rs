@@ -29,7 +29,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
-use carddemo_domain::entities::Transaction;
 use carddemo_domain::format::REPORT_RECORD_LEN;
 use carddemo_domain::messages::{
     ABENDING_PROGRAM, END_OF_EXECUTION_OF_PROGRAM_CBTRN03C, ERROR_CLOSING_REPORT_FILE,
@@ -37,12 +36,12 @@ use carddemo_domain::messages::{
     ERROR_OPENING_TRANSACTION_CATG_FILE, ERROR_OPENING_TRANSACTION_TYPE_FILE,
     ERROR_READING_TRANSACTION_FILE, ERROR_WRITING_REPTFILE, file_status_message,
 };
-use carddemo_domain::numeric::{
-    Alnum, CardNumber, TranCategoryCode, TranTypeCode, TransactionRowId,
+use carddemo_domain::rules::transaction_report::{
+    self, Alnum, CardNumber, ReportAbend, ReportRun, TranCategoryCode, TranTypeCode,
+    TranTypeFileReader, Transaction, TransactionRowId, UnpinnedSortKey, XrefReader,
 };
-use carddemo_domain::ports::{PortError, PortResult, TranTypeFileReader, XrefReader};
-use carddemo_domain::rules::transaction_report::{self, ReportAbend, ReportRun, UnpinnedSortKey};
-use carddemo_persistence::{Db, UnitOfWork};
+use carddemo_domain::rules::{PortError, PortResult};
+use carddemo_persistence::tx::{Db, UnitOfWork};
 use tracing::Span;
 
 use super::{JobContext, JobCounts, backup_live_master, count_of, setup_failure, span_count};

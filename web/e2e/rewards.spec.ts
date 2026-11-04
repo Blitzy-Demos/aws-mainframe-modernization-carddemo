@@ -23,6 +23,7 @@
 //   FieldError, the input marked invalid, focus moved from Save to it, and no
 //   rule stored.
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
+import { z } from "zod";
 
 import type { components } from "../src/api/schema";
 
@@ -47,9 +48,13 @@ import {
   MESSAGES,
   nameMatcher,
   notifications,
+  processingClock,
+  processingDate,
   psql,
   readJson,
   REWARD_SCREENS,
+  rewardBalanceResponseSchema,
+  rewardRuleResponseSchema,
   rowEndpoint,
   rowInput,
   setRewardBalance,
@@ -58,6 +63,7 @@ import {
   tableByCaption,
   test,
   topUpAccruals,
+  transactionAddResponseSchema,
   transactionWriteCheckpoint,
   UNMAPPED_LABELS,
   urlPath,
@@ -67,9 +73,7 @@ import {
   type LabelText,
 } from "./fixtures";
 
-type RewardBalanceResponse = components["schemas"]["RewardBalanceResponse"];
 type RewardRuleResponse = components["schemas"]["RewardRuleResponse"];
-type TransactionAddResponse = components["schemas"]["TransactionAddResponse"];
 
 /** 2^53 + 1: a JavaScript number would show it as 9007199254740992. */
 const EXACT_POINTS = "9007199254740993";
@@ -127,28 +131,70 @@ function pagingControl(page: Page, name: "Previous" | "Next"): Locator {
 
 /**
  * The points and rule the RewardEngine credits for a `typeCode`/`categoryCode`
- * add of `amount` now, computed by PostgreSQL: among the rules active now
- * whose bounds hold the amount, the highest rate wins and a tie goes to the
- * lowest rule_id; points = ceil(amount × rate). "points|rule_id".
+ * add of `amount` at the processing instant (processingClock), computed by
+ * PostgreSQL: among the rules active at that instant whose bounds hold the
+ * amount, the highest rate wins and a tie goes to the lowest rule_id;
+ * points = ceil(amount × rate). "points|rule_id".
  */
 async function expectedAccrual(typeCode: string, categoryCode: string, amount: string): Promise<string> {
   if (!/^[0-9]+\.[0-9]{2}$/.test(amount)) {
     throw new Error(`not an amount: ${amount}`);
   }
   const value = `${sqlLiteral(amount)}::numeric`;
+  const clock = processingClock();
   const expected = await psql(
     `SELECT ceil(${value} * reward_rate)::bigint || '|' || rule_id
        FROM reward_rules
       WHERE transaction_type_cd = ${sqlLiteral(typeCode)}
         AND transaction_category_cd = ${sqlLiteral(categoryCode)}::integer
-        AND active_from <= now() AND (active_to IS NULL OR now() < active_to)
+        AND active_from <= ${clock.instant} AND (active_to IS NULL OR ${clock.instant} < active_to)
         AND (min_transaction_amount IS NULL OR min_transaction_amount <= ${value})
         AND (max_transaction_amount IS NULL OR max_transaction_amount >= ${value})
       ORDER BY reward_rate DESC, rule_id
       LIMIT 1`,
   );
-  expect(expected, `an active ${typeCode}/${categoryCode} rule accrues for ${amount}`).toMatch(/^[0-9]+\|[0-9]+$/);
+  expect(
+    expected,
+    `a ${typeCode}/${categoryCode} rule active at ${clock.label} accrues for ${amount}`,
+  ).toMatch(/^[0-9]+\|[0-9]+$/);
   return expected;
+}
+
+/** PostgreSQL's clock_timestamp() as text: one bound of an add the system clock stamps. */
+async function databaseClock(): Promise<string> {
+  return psql("SELECT clock_timestamp()");
+}
+
+/**
+ * Asserts that the accrual of the live TRAN-ID `tranId` was stamped at the
+ * processing clock expectedAccrual chose its rule at: exactly
+ * CARDDEMO_CLOCK_OVERRIDE when this run sets it, else between `before` and
+ * `after`, databaseClock readings taken just before and just after the add.
+ * A mismatch means the API under test and this Playwright run do not share
+ * CARDDEMO_CLOCK_OVERRIDE, so the expected rule was chosen at another instant.
+ */
+async function expectAccruedAtProcessingClock(tranId: string, before: string, after: string): Promise<void> {
+  const clock = processingClock();
+  const stamped =
+    clock.override === null
+      ? `a.created_at BETWEEN ${sqlLiteral(before)}::timestamptz AND ${sqlLiteral(after)}::timestamptz`
+      : `a.created_at = ${clock.instant}`;
+  const row = await psql(
+    `SELECT ${stamped}, a.created_at
+       FROM transaction_master t JOIN reward_accruals a ON a.transaction_id = t.transaction_id
+      WHERE t.tran_id = ${sqlLiteral(tranId)}`,
+  );
+  const [holds = "", createdAt = ""] = row.split("|");
+  const found = row === "" ? "no accrual" : `an accrual stamped ${createdAt}`;
+  const wanted = clock.override === null ? `within the add (${before} to ${after})` : `at ${clock.label}`;
+  const agreement =
+    clock.override === null
+      ? "CARDDEMO_CLOCK_OVERRIDE unset"
+      : `CARDDEMO_CLOCK_OVERRIDE=${clock.override}`;
+  expect(
+    holds,
+    `TRAN-ID ${tranId} has ${found}, not one ${wanted}: the API under test must run with ${agreement}, as this Playwright run does`,
+  ).toBe("t");
 }
 
 /** "transaction_id|points_earned|rule_id" of the accrual of the live TRAN-ID `tranId`. */
@@ -164,7 +210,7 @@ async function rules(request: APIRequestContext): Promise<RewardRuleResponse[]> 
   const token = await apiToken(request, "admin");
   const response = await request.get(apiPath("/admin/reward-rules"), { headers: bearer(token) });
   expect(response.status()).toBe(200);
-  return readJson<RewardRuleResponse[]>(response);
+  return readJson(response, z.array(rewardRuleResponseSchema));
 }
 
 /** Orders decimal integer strings by value, without converting them to numbers. */
@@ -174,6 +220,13 @@ function byDecimal(a: string, b: string): number {
   }
   return a < b ? -1 : a > b ? 1 : 0;
 }
+
+/** The Status badge text the rule list shows for each server `status`. */
+const RULE_STATUS_LABELS = {
+  active: SCREENS.ruleList.active,
+  scheduled: SCREENS.ruleList.scheduled,
+  ended: SCREENS.ruleList.ended,
+} as const satisfies Record<RewardRuleResponse["status"], string>;
 
 /** The table row of the rule `ruleId` on the rule list. */
 function ruleRow(page: Page, ruleId: string): Locator {
@@ -269,7 +322,7 @@ test.describe("a balance above 2^53", () => {
     });
     expect(response.status()).toBe(200);
     expect(await response.text()).toContain(`"available_points":"${EXACT_POINTS}"`);
-    const balance = await readJson<RewardBalanceResponse>(response);
+    const balance = await readJson(response, rewardBalanceResponseSchema);
     expect(balance).toEqual({
       account_id: FIXTURE_KEYS.account,
       total_points_earned: EXACT_POINTS,
@@ -369,12 +422,16 @@ test.describe("a CT02 add through the API", () => {
 
   test("accrues ceil(amount × rate) under the best active rule", async ({ request }) => {
     const expected = await expectedAccrual(FIXTURE_KEYS.tranType, FIXTURE_KEYS.tranCategory, ADD_AMOUNT);
-    added = await addTransactionViaApi(request, await apiToken(request, "user"), {
+    const token = await apiToken(request, "user");
+    const before = await databaseClock();
+    added = await addTransactionViaApi(request, token, {
       account_id: FIXTURE_KEYS.rewardAccount,
       tran_amt: ADD_AMOUNT_ENTERED,
     });
+    const after = await databaseClock();
     expect(added.status).toBe(201);
     expect(added.tranId).toMatch(/^[0-9]{16}$/);
+    await expectAccruedAtProcessingClock(added.tranId ?? "", before, after);
     const accrual = await accrualOf(added.tranId ?? "");
     expect(accrual.split("|").slice(1).join("|"), "points|rule_id of the new accrual").toBe(expected);
   });
@@ -415,17 +472,19 @@ test.describe("a CT02 add through the screens", () => {
     }
     await controlLocator(page, mapControl("F-COTRN02-001")).click();
     await expect(confirmDialog(page)).toBeVisible();
+    const before = await databaseClock();
     const [response] = await Promise.all([
       page.waitForResponse((r) => isRequestTo(r.request(), rowEndpoint("F-COTRN02-002"))),
       controlLocator(page, mapControl("F-COTRN02-002")).click(),
     ]);
+    const after = await databaseClock();
     expect(response.status()).toBe(201);
     expect(response.request().postDataJSON()).toMatchObject({
       account_id: FIXTURE_KEYS.rewardAccount,
       tran_amt: ADD_AMOUNT_ENTERED,
       confirm: "Y",
     });
-    const body = (await response.json()) as TransactionAddResponse;
+    const body = await readJson(response, transactionAddResponseSchema);
 
     // The success toast is the COTRN02C text with the new TRAN-ID.
     const added = new RegExp(
@@ -438,6 +497,7 @@ test.describe("a CT02 add through the screens", () => {
       throw new Error("the success toast names no TRAN-ID");
     }
     expect(tranId).toBe(body.transaction.tran_id);
+    await expectAccruedAtProcessingClock(tranId, before, after);
     const [transactionId = "", ...credited] = (await accrualOf(tranId)).split("|");
     expect(credited.join("|"), "points|rule_id of the new accrual").toBe(expected);
     const [points = ""] = expected.split("|");
@@ -480,24 +540,47 @@ test.describe("admin reward rules", () => {
     await expect(table.getByRole("columnheader")).toHaveText([...SCREENS.ruleList.columns]);
     const ids = expected.map((rule) => rule.rule_id);
     expect(ids, "the API lists the rules by rule_id").toEqual([...ids].sort(byDecimal));
-    const tops: number[] = [];
-    for (const rule of expected) {
-      const row = ruleRow(page, rule.rule_id);
-      await expect(row).toHaveCount(1);
-      await expect(row).toContainText(rule.reward_rate);
-      if (rule.min_transaction_amount === null) {
-        await expect(await cellUnder(table, row, "Min amount")).toHaveText(SCREENS.ruleList.none);
+    // The table shows the list one window at a time, and Next moves to the
+    // following window without a request, so the windows are walked until
+    // every rule has been seen, each window holding the next rules in order.
+    const rows = dataRows(table);
+    const next = pagingControl(page, "Next");
+    const seen: string[] = [];
+    while (seen.length < expected.length) {
+      const firstId = expected[seen.length]?.rule_id ?? "";
+      if (seen.length > 0) {
+        await expect(next, `Next after rule ${seen.at(-1)}`).toBeEnabled();
+        await next.click();
       }
-      if (rule.max_transaction_amount === null) {
-        await expect(await cellUnder(table, row, "Max amount")).toHaveText(SCREENS.ruleList.none);
+      await expect(await cellUnder(table, rows.first(), "Rule ID")).toHaveText(firstId);
+      const shown = await rows.count();
+      const window = expected.slice(seen.length, seen.length + shown);
+      expect(window.length, `the window from rule ${firstId} holds only listed rules`).toBe(shown);
+      const tops: number[] = [];
+      for (const rule of window) {
+        const row = ruleRow(page, rule.rule_id);
+        await expect(row).toHaveCount(1);
+        await expect(row).toContainText(rule.reward_rate);
+        if (rule.min_transaction_amount === null) {
+          await expect(await cellUnder(table, row, "Min amount")).toHaveText(SCREENS.ruleList.none);
+        }
+        if (rule.max_transaction_amount === null) {
+          await expect(await cellUnder(table, row, "Max amount")).toHaveText(SCREENS.ruleList.none);
+        }
+        await expect(await cellUnder(table, row, "Status")).toHaveText(RULE_STATUS_LABELS[rule.status]);
+        const box = await row.boundingBox();
+        if (box === null) {
+          throw new Error(`the row of rule ${rule.rule_id} is not rendered`);
+        }
+        tops.push(box.y);
+        seen.push(rule.rule_id);
       }
-      const box = await row.boundingBox();
-      if (box === null) {
-        throw new Error(`the row of rule ${rule.rule_id} is not rendered`);
-      }
-      tops.push(box.y);
+      expect(tops, `the window from rule ${firstId} follows rule_id order`).toEqual(
+        [...tops].sort((a, b) => a - b),
+      );
     }
-    expect(tops, "the rows follow rule_id order").toEqual([...tops].sort((a, b) => a - b));
+    expect(seen, "every rule, in rule order").toEqual(ids);
+    await expect(next, "Next on the last window").toBeDisabled();
   });
 
   test("the edit route loads the rule", async ({ page, request }) => {
@@ -514,8 +597,9 @@ test.describe("admin reward rules", () => {
 
   test("a rule is created, edited and soft-deleted through the screens", async ({ page }) => {
     const labels = UNMAPPED_LABELS.rewardRule;
-    const today = await psql("SELECT current_date");
-    expect(today).toMatch(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/);
+    // The processing clock's UTC day: the rule starts no later than the
+    // instant the soft delete below stamps as its active_to.
+    const today = await processingDate();
     await signIn(page, "admin");
     await page.goto(SCREENS.ruleList.route);
     const table = ruleTable(page);
@@ -533,7 +617,7 @@ test.describe("admin reward rules", () => {
         formButton(page, SCREENS.ruleForm.save).click(),
       ]);
       expect(created.status()).toBe(201);
-      const rule = (await created.json()) as RewardRuleResponse;
+      const rule = await readJson(created, rewardRuleResponseSchema);
       expect(rule).toMatchObject({
         transaction_type_cd: FIXTURE_KEYS.ruleTestTypeCode,
         transaction_category_cd: FIXTURE_KEYS.ruleTestCategoryCode,
@@ -541,6 +625,7 @@ test.describe("admin reward rules", () => {
         min_transaction_amount: null,
         max_transaction_amount: null,
         active_to: null,
+        status: "active",
       });
       expect(rule.active_from.startsWith(`${today}T`), `active_from ${rule.active_from} is today`).toBe(true);
       await expect(page).toHaveURL(urlPath(SCREENS.ruleList.route));
@@ -603,7 +688,7 @@ test.describe("admin reward rules", () => {
     const token = await apiToken(request, "admin");
     // An ended rule of the spec's own: the one the screens soft-deleted when
     // that test ran, else one created and soft-deleted here through the API.
-    let ended = (await rules(request)).find((rule) => rule.active_to !== null);
+    let ended = (await rules(request)).find((rule) => rule.status === "ended");
     if (ended === undefined) {
       const created = await request.post(apiPath("/admin/reward-rules"), {
         headers: bearer(token),
@@ -615,12 +700,12 @@ test.describe("admin reward rules", () => {
         },
       });
       expect(created.status()).toBe(201);
-      const ruleId = (await readJson<RewardRuleResponse>(created)).rule_id;
+      const ruleId = (await readJson(created, rewardRuleResponseSchema)).rule_id;
       const first = await request.delete(apiPath(`/admin/reward-rules/${ruleId}`), { headers: bearer(token) });
       expect(first.status()).toBe(200);
       ended = (await rules(request)).find((rule) => rule.rule_id === ruleId);
     }
-    if (ended === undefined || ended.active_to === null) {
+    if (ended === undefined || ended.status !== "ended" || ended.active_to === null) {
       throw new Error("no ended reward rule to delete again");
     }
     const { rule_id: endedId, active_to: endedAt } = ended;
@@ -630,6 +715,7 @@ test.describe("admin reward rules", () => {
     expect(response.status()).toBe(200);
     const after = (await rules(request)).find((rule) => rule.rule_id === endedId);
     expect(after?.active_to).toBe(endedAt);
+    expect(after?.status).toBe("ended");
   });
 
   // forms.spec.ts submits these with Enter from the last field, keyboard only.

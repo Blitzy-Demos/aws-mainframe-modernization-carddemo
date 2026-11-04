@@ -39,7 +39,7 @@ use carddemo_domain::messages;
 use carddemo_runtime::config::Settings;
 use carddemo_testkit::{block_on, fixtures};
 use chrono::{DateTime, Utc};
-use common::{Resp, TestApp, assert_error};
+use common::{Resp, SeededUser, TestApp, assert_error};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -61,6 +61,10 @@ const SEED_PASSWORD: &str = "PASSWORD";
 
 /// The SPA route of the admin menu `COADM01C`, the `XCTL` target for type `A`.
 const ADMIN_LANDING: &str = "/admin";
+
+/// The `CDEMO-USER-TYPE` value of the 88 level `CDEMO-USRTYP-ADMIN`
+/// [app/cpy/COCOM01Y.cpy:L27], the one type `COSGN00C` sends to `COADM01C`.
+const ADMIN_TYPE: &str = "A";
 
 /// The SPA route of the main menu `COMEN01C`, the `XCTL` target for any other
 /// user type.
@@ -115,6 +119,14 @@ const ROWS: [(&str, &str, &str); 5] = [
     ),
 ];
 
+/// The seeded admin: its user ID, stored password and type, read through the
+/// audit [app/jcl/DUSRSECJ.jcl:L35].
+const SEEDED_ADMIN_ROW: &str = "P-CSUSR01Y-008";
+
+/// The seeded regular user: its user ID, stored password and type, read
+/// through the audit [app/jcl/DUSRSECJ.jcl:L40].
+const SEEDED_USER_ROW: &str = "P-CSUSR01Y-009";
+
 /// The parity rows a successful sign-on proves: the upper-casing, the read by
 /// the upper-cased key, the signed-on outcome with its landing, and the two
 /// seeded users signed on.
@@ -122,8 +134,8 @@ const SIGNON_ROWS: &[&str] = &[
     "P-COSGN00C-007",
     "P-COSGN00C-008",
     "P-COSGN00C-009",
-    "P-CSUSR01Y-008",
-    "P-CSUSR01Y-009",
+    SEEDED_ADMIN_ROW,
+    SEEDED_USER_ROW,
 ];
 
 /// The parity row of PF3: the `CCDA-MSG-THANK-YOU` text, replaced by
@@ -244,13 +256,12 @@ const INTERNAL_DETAIL: [&str; 5] = [
     "postgres",
 ];
 
-/// One sign-on that must succeed: what is typed, and the user it signs on.
+/// One sign-on that must succeed: what is typed, and the parity row of the
+/// seeded user it signs on.
 struct SignOn {
     typed_id: &'static str,
     typed_password: &'static str,
-    user_id: &'static str,
-    usr_type: &'static str,
-    landing: &'static str,
+    seeded: &'static str,
 }
 
 /// The seeded admin and user, typed as stored, in lower case and in mixed
@@ -259,32 +270,41 @@ const SIGN_ONS: [SignOn; 4] = [
     SignOn {
         typed_id: "ADMIN001",
         typed_password: SEED_PASSWORD,
-        user_id: "ADMIN001",
-        usr_type: "A",
-        landing: ADMIN_LANDING,
+        seeded: SEEDED_ADMIN_ROW,
     },
     SignOn {
         typed_id: "USER0001",
         typed_password: SEED_PASSWORD,
-        user_id: "USER0001",
-        usr_type: "U",
-        landing: USER_LANDING,
+        seeded: SEEDED_USER_ROW,
     },
     SignOn {
         typed_id: "admin001",
         typed_password: "password",
-        user_id: "ADMIN001",
-        usr_type: "A",
-        landing: ADMIN_LANDING,
+        seeded: SEEDED_ADMIN_ROW,
     },
     SignOn {
         typed_id: "User0001",
         typed_password: "PassWord",
-        user_id: "USER0001",
-        usr_type: "U",
-        landing: USER_LANDING,
+        seeded: SEEDED_USER_ROW,
     },
 ];
+
+/// The SPA route `COSGN00C` lands a user of type `usr_type` on:
+/// `IF CDEMO-USRTYP-ADMIN` it sends the `COMMAREA` to `COADM01C`, else to
+/// `COMEN01C` [app/cbl/COSGN00C.cbl:L230-240].
+fn landing(usr_type: &str) -> &'static str {
+    if usr_type == ADMIN_TYPE {
+        ADMIN_LANDING
+    } else {
+        USER_LANDING
+    }
+}
+
+/// What a sign-on of `user` must answer: its user ID, its type, and the
+/// landing of that type.
+fn signed_on_as(user: &SeededUser) -> (&str, &str, &str) {
+    (&user.user_id, &user.usr_type, landing(&user.usr_type))
+}
 
 /// What one E-20 sign-on must answer.
 enum Answer {
@@ -415,8 +435,10 @@ struct Expected {
 
 /// `ADMIN001` and `USER0001`, typed as stored and in lower and mixed case,
 /// sign on as the upper-cased user and land on the menu of their type, with a
-/// token whose claims carry that user and type. Logout then answers the
-/// thank-you text, and the token still opens a route afterwards.
+/// token whose claims carry that user and type. The user ID, stored password
+/// and type each case expects are those its seeded-user row records, and
+/// what is typed upper-cases to that user ID and password. Logout then
+/// answers the thank-you text, and the token still opens a route afterwards.
 #[test]
 fn signon_lands_the_upper_cased_user_on_its_menu_and_logout_is_stateless() {
     let parity = common::parity_audit();
@@ -427,21 +449,35 @@ fn signon_lands_the_upper_cased_user_on_its_menu_and_logout_is_stateless() {
         quoted(messages::CCDA_MSG_THANK_YOU),
         "{LOGOUT_ROWS:?}: CCDA_MSG_THANK_YOU differs from the audited text"
     );
+    let cases: Vec<(&SignOn, SeededUser)> = SIGN_ONS
+        .iter()
+        .map(|case| (case, common::seeded_user(&parity, case.seeded)))
+        .collect();
+    for (case, seeded) in &cases {
+        let id = case.seeded;
+        assert_eq!(
+            case.typed_id.to_ascii_uppercase(),
+            seeded.user_id,
+            "{id}: {:?} upper-cases to the seeded user ID",
+            case.typed_id
+        );
+        assert_eq!(
+            case.typed_password.to_ascii_uppercase(),
+            seeded.password,
+            "{id}: {:?} upper-cases to the stored password",
+            case.typed_password
+        );
+    }
     let app = TestApp::start();
     block_on(async {
-        for case in &SIGN_ONS {
+        for (case, seeded) in &cases {
             let label = format!(
                 "{SIGNON_ROWS:?} {:?} / {:?}",
                 case.typed_id, case.typed_password
             );
             let before = Utc::now();
             let resp = sign_on(&app, case.typed_id, case.typed_password).await;
-            assert_signed_on(
-                &resp,
-                (case.user_id, case.usr_type, case.landing),
-                before,
-                &label,
-            );
+            assert_signed_on(&resp, signed_on_as(seeded), before, &label);
         }
         logout_is_public_and_stateless(&app).await;
     });
@@ -525,11 +561,12 @@ fn cosgn00c_screen_mechanics_have_their_rest_replacements() {
         .into_iter()
         .map(|id| expected(&validation, &parity, id))
         .collect();
+    let admin = common::seeded_user(&parity, SEEDED_ADMIN_ROW);
     let app = TestApp::start();
     let bodies = block_on(async {
         let mut bodies = Vec::new();
-        enter_key(&app, &map_doc, &rows, &mut bodies).await;
-        other_keys(&app, &parity, &map_doc, &rows, &mut bodies).await;
+        enter_key(&app, &map_doc, &rows, &admin, &mut bodies).await;
+        other_keys(&app, &parity, &map_doc, &rows, &admin, &mut bodies).await;
         plain_text(&app, &parity, &mut bodies).await;
         first_entry_reads_no_file(&app, &rows, &mut bodies).await;
         bodies
@@ -700,10 +737,16 @@ fn with_aid(body: Value, aid: &str) -> Value {
 ///
 /// ENTER is `PROCESS-ENTER-KEY`: each function map row naming the row is the
 /// published `POST /auth/login`, the only operation of its path, whose body
-/// holds the two `COSGN0A` inputs. The seeded admin signs on and lands on its
-/// menu, and an empty body is answered by the first edit of
+/// holds the two `COSGN0A` inputs. The seeded `admin` signs on and lands on
+/// its menu, and an empty body is answered by the first edit of
 /// `PROCESS-ENTER-KEY`.
-async fn enter_key(app: &TestApp, map_doc: &Document, rows: &[Expected], bodies: &mut Vec<String>) {
+async fn enter_key(
+    app: &TestApp,
+    map_doc: &Document,
+    rows: &[Expected],
+    admin: &SeededUser,
+    bodies: &mut Vec<String>,
+) {
     let login = Endpoint {
         method: "post".to_owned(),
         path: LOGIN.to_owned(),
@@ -717,8 +760,7 @@ async fn enter_key(app: &TestApp, map_doc: &Document, rows: &[Expected], bodies:
     assert_eq!(schema_members(&spec, "LoginRequest"), inputs, "{ENTER_ROW}");
     let before = Utc::now();
     let signed_on = sign_on(app, "ADMIN001", SEED_PASSWORD).await;
-    let admin = ("ADMIN001", "A", ADMIN_LANDING);
-    assert_signed_on(&signed_on, admin, before, ENTER_ROW);
+    assert_signed_on(&signed_on, signed_on_as(admin), before, ENTER_ROW);
     let blank = app.post(LOGIN, None, &json!({})).await;
     assert_rejected(&blank, row_of(rows, BLANK_ID), ENTER_ROW);
     bodies.extend([signed_on.2, blank.2]);
@@ -730,13 +772,14 @@ async fn enter_key(app: &TestApp, map_doc: &Document, rows: &[Expected], bodies:
 /// the row sends no request, the row's error is the invalid-key text, whose
 /// audited 49 bytes fit its `X(50)`, and the sign-on body publishes no
 /// member a key could travel in. A sign-on naming another key is answered as
-/// ENTER, signed on or rejected as without it, never with the invalid-key
-/// text.
+/// ENTER, the seeded `admin` signed on or rejected as without it, never with
+/// the invalid-key text.
 async fn other_keys(
     app: &TestApp,
     parity: &Document,
     map_doc: &Document,
     rows: &[Expected],
+    admin: &SeededUser,
     bodies: &mut Vec<String>,
 ) {
     for (id, request) in rows_naming(map_doc, OTHER_KEY_ROW) {
@@ -751,7 +794,7 @@ async fn other_keys(
         let before = Utc::now();
         let body = with_aid(login_body(Some("ADMIN001"), Some(SEED_PASSWORD)), aid);
         let signed_on = app.post(LOGIN, None, &body).await;
-        assert_signed_on(&signed_on, ("ADMIN001", "A", ADMIN_LANDING), before, &label);
+        assert_signed_on(&signed_on, signed_on_as(admin), before, &label);
         let body = with_aid(login_body(Some("ADMIN001"), Some("WRONGPWD")), aid);
         let wrong = app.post(LOGIN, None, &body).await;
         assert_rejected(&wrong, row_of(rows, WRONG_PASSWORD), &label);

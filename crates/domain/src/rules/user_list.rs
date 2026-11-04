@@ -36,11 +36,14 @@
 //! P-COUSR00C-015) and the PF3 return (P-COUSR00C-012) are navigation, not
 //! rules.
 
-use crate::entities::UserSecurity;
 use crate::error::DomainError;
 use crate::messages;
 use crate::numeric::UserId;
 use crate::ports::{Browse, Direction, UserStore};
+
+/// The user record a [`UserListPage`] holds, re-exported from
+/// [`crate::entities`] for the API adapter, which maps it to its response.
+pub use crate::entities::UserSecurity;
 
 /// The BMS field every COUSR00C message concerns: each path moves -1 to
 /// `USRIDINL`, so the cursor stays on the search field.

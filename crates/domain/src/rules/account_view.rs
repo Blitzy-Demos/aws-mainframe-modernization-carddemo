@@ -47,7 +47,12 @@ use crate::messages::{
     customer_master_not_found_message, file_error_message, xref_not_found_message,
 };
 use crate::numeric::{AccountId, Alnum};
-use crate::ports::{AccountReader, CustomerReader, PortError, XrefReader};
+use crate::ports::{CustomerReader, PortError, XrefReader};
+
+/// The account reader [`view`] reads the account master through, re-exported
+/// from [`crate::ports`] for the API adapter, which reads accounts as this rule
+/// does.
+pub use crate::ports::AccountReader;
 
 /// `ACCTSID`, the account number of the `COACTVW` map
 /// [app/cpy-bms/COACTVW.CPY:L55-60]: every outcome places the cursor here

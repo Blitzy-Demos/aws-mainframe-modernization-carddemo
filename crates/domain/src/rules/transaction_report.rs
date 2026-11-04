@@ -38,11 +38,21 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::entities::{CardXref, TranCategoryRecord, TranTypeRecord, Transaction};
+use crate::entities::{CardXref, TranCategoryRecord, TranTypeRecord};
 use crate::format::{self, ReportDetail};
 use crate::messages;
-use crate::numeric::{Alnum, CardNumber, Money, TranCategoryCode, TranId, TranTypeCode};
-use crate::ports::{PortError, PortResult, TranTypeFileReader, TransactionReader, XrefReader};
+use crate::numeric::Money;
+use crate::ports::{PortError, PortResult};
+
+/// The transaction record, the keys and codes it carries, and the readers the
+/// report and its selection read through, re-exported from
+/// [`crate::entities`], [`crate::numeric`] and [`crate::ports`] for the API
+/// and batch adapters.
+pub use crate::entities::Transaction;
+pub use crate::numeric::{
+    Alnum, CardNumber, TranCategoryCode, TranId, TranTypeCode, TransactionRowId,
+};
+pub use crate::ports::{TranTypeFileReader, TransactionReader, XrefReader};
 
 /// `WS-PAGE-SIZE PIC 9(03) COMP-3 VALUE 20` [app/cbl/CBTRN03C.cbl:L131-132]:
 /// a page break is due when the line counter is a multiple of it

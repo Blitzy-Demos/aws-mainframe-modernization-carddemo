@@ -52,9 +52,9 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
-use carddemo_domain::numeric::TranId;
+use carddemo_domain::rules::transaction_report::TranId;
 use carddemo_persistence::repos::LoadOutcome;
-use carddemo_persistence::{Db, UnitOfWork};
+use carddemo_persistence::tx::{Db, UnitOfWork};
 use tracing::Span;
 use tracing::field::display;
 

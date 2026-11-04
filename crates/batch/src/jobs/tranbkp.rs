@@ -25,7 +25,7 @@
 //! The job ends with the condition code of `STEP05R`, the highest of its steps: 0 when the live
 //! master held records, 12 when it was empty (P-TRANBKP-006, E-37).
 
-use carddemo_persistence::{Db, UnitOfWork};
+use carddemo_persistence::tx::{Db, UnitOfWork};
 use tracing::Span;
 
 use super::{Backup, JobContext, backup_live_master_in, count_of, setup_failure, span_count};

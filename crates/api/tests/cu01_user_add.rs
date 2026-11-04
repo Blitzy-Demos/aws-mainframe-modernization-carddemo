@@ -43,7 +43,9 @@ use carddemo_domain::auth::{verify_as_entered, verify_signon};
 use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages;
 use carddemo_testkit::{block_on, fixtures};
-use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
+use common::{
+    Resp, TestApp, assert_error, parity_audit, seeded_user, validation_audit, validation_ids,
+};
 use reqwest::StatusCode;
 use serde_json::{Map, Value};
 
@@ -59,9 +61,6 @@ const NEW_USER: &str = "NEWUSR01";
 /// The password of the baseline body, at its full `PIC X(8)` width and upper
 /// case, so the added user signs on.
 const NEW_PASSWORD: &str = "PASSWORD";
-
-/// The seeded admin user, the first `DUSRSECJ` row (P-CSUSR01Y-008).
-const SEEDED_ADMIN: &str = "ADMIN001";
 
 /// The user added in lower and mixed case, and its mixed-case password (E-20).
 const MIXED_USER: &str = "mixUsr01";
@@ -125,7 +124,8 @@ const COLUMN_ROWS: [&str; 5] = [
     "P-CSUSR01Y-005",
 ];
 
-/// The seeded admin `ADMIN001`, `MARGARET GOLD`, type `A`.
+/// The seeded admin, the first `DUSRSECJ` row [app/jcl/DUSRSECJ.jcl:L35]:
+/// the user ID, names, type and stored password the duplicate add reads.
 const SEEDED_ADMIN_ROW: &str = "P-CSUSR01Y-008";
 
 /// `MAIN-PARA`'s `EVALUATE EIBAID`: ENTER, PF3, PF4 and any other key, each
@@ -567,9 +567,11 @@ async fn added(app: &TestApp, token: &str, proof: &mut Proof) {
 }
 
 /// `WRITE-USER-SEC-FILE` `DUPKEY`/`DUPREC` [app/cbl/COUSR01C.cbl:L260-266]:
-/// the same body again, the same ID with other values, and the seeded
-/// `ADMIN001` are each 409 on `USERID`, and the stored rows are unchanged.
-async fn duplicates(app: &TestApp, token: &str, proof: &mut Proof) {
+/// the same body again, the same ID with other values, and the seeded admin
+/// of [`SEEDED_ADMIN_ROW`] are each 409 on `USERID`, and the stored rows are
+/// unchanged: the admin is stored as that row records it, and still signs on
+/// with its stored password.
+async fn duplicates(app: &TestApp, token: &str, proof: &mut Proof, parity: &Document) {
     let before = existing_user(app, NEW_USER).await;
     let resp = proof.add(app, token, new_user_body(NEW_USER)).await;
     assert_duplicate(&resp);
@@ -590,23 +592,25 @@ async fn duplicates(app: &TestApp, token: &str, proof: &mut Proof) {
         "{NEW_USER} was rewritten"
     );
 
-    let admin_before = existing_user(app, SEEDED_ADMIN).await;
+    let admin = seeded_user(parity, SEEDED_ADMIN_ROW);
+    let admin_before = existing_user(app, &admin.user_id).await;
     let seeded = UserSummary {
-        user_id: SEEDED_ADMIN.to_owned(),
-        first_name: "MARGARET".to_owned(),
-        last_name: "GOLD".to_owned(),
-        usr_type: "A".to_owned(),
+        user_id: admin.user_id.clone(),
+        first_name: admin.first_name.clone(),
+        last_name: admin.last_name.clone(),
+        usr_type: admin.usr_type.clone(),
     };
     assert_eq!(admin_before.summary(), seeded, "{SEEDED_ADMIN_ROW}");
-    let resp = proof.add(app, token, new_user_body(SEEDED_ADMIN)).await;
+    let resp = proof.add(app, token, new_user_body(&admin.user_id)).await;
     assert_duplicate(&resp);
     assert_eq!(
-        existing_user(app, SEEDED_ADMIN).await,
+        existing_user(app, &admin.user_id).await,
         admin_before,
-        "{SEEDED_ADMIN} was rewritten"
+        "{SEEDED_ADMIN_ROW}: {} was rewritten",
+        admin.user_id
     );
     // Its password is still the seeded one.
-    app.admin_token().await;
+    app.login(&admin.user_id, &admin.password).await;
     proof.validation_rows.insert(DUPLICATE_ROW);
     proof.parity_rows.insert(SEEDED_ADMIN_ROW);
 }
@@ -1359,7 +1363,7 @@ fn post_admin_users_adds_as_cousr01c_does() {
             "a rejected add wrote {NEW_USER}"
         );
         added(&app, &token, &mut proof).await;
-        duplicates(&app, &token, &mut proof).await;
+        duplicates(&app, &token, &mut proof, &parity).await;
         mixed_case(&app, &token, &mut proof).await;
         write_failure(&app, &token, &mut proof).await;
         initialized_after_the_write(&app, &token, &mut proof, &parity).await;

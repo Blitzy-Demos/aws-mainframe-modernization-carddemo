@@ -53,6 +53,13 @@ const TITLE = "View Transaction";
 /** The F3=Back and F5=Browse Tran. target, the transaction list. */
 const LIST_ROUTE = "/transactions";
 
+/**
+ * How long the read's status stays empty before it announces the read's
+ * progress, DataTable's delay. The cleared status is committed first, so the
+ * identical result of a repeated read is still announced as a change.
+ */
+const STATUS_ANNOUNCE_DELAY_MS = 150;
+
 /** One display field of the map and the response member it shows. */
 type ScreenField = {
   /** The BMS field name [app/bms/COTRN01.bms:L105-258]. */
@@ -162,7 +169,7 @@ type TransactionPanelProps = {
 /**
  * The map below its title: the key (TRNIDIN), the dashed rule of line 8
  * [app/bms/COTRN01.bms:L94-99] and the display fields of the transaction
- * read with that key.
+ * read with that key, followed by the status that announces the read.
  */
 function TransactionPanel({ tranId }: TransactionPanelProps): JSX.Element {
   const keyIssues = useMemo(() => editKey(tranId), [tranId]);
@@ -196,32 +203,65 @@ function TransactionPanel({ tranId }: TransactionPanelProps): JSX.Element {
   const showFields = transaction !== undefined || reading;
   const titleId = useId();
 
+  // The read's progress for assistive technology: the transaction's identity
+  // once read, never its amount or card number. A rejected key or a failed
+  // read announces nothing here, as the toast and the message line carry it.
+  const statusText =
+    keyPasses && query.isFetching
+      ? "Loading transaction"
+      : transaction !== undefined && !query.isError
+        ? `Transaction ${transaction.tran_id} loaded`
+        : "";
+  // The status is emptied on every change of the text and on every completed
+  // read, then filled after STATUS_ANNOUNCE_DELAY_MS, as DataTable does.
+  const { dataUpdatedAt } = query;
+  const [announcement, setAnnouncement] = useState("");
+  useEffect(() => {
+    setAnnouncement("");
+    if (statusText === "") {
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      setAnnouncement(statusText);
+    }, STATUS_ANNOUNCE_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [statusText, dataUpdatedAt]);
+
+  // The status stays mounted beside the card, outside its busy subtree,
+  // where assistive technology may hold back changes until the read ends.
   return (
-    <Card role="region" aria-labelledby={titleId} aria-busy={reading}>
-      <CardHeader>
-        <CardTitle>
-          <h2 id={titleId}>Transaction details</h2>
-        </CardTitle>
-        {errorLine !== null ? (
-          <CardDescription className="text-destructive">
-            {errorLine}
-          </CardDescription>
-        ) : null}
-      </CardHeader>
-      <CardContent className="flex flex-col gap-6">
-        <dl className="grid gap-x-6 gap-y-4 lg:grid-cols-2">
-          <DetailItem caption="Tran ID" errors={keyIssues}>
-            <span className="tabular-nums">{tranId}</span>
-          </DetailItem>
-        </dl>
-        {showFields ? (
-          <>
-            <Separator />
-            <TransactionFields transaction={transaction} />
-          </>
-        ) : null}
-      </CardContent>
-    </Card>
+    <>
+      <Card role="region" aria-labelledby={titleId} aria-busy={reading}>
+        <CardHeader>
+          <CardTitle>
+            <h2 id={titleId}>Transaction details</h2>
+          </CardTitle>
+          {errorLine !== null ? (
+            <CardDescription className="text-destructive">
+              {errorLine}
+            </CardDescription>
+          ) : null}
+        </CardHeader>
+        <CardContent className="flex flex-col gap-6">
+          <dl className="grid gap-x-6 gap-y-4 lg:grid-cols-2">
+            <DetailItem caption="Tran ID" errors={keyIssues}>
+              <span className="tabular-nums">{tranId}</span>
+            </DetailItem>
+          </dl>
+          {showFields ? (
+            <>
+              <Separator />
+              <TransactionFields transaction={transaction} />
+            </>
+          ) : null}
+        </CardContent>
+      </Card>
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
+    </>
   );
 }
 

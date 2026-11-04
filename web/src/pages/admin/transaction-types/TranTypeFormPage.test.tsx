@@ -546,13 +546,17 @@ describe("update and delete (/admin/transaction-types/:code/edit)", () => {
     });
     await screen.findByRole("button", { name: "Look up" });
     expect(toast.success).toHaveBeenCalledWith(STUB_DELETED);
-    // The re-read of the deleted type is the delete's outcome, not an error.
     expect(toast.error).not.toHaveBeenCalled();
     expect(writes()).toHaveLength(1);
     const [deleted] = writes();
     expect(deleted.method).toBe("DELETE");
     expect(deleted.url.pathname).toBe(`${LIST_PATH}/${PURCHASE.type_code}`);
     expect(deleted.url.searchParams.get("origin")).toBe("form");
+    // The page leaves rather than reading the deleted type again.
+    const afterDelete = sent.slice(sent.indexOf(deleted) + 1);
+    expect(afterDelete.filter((request) => request.method === "GET")).toEqual(
+      [],
+    );
   });
 
   it("Cancel leaves for the empty key entry without a request (F12)", async () => {
@@ -567,6 +571,21 @@ describe("update and delete (/admin/transaction-types/:code/edit)", () => {
     expect(writes()).toEqual([]);
   });
 });
+
+it.each([KEY_ENTRY_ROUTE, EDIT_ROUTE_01])(
+  "titles the form on %s with its level-2 card heading",
+  async (path) => {
+    renderAt(path);
+    if (path === EDIT_ROUTE_01) {
+      await waitForPrefill(PURCHASE.description);
+    }
+
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Transaction type" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("form", { name: "Transaction type" })).toBeTruthy();
+  },
+);
 
 it.each([KEY_ENTRY_ROUTE, EDIT_ROUTE_01])(
   "Back on %s returns to the list (F3)",

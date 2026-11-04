@@ -50,7 +50,7 @@ use reqwest::StatusCode;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
 
-use common::{TestApp, assert_error};
+use common::{TestApp, assert_error, fixture_records};
 
 /// The program whose validation rows this file proves.
 const PROGRAM: &str = "COTRN02C";
@@ -71,9 +71,11 @@ const ACCOUNT_ID: &str = "00000000001";
 /// text.
 const ACCOUNT_KEY: &str = "1";
 
-/// The card of account 1 [app/data/ASCII/cardxref.txt:L49]. It exceeds 2^53,
-/// so its exact echo also proves the integer reading of `FUNCTION NUMVAL`
-/// (P-COTRN02C-027).
+/// The card number the card-keyed requests enter as `CARDNINI`
+/// [app/data/ASCII/cardxref.txt:L49]. The record an add of it writes takes its
+/// card from the decoded cross-reference ([`xref_card`]), which must give
+/// account [`ACCOUNT_ID`]. It exceeds 2^53, so its exact echo also proves the
+/// integer reading of `FUNCTION NUMVAL` (P-COTRN02C-027).
 const CARD_NUMBER: &str = "9680294154603697";
 
 /// One member change from [`BASELINE`]: `Some` sets the member, `None` leaves
@@ -1349,12 +1351,46 @@ fn next_tran_id(tran_id: &str) -> String {
     format!("{:016}", number + 1)
 }
 
+/// Whether the map field `name` of `body` is entered: present and neither
+/// `SPACES` nor `LOW-VALUES`, the test `VALIDATE-INPUT-KEY-FIELDS` makes of
+/// each key field (P-COTRN02C-005, P-COTRN02C-006). An empty member is spaces.
+fn entered<'a>(body: &'a Value, name: &str) -> Option<&'a str> {
+    body[name].as_str().filter(|value| {
+        !(value.bytes().all(|byte| byte == b' ') || value.bytes().all(|byte| byte == 0))
+    })
+}
+
+/// The card `MOVE CARDNINI TO TRAN-CARD-NUM` writes for the add of `body`
+/// (P-COTRN02C-023, card from xref), from the cross-reference
+/// `VALIDATE-INPUT-KEY-FIELDS` reads in `parity`'s fixture: an entered
+/// account ID is tested first and its `CXACAIX` record gives the card
+/// (P-COTRN02C-005); with the account ID blank, the `CCXREF` record of the
+/// entered card number does (P-COTRN02C-006). The record is decoded from
+/// `cardxref.txt` at its reviewed section A offsets (P-CVACT03Y-001,
+/// P-CVACT03Y-003).
+fn xref_card(body: &Value, parity: &Document) -> String {
+    reviewed_result(parity, "P-COTRN02C-023", &["card from xref"]);
+    let xref = if let Some(account_id) = entered(body, "account_id") {
+        reviewed_result(
+            parity,
+            "P-COTRN02C-005",
+            &["READ CXACAIX by account; card number taken from the xref record"],
+        );
+        fixture_records::account_xref(parity, account_id)
+    } else {
+        reviewed_result(parity, "P-COTRN02C-006", &["READ CCXREF by card"]);
+        fixture_records::card_xref(parity, member(body, "card_number"))
+    };
+    xref.value("xref_card_num").to_owned()
+}
+
 /// The `CVTRA05Y` record an add of `body` writes as TRAN-ID `tran_id`
 /// (P-COTRN02C-023): the entered codes, texts and merchant ID, the amount as
-/// its exact two-place decimal (P-COTRN02C-028), the card of account 1 as the
-/// cross-reference gives it, and the entered dates as the timestamps, with no
-/// clock reading (P-COTRN02C-030).
-fn written(body: &Value, tran_id: &str) -> Value {
+/// its exact two-place decimal (P-COTRN02C-028), the card of the
+/// cross-reference the add reads, decoded through `parity` ([`xref_card`]),
+/// and the entered dates as the timestamps, with no clock reading
+/// (P-COTRN02C-030).
+fn written(body: &Value, tran_id: &str, parity: &Document) -> Value {
     json!({
         "tran_id": tran_id,
         "tran_type_cd": member(body, "tran_type_cd"),
@@ -1366,7 +1402,7 @@ fn written(body: &Value, tran_id: &str) -> Value {
         "tran_merchant_name": member(body, "tran_merchant_name"),
         "tran_merchant_city": member(body, "tran_merchant_city"),
         "tran_merchant_zip": member(body, "tran_merchant_zip"),
-        "tran_card_num": CARD_NUMBER,
+        "tran_card_num": xref_card(body, parity),
         "tran_orig_ts": member(body, "tran_orig_date"),
         "tran_proc_ts": member(body, "tran_proc_date"),
     })
@@ -1374,13 +1410,15 @@ fn written(body: &Value, tran_id: &str) -> Value {
 
 /// Sends the add of [`BASELINE`] with `changes` and asserts the success answer
 /// of P-COTRN02C-024: the TRAN-ID `tran_id`, the success text and the record
-/// written, which CT01 then reads back unchanged. Returns the TRAN-ID.
+/// written, its card read through `parity` ([`written`]), which CT01 then
+/// reads back unchanged. Returns the TRAN-ID.
 async fn add(
     app: &TestApp,
     token: &str,
     success: &Success,
     changes: &[Change],
     tran_id: &str,
+    parity: &Document,
 ) -> String {
     let body = body(changes);
     let (status, answer, raw) = app.post(ROUTE, Some(token), &body).await;
@@ -1398,7 +1436,7 @@ async fn add(
     );
     assert_eq!(
         answer["transaction"],
-        written(&body, tran_id),
+        written(&body, tran_id, parity),
         "the record of the add with {changes:?}: {raw}"
     );
     let (status, viewed, raw) = app.get(&format!("{ROUTE}/{tran_id}"), Some(token)).await;
@@ -1526,7 +1564,7 @@ async fn numval_c_adds(
             Some(success.text(&tran_id).as_str()),
             "the success text of the add of {entry}: {raw}"
         );
-        let mut record = written(&body, &tran_id);
+        let mut record = written(&body, &tran_id, parity);
         record["tran_amt"] = Value::from(numval_c(entry));
         assert_eq!(answer["transaction"], record, "the add of {entry}: {raw}");
         assert_add_answer(&answer, parity);
@@ -1764,7 +1802,7 @@ fn ct02_adds_the_next_tran_id_and_accrues_its_points_with_the_insert() {
         let account_before = stack.fetch_text_rows(ACCOUNT_BALANCES).await;
 
         let first = next_tran_id(HIGHEST_LIVE);
-        add(&app, &token, &success, QUALIFYING, &first).await;
+        add(&app, &token, &success, QUALIFYING, &first, &parity).await;
         let points = points_of(QUALIFYING, rate);
         let accrued = vec![accrual_row(&first, &rule_id, points)];
         assert_eq!(
@@ -1780,10 +1818,16 @@ fn ct02_adds_the_next_tran_id_and_accrues_its_points_with_the_insert() {
             "account 1 is credited"
         );
 
+        assert_eq!(
+            fixture_records::card_xref(&parity, CARD_NUMBER).value("xref_acct_id"),
+            ACCOUNT_ID,
+            "P-CVACT03Y-001, P-CVACT03Y-003: the card the card-keyed add enters cross-references \
+             account 1, whose balance is checked below"
+        );
         let mut previous = first;
         for changes in NON_QUALIFYING {
             let tran_id = next_tran_id(&previous);
-            previous = add(&app, &token, &success, changes, &tran_id).await;
+            previous = add(&app, &token, &success, changes, &tran_id, &parity).await;
         }
         let last = numval_c_adds(&app, &token, &success, &previous, &parity).await;
         copy_last_source(&app, &token, &last, &parity).await;
@@ -1810,7 +1854,8 @@ fn ct02_adds_the_next_tran_id_and_accrues_its_points_with_the_insert() {
 /// carries the unexpected-error text and no internal detail.
 #[test]
 fn a_failed_accrual_rolls_the_ct02_add_back_whole() {
-    let success = success_answer(&common::parity_audit());
+    let parity = common::parity_audit();
+    let success = success_answer(&parity);
     let app = TestApp::start_with_clock(CLOCK);
     block_on(async {
         let stack = app.stack();
@@ -1841,7 +1886,7 @@ fn a_failed_accrual_rolls_the_ct02_add_back_whole() {
         stack.exec_sql(DROP_FAIL_ACCRUAL).await;
         let (rule_id, rate) = retail_rule(&app).await;
         let tran_id = next_tran_id(HIGHEST_LIVE);
-        add(&app, &token, &success, QUALIFYING, &tran_id).await;
+        add(&app, &token, &success, QUALIFYING, &tran_id, &parity).await;
         assert_eq!(
             stack.fetch_text_rows(ACCRUALS).await,
             vec![accrual_row(&tran_id, &rule_id, points_of(QUALIFYING, rate))],
@@ -1867,7 +1912,15 @@ fn ct02_answers_each_audited_io_failure_and_writes_nothing() {
             assert_fault(&app, &token, &doc, fault, &before).await;
         }
         signed_off_add(&app, &parity, &before).await;
-        add(&app, &token, &success, &[], &next_tran_id(HIGHEST_LIVE)).await;
+        add(
+            &app,
+            &token,
+            &success,
+            &[],
+            &next_tran_id(HIGHEST_LIVE),
+            &parity,
+        )
+        .await;
     });
 }
 

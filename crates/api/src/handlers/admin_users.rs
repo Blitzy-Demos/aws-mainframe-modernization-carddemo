@@ -51,7 +51,7 @@ use carddemo_domain::rules::user_add::{self, UserAdded};
 use carddemo_domain::rules::user_delete;
 use carddemo_domain::rules::user_list::{self, UserListInput};
 use carddemo_domain::rules::user_update::{self, UserUpdateOutcome};
-use carddemo_persistence::UnitOfWork;
+use carddemo_persistence::tx::UnitOfWork;
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 

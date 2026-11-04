@@ -1,9 +1,10 @@
 // FN test of the admin reward-rule form (RewardRuleFormPage) in new mode: valid
 // input is sent as the RewardRuleRequest body of `POST /admin/reward-rules`,
 // input the schema rejects is never sent, and a server 400 lands on its field
-// with a toast and the cursor. The page runs with the real API client, query
-// hooks and error helper; only the network is stubbed, through the global the
-// client looks up on every request.
+// with a toast and the cursor. In edit mode, the `PUT /admin/reward-rules/{id}`
+// body keeps each stored window instant whose date was left unchanged. The page
+// runs with the real API client, query hooks and error helper; only the network
+// is stubbed, through the global the client looks up on every request.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
@@ -31,6 +32,7 @@ type FieldName = keyof RewardRuleFormInput;
 type FormEntry = Record<FieldName, string>;
 
 const NEW_ROUTE = "/admin/reward-rules/new";
+const EDIT_ROUTE = "/admin/reward-rules/:ruleId/edit";
 const LIST_ROUTE = "/admin/reward-rules";
 
 // What the list route renders in place of RewardRuleListPage, so the page's
@@ -81,9 +83,10 @@ afterEach(() => {
   fetchMock.mockReset();
 });
 
-// The page alone at its own route, beside a marker list route, with a fresh
-// query cache and router per test so no state carries over between cases.
-function renderPage(): void {
+// The page alone at its own routes, beside a marker list route, opened at
+// `initialEntry`, with a fresh query cache and router per test so no state
+// carries over between cases.
+function renderPage(initialEntry: string = NEW_ROUTE): void {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -94,9 +97,14 @@ function renderPage(): void {
         element: <RewardRuleFormPage />,
         handle: { crumb: "New rule" } satisfies RouteHandle,
       },
+      {
+        path: EDIT_ROUTE,
+        element: <RewardRuleFormPage />,
+        handle: { crumb: "Edit rule" } satisfies RouteHandle,
+      },
       { path: LIST_ROUTE, element: <div>{LIST_MARKER}</div> },
     ],
-    { initialEntries: [NEW_ROUTE] },
+    { initialEntries: [initialEntry] },
   );
   render(
     <QueryClientProvider client={queryClient}>
@@ -155,6 +163,7 @@ describe("RewardRuleFormPage (new rule)", () => {
       max_transaction_amount: null,
       active_from: "2022-01-01T00:00:00Z",
       active_to: null,
+      status: "active",
     };
     fetchMock.mockResolvedValueOnce(Response.json(stored, { status: 201 }));
     const user = userEvent.setup();
@@ -229,5 +238,155 @@ describe("RewardRuleFormPage (new rule)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(LIST_MARKER)).toBeNull();
     expect(screen.getByRole("form", { name: "New reward rule" })).toBeTruthy();
+  });
+});
+
+// A rule with a non-midnight start and an end with a microsecond fraction, as
+// `GET /admin/reward-rules` writes them.
+const TIMED_RULE: RewardRuleResponse = {
+  rule_id: "3",
+  transaction_type_cd: "07",
+  transaction_category_cd: "0001",
+  reward_rate: "1.2500",
+  min_transaction_amount: "5.00",
+  max_transaction_amount: null,
+  active_from: "2022-07-01T12:00:00Z",
+  active_to: "2030-01-01T06:30:00.123456Z",
+  status: "active",
+};
+
+// A soft-deleted rule: DELETE set its end to the processing clock's instant.
+const ENDED_RULE: RewardRuleResponse = {
+  rule_id: "4",
+  transaction_type_cd: "07",
+  transaction_category_cd: "0002",
+  reward_rate: "2.0000",
+  min_transaction_amount: null,
+  max_transaction_amount: null,
+  active_from: "2022-03-15T08:15:30Z",
+  active_to: "2026-11-04T10:00:14.437498Z",
+  status: "ended",
+};
+
+// Answers the rule list with `rule` alone, and the PUT that saves it with the
+// rule as stored.
+function stubRuleApi(rule: RewardRuleResponse): void {
+  fetchMock.mockImplementation((input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    return Promise.resolve(
+      Response.json(request.method === "GET" ? [rule] : rule),
+    );
+  });
+}
+
+// The value shown in the input labelled `label`.
+function inputValue(label: string): string {
+  const input = textbox(label);
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`${label} is not an input`);
+  }
+  return input.value;
+}
+
+// The one request with `method` the client handed to the network.
+function onlyRequest(method: string): Request {
+  const requests = fetchMock.mock.calls
+    .map(([input, init]) =>
+      input instanceof Request ? input : new Request(input, init),
+    )
+    .filter((request) => request.method === method);
+  expect(requests).toHaveLength(1);
+  return requests[0];
+}
+
+describe("RewardRuleFormPage (edit rule)", () => {
+  it.each<{
+    name: string;
+    rule: RewardRuleResponse;
+    label: string;
+    value: string;
+    sent: RewardRuleRequest;
+  }>([
+    {
+      name: "keeps a non-midnight start and a microsecond end when only the rate changes",
+      rule: TIMED_RULE,
+      label: "Reward rate",
+      value: "1.5000",
+      sent: {
+        transaction_type_cd: "07",
+        transaction_category_cd: "0001",
+        reward_rate: "1.5000",
+        min_transaction_amount: "5.00",
+        active_from: "2022-07-01T12:00:00Z",
+        active_to: "2030-01-01T06:30:00.123456Z",
+      },
+    },
+    {
+      name: "keeps a soft-deleted rule's start and end when only the rate changes",
+      rule: ENDED_RULE,
+      label: "Reward rate",
+      value: "2.5000",
+      sent: {
+        transaction_type_cd: "07",
+        transaction_category_cd: "0002",
+        reward_rate: "2.5000",
+        active_from: "2022-03-15T08:15:30Z",
+        active_to: "2026-11-04T10:00:14.437498Z",
+      },
+    },
+    {
+      name: "sends a changed start as midnight UTC and keeps the stored end",
+      rule: TIMED_RULE,
+      label: "Active from",
+      value: "2022-08-01",
+      sent: {
+        transaction_type_cd: "07",
+        transaction_category_cd: "0001",
+        reward_rate: "1.2500",
+        min_transaction_amount: "5.00",
+        active_from: "2022-08-01T00:00:00Z",
+        active_to: "2030-01-01T06:30:00.123456Z",
+      },
+    },
+    {
+      name: "sends a changed end as midnight UTC and keeps the stored start",
+      rule: TIMED_RULE,
+      label: "Active to",
+      value: "2031-06-30",
+      sent: {
+        transaction_type_cd: "07",
+        transaction_category_cd: "0001",
+        reward_rate: "1.2500",
+        min_transaction_amount: "5.00",
+        active_from: "2022-07-01T12:00:00Z",
+        active_to: "2031-06-30T00:00:00Z",
+      },
+    },
+  ])("$name", async ({ rule, label, value, sent }) => {
+    stubRuleApi(rule);
+    const user = userEvent.setup();
+    renderPage(`${LIST_ROUTE}/${rule.rule_id}/edit`);
+
+    // The form shows each stored instant as its date only.
+    expect(
+      await screen.findByRole("form", {
+        name: `Edit reward rule ${rule.rule_id}`,
+      }),
+    ).toBeTruthy();
+    expect(inputValue("Active from")).toBe(rule.active_from.slice(0, 10));
+    expect(inputValue("Active to")).toBe(rule.active_to?.slice(0, 10));
+
+    await user.clear(textbox(label));
+    await user.type(textbox(label), value);
+    await save(user);
+
+    expect(await screen.findByText(LIST_MARKER)).toBeTruthy();
+    const request = onlyRequest("PUT");
+    expect(new URL(request.url).pathname).toBe(
+      `/api/admin/reward-rules/${rule.rule_id}`,
+    );
+    // Strict: the instants byte for byte, and no key beyond these.
+    const body: RewardRuleRequest = await request.clone().json();
+    expect(body).toStrictEqual(sent);
   });
 });

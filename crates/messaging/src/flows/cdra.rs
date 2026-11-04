@@ -40,11 +40,10 @@
 use std::future::{self, Future};
 use std::time::Duration;
 
-use carddemo_domain::entities::Account;
-use carddemo_domain::numeric::AccountId;
-use carddemo_domain::ports::{AccountReader, PortError, PortResult};
-use carddemo_domain::rules::mq_account_reply::{self, AccountRequest, ReplyOutcome};
-use carddemo_persistence::{Db, UnitOfWork};
+use carddemo_domain::rules::mq_account_reply::{
+    self, Account, AccountId, AccountReader, AccountRequest, PortError, PortResult, ReplyOutcome,
+};
+use carddemo_persistence::tx::{Db, UnitOfWork};
 
 use crate::connection::BROKER_TIMEOUT;
 use crate::consumer::{Disposition, FailureAction, Flow, PublishFailure, Reply, Request};

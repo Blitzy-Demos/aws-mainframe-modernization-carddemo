@@ -12,9 +12,16 @@
 //
 // The psql helper runs inside the Compose project the environment names
 // (COMPOSE_PROJECT_NAME and COMPOSE_FILE, when set) from the repository root,
-// so a spec reaches the same PostgreSQL the API under test uses.
+// so a spec reaches the same PostgreSQL the API under test uses. Every call is
+// bounded per statement (lock wait and run time) and as a whole command inside
+// the container, and runs as a session named for that call alone. A failed
+// call settles only once its session has been reaped and can no longer write,
+// or rejects reporting it unconfirmed, which blocks checkpoint restores. A
+// restore also waits for the calls still in flight, so SQL a timed-out test
+// left running cannot land after the restore.
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -22,17 +29,16 @@ import {
   expect,
   test,
   type APIRequestContext,
-  type APIResponse,
   type Locator,
   type Page,
   type Request,
 } from "@playwright/test";
+import { z } from "zod";
 
 import type { components } from "../src/api/schema";
 
 export { expect, test };
 
-type LoginResponse = components["schemas"]["LoginResponse"];
 type TransactionAddRequest = components["schemas"]["TransactionAddRequest"];
 type TransactionAddResponse = components["schemas"]["TransactionAddResponse"];
 type ErrorBody = components["schemas"]["ErrorBody"];
@@ -61,6 +67,96 @@ function readRepoText(relative: string): string {
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * PostgreSQL's bounds on each statement a psql() call sends: the longest wait
+ * for a lock, and the longest run, lock wait included. They reach the psql
+ * inside the container through PGOPTIONS, which adds no output line. The
+ * fixtures' statements are small, so only a blocked or runaway statement
+ * meets them.
+ */
+const PSQL_LOCK_TIMEOUT = "15s";
+const PSQL_STATEMENT_TIMEOUT = "30s";
+
+/**
+ * How often a running statement checks that its psql is still connected (also
+ * through PGOPTIONS), so a backend whose psql was killed aborts its statement,
+ * and with it the rest of the call's SQL, within this interval.
+ */
+const PSQL_CONNECTION_CHECK_INTERVAL = "500ms";
+
+/**
+ * The bound on one whole psql() command, in seconds, applied inside the
+ * container: `timeout` kills psql with SIGKILL once it has run this long,
+ * however many statements its SQL holds. It exceeds PSQL_STATEMENT_TIMEOUT, so
+ * a single statement's own error normally arrives first.
+ */
+const PSQL_COMMAND_TIMEOUT_S = 45;
+
+/**
+ * The client's backstop on one `docker compose exec` child, in milliseconds:
+ * the in-container bound plus room for a slow docker start. It stays below the
+ * 120 s Playwright test timeout.
+ */
+const PSQL_CHILD_TIMEOUT_MS = 75_000;
+
+/**
+ * The bounds of the reap that follows a failed call (reapSession): one
+ * attempt's in-container and client bounds, how long it waits for each
+ * signalled backend to exit, and how many attempts it makes, a second apart,
+ * before it reports the session unconfirmed.
+ */
+const REAP_COMMAND_TIMEOUT_S = 12;
+const REAP_CHILD_TIMEOUT_MS = 20_000;
+const REAP_TERMINATE_WAIT_MS = 5_000;
+const REAP_ATTEMPTS = 3;
+const REAP_RETRY_DELAY_MS = 1_000;
+
+// The psql() calls not yet settled. A checkpoint restore waits for those in
+// flight when it starts, so a call a timed-out test left running cannot write
+// after the restore.
+const psqlInFlight = new Set<Promise<unknown>>();
+
+// The sessions of failed psql() calls whose end no reap could confirm. A
+// checkpoint restore refuses to run while any remains (confirmSessionsEnded).
+const unconfirmedSessions = new Set<string>();
+
+// The last number given to a psql session of this process.
+let sessionSequence = 0;
+
+// A new application_name for one psql session: carddemo-e2e-<pid>-<n> for a
+// psql() call, carddemo-e2e-<pid>-reap-<n> for a reap. Each Playwright worker
+// is its own process, so no two sessions share a name, and every name stays
+// far below PostgreSQL's 63-byte limit.
+function sessionTag(kind: "call" | "reap"): string {
+  sessionSequence += 1;
+  return kind === "call"
+    ? `carddemo-e2e-${process.pid}-${sessionSequence}`
+    : `carddemo-e2e-${process.pid}-reap-${sessionSequence}`;
+}
+
+// Whether `error` is execFile's report of a child it killed at its timeout.
+// A maxBuffer overflow, the only other kill, reports a RangeError without
+// `killed`.
+function killedAtTimeout(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "killed" in error && error.killed === true;
+}
+
+// The signal that ended the child, as execFile reports it.
+function exitSignal(error: unknown): string {
+  if (typeof error === "object" && error !== null && "signal" in error) {
+    return String(error.signal);
+  }
+  return "unknown signal";
+}
+
+// The exit status of a child that ran and failed, as execFile reports it.
+function exitStatus(error: unknown): number | undefined {
+  if (typeof error === "object" && error !== null && "code" in error && typeof error.code === "number") {
+    return error.code;
+  }
+  return undefined;
+}
+
 // Text a child-process failure carries: the stderr of the failed command, or
 // the error itself when the command could not start.
 function describeExecFailure(error: unknown): string {
@@ -76,39 +172,179 @@ function describeExecFailure(error: unknown): string {
   return String(error);
 }
 
+// What ended a failed psql child bounded by `commandTimeoutS` inside the
+// container and `childTimeoutMs` by the client: the client's kill, the
+// in-container kill (`timeout` exits 137 after SIGKILL, 124 after another
+// signal), else psql's own error text.
+function describePsqlFailure(error: unknown, commandTimeoutS: number, childTimeoutMs: number): string {
+  if (killedAtTimeout(error)) {
+    return `psql exceeded ${childTimeoutMs} ms and its docker child was killed with ${exitSignal(error)}`;
+  }
+  const status = exitStatus(error);
+  if (status === 124 || status === 137) {
+    return `psql ran past its ${commandTimeoutS} s bound and was killed inside the container (exit ${status})`;
+  }
+  return `psql failed: ${describeExecFailure(error)}`;
+}
+
+// Runs psql in the Compose `postgres` service from the repository root as the
+// session `tag`, with each of `commands` sent by its own -c, so each runs and
+// commits on its own, and returns the output without the final newline.
+// `timeout --foreground` kills psql after `commandTimeoutS` and itself stays
+// alive to reap it: without --foreground it would also kill itself, leaving
+// psql to the container's PID 1, the postmaster, which takes any child's
+// SIGKILL for a crashed backend and restarts the whole server.
+async function execPsql(
+  tag: string,
+  commandTimeoutS: number,
+  childTimeoutMs: number,
+  commands: readonly string[],
+): Promise<string> {
+  const { stdout } = await execFileAsync(
+    "docker",
+    [
+      "compose",
+      "exec",
+      "-T",
+      "-e",
+      `PGAPPNAME=${tag}`,
+      "-e",
+      `PGOPTIONS=-c lock_timeout=${PSQL_LOCK_TIMEOUT} -c statement_timeout=${PSQL_STATEMENT_TIMEOUT} -c client_connection_check_interval=${PSQL_CONNECTION_CHECK_INTERVAL}`,
+      "postgres",
+      "timeout",
+      "--foreground",
+      "-s",
+      "KILL",
+      String(commandTimeoutS),
+      "psql",
+      "-U",
+      "carddemo",
+      "-d",
+      "carddemo",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-tA",
+      ...commands.flatMap((command) => ["-c", command]),
+    ],
+    {
+      cwd: repoRoot,
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: childTimeoutMs,
+      killSignal: "SIGKILL",
+    },
+  );
+  return stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+}
+
+// A reap's outcome: the session is gone, after `found` of its backends were
+// still open and terminated, or its end is unconfirmed for `reason`.
+type Reap = { ended: true; found: number } | { ended: false; reason: string };
+
+// Ends every backend of the session `tag` and confirms none remains, through
+// a separate bounded psql session that is neither in flight nor reaped itself.
+// An attempt signals each backend named `tag`, waiting REAP_TERMINATE_WAIT_MS
+// for it to exit, then counts those left by a second -c, whose own
+// transaction reads pg_stat_activity afresh. Up to REAP_ATTEMPTS attempts run.
+async function reapSession(tag: string): Promise<Reap> {
+  const name = sqlLiteral(tag);
+  const terminate = `SELECT count(*)
+                       FROM (SELECT pg_terminate_backend(pid, ${REAP_TERMINATE_WAIT_MS})
+                               FROM pg_stat_activity
+                              WHERE application_name = ${name}) AS signalled`;
+  const remaining = `SELECT count(*) FROM pg_stat_activity WHERE application_name = ${name}`;
+  let found = 0;
+  let reason = "no reap attempt ran";
+  for (let attempt = 1; attempt <= REAP_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) {
+      await delay(REAP_RETRY_DELAY_MS);
+    }
+    let out: string;
+    try {
+      out = await execPsql(sessionTag("reap"), REAP_COMMAND_TIMEOUT_S, REAP_CHILD_TIMEOUT_MS, [terminate, remaining]);
+    } catch (error) {
+      reason = `the reap failed: ${describePsqlFailure(error, REAP_COMMAND_TIMEOUT_S, REAP_CHILD_TIMEOUT_MS)}`;
+      continue;
+    }
+    const counts = /^([0-9]+)\n([0-9]+)$/.exec(out);
+    if (counts === null) {
+      reason = `the reap printed ${JSON.stringify(out)}, not two counts`;
+      continue;
+    }
+    found += Number(counts[1]);
+    if (counts[2] === "0") {
+      return { ended: true, found };
+    }
+    reason = `${counts[2]} of its backends still open`;
+  }
+  return { ended: false, reason };
+}
+
+// Reaps again every session in unconfirmedSessions; a session confirmed ended
+// leaves the set. Rejects, naming each session left, while any remains, since
+// its SQL might still write.
+async function confirmSessionsEnded(): Promise<void> {
+  const open: string[] = [];
+  for (const tag of [...unconfirmedSessions]) {
+    const reap = await reapSession(tag);
+    if (reap.ended) {
+      unconfirmedSessions.delete(tag);
+    } else {
+      open.push(`${tag} (${reap.reason})`);
+    }
+  }
+  if (open.length > 0) {
+    throw new Error(
+      `checkpoint restore refused: the session of a failed psql() call is not confirmed ended and might still write: ${open.join("; ")}`,
+    );
+  }
+}
+
 /**
  * Runs `sql` with psql in the Compose `postgres` service, exactly as
- * `docker compose exec -T postgres psql -U carddemo -d carddemo
- * -v ON_ERROR_STOP=1 -tA -c <sql>` from the repository root, and returns its
- * unaligned, tuples-only output without the final newline. Rows are separated
- * by newlines and columns by `|`. A failing statement rejects with psql's
- * error text.
+ * `docker compose exec -T -e PGAPPNAME=<session> -e PGOPTIONS=<bounds> postgres
+ * timeout --foreground -s KILL <PSQL_COMMAND_TIMEOUT_S> psql -U carddemo
+ * -d carddemo -v ON_ERROR_STOP=1 -tA -c <sql>` from the repository root, and
+ * returns its unaligned, tuples-only output without the final newline. Rows
+ * are separated by newlines and columns by `|`. A failing statement rejects
+ * with psql's error text.
+ *
+ * Bounds: PostgreSQL fails a statement that waits PSQL_LOCK_TIMEOUT for a lock
+ * or runs PSQL_STATEMENT_TIMEOUT; `timeout` kills psql once the whole command
+ * has run PSQL_COMMAND_TIMEOUT_S, and its backend then aborts within
+ * PSQL_CONNECTION_CHECK_INTERVAL; the client kills a docker child still
+ * running after PSQL_CHILD_TIMEOUT_MS. Each call runs as its own session
+ * (sessionTag), and a failed call settles only after a reap has ended that
+ * session's backends and confirmed none remains, so its SQL can no longer
+ * write. When no reap can confirm that, the call rejects saying so, and every
+ * checkpoint restore is refused until a later reap does. Until the call
+ * settles it is in flight, and a checkpoint restore that starts meanwhile
+ * waits for it.
  */
 export async function psql(sql: string): Promise<string> {
+  const call = runPsql(sql);
+  psqlInFlight.add(call);
   try {
-    const { stdout } = await execFileAsync(
-      "docker",
-      [
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        "carddemo",
-        "-d",
-        "carddemo",
-        "-v",
-        "ON_ERROR_STOP=1",
-        "-tA",
-        "-c",
-        sql,
-      ],
-      { cwd: repoRoot, maxBuffer: 64 * 1024 * 1024 },
-    );
-    return stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+    return await call;
+  } finally {
+    psqlInFlight.delete(call);
+  }
+}
+
+async function runPsql(sql: string): Promise<string> {
+  const tag = sessionTag("call");
+  try {
+    return await execPsql(tag, PSQL_COMMAND_TIMEOUT_S, PSQL_CHILD_TIMEOUT_MS, [sql]);
   } catch (error) {
-    throw new Error(`psql failed: ${describeExecFailure(error)}\nSQL: ${sql}`);
+    const failure = describePsqlFailure(error, PSQL_COMMAND_TIMEOUT_S, PSQL_CHILD_TIMEOUT_MS);
+    const reap = await reapSession(tag);
+    if (reap.ended) {
+      const ended = reap.found > 0 ? `\nits session ${tag} was still open and has been terminated` : "";
+      throw new Error(`${failure}${ended}\nSQL: ${sql}`);
+    }
+    unconfirmedSessions.add(tag);
+    throw new Error(
+      `${failure}\nits session ${tag} is not confirmed ended (${reap.reason}), so checkpoint restores are refused until it is\nSQL: ${sql}`,
+    );
   }
 }
 
@@ -151,7 +387,11 @@ export type RowScope = { table: string; where: string };
 export type Checkpoint = {
   /**
    * Puts every covered row back as it was when the checkpoint was taken, in
-   * one database transaction. A second call does nothing.
+   * one database transaction, after the psql() calls in flight when it starts
+   * have settled and every failed call's session is confirmed ended; while
+   * one is not, it rejects naming it. A call after a successful restore does
+   * nothing; concurrent calls share one attempt; a failed attempt rejects, and
+   * a later call retries it.
    */
   restore(): Promise<void>;
 };
@@ -245,13 +485,31 @@ export async function checkpoint(scopes: readonly RowScope[]): Promise<Checkpoin
     snapshots.push(await snapshotScope(scope));
   }
   let restored = false;
+  let attempt: Promise<void> | undefined;
+  // One restore attempt. The psql() calls in flight are read before its own
+  // call starts, and waited for (each is bounded and settles only once its
+  // session can no longer write), so a call a timed-out test left running
+  // cannot write after the restore. The attempt then refuses to run while a
+  // failed call's session is still unconfirmed. The restore SQL is one
+  // transaction, so a failed attempt changes nothing and a later call can
+  // retry it.
+  const restoreOnce = async (): Promise<void> => {
+    try {
+      await Promise.allSettled([...psqlInFlight]);
+      await confirmSessionsEnded();
+      await psql(restoreSql(snapshots));
+      restored = true;
+    } finally {
+      attempt = undefined;
+    }
+  };
   return {
     async restore(): Promise<void> {
       if (restored) {
         return;
       }
-      restored = true;
-      await psql(restoreSql(snapshots));
+      attempt ??= restoreOnce();
+      await attempt;
     },
   };
 }
@@ -903,6 +1161,57 @@ export function routePattern(route: string): RegExp {
 }
 
 // ---------------------------------------------------------------------------
+// Processing clock
+// ---------------------------------------------------------------------------
+
+/**
+ * The processing clock the API under test runs on, as this Playwright run
+ * names it. CT02 accrues rewards, under the rules active at that instant,
+ * and DELETE /admin/reward-rules/{id} ends a rule at it; both read
+ * CARDDEMO_CLOCK_OVERRIDE (AAP 0.6.4), an RFC 3339 instant that pins the
+ * clock, where only an empty value counts as unset. The API and the
+ * Playwright run must therefore share the same CARDDEMO_CLOCK_OVERRIDE, both
+ * unset by default; the CT02 accrual tests of rewards.spec.ts assert that
+ * they do.
+ */
+export type ProcessingClock = {
+  /** The run's CARDDEMO_CLOCK_OVERRIDE verbatim; null when unset or empty (the system clock). */
+  override: string | null;
+  /** The processing instant as an SQL timestamptz expression: the override, else now(). */
+  instant: string;
+  /** The instant as assertion messages name it. */
+  label: string;
+};
+
+/** The processing clock of this run, from CARDDEMO_CLOCK_OVERRIDE (see ProcessingClock). */
+export function processingClock(): ProcessingClock {
+  const override = process.env.CARDDEMO_CLOCK_OVERRIDE;
+  if (override === undefined || override === "") {
+    return { override: null, instant: "now()", label: "now() (CARDDEMO_CLOCK_OVERRIDE unset)" };
+  }
+  return {
+    override,
+    instant: `${sqlLiteral(override)}::timestamptz`,
+    label: `CARDDEMO_CLOCK_OVERRIDE ${override}`,
+  };
+}
+
+/**
+ * The UTC date (`YYYY-MM-DD`) of the processing instant, computed by
+ * PostgreSQL: the day the reward-rule form's `active_from` must name for a
+ * rule the processing clock has already started, since the form sends a
+ * date as midnight UTC of that day.
+ */
+export async function processingDate(): Promise<string> {
+  const clock = processingClock();
+  const date = await psql(`SELECT to_char((${clock.instant}) AT TIME ZONE 'UTC', 'YYYY-MM-DD')`);
+  if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(date)) {
+    throw new Error(`no UTC date for the processing instant ${clock.label} (got ${JSON.stringify(date)})`);
+  }
+  return date;
+}
+
+// ---------------------------------------------------------------------------
 // Database fixtures
 // ---------------------------------------------------------------------------
 
@@ -1019,11 +1328,22 @@ export async function latestTranId(): Promise<string> {
   return tranId;
 }
 
-/** The TRAN-ID CT02 and CB00 allocate next: highest key + 1 as 9(16). */
+/**
+ * The TRAN-ID CT02 and CB00 allocate next: highest key + 1 as 9(16). The ADD
+ * has no ON SIZE ERROR, so a sum that does not fit 16 digits loses its
+ * high-order digit and 9999999999999999 is followed by 0000000000000000, as
+ * `TranId::next` computes it. The sum is therefore reduced modulo 10^16 before
+ * it is padded: `lpad` would cut a 17-digit sum on the right instead.
+ *
+ * An empty live master gives 0000000000000001, the first key of an empty file
+ * (P-COTRN02C-022). CT02 and CB00 allocate nothing there (STARTBR NOTFND,
+ * E-27), so a spec that needs a live row writes it with this key itself.
+ */
 export async function nextTranId(): Promise<string> {
   return assertDigits(
     await psql(
-      "SELECT lpad((coalesce(max(tran_id::numeric), 0) + 1)::text, 16, '0') FROM transaction_master",
+      `SELECT lpad(((coalesce(max(tran_id::numeric), 0) + 1) % 10000000000000000)::text, 16, '0')
+         FROM transaction_master`,
     ),
     16,
   );
@@ -1072,9 +1392,108 @@ export function apiPath(path: string): string {
   return `/api${path}`;
 }
 
-/** `response`'s JSON body typed as `T`; the specs assert its contents. */
-export async function readJson<T>(response: APIResponse): Promise<T> {
-  return (await response.json()) as T;
+// Checked decoders of the API responses the specs read, one per OpenAPI
+// schema. Each is strict, so a body with a key the schema does not declare is
+// rejected like a body missing one, and `satisfies` fails `tsc` when a decoder
+// drifts from the generated type.
+
+export const loginResponseSchema = z
+  .object({
+    expires_at: z.string(),
+    landing: z.string(),
+    token: z.string(),
+    user_id: z.string(),
+    usr_type: z.string(),
+  })
+  .strict() satisfies z.ZodType<components["schemas"]["LoginResponse"]>;
+
+export const transactionResponseSchema = z
+  .object({
+    tran_amt: z.string(),
+    tran_card_num: z.string(),
+    tran_cat_cd: z.string(),
+    tran_desc: z.string(),
+    tran_id: z.string(),
+    tran_merchant_city: z.string(),
+    tran_merchant_id: z.string(),
+    tran_merchant_name: z.string(),
+    tran_merchant_zip: z.string(),
+    tran_orig_ts: z.string(),
+    tran_proc_ts: z.string(),
+    tran_source: z.string(),
+    tran_type_cd: z.string(),
+  })
+  .strict() satisfies z.ZodType<components["schemas"]["TransactionResponse"]>;
+
+export const transactionAddResponseSchema = z
+  .object({
+    message: z.string(),
+    transaction: transactionResponseSchema,
+  })
+  .strict() satisfies z.ZodType<components["schemas"]["TransactionAddResponse"]>;
+
+export const errorFieldBodySchema = z
+  .object({
+    field: z.string(),
+    message: z.string(),
+  })
+  .strict() satisfies z.ZodType<components["schemas"]["ErrorFieldBody"]>;
+
+export const errorBodySchema = z
+  .object({
+    code: z.string(),
+    fields: z.array(errorFieldBodySchema).optional(),
+    message: z.string(),
+  })
+  .strict() satisfies z.ZodType<components["schemas"]["ErrorBody"]>;
+
+export const rewardRuleResponseSchema = z
+  .object({
+    active_from: z.string(),
+    active_to: z.string().nullable(),
+    max_transaction_amount: z.string().nullable(),
+    min_transaction_amount: z.string().nullable(),
+    reward_rate: z.string(),
+    rule_id: z.string(),
+    status: z.enum(["scheduled", "active", "ended"]),
+    transaction_category_cd: z.string(),
+    transaction_type_cd: z.string(),
+  })
+  .strict() satisfies z.ZodType<components["schemas"]["RewardRuleResponse"]>;
+
+export const rewardBalanceResponseSchema = z
+  .object({
+    account_id: z.string(),
+    available_points: z.string(),
+    total_points_earned: z.string(),
+    total_points_redeemed: z.string(),
+  })
+  .strict() satisfies z.ZodType<components["schemas"]["RewardBalanceResponse"]>;
+
+/**
+ * `response`'s JSON body decoded by `schema`, for an API response and a
+ * browser response alike. A body that is not JSON, or that `schema` rejects,
+ * throws an error that names the URL and, for a rejected body, every issue
+ * `schema` reports with its path.
+ */
+export async function readJson<T>(
+  response: { json(): Promise<unknown>; url(): string },
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
+): Promise<T> {
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw new Error(`the body of ${response.url()} is not JSON`, { cause: error });
+  }
+  const decoded = schema.safeParse(body);
+  if (!decoded.success) {
+    const issues = decoded.error.issues
+      .map((issue) => `${issue.path.length === 0 ? "(body)" : issue.path.join(".")}: ${issue.message}`)
+      .join("; ");
+    throw new Error(`the JSON body of ${response.url()} does not match its schema: ${issues}`);
+  }
+  return decoded.data;
 }
 
 /** The bearer header of `token`. */
@@ -1089,7 +1508,7 @@ export async function apiToken(request: APIRequestContext, role: Role): Promise<
     data: { user_id: user.userId, password: user.password },
   });
   expect(response.status(), `sign-on of ${user.userId}`).toBe(200);
-  const body = await readJson<LoginResponse>(response);
+  const body = await readJson(response, loginResponseSchema);
   expect(body.user_id).toBe(user.userId);
   expect(body.usr_type).toBe(user.usrType);
   expect(body.landing).toBe(user.landing);
@@ -1170,8 +1589,8 @@ export async function addTransactionViaApi(
     const status = response.status();
     const parsed =
       status === 201
-        ? await readJson<TransactionAddResponse>(response)
-        : await readJson<ErrorBody>(response);
+        ? await readJson(response, transactionAddResponseSchema)
+        : await readJson(response, errorBodySchema);
     const tranId = status === 201 && "transaction" in parsed ? parsed.transaction.tran_id : null;
     return { status, body: parsed, tranId, restore: () => cp.restore() };
   } catch (error) {
@@ -1393,7 +1812,9 @@ export const REWARD_SCREENS = {
     ],
     /** A null bound or end, as the list shows it. */
     none: "—",
+    /** The Status badge of each server `status`. */
     active: "Active",
+    scheduled: "Scheduled",
     ended: "Ended",
     edit: "Edit",
     delete: "Delete",

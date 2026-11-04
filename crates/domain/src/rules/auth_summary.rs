@@ -52,13 +52,19 @@
 //! The CICS `RESP` and IMS status codes inside the messages are those E-44
 //! proposes for `PostgreSQL` outcomes.
 
-use crate::entities::{Account, CardXref, Customer, PendingAuthDetail, PendingAuthSummary};
+use crate::entities::{Account, CardXref, Customer, PendingAuthDetail};
 use crate::error::DomainError;
 use crate::messages::{self, AuthLookupFailure};
 use crate::numeric::{AccountId, AuthId, CustomerId};
 use crate::ports::{
-    AccountReader, AuthorizationStore, Browse, CustomerReader, Direction, PortError, XrefReader,
+    AccountReader, AuthorizationStore, Browse, CustomerReader, Direction, PortError,
 };
+
+/// The summary record and the cross-reference reader [`summary`] works on,
+/// re-exported from [`crate::entities`] and [`crate::ports`] for the API
+/// adapter.
+pub use crate::entities::PendingAuthSummary;
+pub use crate::ports::XrefReader;
 
 /// The rows of one page: the five list lines `SEL0001` to `SEL0005` of
 /// `COPAU00` [app/app-authorization-ims-db2-mq/cpy-bms/COPAU00.cpy:L150], filled

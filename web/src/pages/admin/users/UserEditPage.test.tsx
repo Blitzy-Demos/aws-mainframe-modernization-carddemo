@@ -1,7 +1,9 @@
 // FN tests of CU02, the COUSR02C "Update User" screen (UserEditPage): valid
 // input reaches PUT /admin/users/{id} as the request body the API defines,
-// input the schema rejects sends nothing and marks its field, and a server
-// rejection marks the field it names, toasts its message and takes the focus.
+// input the schema rejects sends nothing, Save marking its field and Save and
+// exit returning to the user list as PF3 does whatever the outcome, and a
+// server rejection marks the field it names, toasts its message and takes the
+// focus.
 //
 // E-21 runs through every case: GET returns no password, so the password field
 // starts empty and disabled, the body leaves `password` out unless "Change
@@ -323,6 +325,39 @@ describe("UserEditPage (CU02, COUSR02C)", () => {
       "success",
     );
   });
+
+  // PF3 returns to the list whatever the update outcome (F-COUSR02-002,
+  // P-COUSR02C-008); the input the schema rejects is never sent.
+  it.each([
+    {
+      variant: "Last Name cleared",
+      enter: async (user: UserEvent) => {
+        await user.clear(textbox("Last Name"));
+      },
+    },
+    {
+      variant: "Reset pressed",
+      enter: async (user: UserEvent) => {
+        await user.click(screen.getByRole("button", { name: "Reset" }));
+      },
+    },
+  ])(
+    "returns to the user list without a PUT when Save and exit has input the schema rejects ($variant)",
+    async ({ enter }) => {
+      const { user, router } = renderAt(EDIT_PATH);
+      await loadedForm();
+
+      await enter(user);
+      expect(textbox("Last Name").value).toBe("");
+      await user.click(screen.getByRole("button", { name: "Save and exit" }));
+
+      await waitFor(() => {
+        expect(router.state.location.pathname).toBe(USER_LIST_PATH);
+      });
+      expect(await screen.findByText("User list")).toBeTruthy();
+      expect(puts()).toHaveLength(0);
+    },
+  );
 
   it.each([
     {

@@ -69,23 +69,18 @@ use std::collections::HashMap;
 use std::error::Error;
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
-use carddemo_domain::entities::{
-    Account, CardXref, DisclosureGroup, DisclosureGroupKey, NewTransaction, TranCatBalance,
-    TranCatBalanceKey,
-};
 use carddemo_domain::messages::{
     ABENDING_PROGRAM, END_OF_EXECUTION_OF_PROGRAM_CBACT04C, ERROR_CLOSING_TRANSACTION_FILE,
     ERROR_OPENING_TRANSACTION_FILE, file_status_message,
 };
-use carddemo_domain::numeric::{
-    AccountGroupId, AccountId, Alnum, CardNumber, TranCategoryCode, TranTypeCode,
+use carddemo_domain::rules::interest::{
+    Account, AccountGroupId, AccountId, AccountReader, AccountWriter, Alnum, CardNumber, CardXref,
+    DisclosureGroup, DisclosureGroupKey, DisclosureGroupReader, InterestAbend, InterestFile,
+    InterestRun, NewTransaction, TranCatBalance, TranCatBalanceKey, TranCatBalanceStore,
+    TranCategoryCode, TranTypeCode, XrefReader,
 };
-use carddemo_domain::ports::{
-    AccountReader, AccountWriter, DisclosureGroupReader, PortError, PortResult,
-    TranCatBalanceStore, XrefReader,
-};
-use carddemo_domain::rules::interest::{InterestAbend, InterestFile, InterestRun};
-use carddemo_persistence::{Db, UnitOfWork};
+use carddemo_domain::rules::{PortError, PortResult};
+use carddemo_persistence::tx::{Db, UnitOfWork};
 use tracing::Span;
 
 use super::{JobContext, setup_failure, span_count};

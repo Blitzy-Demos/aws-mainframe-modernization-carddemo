@@ -251,6 +251,11 @@ type TextFieldProps = {
   config: FieldConfig;
   /** The id of the group description the input is also described by. */
   groupDescriptionId?: string;
+  /**
+   * The keyboard lock of a running PF5 copy or confirmed add: the input keeps
+   * its value, and stays focusable, so the cursor is not lost.
+   */
+  readOnly: boolean;
 };
 
 /**
@@ -258,7 +263,12 @@ type TextFieldProps = {
  * Input, so a client or server error focuses it, as the COBOL `MOVE -1 TO
  * <field>L` places the cursor.
  */
-function TextField({ control, config, groupDescriptionId }: TextFieldProps): JSX.Element {
+function TextField({
+  control,
+  config,
+  groupDescriptionId,
+  readOnly,
+}: TextFieldProps): JSX.Element {
   const { bms, label, maxLength, inputMode, placeholder, description } = config;
   const descriptionId = description === undefined ? undefined : `${bms}-description`;
   const errorId = `${bms}-error`;
@@ -285,6 +295,7 @@ function TextField({ control, config, groupDescriptionId }: TextFieldProps): JSX
               inputMode={inputMode}
               placeholder={placeholder}
               autoComplete="off"
+              readOnly={readOnly}
               aria-invalid={fieldState.invalid}
               aria-describedby={describedBy === "" ? undefined : describedBy}
             />
@@ -317,10 +328,25 @@ export default function TransactionAddPage(): JSX.Element {
   const [confirmation, setConfirmation] = useState<TransactionAddFormValues | null>(null);
   const [confirming, setConfirming] = useState(false);
 
-  // A PF5 copy in flight: the screen takes no other key until it answers, as
-  // the 3270 keyboard locks while the task runs. Its own button stays enabled,
-  // since it holds the focus, and ignores presses instead.
-  const copying = copyLast.isPending || check.isPending;
+  // The keyboard lock, as the 3270 keyboard locks while the task runs: from a
+  // PF5 press until its key edits, read and check have all answered
+  // (`copying`), and while a confirmed add runs. The entry stays the one its
+  // request was built from, so the copy, the clear or the field errors of the
+  // answer land on that entry:
+  // - every input is read-only, keeping its value and, unlike a disabled
+  //   input, the focus it holds;
+  // - Reset is disabled;
+  // - ENTER is ignored before the edits run, so it neither marks a field nor
+  //   opens the confirm dialog;
+  // - the submit is disabled during PF5 only. During the add, the closed
+  //   dialog gives the focus back to its opener (the submit, or the input
+  //   ENTER was pressed in), and a disabled submit would leave it on the body;
+  // - "Copy last transaction" stays enabled, since it holds the focus during
+  //   PF5, and ignores presses instead.
+  // `copyingRef` changes with `copying`, so a second press before the next
+  // render cannot start a second copy.
+  const [copying, setCopying] = useState(false);
+  const copyingRef = useRef(false);
   const busy = copying || add.isPending;
   // Set when a PF5 check answers with the confirmation prompt alone. The
   // submit is still disabled while that answer's callback runs, and a disabled
@@ -359,6 +385,8 @@ export default function TransactionAddPage(): JSX.Element {
     if (values === null) {
       return;
     }
+    // The inputs stay read-only while the add runs, so its answer clears or
+    // marks the entry confirmed, never a newer one.
     add.mutate(
       { ...values, confirm: CONFIRM_YES },
       {
@@ -395,14 +423,33 @@ export default function TransactionAddPage(): JSX.Element {
   //    then shown on the copied screen.
   // The key fields keep what the user entered: the COBOL copies none of them
   // [app/cbl/COTRN02C.cbl:L479-492].
+  // The keyboard lock is taken before the key edits and released on every
+  // way the task ends: rejected keys, key edits that throw, a failed read, an
+  // empty master, and the check's answer. The answers release it in
+  // onSettled, which TanStack Query runs even when onSuccess or onError throws.
   async function copyLastTransaction(): Promise<void> {
-    if (busy) {
+    if (copyingRef.current || add.isPending) {
       return;
     }
-    const keysValid = await form.trigger([...KEY_FIELDS], { shouldFocus: true });
+    copyingRef.current = true;
+    setCopying(true);
+    const releaseCopy = (): void => {
+      copyingRef.current = false;
+      setCopying(false);
+    };
+    const keysValid = await form
+      .trigger([...KEY_FIELDS], { shouldFocus: true })
+      .catch((error: unknown) => {
+        releaseCopy();
+        throw error;
+      });
     if (!keysValid) {
+      releaseCopy();
       return;
     }
+    // The entry the edited keys belong to. The check is built from it and its
+    // answer applied to it, never to the live form.
+    const entry = form.getValues();
     copyLast.mutate(undefined, {
       onSuccess: ({ transaction, message }) => {
         if (transaction === undefined) {
@@ -411,10 +458,10 @@ export default function TransactionAddPage(): JSX.Element {
         }
         const copied = transactionToAddFormValues(transaction);
         const applyCopy = (): void => {
-          form.reset({ ...form.getValues(), ...copied }, { keepFieldsRef: true });
+          form.reset({ ...entry, ...copied }, { keepFieldsRef: true });
         };
         check.mutate(
-          { ...form.getValues(), ...copied, confirm: CONFIRM_BLANK },
+          { ...entry, ...copied, confirm: CONFIRM_BLANK },
           {
             onSuccess: ({ data }) => {
               applyCopy();
@@ -433,11 +480,19 @@ export default function TransactionAddPage(): JSX.Element {
                   applied.fields[0] === transactionAddBmsFieldMap.CONFIRM,
               );
             },
+            onSettled: releaseCopy,
           },
         );
       },
       onError: (error) => {
         applyApiError(error, form, transactionAddBmsFieldMap);
+      },
+      // A failed read or an empty master ends the task here. A record read
+      // hands it to the check, whose answer ends it.
+      onSettled: (last) => {
+        if (last?.transaction === undefined) {
+          releaseCopy();
+        }
       },
     });
   }
@@ -451,7 +506,17 @@ export default function TransactionAddPage(): JSX.Element {
           </Button>
         }
       />
-      <form noValidate onSubmit={form.handleSubmit(askForConfirmation)}>
+      <form
+        noValidate
+        onSubmit={(event) => {
+          // ENTER under the keyboard lock is ignored before the edits run.
+          if (busy) {
+            event.preventDefault();
+            return;
+          }
+          void form.handleSubmit(askForConfirmation)(event);
+        }}
+      >
         <Card>
           <CardContent>
             <FieldGroup>
@@ -478,6 +543,7 @@ export default function TransactionAddPage(): JSX.Element {
                             control={form.control}
                             config={config}
                             groupDescriptionId={groupDescriptionId}
+                            readOnly={busy}
                           />
                         ))}
                       </FieldGroup>
@@ -492,7 +558,7 @@ export default function TransactionAddPage(): JSX.Element {
             <Button ref={submitRef} type="submit" disabled={copying}>
               Add transaction
             </Button>
-            <Button type="button" variant="outline" disabled={copying} onClick={clearForm}>
+            <Button type="button" variant="outline" disabled={busy} onClick={clearForm}>
               Reset
             </Button>
             <Button

@@ -17,13 +17,29 @@ const apiProxyTarget =
 // the modules assigned here in execution order and adds to each one's group
 // every ungrouped module its static imports reach, directly or through other
 // ungrouped modules, so a dependency left unassigned joins the group of the
-// earliest-executing assigned module that reaches it. Only the packages the
-// app imports therefore need naming here.
+// earliest-executing assigned module that reaches it.
+//
+// The groups keep what the entry needs (react, query, openapi and the Radix
+// primitives of the app shell: sidebar sheet, menus, tooltips, separators,
+// Slot) apart from what only lazy routes need (table, forms), so the latter
+// load with the first route that uses them. The `radix-ui` barrel the
+// components import stays unassigned: it imports every primitive it
+// re-exports, so assigning it would pull them all into its group. The shell
+// primitives are named by their own packages instead, and the route-only
+// primitives stay unassigned, so they go to the lazy chunks Rollup creates
+// for the routes that import them.
 const vendorChunks: Record<string, readonly string[]> = {
   react: ["react", "react-dom", "react-router"],
-  tanstack: ["@tanstack/react-query", "@tanstack/react-table"],
+  query: ["@tanstack/react-query"],
+  table: ["@tanstack/react-table"],
   forms: ["react-hook-form", "zod", "@hookform/resolvers"],
-  radix: ["radix-ui"],
+  radix: [
+    "@radix-ui/react-dialog",
+    "@radix-ui/react-dropdown-menu",
+    "@radix-ui/react-tooltip",
+    "@radix-ui/react-separator",
+    "@radix-ui/react-slot",
+  ],
   openapi: ["openapi-fetch"],
 };
 

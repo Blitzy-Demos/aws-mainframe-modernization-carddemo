@@ -53,10 +53,9 @@
 
 use std::fmt;
 
-use carddemo_domain::entities::UserSecurity;
-use carddemo_domain::error::ErrorKind;
+use carddemo_domain::rules::ErrorKind;
 use carddemo_domain::rules::user_add::UserAddInput;
-use carddemo_domain::rules::user_list::UserListPage;
+use carddemo_domain::rules::user_list::{UserListPage, UserSecurity};
 use carddemo_domain::rules::user_update::UserUpdateInput;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};

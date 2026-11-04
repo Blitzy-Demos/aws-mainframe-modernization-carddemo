@@ -47,10 +47,11 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+use axum::extract::FromRef;
 use axum::http::HeaderValue;
 use carddemo_domain::clock::{AnyClock, ClockError};
 use carddemo_domain::rules::{VersionError, VersionKey};
-use carddemo_persistence::Db;
+use carddemo_persistence::tx::Db;
 use carddemo_runtime::config::Settings;
 
 use crate::auth::jwt::JwtKeys;
@@ -498,6 +499,16 @@ impl AppState {
     #[must_use]
     pub fn cors_origin(&self) -> &HeaderValue {
         &self.cors_origin
+    }
+}
+
+impl FromRef<AppState> for Arc<JwtKeys> {
+    /// The token keys alone, for an extractor that needs nothing else of the
+    /// state: `crate::auth::extract::BearerUser`, the only input of the
+    /// public `POST /auth/logout`, which can then reach no database, setting
+    /// or clock.
+    fn from_ref(state: &AppState) -> Self {
+        Arc::clone(&state.jwt)
     }
 }
 

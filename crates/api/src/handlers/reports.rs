@@ -54,9 +54,10 @@ use axum::http::HeaderValue;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use carddemo_domain::clock::Clock;
-use carddemo_domain::ports::{TranTypeFileReader, TransactionReader, XrefReader};
 use carddemo_domain::rules::report_request::{self, ReportRange, ReportRequestOutcome};
-use carddemo_domain::rules::transaction_report::{ReportRun, ReportSelection};
+use carddemo_domain::rules::transaction_report::{
+    ReportRun, ReportSelection, TranTypeFileReader, TransactionReader, XrefReader,
+};
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 

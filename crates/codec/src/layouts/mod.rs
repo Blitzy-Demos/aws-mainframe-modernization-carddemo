@@ -3,7 +3,7 @@
 //! `CVTRA02Y`, `CVTRA03Y`, `CVTRA04Y` and `CSUSR01Y`, and the `CBTRN02C`
 //! `REJECT-RECORD` of `DALYREJS`, twelve in all.
 //!
-//! Each module holds one [`Layout`](crate::Layout): the field specifications in
+//! Each module holds one [`Layout`]: the field specifications in
 //! copybook order with their section A audit rows, the typed record, and the
 //! decoder and encoder between the two. `FILLER` is kept as its raw bytes in
 //! every record that has one, so a decoded record re-encodes to the bytes it
@@ -57,3 +57,10 @@ pub use tran_category::{TranCategoryFileRecord, TranCategoryLayout};
 pub use tran_type::{TranTypeFileRecord, TranTypeLayout};
 pub use transaction::{TransactionLayout, TransactionRecord};
 pub use user_security::{UserSecurityLayout, UserSecurityRecord};
+
+/// The layout trait, character set, error and file framing the records of this
+/// module are encoded with, re-exported from the crate root and
+/// [`crate::framing`], so the persistence seed and the batch jobs read and
+/// write a record file through `layouts` alone (AAP 0.7.2).
+pub use crate::framing::{Framed, decode_ascii_file, decode_ascii_lf, encode_ascii_lf, pad};
+pub use crate::{Charset, CodecError, Layout};

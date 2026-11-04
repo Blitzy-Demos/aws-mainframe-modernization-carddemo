@@ -16,8 +16,12 @@
 //!   (`active_to` equal to `active_from`) are accepted.
 //! - A delete is soft: it sets `active_to` to the processing clock when the
 //!   rule is open-ended or ends later, and leaves a rule that has already
-//!   ended unchanged. The clock is pinned to [`PINNED_CLOCK`] through
+//!   ended unchanged, and its answer names that `outcome` (`deleted` or
+//!   `unchanged`). The clock is pinned to [`PINNED_CLOCK`] through
 //!   `CARDDEMO_CLOCK_OVERRIDE`, so the stored instant is known.
+//! - Every rule answered carries its `status` at the pinned clock, not at the
+//!   wall clock: a rule starting after it is `scheduled`, one ending
+//!   2022-07-02 is still `active`, and a soft-deleted rule is `ended`.
 //!
 //! Rewards have no COBOL oracle: the README lists DB2 Rewards only as a
 //! roadmap item [README.md:L357-369], so no audit row gates these cases. The
@@ -65,8 +69,9 @@ const MISSING_RULE_ID: &str = "999";
 /// table state a rejected write must leave as it found it.
 const RULE_ROWS: &str = "SELECT * FROM reward_rules ORDER BY rule_id";
 
-/// The keys of a rule in every response: the 8 `reward_rules` columns.
-const RULE_KEYS: usize = 8;
+/// The keys of a rule in every response: the 8 `reward_rules` columns and
+/// `status`.
+const RULE_KEYS: usize = 9;
 
 /// The fraction digits of `reward_rate` in a response (`NUMERIC(9,4)`).
 const RATE_SCALE: u32 = 4;
@@ -86,7 +91,18 @@ struct StoredRule {
     max_transaction_amount: Option<Decimal>,
     active_from: DateTime<Utc>,
     active_to: Option<DateTime<Utc>>,
+    /// `scheduled`, `active` or `ended` at the pinned clock.
+    status: String,
 }
+
+/// The `status` of a rule active at the pinned clock.
+const ACTIVE: &str = "active";
+
+/// The `status` of a rule that starts after the pinned clock.
+const SCHEDULED: &str = "scheduled";
+
+/// The `status` of a rule whose `active_to` is at or before the pinned clock.
+const ENDED: &str = "ended";
 
 /// The exact decimal `text`.
 fn dec(text: &str) -> Decimal {
@@ -160,6 +176,7 @@ fn rule_from(value: &Value, raw: &str) -> StoredRule {
         active_from: instant("active_from")
             .unwrap_or_else(|| panic!("`active_from` is null: {raw}")),
         active_to: instant("active_to"),
+        status: required(object, "status", raw),
     }
 }
 
@@ -168,6 +185,24 @@ fn rule_of(resp: &Resp, status: StatusCode) -> StoredRule {
     let (actual, body, raw) = resp;
     assert_eq!(*actual, status, "status of the rule answer: {raw}");
     rule_from(body, raw)
+}
+
+/// The rule and the `outcome` of the 200 answer `resp` to a delete: the rule
+/// keys of [`rule_from`] with `outcome` beside them.
+fn deletion_of(resp: &Resp) -> (StoredRule, String) {
+    let (actual, body, raw) = resp;
+    assert_eq!(
+        *actual,
+        StatusCode::OK,
+        "status of the delete answer: {raw}"
+    );
+    let Value::Object(object) = body else {
+        panic!("the delete answer is not a JSON object: {raw}");
+    };
+    let outcome = required(object, "outcome", raw);
+    let mut rule = object.clone();
+    rule.remove("outcome");
+    (rule_from(&Value::Object(rule), raw), outcome)
 }
 
 /// The path of the rule `rule_id`.
@@ -186,6 +221,7 @@ fn seed_rules() -> Vec<StoredRule> {
         max_transaction_amount: None,
         active_from: at(SEED_ACTIVE_FROM),
         active_to: None,
+        status: ACTIVE.to_owned(),
     };
     vec![
         seed(RETAIL_RULE_ID, "01", "0001", "1.0000"),
@@ -220,6 +256,7 @@ fn new_rule(rule_id: &str) -> StoredRule {
         max_transaction_amount: Some(dec("500.00")),
         active_from: at(SEED_ACTIVE_FROM),
         active_to: None,
+        status: ACTIVE.to_owned(),
     }
 }
 
@@ -290,6 +327,7 @@ fn replaced_rule(rule_id: &str) -> StoredRule {
         max_transaction_amount: Some(dec("75.50")),
         active_from: at("2022-02-01T00:00:00Z"),
         active_to: Some(at("2023-01-01T00:00:00Z")),
+        status: ACTIVE.to_owned(),
     }
 }
 
@@ -341,7 +379,8 @@ fn assert_rule_not_found(resp: &Resp) {
 /// The list answers the two seed rules; a create answers 201 with the rule
 /// as stored under a new `rule_id`, and the boundary of each strict check is
 /// accepted: a minimum equal to the maximum, and an `active_to` equal to
-/// `active_from`.
+/// `active_from`. Each rule's `status` places the pinned clock against its
+/// window, in the create answer and in the list alike.
 #[test]
 fn list_shows_the_seed_rules_and_create_stores_new_rules() {
     let app = TestApp::start_with_clock(PINNED_CLOCK);
@@ -368,20 +407,47 @@ fn list_shows_the_seed_rules_and_create_stores_new_rules() {
             ],
         );
         let boundary = create(&app, &token, &boundary_body).await;
+        // The empty window holds no instant and lies before the pinned clock.
         let expected_boundary = StoredRule {
             min_transaction_amount: Some(dec("25.00")),
             max_transaction_amount: Some(dec("25.00")),
             active_to: Some(at(SEED_ACTIVE_FROM)),
+            status: ENDED.to_owned(),
             ..new_rule(&boundary.rule_id)
         };
         assert_eq!(boundary, expected_boundary, "the boundary rule");
 
         let mut expected = seeds;
         expected.extend([created, boundary]);
+
+        // The status is taken at the pinned clock, whatever the wall clock
+        // reads: (`active_from`, `active_to`, status).
+        let windows = [
+            ("2030-01-01T00:00:00Z", None, SCHEDULED),
+            ("2022-07-01T12:00:00.000001Z", None, SCHEDULED),
+            (PINNED_CLOCK, None, ACTIVE),
+            (SEED_ACTIVE_FROM, Some("2022-07-02T00:00:00Z"), ACTIVE),
+            (SEED_ACTIVE_FROM, Some(PINNED_CLOCK), ENDED),
+        ];
+        for (from, to, status) in windows {
+            let body = with(
+                new_rule_body(),
+                &[("active_from", json!(from)), ("active_to", json!(to))],
+            );
+            let rule = create(&app, &token, &body).await;
+            let stored = StoredRule {
+                active_from: at(from),
+                active_to: to.map(at),
+                status: status.to_owned(),
+                ..new_rule(&rule.rule_id)
+            };
+            assert_eq!(rule, stored, "the rule from {from} to {to:?}");
+            expected.push(stored);
+        }
         assert_eq!(
             list(&app, &token).await,
             expected,
-            "the list after both creates"
+            "the list after the creates"
         );
     });
 }
@@ -436,10 +502,12 @@ fn create_and_update_reject_strict_violations_and_update_replaces_the_rule() {
     });
 }
 
-/// A delete sets `active_to` to the pinned clock for an open-ended rule and
-/// for one that ends later, answers a rule that has already ended unchanged
-/// (a repeated delete included), and removes no row: the list still shows
-/// every soft-deleted rule in `rule_id` order. A missing rule is 404.
+/// A delete sets `active_to` to the pinned clock for an open-ended rule, for
+/// one that ends later and for one that has not started, answering `outcome`
+/// `deleted`; it answers a rule that has already ended unchanged (a repeated
+/// delete included) with `outcome` `unchanged`. Every deleted rule is
+/// `ended`, and no row is removed: the list still shows every soft-deleted
+/// rule in `rule_id` order. A missing rule is 404.
 #[test]
 fn delete_ends_the_window_at_the_pinned_clock_and_keeps_every_rule() {
     let app = TestApp::start_with_clock(PINNED_CLOCK);
@@ -448,33 +516,59 @@ fn delete_ends_the_window_at_the_pinned_clock_and_keeps_every_rule() {
         let retail = rule_path(RETAIL_RULE_ID);
         let mut expected = seed_rules();
         expected[0].active_to = Some(at(PINNED_CLOCK));
-        for attempt in ["first", "repeated"] {
+        expected[0].status = ENDED.to_owned();
+        for (attempt, outcome) in [("first", "deleted"), ("repeated", "unchanged")] {
             let deleted = app.delete(&retail, Some(&token)).await;
             assert_eq!(
-                rule_of(&deleted, StatusCode::OK),
-                expected[0],
+                deletion_of(&deleted),
+                (expected[0].clone(), outcome.to_owned()),
                 "the {attempt} delete of the open-ended retail rule"
             );
         }
 
-        // (`active_to` at creation, `active_to` after the delete)
+        // (`active_from`, `active_to` at creation, its status then,
+        // `active_to` after the delete, the delete's outcome)
         let cases = [
-            ("2030-01-01T00:00:00Z", PINNED_CLOCK),
-            ("2022-03-01T00:00:00Z", "2022-03-01T00:00:00Z"),
+            (
+                SEED_ACTIVE_FROM,
+                Some("2030-01-01T00:00:00Z"),
+                ACTIVE,
+                PINNED_CLOCK,
+                "deleted",
+            ),
+            (
+                SEED_ACTIVE_FROM,
+                Some("2022-03-01T00:00:00Z"),
+                ENDED,
+                "2022-03-01T00:00:00Z",
+                "unchanged",
+            ),
+            (
+                "2030-01-01T00:00:00Z",
+                None,
+                SCHEDULED,
+                PINNED_CLOCK,
+                "deleted",
+            ),
         ];
-        for (end, after) in cases {
-            let body = with(new_rule_body(), &[("active_to", json!(end))]);
+        for (from, end, before, after, outcome) in cases {
+            let body = with(
+                new_rule_body(),
+                &[("active_from", json!(from)), ("active_to", json!(end))],
+            );
             let created = create(&app, &token, &body).await;
-            assert_eq!(created.active_to, Some(at(end)), "the rule ending {end}");
+            assert_eq!(created.active_to, end.map(at), "the rule ending {end:?}");
+            assert_eq!(created.status, before, "the rule from {from} to {end:?}");
             let deleted = app.delete(&rule_path(&created.rule_id), Some(&token)).await;
             let ended = StoredRule {
                 active_to: Some(at(after)),
+                status: ENDED.to_owned(),
                 ..created
             };
             assert_eq!(
-                rule_of(&deleted, StatusCode::OK),
-                ended,
-                "the delete of the rule ending {end}"
+                deletion_of(&deleted),
+                (ended.clone(), outcome.to_owned()),
+                "the delete of the rule from {from} to {end:?}"
             );
             expected.push(ended);
         }

@@ -28,9 +28,8 @@
 use std::ops::RangeInclusive;
 
 use carddemo_domain::clock::parse_instant;
-use carddemo_domain::entities::RewardRule;
 use carddemo_domain::numeric::{Money, TranCategoryCode, TranTypeCode};
-use carddemo_domain::rewards::RuleDraft;
+use carddemo_domain::rules::{RewardRule, RuleDraft};
 use chrono::{DateTime, Datelike, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -186,7 +185,48 @@ impl RewardRuleRequest {
     }
 }
 
-/// One stored reward rule: every column of a `reward_rules` row, as the list,
+/// Where the processing clock's instant of an answer lies against a rule's
+/// active window, from `active_from` (inclusive) to `active_to` (exclusive)
+/// (AAP 0.3.5).
+///
+/// The instant is the server's processing clock (`CARDDEMO_CLOCK_OVERRIDE`
+/// pins it, AAP 0.6.4), the one the reward engine matches transactions
+/// against, so a client never has to judge a rule by a clock of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RewardRuleStatus {
+    /// `scheduled`: the rule has not started, because `active_from` is later
+    /// than the instant, and its window has not been closed by then.
+    Scheduled,
+    /// `active`: the window holds the instant, so the rule matches a
+    /// transaction processed then.
+    Active,
+    /// `ended`: `active_to` is at or before the instant, as a soft delete
+    /// leaves it, so the rule matches no transaction from then on.
+    Ended,
+}
+
+impl RewardRuleStatus {
+    /// The status of `rule` at instant `now`.
+    ///
+    /// Active is exactly [`RewardRule::is_active_at`], the one definition of
+    /// the window. Otherwise a rule whose `active_to` is at or before `now`
+    /// has ended, which covers a rule soft-deleted before it started (its
+    /// `active_to` then precedes `active_from`); any other rule starts later.
+    #[must_use]
+    pub fn of(rule: &RewardRule, now: DateTime<Utc>) -> Self {
+        if rule.is_active_at(now) {
+            Self::Active
+        } else if rule.active_to.is_some_and(|end| end <= now) {
+            Self::Ended
+        } else {
+            Self::Scheduled
+        }
+    }
+}
+
+/// One stored reward rule: every column of a `reward_rules` row, plus its
+/// `status` at the processing clock's instant of the answer, as the list,
 /// create, update and soft-delete endpoints answer it.
 ///
 /// The list returns active and soft-deleted rules alike, ordered by
@@ -229,10 +269,20 @@ pub struct RewardRuleResponse {
     /// to 9999 as the request requires; `null` for an open-ended rule.
     #[schema(required = true)]
     pub active_to: Option<DateTime<Utc>>,
+    /// The rule's state at the processing clock's instant of this answer:
+    /// `scheduled`, `active` or `ended`. The instant is the server's, never
+    /// the client's.
+    pub status: RewardRuleStatus,
 }
 
-impl From<&RewardRule> for RewardRuleResponse {
-    fn from(rule: &RewardRule) -> Self {
+impl RewardRuleResponse {
+    /// The answer for `rule` at `now`, the processing clock's instant of the
+    /// request (AAP 0.6.4), which decides its `status`.
+    ///
+    /// A handler reads the clock once per request and builds every rule of
+    /// its answer at that instant, so the rules of one list are judged alike.
+    #[must_use]
+    pub fn at(rule: &RewardRule, now: DateTime<Utc>) -> Self {
         Self {
             rule_id: id_string(&rule.rule_id),
             transaction_type_cd: id_string(&rule.transaction_type_cd),
@@ -242,8 +292,46 @@ impl From<&RewardRule> for RewardRuleResponse {
             max_transaction_amount: rule.max_transaction_amount.map(money),
             active_from: rule.active_from,
             active_to: rule.active_to,
+            status: RewardRuleStatus::of(rule, now),
         }
     }
+}
+
+/// What a `DELETE /admin/reward-rules/{id}` of an existing rule did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RewardRuleDeleteOutcome {
+    /// `deleted`: the rule's `active_to` was absent or later than the delete
+    /// instant and is now that instant, so the rule has ended.
+    Deleted,
+    /// `unchanged`: the rule had already ended at the delete instant, so
+    /// nothing was written.
+    Unchanged,
+}
+
+impl RewardRuleDeleteOutcome {
+    /// The wire value, which is also the `outcome` the handler span records.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deleted => "deleted",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// The 200 answer of `DELETE /admin/reward-rules/{id}`: the rule after the
+/// soft delete, under the same top-level keys as `RewardRuleResponse`, with
+/// `outcome` beside them, so a client reports what the server did rather than
+/// guess it from the rule it showed before.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RewardRuleDeleteResponse {
+    /// The rule as stored after the delete, its `status` at the delete
+    /// instant: always `ended`.
+    #[serde(flatten)]
+    pub rule: RewardRuleResponse,
+    /// Whether the delete ended the rule or found it already ended.
+    pub outcome: RewardRuleDeleteOutcome,
 }
 
 /// A field a reward-rule rejection names in `fields[].field`: exactly the
@@ -391,7 +479,10 @@ mod tests {
     use serde_json::{Value, json};
     use utoipa::PartialSchema;
 
-    use super::{RewardRuleField, RewardRuleRequest, RewardRuleResponse};
+    use super::{
+        RewardRuleDeleteOutcome, RewardRuleDeleteResponse, RewardRuleField, RewardRuleRequest,
+        RewardRuleResponse, RewardRuleStatus,
+    };
     use crate::dto::BmsField;
     use crate::error::ApiError;
 
@@ -742,8 +833,8 @@ mod tests {
                 active_to: draft.active_to,
                 ..retail_rule()
             };
-            let response =
-                serde_json::to_value(RewardRuleResponse::from(&rule)).expect("serializes");
+            let response = serde_json::to_value(RewardRuleResponse::at(&rule, noon_plus(0)))
+                .expect("serializes");
             let mut echo = retail_body();
             for field in ["active_from", "active_to"] {
                 assert_eq!(response[field], json!(written), "{field} {text}");
@@ -845,9 +936,9 @@ mod tests {
     }
 
     #[test]
-    fn response_serializes_every_column_as_text() {
-        let json =
-            serde_json::to_value(RewardRuleResponse::from(&retail_rule())).expect("serializes");
+    fn response_serializes_every_column_as_text_and_the_status() {
+        let json = serde_json::to_value(RewardRuleResponse::at(&retail_rule(), noon_plus(0)))
+            .expect("serializes");
         assert_eq!(
             json,
             json!({
@@ -859,8 +950,146 @@ mod tests {
                 "max_transaction_amount": null,
                 "active_from": "2022-01-01T00:00:00Z",
                 "active_to": null,
+                "status": "active",
             })
         );
+    }
+
+    /// `retail_rule` with the window from `active_from` to `active_to`.
+    fn window(active_from: DateTime<Utc>, active_to: Option<DateTime<Utc>>) -> RewardRule {
+        RewardRule {
+            active_from,
+            active_to,
+            ..retail_rule()
+        }
+    }
+
+    #[test]
+    fn status_places_the_instant_against_the_window() {
+        let start = instant(2022, 1, 1, 0);
+        let end = instant(2022, 7, 2, 0);
+        let micro = TimeDelta::microseconds(1);
+        // (case, rule, instant, status)
+        let cases = [
+            (
+                "before the start",
+                window(start, Some(end)),
+                start - micro,
+                RewardRuleStatus::Scheduled,
+            ),
+            (
+                "at the start",
+                window(start, Some(end)),
+                start,
+                RewardRuleStatus::Active,
+            ),
+            (
+                "inside the window",
+                window(start, Some(end)),
+                noon_plus(0),
+                RewardRuleStatus::Active,
+            ),
+            (
+                "just before the end",
+                window(start, Some(end)),
+                end - micro,
+                RewardRuleStatus::Active,
+            ),
+            (
+                "at the end",
+                window(start, Some(end)),
+                end,
+                RewardRuleStatus::Ended,
+            ),
+            (
+                "after the end",
+                window(start, Some(end)),
+                end + micro,
+                RewardRuleStatus::Ended,
+            ),
+            (
+                "open-ended, before the start",
+                window(start, None),
+                start - micro,
+                RewardRuleStatus::Scheduled,
+            ),
+            (
+                "open-ended, long after the start",
+                window(start, None),
+                instant(9999, 12, 31, 23),
+                RewardRuleStatus::Active,
+            ),
+            (
+                "empty window, before it",
+                window(end, Some(end)),
+                end - micro,
+                RewardRuleStatus::Scheduled,
+            ),
+            (
+                "empty window, at it",
+                window(end, Some(end)),
+                end,
+                RewardRuleStatus::Ended,
+            ),
+            (
+                "deleted before its start, its end preceding its start",
+                window(instant(2030, 1, 1, 0), Some(noon_plus(0))),
+                noon_plus(0),
+                RewardRuleStatus::Ended,
+            ),
+        ];
+        for (case, rule, now, status) in cases {
+            assert_eq!(RewardRuleStatus::of(&rule, now), status, "{case}");
+            assert_eq!(
+                rule.is_active_at(now),
+                status == RewardRuleStatus::Active,
+                "{case}: active is exactly the domain window"
+            );
+            let json =
+                serde_json::to_value(RewardRuleResponse::at(&rule, now)).expect("serializes");
+            assert_eq!(
+                json["status"],
+                serde_json::to_value(status).expect("serializes")
+            );
+        }
+    }
+
+    #[test]
+    fn status_and_outcome_names_are_lowercase_words() {
+        for (status, wire) in [
+            (RewardRuleStatus::Scheduled, "scheduled"),
+            (RewardRuleStatus::Active, "active"),
+            (RewardRuleStatus::Ended, "ended"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).expect("serializes"),
+                json!(wire)
+            );
+        }
+        for (outcome, wire) in [
+            (RewardRuleDeleteOutcome::Deleted, "deleted"),
+            (RewardRuleDeleteOutcome::Unchanged, "unchanged"),
+        ] {
+            assert_eq!(outcome.as_str(), wire);
+            assert_eq!(
+                serde_json::to_value(outcome).expect("serializes"),
+                json!(wire)
+            );
+        }
+    }
+
+    #[test]
+    fn delete_response_is_the_rule_keys_plus_the_outcome() {
+        let rule = window(instant(2022, 1, 1, 0), Some(noon_plus(0)));
+        let answer = RewardRuleDeleteResponse {
+            rule: RewardRuleResponse::at(&rule, noon_plus(0)),
+            outcome: RewardRuleDeleteOutcome::Deleted,
+        };
+        let mut expected =
+            serde_json::to_value(RewardRuleResponse::at(&rule, noon_plus(0))).expect("serializes");
+        expected["outcome"] = json!("deleted");
+        assert_eq!(serde_json::to_value(&answer).expect("serializes"), expected);
+        assert_eq!(expected["status"], json!("ended"));
     }
 
     #[test]
@@ -875,7 +1104,8 @@ mod tests {
             active_to: Some(instant(2022, 7, 1, 12)),
             ..retail_rule()
         };
-        let json = serde_json::to_value(RewardRuleResponse::from(&rule)).expect("serializes");
+        let json =
+            serde_json::to_value(RewardRuleResponse::at(&rule, noon_plus(0))).expect("serializes");
         assert_eq!(json["rule_id"], json!("9007199254740993"));
         assert_eq!(json["transaction_type_cd"], json!("4"));
         assert_eq!(json["transaction_category_cd"], json!("0003"));
@@ -883,6 +1113,7 @@ mod tests {
         assert_eq!(json["min_transaction_amount"], json!("10.00"));
         assert_eq!(json["max_transaction_amount"], json!("-0.05"));
         assert_eq!(json["active_to"], json!("2022-07-01T12:00:00Z"));
+        assert_eq!(json["status"], json!("ended"));
     }
 
     fn schema_json<T: PartialSchema>() -> Value {
@@ -932,13 +1163,35 @@ mod tests {
     fn response_and_field_schemas_are_strings_throughout() {
         let schema = schema_json::<RewardRuleResponse>();
         let required = schema["required"].as_array().expect("a required list");
-        assert_eq!(required.len(), 8, "{schema}");
+        assert_eq!(required.len(), 9, "{schema}");
+        assert!(required.contains(&json!("status")), "{schema}");
         for (name, property) in schema["properties"].as_object().expect("properties") {
+            if name == "status" {
+                assert_eq!(
+                    property["$ref"],
+                    json!("#/components/schemas/RewardRuleStatus"),
+                    "{property}"
+                );
+                continue;
+            }
             let kind = &property["type"];
             assert!(
                 *kind == json!("string") || *kind == json!(["string", "null"]),
                 "{name}: {property}"
             );
+        }
+        for (schema, values) in [
+            (
+                schema_json::<RewardRuleStatus>(),
+                json!(["scheduled", "active", "ended"]),
+            ),
+            (
+                schema_json::<RewardRuleDeleteOutcome>(),
+                json!(["deleted", "unchanged"]),
+            ),
+        ] {
+            assert_eq!(schema["type"], json!("string"), "{schema}");
+            assert_eq!(schema["enum"], values, "{schema}");
         }
         let field = schema_json::<RewardRuleField>();
         assert_eq!(

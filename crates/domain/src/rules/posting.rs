@@ -34,9 +34,7 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use crate::clock::{Clock, db2_timestamp};
-use crate::entities::{
-    Account, CardXref, DailyTran, NewTransaction, TranCatBalance, TranCatBalanceKey, Transaction,
-};
+use crate::entities::{NewTransaction, TranCatBalance, TranCatBalanceKey, Transaction};
 use crate::messages::{
     ABENDING_PROGRAM, ACCOUNT_RECORD_NOT_FOUND, ERROR_CLOSING_DAILY_REJECTS_FILE,
     ERROR_OPENING_ACCOUNT_MASTER_FILE, ERROR_OPENING_CROSS_REF_FILE,
@@ -48,10 +46,15 @@ use crate::messages::{
     INVALID_CARD_NUMBER_FOUND, OVERLIMIT_TRANSACTION, TRANSACTION_RECEIVED_AFTER_ACCT_EXPIRATION,
     UNEXPECTED_ERROR, file_status_message,
 };
-use crate::numeric::{Alnum, Money};
-use crate::ports::{
-    AccountReader, AccountWriter, PortError, TranCatBalanceStore, TransactionWriter, XrefReader,
-};
+use crate::numeric::Money;
+use crate::ports::{AccountWriter, PortError, TransactionWriter};
+
+/// The records, keys and ports [`validate`] and [`post`] take, and those the
+/// POSTTRAN job reads around them, re-exported from [`crate::entities`],
+/// [`crate::numeric`] and [`crate::ports`] for the batch adapter.
+pub use crate::entities::{Account, CardXref, DailyTran};
+pub use crate::numeric::{AccountId, Alnum, CardNumber, NumericCode};
+pub use crate::ports::{AccountReader, TranCatBalanceStore, TransactionReader, XrefReader};
 
 /// `REJECT-TRAN-DATA PIC X(350)`, the `DALYTRAN` record as read —
 /// P-CBTRN02C-001 [app/cbl/CBTRN02C.cbl:L177].

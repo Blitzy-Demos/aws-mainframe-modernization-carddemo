@@ -12,7 +12,10 @@
  * Decimals stay strings from input to request body: the rate is a
  * `NUMERIC(9,4)` reward rate and the bounds are `S9(09)V99` amounts, and no
  * value is ever converted to a JavaScript number. Dates are entered as
- * `YYYY-MM-DD` (there is no date picker) and sent as midnight UTC instants.
+ * `YYYY-MM-DD` (there is no date picker) and sent as midnight UTC instants,
+ * except in an edit (`rewardRuleEditSchema`): a window boundary whose date is
+ * left as the stored instant's is sent as that stored instant, unchanged, so
+ * saving an edit never moves a time of day the form cannot show.
  */
 import { z } from "zod";
 
@@ -85,6 +88,19 @@ const date = z.string().date();
 
 const startOfDayUtc = (value: string): string => `${value}T00:00:00Z`;
 
+// The `YYYY-MM-DD` date of an RFC 3339 UTC instant as the API writes it.
+const dateOf = (instant: string): string => instant.slice(0, 10);
+
+// The instant a window boundary entered as the date `entered` is sent as: the
+// boundary's `stored` instant, verbatim, when `entered` is its date, so an edit
+// that leaves the date alone keeps the stored time of day and fraction;
+// otherwise midnight UTC of `entered`. `null` is a boundary with no stored
+// instant (a new rule, or an open-ended rule's end).
+const boundaryInstant = (entered: string, stored: string | null): string =>
+  stored !== null && dateOf(stored) === entered
+    ? stored
+    : startOfDayUtc(entered);
+
 // An optional field: the empty input (or an absent key) is omitted from the
 // body, which the server reads as `null` (an unbounded amount or an
 // open-ended window).
@@ -94,6 +110,20 @@ const blankOr = <T extends z.ZodTypeAny>(schema: T) =>
 const omitBlank = (value: string | undefined): string | undefined =>
   value === undefined || value === "" ? undefined : value;
 
+// `active_from`, required, against its stored instant (`null` for a new rule).
+const activeFrom = (stored: string | null) =>
+  date.transform((entered) => boundaryInstant(entered, stored));
+
+// `active_to`, blank for an open-ended window, against its stored instant
+// (`null` for a new or open-ended rule). A cleared end is omitted, whatever
+// was stored.
+const activeTo = (stored: string | null) =>
+  blankOr(date).transform((value) => {
+    const entered = omitBlank(value);
+    return entered === undefined ? undefined : boundaryInstant(entered, stored);
+  });
+
+/** The new-rule form: both window boundaries are sent as midnight UTC. */
 export const rewardRuleSchema = z.object({
   // TRAN-TYPE-CD PIC X(02): the OpenAPI maxLength and pattern, and not blank.
   transaction_type_cd: z.string().min(1).max(2).regex(TYPE_CODE_PATTERN),
@@ -101,11 +131,8 @@ export const rewardRuleSchema = z.object({
   reward_rate: rewardRate,
   min_transaction_amount: blankOr(amount).transform(omitBlank),
   max_transaction_amount: blankOr(amount).transform(omitBlank),
-  active_from: date.transform(startOfDayUtc),
-  active_to: blankOr(date).transform((value) => {
-    const entered = omitBlank(value);
-    return entered === undefined ? undefined : startOfDayUtc(entered);
-  }),
+  active_from: activeFrom(null),
+  active_to: activeTo(null),
 }) satisfies z.ZodType<RewardRuleRequest>;
 
 /** The form's field values as entered: every field a string. */
@@ -114,13 +141,28 @@ export type RewardRuleFormInput = z.input<typeof rewardRuleSchema>;
 /** The parsed form: the `RewardRuleRequest` body to submit. */
 export type RewardRuleFormValues = z.infer<typeof rewardRuleSchema>;
 
-// The `YYYY-MM-DD` date of an RFC 3339 UTC instant as the API writes it.
-const dateOf = (instant: string): string => instant.slice(0, 10);
+/**
+ * The edit form of the stored `rule`: `rewardRuleSchema` but for the window.
+ * `PUT /admin/reward-rules/{id}` replaces every column, so each boundary whose
+ * entered date is the date of its stored instant is sent as that instant,
+ * byte for byte; a changed date is sent as midnight UTC, a cleared end is
+ * omitted (open-ended), and a date entered for an open-ended rule is sent as
+ * midnight UTC.
+ */
+export function rewardRuleEditSchema(
+  rule: RewardRuleResponse,
+): typeof rewardRuleSchema {
+  return rewardRuleSchema.extend({
+    active_from: activeFrom(rule.active_from),
+    active_to: activeTo(rule.active_to),
+  }) satisfies z.ZodType<RewardRuleRequest>;
+}
 
 /**
- * The edit form's starting values for a stored rule. Instants keep only their
- * date, as the form enters dates only, so saving sends midnight UTC of that
- * date; a `null` bound or end becomes the empty input.
+ * The edit form's starting values for a stored rule. Instants show only their
+ * date, as the form enters dates only; `rewardRuleEditSchema` of the same rule
+ * sends a date left unchanged as the stored instant. A `null` bound or end
+ * becomes the empty input.
  */
 export function rewardRuleToFormInput(
   rule: RewardRuleResponse,

@@ -66,7 +66,7 @@
 
 use super::Confirm;
 use super::date_validation::{self, DatePicture, DateValidationError};
-use crate::entities::{CardXref, NewTransaction, Transaction};
+use crate::entities::{CardXref, NewTransaction};
 use crate::error::DomainError;
 use crate::format::{PIC_TRAN_AMT_DISPLAY, edit_money};
 use crate::messages::{
@@ -88,6 +88,12 @@ use crate::numeric::{
     AccountId, Alnum, CardNumber, MerchantId, Money, TranCategoryCode, TranId, TranTypeCode,
 };
 use crate::ports::{PortError, PortResult, XrefReader};
+
+/// The transaction record [`copied_fields`] reads and the writer whose outcome
+/// [`write_result`] maps, re-exported from [`crate::entities`] and
+/// [`crate::ports`] for the API adapter.
+pub use crate::entities::Transaction;
+pub use crate::ports::TransactionWriter;
 
 /// The BMS field `ACTIDIN` (`ACTIDINI X(11)`): the account ID, and the cursor
 /// field of the account, allocation and write messages (V-COTRN02C-001,

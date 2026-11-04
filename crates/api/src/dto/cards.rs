@@ -33,11 +33,11 @@
 
 use std::fmt;
 
-use carddemo_domain::entities::Card;
-use carddemo_domain::error::ErrorKind;
 use carddemo_domain::numeric::CardNumber;
-use carddemo_domain::ports::Direction;
-use carddemo_domain::rules::{VersionToken, card_list, card_update, card_view};
+use carddemo_domain::rules::card_view::Card;
+use carddemo_domain::rules::{
+    Direction, ErrorKind, VersionToken, card_list, card_update, card_view,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use validator::{Validate, ValidationError};

@@ -2,15 +2,16 @@
 // reaches GET /reports/transactions only through the confirmation dialog,
 // input the form schema rejects is never sent, and a server rejection lands on
 // the form: its message as a toast, each `fields[]` entry on its form field,
-// and the cursor on the first of them. Controls are found by the accessible
-// names of the F-CORPT00 rows in docs/parity/function-map.md; expected texts
-// are the CORPT00C rows of docs/parity/validation-audit.md and
-// docs/parity/parity-oracle-audit.md.
+// and the cursor on the first of them. An answer that arrives after the entry
+// was edited is still shown but leaves the newer entry as typed. Controls are
+// found by the accessible names of the F-CORPT00 rows in
+// docs/parity/function-map.md; expected texts are the CORPT00C rows of
+// docs/parity/validation-audit.md and docs/parity/parity-oracle-audit.md.
 //
 // The network is the global the API client looks up on every request, stubbed
 // per test; the client passes it the Request it built.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
@@ -249,6 +250,59 @@ const SERVER_REJECTIONS: readonly ServerRejection[] = [
   },
 ];
 
+/** The range typed over the sent one while its request is still running. */
+const NEWER_RANGE = ["2023-03-01", "2023-03-31"] as const;
+
+/** V-CORPT00C-014, on SDTMM [app/cbl/CORPT00C.cbl:L381-406]. */
+const START_DATE_INVALID = "Start Date - Not a valid date...";
+
+/** An answer that arrives once the entry it was sent for has been replaced. */
+interface LateAnswer {
+  readonly outcome: string;
+  readonly sent: readonly [startDate: string, endDate: string];
+  readonly status: number;
+  readonly body: ReportResponse | ErrorBody;
+  /** The toast that still carries the answer's message. */
+  readonly toast: "success" | "error";
+  readonly message: string;
+  /** The names of the report regions shown afterwards. */
+  readonly regions: readonly string[];
+}
+
+const LATE_ANSWERS: readonly LateAnswer[] = [
+  {
+    outcome: "printed report",
+    sent: ["2022-01-01", "2022-07-06"],
+    status: 200,
+    body: report("Custom", "2022-01-01", "2022-07-06"),
+    toast: "success",
+    message: "Custom report submitted for printing ...",
+    regions: ["Custom"],
+  },
+  {
+    outcome: "V-CORPT00C-014 rejection",
+    sent: ["2022-02-30", "2022-07-06"],
+    status: 400,
+    body: {
+      code: "INVALID",
+      message: START_DATE_INVALID,
+      fields: [{ field: "SDTMM", message: START_DATE_INVALID }],
+    } satisfies ErrorBody,
+    toast: "error",
+    message: START_DATE_INVALID,
+    regions: [],
+  },
+];
+
+/** Lets the timer task pass on which react-hook-form's setFocus moves focus. */
+async function nextTask(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
 describe("TransactionReportPage (CR00)", () => {
   it("runs a confirmed custom report and shows its records untrimmed", async () => {
     // F-CORPT00-001 and F-CORPT00-002; the success text is P-CORPT00C-014.
@@ -384,6 +438,63 @@ describe("TransactionReportPage (CR00)", () => {
       // The entries stay for correction, and no report is shown.
       expect([start.value, end.value]).toEqual([startDate, endDate]);
       expect(screen.queryByRole("region")).toBeNull();
+    },
+  );
+
+  it.each(LATE_ANSWERS)(
+    "keeps a range typed while the report runs when its $outcome arrives",
+    async ({ sent: [startDate, endDate], status, body, toast: kind, message, regions }) => {
+      const toasts = {
+        success: vi.spyOn(toast, "success"),
+        error: vi.spyOn(toast, "error"),
+      };
+      // The answer is held until the newer range has been typed.
+      let release: (response: Response) => void = () => undefined;
+      fetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+      );
+      const { user } = renderPage();
+
+      const { start, end } = await enterCustomRange(user, startDate, endDate);
+      await runAndConfirm(user);
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+        expect(onlyQuery()).toEqual({
+          report_type: "custom",
+          start_date: startDate,
+          end_date: endDate,
+          confirm: "Y",
+        });
+      });
+      await user.clear(start);
+      await user.type(start, NEWER_RANGE[0]);
+      await user.clear(end);
+      await user.type(end, NEWER_RANGE[1]);
+      release(jsonResponse(status, body));
+
+      // The outcome of the request sent is still shown.
+      await waitFor(() => {
+        expect(toasts[kind]).toHaveBeenCalledWith(message);
+      });
+      await nextTask();
+      expect(
+        screen
+          .queryAllByRole("region")
+          .map((region) => within(region).getByRole("heading").textContent),
+      ).toEqual(regions);
+      // The newer entry is neither cleared nor marked, and the cursor stays
+      // where it was typed instead of moving to MONTHLY or a date.
+      expect(
+        screen.getByRole("radio", { name: CUSTOM }).getAttribute("aria-checked"),
+      ).toBe("true");
+      expect([start.value, end.value]).toEqual([...NEWER_RANGE]);
+      expect(
+        [start, end].map((input) => input.getAttribute("aria-invalid")),
+      ).toEqual(["false", "false"]);
+      expect(screen.queryAllByRole("alert")).toEqual([]);
+      expect(document.activeElement).toBe(end);
     },
   );
 

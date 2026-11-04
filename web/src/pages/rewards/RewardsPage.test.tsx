@@ -6,7 +6,13 @@
 //   number would read as 9007199254740992 (o8);
 // - an unknown account is reported by one toast and leaves the form usable;
 // - the history pages forward with Next and back with Previous, both reached
-//   and pressed from the keyboard.
+//   and pressed from the keyboard;
+// - a repeated lookup of the same account keeps the history table loading
+//   until its new answer arrives, from the newest page or a later one, while
+//   a page Previous brings back from the cache keeps its rows as it is reread;
+// - the page's status region announces each balance lookup, a repeated one
+//   included, by its account and never by a points value, and stays empty for
+//   a failed one.
 //
 // The network is the stubbed global the API client looks up on every request,
 // answered from the `balances` and `histories` tables below. A request neither
@@ -51,6 +57,10 @@ const UNKNOWN_ACCOUNT = "99999999999";
 /** 2^53 + 1, the smallest integer a JavaScript number cannot hold exactly. */
 const BEYOND_DOUBLE = "9007199254740993";
 
+/** The status region's texts while the balance is read and once it is. */
+const BALANCE_LOADING = "Loading reward balance";
+const BALANCE_LOADED = `Reward balance of account ${ACCOUNT} loaded`;
+
 const balanceBody: RewardBalance = {
   account_id: ACCOUNT,
   total_points_earned: BEYOND_DOUBLE,
@@ -91,6 +101,14 @@ const PAGE_TWO: RewardHistoryPage = {
   prev_key: null,
 };
 
+// The newest page read again once one more accrual has been earned on top of
+// PAGE_ONE's.
+const PAGE_ONE_REREAD: RewardHistoryPage = {
+  items: [accrual("44", "251", "25"), ...PAGE_ONE.items],
+  next_key: "41",
+  prev_key: null,
+};
+
 // The server's answer for an account not on file (crates/api/src/error.rs
 // maps NotFound to 404 with this code).
 const accountNotFound: ErrorBody = {
@@ -112,6 +130,14 @@ const histories = new Map<string, Reply>();
 
 // Every request no table answered, as "METHOD path?query".
 const unexpected: string[] = [];
+
+// While an endpoint's gate is set, each of its requests waits for that
+// promise before it is answered from its table, so a test sees the page while
+// the read runs.
+const gates: {
+  balance: Promise<void> | null;
+  history: Promise<void> | null;
+} = { balance: null, history: null };
 
 function historyKey(accountId: string, startKey: string | null = null): string {
   return `${accountId} ${startKey ?? "(newest)"}`;
@@ -150,6 +176,18 @@ function answer(request: Request): Reply | undefined {
   return undefined;
 }
 
+// The gate `request` waits on: its endpoint's, null when none is set.
+function gateOf(request: Request): Promise<void> | null {
+  const { pathname } = new URL(request.url);
+  if (BALANCE_PATH.test(pathname)) {
+    return gates.balance;
+  }
+  if (HISTORY_PATH.test(pathname)) {
+    return gates.history;
+  }
+  return null;
+}
+
 function jsonResponse({ status, body }: Reply): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -160,6 +198,10 @@ function jsonResponse({ status, body }: Reply): Response {
 const fetchMock = vi.fn(
   async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = asRequest(input, init);
+    const gate = gateOf(request);
+    if (gate !== null) {
+      await gate;
+    }
     const reply = answer(request);
     if (reply === undefined) {
       unexpected.push(describeRequest(request));
@@ -278,15 +320,105 @@ async function tabTo(user: UserEvent, target: HTMLElement): Promise<void> {
   expect(document.activeElement).toBe(target);
 }
 
+/** A promise and its resolver, so a test decides when an answer arrives. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+// The page's lookup status line. The history table has a status region of its
+// own, a div, so the page's paragraph is told apart by its element.
+function lookupStatus(): HTMLElement {
+  const regions = screen
+    .getAllByRole("status")
+    .filter((region) => region.tagName === "P");
+  expect(regions).toHaveLength(1);
+  return regions[0];
+}
+
+// The observers recordTexts started, disconnected after each test.
+const observers: MutationObserver[] = [];
+
+// Every text `region` takes from now on, in order, so the cleared state
+// between two announcements is seen although it lasts only the announcement
+// delay.
+function recordTexts(region: HTMLElement): string[] {
+  const texts: string[] = [];
+  const observer = new MutationObserver(() => {
+    texts.push(region.textContent ?? "");
+  });
+  observer.observe(region, {
+    childList: true,
+    characterData: true,
+    subtree: true,
+  });
+  observers.push(observer);
+  return texts;
+}
+
+// The history table's own status region, DataTable's div.
+function historyStatus(): HTMLElement {
+  const regions = screen
+    .getAllByRole("status")
+    .filter((region) => region.tagName === "DIV");
+  expect(regions).toHaveLength(1);
+  return regions[0];
+}
+
+// Every value the `aria-busy` attribute of `element` takes from now on, in
+// order, null while it is absent. A record keeps the value its change
+// replaced, so a value that lasts only until the next change of the same
+// batch is seen too.
+function recordBusy(element: HTMLElement): Array<string | null> {
+  const states: Array<string | null> = [];
+  const observer = new MutationObserver((records) => {
+    records.slice(1).forEach((record) => {
+      states.push(record.oldValue);
+    });
+    states.push(element.getAttribute("aria-busy"));
+  });
+  observer.observe(element, {
+    attributeFilter: ["aria-busy"],
+    attributeOldValue: true,
+  });
+  observers.push(observer);
+  return states;
+}
+
+// Asserts DataTable's loading state on the history table holding `heldRows`
+// rows: busy, one skeleton row per held row (so its height holds) with no
+// row content, both page controls disabled and no result announced.
+function expectHistoryLoading(table: HTMLElement, heldRows: number): void {
+  expect(table.getAttribute("aria-busy")).toBe("true");
+  const rows = Array.from(table.querySelectorAll("tbody tr"));
+  expect(rows).toHaveLength(heldRows);
+  rows.forEach((row) => {
+    expect(row.getAttribute("aria-hidden")).toBe("true");
+    expect(row.querySelector('[data-slot="skeleton"]')).not.toBeNull();
+    expect(row.textContent).toBe("");
+  });
+  expect(isDisabled(pageControl("Previous"))).toBe(true);
+  expect(isDisabled(pageControl("Next"))).toBe(true);
+  expect(historyStatus().textContent).toBe("");
+}
+
 beforeEach(() => {
   balances.clear();
   histories.clear();
   unexpected.length = 0;
+  gates.balance = null;
+  gates.history = null;
   fetchMock.mockClear();
   vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
+  observers.splice(0).forEach((observer) => {
+    observer.disconnect();
+  });
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   expect(unexpected).toEqual([]);
@@ -410,6 +542,9 @@ describe("RewardsPage", () => {
     expect(isDisabled(pageControl("Previous"))).toBe(false);
     expect(isDisabled(pageControl("Next"))).toBe(true);
 
+    // The reread below is held, so the page is seen before any answer.
+    const heldHistory = deferred<void>();
+    gates.history = heldHistory.promise;
     await tabTo(user, pageControl("Previous"));
     await user.keyboard("{Enter}");
 
@@ -418,10 +553,167 @@ describe("RewardsPage", () => {
     expect(isDisabled(pageControl("Previous"))).toBe(true);
     expect(isDisabled(pageControl("Next"))).toBe(false);
     // The cached page is stale (the query client's default staleTime of 0),
-    // so it is reread behind the shown rows; page two is never read again.
+    // so it is reread behind the shown rows, which stay settled meanwhile;
+    // page two is never read again.
     await waitFor(() => {
       expect(historyStartKeys()).toEqual([null, "41", null]);
     });
     expect(historyRows()).toEqual(rowsOf(PAGE_ONE));
+    expect(
+      screen
+        .getByRole("table", { name: "Reward history" })
+        .hasAttribute("aria-busy"),
+    ).toBe(false);
+    expect(isDisabled(pageControl("Next"))).toBe(false);
+    heldHistory.resolve();
+  });
+
+  it.each([
+    { from: "the newest page", pagesForward: 0, startKeys: [null, null] },
+    { from: "a later page", pagesForward: 1, startKeys: [null, "41", null] },
+  ])(
+    "keeps the history table loading while a repeated lookup from $from reads the newest page again",
+    async ({ pagesForward, startKeys }) => {
+      balances.set(ACCOUNT, { status: 200, body: balanceBody });
+      histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
+      histories.set(historyKey(ACCOUNT, "41"), { status: 200, body: PAGE_TWO });
+      const user = renderPage();
+      await lookUp(user, ACCOUNT);
+      await waitFor(() => {
+        expect(historyRows()).toEqual(rowsOf(PAGE_ONE));
+      });
+      if (pagesForward > 0) {
+        await user.click(pageControl("Next"));
+        await waitFor(() => {
+          expect(historyRows()).toEqual(rowsOf(PAGE_TWO));
+        });
+      }
+      const table = screen.getByRole("table", { name: "Reward history" });
+      const busy = recordBusy(table);
+
+      // The same account again, with both reads held. The newest page has
+      // gained an accrual since it was read.
+      histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE_REREAD });
+      const heldBalance = deferred<void>();
+      const heldHistory = deferred<void>();
+      gates.balance = heldBalance.promise;
+      gates.history = heldHistory.promise;
+      await lookUp(user, ACCOUNT);
+
+      // The table loads from the lookup on, while the balance is read again,
+      await waitFor(() => {
+        expect(lookupStatus().textContent).toBe(BALANCE_LOADING);
+      });
+      expectHistoryLoading(table, PAGE_ONE.items.length);
+
+      // and still once the balance has answered and been announced, while the
+      // newest page is read again.
+      heldBalance.resolve();
+      await waitFor(() => {
+        expect(historyStartKeys()).toEqual(startKeys);
+      });
+      await waitFor(() => {
+        expect(lookupStatus().textContent).toBe(BALANCE_LOADED);
+      });
+      expectHistoryLoading(table, PAGE_ONE.items.length);
+
+      heldHistory.resolve();
+
+      await waitFor(() => {
+        expect(historyRows()).toEqual(rowsOf(PAGE_ONE_REREAD));
+      });
+      expect(table.hasAttribute("aria-busy")).toBe(false);
+      expect(isDisabled(pageControl("Previous"))).toBe(true);
+      expect(isDisabled(pageControl("Next"))).toBe(false);
+      await waitFor(() => {
+        expect(historyStatus().textContent).toBe("Reward history: 3 rows");
+      });
+      // One busy span, from the lookup to the held answer: the rows held
+      // before it are never shown as its result.
+      expect(busy).toEqual(["true", null]);
+      expect(historyStartKeys()).toEqual(startKeys);
+    },
+  );
+
+  it("announces each balance lookup by its account, a repeated one included", async () => {
+    balances.set(ACCOUNT, { status: 200, body: balanceBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
+    const user = renderPage();
+
+    // Present and empty before any lookup, so assistive technology tracks the
+    // region before it first changes.
+    const region = lookupStatus();
+    expect(region.textContent).toBe("");
+
+    await lookUp(user, ACCOUNT);
+
+    await waitFor(() => {
+      expect(region.textContent).toBe(BALANCE_LOADED);
+    });
+    // The same element throughout: the region is never remounted.
+    expect(lookupStatus()).toBe(region);
+    // It names the account looked up, never a points value.
+    expect(region.textContent).not.toContain(BEYOND_DOUBLE);
+
+    // The same account again, its balance answer held so that the progress
+    // is seen.
+    const heldBalance = deferred<Response>();
+    fetchMock.mockImplementationOnce(async () => heldBalance.promise);
+    const texts = recordTexts(region);
+    await lookUp(user, ACCOUNT);
+
+    await waitFor(() => {
+      expect(region.textContent).toBe(BALANCE_LOADING);
+    });
+    heldBalance.resolve(jsonResponse({ status: 200, body: balanceBody }));
+    await waitFor(() => {
+      expect(region.textContent).toBe(BALANCE_LOADED);
+    });
+    // Cleared before each text, so the unchanged result is announced again.
+    expect(texts).toEqual(["", BALANCE_LOADING, "", BALANCE_LOADED]);
+    await waitFor(() => {
+      expect(requestedPathnames()).toEqual([
+        `GET /api/rewards/balance/${ACCOUNT}`,
+        `GET /api/rewards/history/${ACCOUNT}`,
+        `GET /api/rewards/balance/${ACCOUNT}`,
+        `GET /api/rewards/history/${ACCOUNT}`,
+      ]);
+    });
+  });
+
+  it("empties the status region when a lookup after a found account fails, and its toast reports it", async () => {
+    balances.set(ACCOUNT, { status: 200, body: balanceBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
+    const toastError = vi.spyOn(toast, "error");
+    const user = renderPage();
+    await lookUp(user, ACCOUNT);
+    const region = lookupStatus();
+    await waitFor(() => {
+      expect(region.textContent).toBe(BALANCE_LOADED);
+    });
+
+    // The unknown account's 404 is held so that the progress is seen.
+    const heldBalance = deferred<Response>();
+    fetchMock.mockImplementationOnce(async () => heldBalance.promise);
+    const texts = recordTexts(region);
+    await lookUp(user, UNKNOWN_ACCOUNT);
+
+    await waitFor(() => {
+      expect(region.textContent).toBe(BALANCE_LOADING);
+    });
+    heldBalance.resolve(jsonResponse({ status: 404, body: accountNotFound }));
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledWith("Account not found");
+    });
+    await waitFor(() => {
+      expect(region.textContent).toBe("");
+    });
+    expect(texts).toEqual(["", BALANCE_LOADING, ""]);
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(requestedPathnames()).toEqual([
+      `GET /api/rewards/balance/${ACCOUNT}`,
+      `GET /api/rewards/history/${ACCOUNT}`,
+      `GET /api/rewards/balance/${UNKNOWN_ACCOUNT}`,
+    ]);
   });
 });

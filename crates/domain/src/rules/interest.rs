@@ -47,7 +47,6 @@ use std::error::Error;
 use std::fmt;
 
 use crate::clock::{Clock, db2_timestamp};
-use crate::entities::{CardXref, DisclosureGroupKey, NewTransaction, TranCatBalance};
 use crate::messages::{
     ABENDING_PROGRAM, ACCOUNT_NOT_FOUND_CBACT04C, ERROR_CLOSING_ACCOUNT_FILE,
     ERROR_CLOSING_CROSS_REF_FILE, ERROR_CLOSING_DISCLOSURE_GROUP_FILE,
@@ -58,11 +57,23 @@ use crate::messages::{
     ERROR_READING_DISCLOSURE_GROUP_FILE, ERROR_READING_TRANSACTION_CATEGORY_FILE,
     ERROR_READING_XREF_FILE, ERROR_WRITING_TRANSACTION_RECORD, file_status_message,
 };
-use crate::numeric::{
-    AccountGroupId, AccountId, Alnum, InterestRate, MerchantId, Money, TranCategoryCode, TranId,
-    TranTypeCode,
+use crate::numeric::{InterestRate, MerchantId, Money, TranId};
+use crate::ports::PortError;
+
+/// The records, keys, codes and ports [`InterestRun`] takes, and those the
+/// INTCALC job reads and writes around it, re-exported from
+/// [`crate::entities`], [`crate::numeric`] and [`crate::ports`] for the batch
+/// adapter.
+pub use crate::entities::{
+    Account, CardXref, DisclosureGroup, DisclosureGroupKey, NewTransaction, TranCatBalance,
+    TranCatBalanceKey,
 };
-use crate::ports::{AccountReader, AccountWriter, DisclosureGroupReader, PortError, XrefReader};
+pub use crate::numeric::{
+    AccountGroupId, AccountId, Alnum, CardNumber, TranCategoryCode, TranTypeCode,
+};
+pub use crate::ports::{
+    AccountReader, AccountWriter, DisclosureGroupReader, TranCatBalanceStore, XrefReader,
+};
 
 // The literals 1300-B-WRITE-TX moves into the interest record
 // [app/cbl/CBACT04C.cbl:L482-494] (P-CBACT04C-008, P-CBACT04C-173). They are

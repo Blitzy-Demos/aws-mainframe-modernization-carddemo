@@ -106,6 +106,14 @@ describe("LoginPage (CC00 sign-on)", () => {
     const user = userEvent.setup();
     const { router } = renderLogin();
 
+    // The card title is a level-2 heading, and it names the form.
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Sign on to CardDemo" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("form", { name: "Sign on to CardDemo" }),
+    ).toBeTruthy();
+
     await user.type(inputByLabel("User ID"), "USER0001");
     await user.type(inputByLabel("Password"), "PASSWORD{Enter}");
 

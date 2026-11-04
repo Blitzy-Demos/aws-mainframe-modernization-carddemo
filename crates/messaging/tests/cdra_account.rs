@@ -34,7 +34,7 @@
 //! `P-COACCT01-030` and `P-COACCT01-031` are only checked to exist here. A key
 //! holding non-digits stays at `halt` (E-28) and is never sent.
 
-mod common;
+pub mod common;
 
 use std::time::Duration;
 

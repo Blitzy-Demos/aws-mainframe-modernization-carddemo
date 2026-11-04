@@ -38,6 +38,31 @@
 //! confirmation fields) and [`ReturnMsg`]
 //! (the first-message-wins `WS-RETURN-MSG` accumulator). Every other item is
 //! imported from its own module, as `rules::<module>::<item>`.
+//!
+//! # Adapter-facing re-exports
+//!
+//! The import boundary of the adapters (AAP 0.7.2) names `rules`, not
+//! [`crate::ports`] or [`crate::entities`]: `carddemo-batch` does not name
+//! [`crate::numeric`] either, and `carddemo-messaging` names only
+//! [`mq_date_reply`], [`mq_account_reply`] and [`auth_decision`]. Each rule
+//! module therefore re-exports, by `pub use` of the item itself, the records,
+//! keys and port traits its adapter names beside the rule: the ones the rule
+//! takes or returns, and the ones the adapter reads or writes around it. The
+//! items several rules or adapters share are re-exported here, once:
+//!
+//! - the port vocabulary: [`Browse`], [`Direction`], [`PortError`] and
+//!   [`PortResult`]. [`mq_account_reply`] and [`auth_decision`] re-export the
+//!   parts of it the messaging flows name;
+//! - the [`ErrorKind`] and [`FieldError`] entries of the
+//!   [`DomainError`](crate::error::DomainError) every rule rejects with;
+//! - the reward items the adapters name beside
+//!   [`RewardEngine`](crate::rewards::RewardEngine): the [`AccrualInput`] and
+//!   [`RewardError`] of an accrual, the [`RuleDraft`] that [`validate_rule`]
+//!   checks, and the [`RewardRule`], [`RewardAccrual`] and [`RewardBalance`]
+//!   records.
+//!
+//! The adapters import [`RewardEngine`](crate::rewards::RewardEngine) and
+//! [`DomainError`](crate::error::DomainError) from their own modules.
 
 pub mod account_update;
 pub mod account_view;
@@ -73,6 +98,25 @@ pub mod user_update;
 use std::fmt;
 
 use argon2::{Algorithm, Argon2, Params, Version};
+
+/// The reward rule, accrual and balance records the API's reward screens and
+/// reward-rule administration show, re-exported from [`crate::entities`].
+pub use crate::entities::{RewardAccrual, RewardBalance, RewardRule};
+/// The kind and field entries of the [`DomainError`](crate::error::DomainError)
+/// every rule rejects with, re-exported from [`crate::error`] for the API
+/// adapter, which maps them to its responses.
+pub use crate::error::{ErrorKind, FieldError};
+/// The browse request, browse direction and port outcome several rules take or
+/// return, re-exported from [`crate::ports`] for the API and batch adapters.
+pub use crate::ports::{Browse, Direction, PortError, PortResult};
+/// The accrual input and failure of
+/// [`RewardEngine::accrue`](crate::rewards::RewardEngine::accrue), re-exported
+/// from [`crate::rewards`] for the adapters of the CT02 and POSTTRAN rules,
+/// which drive it inside the unit of work that records the transaction.
+pub use crate::rewards::{AccrualInput, RewardError};
+/// The reward-rule draft and the check the API's reward-rule administration
+/// runs on it, re-exported from [`crate::rewards`].
+pub use crate::rewards::{RuleDraft, validate_rule};
 
 /// The length of a rendered [`VersionToken`]: a 64-bit digest in hex.
 const VERSION_TOKEN_LEN: usize = 16;
@@ -481,7 +525,7 @@ pub(crate) mod test_support {
     /// The name of every port method, in the order `crate::ports` declares
     /// them: the names [`FakeStore::fail_next`] accepts and
     /// [`FakeStore::calls`] records.
-    pub(crate) const PORT_METHODS: [&str; 54] = [
+    pub(crate) const PORT_METHODS: [&str; 55] = [
         "read_account",
         "read_account_for_update",
         "rewrite_account",
@@ -522,6 +566,7 @@ pub(crate) mod test_support {
         "update_user",
         "delete_user",
         "read_summary",
+        "read_summary_for_update",
         "read_summary_of_detail",
         "insert_summary",
         "update_summary",
@@ -1244,6 +1289,14 @@ pub(crate) mod test_support {
     impl AuthorizationStore for FakeStore {
         async fn read_summary(&mut self, id: AccountId) -> PortResult<PendingAuthSummary> {
             self.enter("read_summary").await?;
+            found(self.summaries.get(&id))
+        }
+
+        async fn read_summary_for_update(
+            &mut self,
+            id: AccountId,
+        ) -> PortResult<PendingAuthSummary> {
+            self.enter("read_summary_for_update").await?;
             found(self.summaries.get(&id))
         }
 
@@ -2115,6 +2168,11 @@ mod tests {
         fails_as_injected!(store, "read_summary", store.read_summary(account_id(1)));
         fails_as_injected!(
             store,
+            "read_summary_for_update",
+            store.read_summary_for_update(account_id(1))
+        );
+        fails_as_injected!(
+            store,
             "read_summary_of_detail",
             store.read_summary_of_detail(first)
         );
@@ -2679,6 +2737,14 @@ mod tests {
         assert_eq!(block_on(store.read_summary(account_id(1))), Ok(summary(1)));
         assert_eq!(
             block_on(store.read_summary(account_id(9))),
+            Err(PortError::NotFound)
+        );
+        assert_eq!(
+            block_on(store.read_summary_for_update(account_id(1))),
+            Ok(summary(1))
+        );
+        assert_eq!(
+            block_on(store.read_summary_for_update(account_id(9))),
             Err(PortError::NotFound)
         );
         assert_eq!(

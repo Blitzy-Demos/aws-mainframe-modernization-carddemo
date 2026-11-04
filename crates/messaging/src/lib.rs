@@ -59,7 +59,7 @@
 //!   the longest delivery, CP00's, with every database call within its
 //!   30-second deadline and every publish within
 //!   [`connection::BROKER_TIMEOUT`], plus the consumer's closing
-//!   `channel.close` and one broker timeout more, 330 seconds in all. One
+//!   `channel.close` and one broker timeout more, 360 seconds in all. One
 //!   still running then is aborted and logged at ERROR, since the CP00 writes
 //!   it has not committed are lost.
 //! - Each consumer channel still open is closed, then the connection, and the
@@ -92,7 +92,7 @@ pub mod flows {
 use std::time::Duration;
 
 use carddemo_domain::clock::{AnyClock, ClockError};
-use carddemo_persistence::{Db, PersistenceError};
+use carddemo_persistence::tx::{Db, PersistenceError};
 use carddemo_runtime::config::Settings;
 use futures_util::stream::AbortHandle;
 use lapin::{Channel, Connection};
@@ -160,14 +160,14 @@ pub enum MessagingError {
 /// A delivery can be anywhere in its handling when the intake stops, so the
 /// wait covers a whole delivery of the slowest flow, each database call and
 /// publish within its own limit: CP00's read unit of work, reply and
-/// post-acknowledgement unit of work (`flows::cp00::DELIVERY_BUDGET`, 310
+/// post-acknowledgement unit of work (`flows::cp00::DELIVERY_BUDGET`, 340
 /// seconds), ahead of CDRA's 110 seconds and CDRD's 20. Each budget counts
 /// the calls its flow makes; settling an abandoned database call runs inside
 /// the next call's deadline, so the counts are complete. A stopped consumer
 /// then closes its channel within one broker timeout ([`consumer::run_until`]).
 /// The broker timeout added last covers the steps no limit bounds, the
 /// acknowledgement and the work between the calls, and the timers' lateness.
-/// The drain is therefore 330 seconds, and a consumer still running at its
+/// The drain is therefore 360 seconds, and a consumer still running at its
 /// end is one whose acknowledgement the broker held back longer than that
 /// allowance.
 const DRAIN_TIMEOUT: Duration = longer(
@@ -259,7 +259,7 @@ impl Running {
     /// Stops every consumer and closes the broker connection.
     ///
     /// Each consumer's intake is stopped first, so it ends after the delivery
-    /// it is settling and closes its channel, and the tasks get 330 seconds
+    /// it is settling and closes its channel, and the tasks get 360 seconds
     /// (`DRAIN_TIMEOUT`) to end: a whole delivery of the slowest flow, CP00,
     /// with every database call and publish within its limit, the channel
     /// close, and one broker timeout more. The connection is closed only after
@@ -532,13 +532,13 @@ mod tests {
 
     #[test]
     fn the_drain_outlasts_every_delivery_and_its_channel_close_by_one_broker_timeout() {
-        // CP00: 6 read-unit calls and 4 post-acknowledgement calls of 30 s, and
+        // CP00: 6 read-unit calls and 5 post-acknowledgement calls of 30 s, and
         // the reply's 10 s; CDRA: 3 calls of 30 s and 2 publishes of 10 s;
         // CDRD: 2 publishes of 10 s. Each consumer then closes its channel
         // within one broker timeout.
         let budgets = [
-            ("CP00 writes", flows::cp00::POST_ACK_BUDGET, 120),
-            ("CP00", flows::cp00::DELIVERY_BUDGET, 310),
+            ("CP00 writes", flows::cp00::POST_ACK_BUDGET, 150),
+            ("CP00", flows::cp00::DELIVERY_BUDGET, 340),
             ("CDRA", flows::cdra::DELIVERY_BUDGET, 110),
             ("CDRD", flows::cdrd::DELIVERY_BUDGET, 20),
         ];
@@ -549,6 +549,6 @@ mod tests {
                 "{flow}: {budget:?}, the channel close and the allowance outlast the drain"
             );
         }
-        assert_eq!(DRAIN_TIMEOUT, Duration::from_secs(330));
+        assert_eq!(DRAIN_TIMEOUT, Duration::from_secs(360));
     }
 }

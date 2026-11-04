@@ -26,13 +26,16 @@
 //! by the response mapping with [`crate::format::PIC_TRAN_AMT_DISPLAY`]; the
 //! rule returns the stored record unchanged.
 
-use crate::entities::Transaction;
 use crate::error::DomainError;
 use crate::messages::{
     TRAN_ID_CAN_NOT_BE_EMPTY, TRANSACTION_ID_NOT_FOUND, UNABLE_TO_LOOKUP_TRANSACTION,
 };
 use crate::numeric::TranId;
 use crate::ports::{PortError, TransactionReader};
+
+/// The transaction record [`view`] returns, re-exported from
+/// [`crate::entities`] for the API adapter, which maps it to its response.
+pub use crate::entities::Transaction;
 
 /// `TRNIDIN`, the Tran ID input field of map `COTRN1A`
 /// [app/cpy-bms/COTRN01.CPY:L55-60]: the BMS field of every `COTRN01C`

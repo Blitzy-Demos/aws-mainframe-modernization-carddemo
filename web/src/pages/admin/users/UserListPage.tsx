@@ -31,7 +31,6 @@ import {
 import { Link } from "react-router";
 import { Controller, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import type { ColumnDef } from "@tanstack/react-table";
 import { ArrowLeftIcon } from "lucide-react";
 
 import {
@@ -42,7 +41,7 @@ import {
   type UserListParams,
 } from "@/api/queries/admin-users";
 import { ConfirmDialog } from "@/components/confirm-dialog";
-import { DataTable } from "@/components/data-table";
+import { DataTable, type DataTableProps } from "@/components/data-table";
 import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -143,7 +142,11 @@ export default function UserListPage(): JSX.Element {
   // [app/cbl/COUSR00C.cbl:L115-119].
   const [cursor, setCursor] = useState<Cursor>({});
   const usersQuery = useUsers(cursor);
-  const page = usersQuery.data;
+  // A failed read of the same request keeps the query's last page; it is not
+  // shown, because it does not answer the read that failed. Its rows, row
+  // actions and paging keys leave with it, and the failure's text stands in
+  // the table in their place.
+  const page = usersQuery.isError ? undefined : usersQuery.data;
 
   // Counts the browses the user asked for (first entry, ENTER, PF7, PF8), so a
   // page's text is shown for the answer to a browse and not again when the
@@ -178,23 +181,33 @@ export default function UserListPage(): JSX.Element {
     }
   };
 
-  // A failed browse is shown once per error: toasted, set on USRIDIN, where
-  // every COUSR00C path puts the cursor, and kept in place of the rows, which
-  // the answer did not supply. The ref keeps StrictMode's repeated effect and
-  // re-renders from showing the same error twice. A layout effect, so the
-  // table never paints its no-records text for a failed read.
+  // A failed browse is shown once per error, when its read settles: toasted,
+  // set on USRIDIN, where every COUSR00C path puts the cursor, and kept in
+  // place of the rows, which the answer did not supply. The query keeps a
+  // failed read's error beside the page read before it, so a return to the
+  // page, or a repeated Search, finds that error while its own read of the
+  // browse is still out; that read's answer, the page or a new error, is what
+  // the page reports, so no error is shown while a read is out, fetching or
+  // paused offline. The ref keeps StrictMode's repeated effect and re-renders
+  // from showing the same error twice. A layout effect, so the table never
+  // paints its no-records text for a failed read.
   const listError = usersQuery.error;
+  const reading = usersQuery.fetchStatus !== "idle";
   const shownListError = useRef<unknown>(null);
   const [listErrorText, setListErrorText] = useState<string | null>(null);
   useLayoutEffect(() => {
-    if (listError === null || listError === shownListError.current) {
+    if (
+      listError === null ||
+      reading ||
+      listError === shownListError.current
+    ) {
       return;
     }
     shownListError.current = listError;
     setListErrorText(
       applyApiError(listError, filterForm, userListBmsFieldMap).message,
     );
-  }, [listError, filterForm]);
+  }, [listError, reading, filterForm]);
 
   // The page-boundary text of a page with rows (V-COUSR00C-005,
   // V-COUSR00C-008) is toasted once per browse, when its answer arrives: a
@@ -218,6 +231,16 @@ export default function UserListPage(): JSX.Element {
       showMessage(page.message);
     }
   }, [page, dataUpdatedAt, isPlaceholderData]);
+
+  // The table waits for the read that is out: the first one, a page loading
+  // behind the one kept on screen, or a re-read of a browse whose last read
+  // failed. That failure stays in the query until the re-read answers, but it
+  // does not answer the re-read, so its text does not stand in the table, and
+  // Previous and Next stay disabled, until the re-read's own answer arrives.
+  const tableLoading =
+    usersQuery.isPending ||
+    isPlaceholderData ||
+    (usersQuery.isError && reading);
 
   // ---------------------------------------------------------------------
   // CU03: read the user, confirm, delete
@@ -290,7 +313,7 @@ export default function UserListPage(): JSX.Element {
   // its cells, and the focused Edit or Delete would lose focus. They
   // therefore depend on nothing but the stable id prefix and the stable state
   // setter.
-  const columns = useMemo<ColumnDef<User>[]>(
+  const columns = useMemo<DataTableProps<User>["columns"]>(
     () => [
       {
         accessorKey: "user_id",
@@ -418,7 +441,7 @@ export default function UserListPage(): JSX.Element {
         onNext={onNext}
         caption="Users, in user ID order"
         emptyMessage={usersQuery.isError ? listErrorText : page?.message}
-        loading={usersQuery.isPending || isPlaceholderData}
+        loading={tableLoading}
       />
 
       {dialogUser === null ? null : (

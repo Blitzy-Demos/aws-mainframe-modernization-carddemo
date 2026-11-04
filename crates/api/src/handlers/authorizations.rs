@@ -71,10 +71,10 @@ use carddemo_domain::clock::Clock;
 use carddemo_domain::error::DomainError;
 use carddemo_domain::messages;
 use carddemo_domain::numeric::{AccountId, AuthId, CustomerId};
-use carddemo_domain::ports::{AuthorizationStore, PortError, XrefReader};
-use carddemo_domain::rules::auth_detail::{self, FraudOutcome};
-use carddemo_domain::rules::auth_summary::{self, AuthSummaryInput};
-use carddemo_persistence::UnitOfWork;
+use carddemo_domain::rules::PortError;
+use carddemo_domain::rules::auth_detail::{self, AuthorizationStore, FraudOutcome};
+use carddemo_domain::rules::auth_summary::{self, AuthSummaryInput, XrefReader};
+use carddemo_persistence::tx::UnitOfWork;
 use tracing::Span;
 use tracing::field::{Empty, display};
 

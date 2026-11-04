@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
 use carddemo_domain::clock::AnyClock;
-use carddemo_persistence::{Db, UnitOfWork};
+use carddemo_persistence::tx::{Db, UnitOfWork};
 use carddemo_runtime::config::Settings;
 use tracing::field::{Empty, debug, display};
 use tracing::{Instrument, Span};
@@ -322,7 +322,7 @@ async fn run(command: Command, ctx: &JobContext) -> ExitStatus {
 /// Opens the pool on `CARDDEMO_DATABASE_URL`. A JCL job has no counterpart of a connection
 /// failure, so it is a setup failure (exit 16).
 async fn connect(ctx: &JobContext) -> Result<Db, ExitStatus> {
-    carddemo_persistence::connect(&ctx.settings.database_url)
+    carddemo_persistence::tx::connect(&ctx.settings.database_url)
         .await
         .map_err(|err| setup_failure("database connection failed", err))
 }

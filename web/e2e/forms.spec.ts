@@ -42,6 +42,7 @@ import {
   nextTranId,
   notifications,
   pressControl,
+  processingDate,
   psql,
   REWARD_SCREENS,
   rowEndpoint,
@@ -250,6 +251,28 @@ async function expectWrite(
   ]);
   expect(response.status(), `${endpoint.method} ${endpoint.path}`).toBe(status);
   return response;
+}
+
+/**
+ * Runs `action` and asserts that no `endpoint` request was sent while it ran,
+ * as for input a form's schema rejects (AAP 0.5.4.3). `action` ends on the
+ * state the page reaches, so a request it would send goes out before the spy
+ * is removed.
+ */
+async function expectNoRequest(page: Page, endpoint: Endpoint, action: () => Promise<void>): Promise<void> {
+  const sent: string[] = [];
+  const spy = (request: Request): void => {
+    if (isRequestTo(request, endpoint)) {
+      sent.push(`${request.method()} ${request.url()}`);
+    }
+  };
+  page.on("request", spy);
+  try {
+    await action();
+  } finally {
+    page.off("request", spy);
+  }
+  expect(sent, `no ${endpoint.method} ${endpoint.path}`).toEqual([]);
 }
 
 /** The data rows of the page's table that hold `text`. */
@@ -662,12 +685,19 @@ test.describe("transaction reports (F-CORPT00-001, F-CORPT00-002, F-CORPT00-003,
     await page.goto(mapControl("F-CORPT00-001").route);
   });
 
-  test("rejects a report without a type", async ({ page }) => {
-    // V-CORPT00C-001 names MONTHLY, the first radio of the report-type group:
-    // the text is asserted, as a radio group keeps no aria-invalid of its own
-    // on one radio and the page brief fixes no focus target inside the group.
+  test("rejects a report without a type (V-CORPT00C-001, MONTHLY)", async ({ page }) => {
+    // V-CORPT00C-001 names MONTHLY, the first radio of the report-type group.
+    // The group and each of its radios are aria-invalid, and the cursor of
+    // MOVE -1 TO MONTHLYL lands on the Monthly radio (AAP 0.5.4.3). The
+    // FieldError belongs to the group's FieldSet, not to the per-radio Field
+    // that expectFieldError searches, so the text is asserted on the page.
     await enterOn(page, "F-CORPT00-001");
     await expectMessage(page, MESSAGES.SELECT_A_REPORT_TYPE_TO_PRINT_REPORT);
+    const group = content(page).getByRole("radiogroup", { name: "Report type", exact: true });
+    await expect(group).toHaveAttribute("aria-invalid", "true");
+    const monthly = input(page, "F-CORPT00-001", 0);
+    await expect(monthly).toHaveAttribute("aria-invalid", "true");
+    await expect(monthly).toBeFocused();
   });
 
   test("rejects a custom report without dates (V-CORPT00C-002, SDTMM)", async ({ page }) => {
@@ -924,17 +954,25 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
     await expect(newUserPassword(page)).toBeDisabled();
   });
 
-  test("update: Reset clears the fields, Cancel and Save and exit return to the list", async ({ page }) => {
+  test("update: Reset clears the fields, Save and exit returns to the list without a PUT for them, Cancel returns to the list, Save and exit saves valid input and returns", async ({ page }) => {
+    const exitTarget = urlPath(mapControl("F-COUSR02-002").target ?? "/admin/users");
     await openEdit(page);
     await typeInto(page, textbox(page, labels.firstName), "Changed");
     await enterOn(page, "F-COUSR02-003");
     await expect(textbox(page, labels.firstName)).toHaveValue("");
+    // P-COUSR02C-008: PF3 returns whatever the update outcome; the blank
+    // fields the schema rejects are not sent.
+    await expectNoRequest(page, userEndpoint("PUT"), async () => {
+      await enterOn(page, "F-COUSR02-002");
+      await expect(page).toHaveURL(exitTarget);
+    });
+    await openEdit(page);
     await enterOn(page, "F-COUSR02-005");
     await expect(page).toHaveURL(urlPath(mapControl("F-COUSR02-005").target ?? "/admin/users"));
     await openEdit(page);
     await typeInto(page, textbox(page, labels.firstName), "Edwina");
     await expectWrite(page, userEndpoint("PUT"), () => enterOn(page, "F-COUSR02-002"));
-    await expect(page).toHaveURL(urlPath(mapControl("F-COUSR02-002").target ?? "/admin/users"));
+    await expect(page).toHaveURL(exitTarget);
     expect(await psql(`SELECT sec_usr_fname FROM users WHERE user_id = ${sqlLiteral(NEW_USER_ID)}`)).toBe("Edwina");
   });
 
@@ -1118,8 +1156,9 @@ test.describe("reward rule form", () => {
 
   test.beforeAll(async () => {
     saved = await checkpoint([{ table: "reward_rules", where: "TRUE" }]);
-    today = await psql("SELECT current_date");
-    expect(today).toMatch(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/);
+    // The processing clock's UTC day: the created rule starts no later than
+    // the instant its soft delete stamps as active_to.
+    today = await processingDate();
   });
 
   test.afterAll(async () => {

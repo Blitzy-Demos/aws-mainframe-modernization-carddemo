@@ -146,6 +146,85 @@ describe("clearSession", () => {
   });
 });
 
+describe("takeSessionEndCause", () => {
+  it("hands out once the cause recorded when clearSession ended a session", async () => {
+    const { clearSession, setSession, takeSessionEndCause } =
+      await loadSession();
+    setSession(sessionExpiringIn(60_000));
+    const cause = new Error("Authentication required");
+
+    clearSession(cause);
+
+    expect(takeSessionEndCause()).toBe(cause);
+    expect(takeSessionEndCause()).toBeUndefined();
+  });
+
+  it("records no cause when no session was present, keeping the one recorded", async () => {
+    const { clearSession, setSession, takeSessionEndCause } =
+      await loadSession();
+    clearSession(new Error("signed out already"));
+    expect(takeSessionEndCause()).toBeUndefined();
+    setSession(sessionExpiringIn(60_000));
+    const cause = new Error("Authentication required");
+    clearSession(cause);
+
+    clearSession(new Error("signed out already"));
+    clearSession();
+
+    expect(takeSessionEndCause()).toBe(cause);
+  });
+
+  it("is reset by a sign-on", async () => {
+    const { clearSession, setSession, takeSessionEndCause } =
+      await loadSession();
+    setSession(sessionExpiringIn(60_000));
+    clearSession(new Error("Authentication required"));
+
+    setSession(sessionExpiringIn(120_000));
+
+    expect(takeSessionEndCause()).toBeUndefined();
+  });
+
+  it.each<{ end: string; run: (module: SessionModule) => void }>([
+    {
+      end: "a sign-off",
+      run: ({ clearSession }) => {
+        clearSession();
+      },
+    },
+    {
+      end: "the expiry timer",
+      run: () => {
+        vi.advanceTimersByTime(60_000);
+      },
+    },
+    {
+      end: "getSession after the expiry",
+      run: ({ getSession }) => {
+        vi.setSystemTime(NOW.getTime() + 60_000);
+        getSession();
+      },
+    },
+    {
+      end: "a resync with a store another page emptied",
+      run: () => {
+        sessionStorage.removeItem(KEY);
+        window.dispatchEvent(
+          new PageTransitionEvent("pageshow", { persisted: true }),
+        );
+      },
+    },
+  ])("is undefined after $end", async ({ run }) => {
+    const session = await loadSession();
+    session.setSession(sessionExpiringIn(60_000));
+
+    run(session);
+
+    expect(session.getSession()).toBeNull();
+    expect(session.takeSessionEndCause()).toBeUndefined();
+  });
+});
+
 describe("getSession", () => {
   it("returns null and clears storage once the session has expired", async () => {
     const { getSession, setSession, subscribe } = await loadSession();
@@ -248,6 +327,173 @@ describe("rehydration on module load", () => {
     const { getSession } = await loadSession();
 
     expect(getSession()).toBeNull();
+  });
+});
+
+// Each test loads a fresh module instance, and the instances of earlier tests
+// keep their window listeners, so they react to the events dispatched here as
+// well. The assertions therefore read only the instance under test.
+describe("resync with sessionStorage", () => {
+  const USER = sessionExpiringIn(60_000, {
+    token: "user.session.token",
+    user_id: "USER0001",
+    usr_type: "U",
+    landing: "/",
+  });
+
+  // What another document of the tab left in the store after signing on.
+  const OTHER = sessionExpiringIn(120_000, { token: "other.session.token" });
+
+  function restoredFromCache(): Event {
+    return new PageTransitionEvent("pageshow", { persisted: true });
+  }
+
+  it.each<{
+    event: string;
+    outcome: string;
+    make: () => Event;
+    ends: boolean;
+  }>([
+    {
+      event: "a pageshow restoring the page from the back/forward cache",
+      outcome: "ends",
+      make: restoredFromCache,
+      ends: true,
+    },
+    {
+      event: "a pageshow of a fresh load",
+      outcome: "keeps",
+      make: () => new PageTransitionEvent("pageshow", { persisted: false }),
+      ends: false,
+    },
+    {
+      event: "a storage event for the session key",
+      outcome: "ends",
+      make: () =>
+        new StorageEvent("storage", { key: KEY, storageArea: sessionStorage }),
+      ends: true,
+    },
+    {
+      event: "a storage event for clear()",
+      outcome: "ends",
+      make: () =>
+        new StorageEvent("storage", { key: null, storageArea: sessionStorage }),
+      ends: true,
+    },
+    {
+      event: "a storage event for another key",
+      outcome: "keeps",
+      make: () =>
+        new StorageEvent("storage", {
+          key: "carddemo.theme",
+          storageArea: sessionStorage,
+        }),
+      ends: false,
+    },
+    {
+      event: "a storage event for another storage area",
+      outcome: "keeps",
+      make: () => new StorageEvent("storage", { key: KEY, storageArea: null }),
+      ends: false,
+    },
+  ])(
+    "$event $outcome a session another page of the tab signed off",
+    async ({ make, ends }) => {
+      const { getSession, setSession, subscribe } = await loadSession();
+      setSession(USER);
+      const listener = vi.fn();
+      subscribe(listener);
+      // The later page's sign-off, which this page's memory never saw.
+      sessionStorage.removeItem(KEY);
+
+      window.dispatchEvent(make());
+
+      expect(getSession()).toEqual(ends ? null : USER);
+      expect(listener).toHaveBeenCalledTimes(ends ? 1 : 0);
+      expect(vi.getTimerCount()).toBe(ends ? 0 : 1);
+    },
+  );
+
+  it.each<{ store: string; arrange: () => void; storedAfter: unknown }>([
+    {
+      store: "holds no session",
+      arrange: () => {
+        sessionStorage.removeItem(KEY);
+      },
+      storedAfter: null,
+    },
+    {
+      store: "holds another page's live session",
+      arrange: () => {
+        sessionStorage.setItem(KEY, JSON.stringify(OTHER));
+      },
+      storedAfter: OTHER,
+    },
+    {
+      store: "holds text that is not a session",
+      arrange: () => {
+        sessionStorage.setItem(KEY, "{not json");
+      },
+      storedAfter: null,
+    },
+  ])(
+    "ends the in-memory session when the store $store, leaving the store as the other page wrote it",
+    async ({ arrange, storedAfter }) => {
+      const { getSession, setSession, subscribe } = await loadSession();
+      setSession(USER);
+      const listener = vi.fn();
+      subscribe(listener);
+      arrange();
+
+      window.dispatchEvent(restoredFromCache());
+
+      expect(getSession()).toBeNull();
+      expect(listener).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(storedValue()).toEqual(storedAfter);
+    },
+  );
+
+  it.each<{
+    store: string;
+    signOn: (setSession: (s: Session) => void) => void;
+  }>([
+    {
+      store: "still holds its token",
+      signOn: (setSession) => {
+        setSession(USER);
+      },
+    },
+    {
+      store: "cannot be read",
+      signOn: (setSession) => {
+        setSession(USER);
+        vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+          throw new DOMException("storage is blocked", "SecurityError");
+        });
+      },
+    },
+    {
+      store: "never received it, because the write was rejected",
+      signOn: (setSession) => {
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+          throw new DOMException("quota exceeded", "QuotaExceededError");
+        });
+        setSession(USER);
+      },
+    },
+  ])("keeps the session when the store $store", async ({ signOn }) => {
+    const { getSession, setSession, subscribe } = await loadSession();
+    signOn(setSession);
+    const listener = vi.fn();
+    subscribe(listener);
+
+    window.dispatchEvent(restoredFromCache());
+
+    expect(getSession()).toEqual(USER);
+    expect(listener).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
   });
 });
 

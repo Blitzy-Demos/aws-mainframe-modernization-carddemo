@@ -91,14 +91,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use carddemo_codec::framing::decode_ascii_file;
-use carddemo_codec::{
+use carddemo_codec::layouts::{
     AccountLayout, AccountRecord, CardLayout, CardRecord, CardXrefLayout, CardXrefRecord, Charset,
     CustomerLayout, CustomerRecord, DisclosureGroupLayout, DisclosureGroupRecord, Layout,
     TranCatBalanceLayout, TranCatBalanceRecord, TranCategoryFileRecord, TranCategoryLayout,
-    TranTypeFileRecord, TranTypeLayout, UserSecurityLayout,
+    TranTypeFileRecord, TranTypeLayout, UserSecurityLayout, decode_ascii_file,
 };
-use carddemo_domain::auth::hash_stored_password;
+use carddemo_domain::entities::user_security::hash_stored_password;
 use carddemo_domain::entities::{NewRewardRule, TranCategoryMaster, TranTypeMaster};
 use carddemo_domain::numeric::{
     Alnum, Money, NumericError, RewardRate, RuleId, TranCategoryCode, TranTypeCode,

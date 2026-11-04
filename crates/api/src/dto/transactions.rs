@@ -76,13 +76,11 @@
 
 use std::fmt;
 
-use carddemo_domain::entities::Transaction;
-use carddemo_domain::error::ErrorKind;
 use carddemo_domain::numeric::{AccountId, CardNumber};
-use carddemo_domain::ports::Direction;
-use carddemo_domain::rules::Confirm;
 use carddemo_domain::rules::transaction_add::TransactionAddInput;
 use carddemo_domain::rules::transaction_list::TransactionListInput;
+use carddemo_domain::rules::transaction_view::Transaction;
+use carddemo_domain::rules::{Confirm, Direction, ErrorKind};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};

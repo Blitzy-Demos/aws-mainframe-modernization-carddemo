@@ -74,7 +74,7 @@
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 
 use crate::clock::Clock;
-use crate::entities::{AuthFraud, FraudFlag, PendingAuthDetail};
+use crate::entities::{AuthFraud, FraudFlag};
 use crate::error::DomainError;
 use crate::messages::{
     ALREADY_AT_THE_LAST_AUTHORIZATION, AUTH_FRAUD_REMOVED, AUTH_MARKED_FRAUD,
@@ -84,7 +84,13 @@ use crate::messages::{
     UNEXPECTED_ERROR, UPDT_ERROR_DB2_CODE, fraud_db2_error_message, ims_status_message,
 };
 use crate::numeric::{AccountId, Alnum, AuthId, CustomerId};
-use crate::ports::{AuthorizationStore, Direction, PortError};
+use crate::ports::{Direction, PortError};
+
+/// The detail record and the authorization store [`detail`], [`next`] and
+/// [`toggle_fraud`] work on, re-exported from [`crate::entities`] and
+/// [`crate::ports`] for the API adapter.
+pub use crate::entities::PendingAuthDetail;
+pub use crate::ports::AuthorizationStore;
 
 /// `CARDNUM`, the card number field of map `COPAU1A`
 /// [app/app-authorization-ims-db2-mq/cpy-bms/COPAU01.cpy:L55-60]: the BMS

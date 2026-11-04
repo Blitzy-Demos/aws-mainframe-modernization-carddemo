@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT pa_acct_id AS acct_id, pa_cust_id AS cust_id,\n                              pa_auth_status AS auth_status, pa_account_status AS account_status,\n                              pa_credit_limit AS credit_limit, pa_cash_limit AS cash_limit,\n                              pa_credit_balance AS credit_balance, pa_cash_balance AS cash_balance,\n                              pa_approved_auth_cnt AS approved_auth_cnt,\n                              pa_declined_auth_cnt AS declined_auth_cnt,\n                              pa_approved_auth_amt AS approved_auth_amt,\n                              pa_declined_auth_amt AS declined_auth_amt\n                         FROM pending_auth_summaries\n                        WHERE pa_acct_id > $1\n                        ORDER BY pa_acct_id\n                        LIMIT $2",
+  "query": "SELECT pa_acct_id AS acct_id, pa_cust_id AS cust_id,\n                              pa_auth_status AS auth_status, pa_account_status AS account_status,\n                              pa_credit_limit AS credit_limit, pa_cash_limit AS cash_limit,\n                              pa_credit_balance AS credit_balance, pa_cash_balance AS cash_balance,\n                              pa_approved_auth_cnt AS approved_auth_cnt,\n                              pa_declined_auth_cnt AS declined_auth_cnt,\n                              pa_approved_auth_amt AS approved_auth_amt,\n                              pa_declined_auth_amt AS declined_auth_amt\n                         FROM pending_auth_summaries\n                        ORDER BY pa_acct_id\n                        LIMIT $1\n                          FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -66,7 +66,6 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
         "Int8"
       ]
     },
@@ -85,5 +84,5 @@
       false
     ]
   },
-  "hash": "9ee25c5d6e82827ee0f19db49c10b9454fc5248606baf865a78ca6c6308711a9"
+  "hash": "4c7ce1da13393e96c666918495768296c379be2907a6ddb2d8b5ad5b0cd513fa"
 }

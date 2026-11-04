@@ -101,11 +101,10 @@
 //!   non-ASCII key would browse from the code its first two bytes spell; it
 //!   is held to ASCII on no field, as no BMS field holds it.
 
-use carddemo_domain::entities::TranTypeMaster;
 use carddemo_domain::numeric::TranTypeCode;
-use carddemo_domain::ports::Direction;
+use carddemo_domain::rules::Direction;
 use carddemo_domain::rules::tran_type_list::{
-    TranTypeDeleted, TranTypeListInput, TranTypePage, TranTypeUpdated,
+    TranTypeDeleted, TranTypeListInput, TranTypeMaster, TranTypePage, TranTypeUpdated,
 };
 use carddemo_domain::rules::tran_type_update::{
     self, FIELD_DESCRIPTION, FIELD_TYPE_CODE, TranTypeSaved, TranTypeUpsertInput,

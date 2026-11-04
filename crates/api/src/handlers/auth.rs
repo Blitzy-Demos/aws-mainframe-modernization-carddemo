@@ -19,9 +19,12 @@
 //! a stored code other than exactly `A`, such as a legacy `X` or `a`, takes
 //! the `ELSE` path of `IF CDEMO-USRTYP-ADMIN` [app/cbl/COSGN00C.cbl:L230-240]
 //! and is issued as `U`. The `usr_type` and `landing` of the response carry
-//! the same type and serve the SPA's navigation only. Neither operation takes
-//! a token, and [`logout`] is stateless: no server-side session exists, so the
-//! SPA discards its token.
+//! the same type and serve the SPA's navigation only. Neither operation
+//! requires a token: [`login`] reads none, and [`logout`] answers alike with
+//! or without one. [`logout`] is stateless: no server-side session exists, so
+//! the SPA discards its token. A bearer token the SPA still sends there only
+//! names its user in the logout span when it verifies; no store is read and
+//! nothing is refused.
 //!
 //! # Sign-on sequence
 //!
@@ -48,10 +51,22 @@
 //!
 //! # Telemetry
 //!
-//! [`login`] runs in a span with `transaction` `CC00`, the `user_id` that
-//! signed on (recorded on success only) and `outcome`: `ok` for an issued
-//! token, `rejected` for a 4xx answer and `failed` for a 5xx one, or
-//! `cancelled` for a sign-on dropped before its answer, its client gone.
+//! [`login`] runs in a span with `transaction` `CC00`, `user_id` and
+//! `outcome`. `user_id` is the user the sign-on is attempted for, recorded
+//! once, before the sign-on runs, when the user ID passes its length and
+//! blank edits: the upper-cased `USRSEC` key the rule reads by, which is
+//! also the `user_id` of a successful response. A wrong password, an unknown
+//! user, a password refused by its own edits and a failure to read the user
+//! are therefore all attributed; an over-length or blank user ID records
+//! none. `outcome` is `ok` for an issued token, `rejected` for a 4xx answer
+//! and `failed` for a 5xx one, or `cancelled` for a sign-on dropped before
+//! its answer, its client gone.
+//!
+//! [`logout`] runs in a span with `transaction` `CC00`, `outcome` `ok` and,
+//! when the request's one bearer token verifies, that token's `sub` as
+//! `user_id`. A request without a token, or whose token does not verify,
+//! records no user, and no event is logged for it.
+//!
 //! Neither the password, the stored hash nor the token is recorded or logged.
 
 use std::future::{Ready, ready};
@@ -63,7 +78,9 @@ use carddemo_domain::rules::signon::{self, SignonCheck, SignonInput, SignonOutco
 use tracing::{Span, field};
 
 use crate::auth::UserType;
-use crate::dto::auth::{LoginRequest, LoginResponse, MessageResponse};
+use crate::auth::extract::BearerUser;
+use crate::dto::auth::{LoginField, LoginRequest, LoginResponse, MessageResponse};
+use crate::dto::id_string;
 use crate::error::{ApiError, ApiJson, ErrorBody};
 use crate::state::AppState;
 
@@ -134,12 +151,38 @@ pub async fn login(
     ApiJson(body): ApiJson<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
     let span = Span::current();
+    record_attempted_user(&span, &body);
     let result = crate::cancellable(span.clone(), sign_on_user(&state, body)).await;
-    if let Ok(response) = &result {
-        span.record("user_id", response.user_id.as_str());
-    }
     span.record("outcome", outcome(&result));
     result.map(Json)
+}
+
+/// COSGN00C PROCESS-ENTER-KEY — P-COSGN00C-005, P-COSGN00C-007,
+/// V-COSGN00C-001: records on `span`, the [`login`] span, the `user_id` the
+/// sign-on of `body` is attempted for, before the sign-on runs.
+///
+/// It is recorded once the user ID passes its own edits: the map-field
+/// length of [`LoginRequest::check`], which then names no over-length
+/// `USERID`, and the blank edit of V-COSGN00C-001. The value is the `USRSEC`
+/// key the rule reads by ([`signon::entered_user_key`]), upper-cased and
+/// without trailing spaces: for a failed sign-on the user it was attempted
+/// for, and for a successful one the user that signed on, the `user_id` of
+/// its response. An over-length or blank user ID records nothing. The
+/// password's edits do not decide it, and the password is never recorded.
+fn record_attempted_user(span: &Span, body: &LoginRequest) {
+    let user_id_too_long = body.check().is_err_and(|error| {
+        error
+            .body()
+            .fields
+            .iter()
+            .any(|entry| entry.field == LoginField::UserId.as_str())
+    });
+    if user_id_too_long {
+        return;
+    }
+    if let Some(key) = signon::entered_user_key(body.user_id.as_deref().unwrap_or_default()) {
+        span.record("user_id", id_string(&key).as_str());
+    }
 }
 
 /// The span `outcome` of a sign-on `result`: [`OUTCOME_OK`] for an issued
@@ -158,8 +201,10 @@ fn outcome<T>(result: &Result<T, ApiError>) -> &'static str {
 /// `POST /auth/logout`: PF3 on the sign-on screen, answered with the
 /// `CCDA-MSG-THANK-YOU` text of `CSMSG01Y` byte for byte, trailing spaces
 /// included [app/cpy/CSMSG01Y.cpy:L18-19]. Public and stateless: no token is
-/// read and no session ends, because none exists on the server; the SPA
-/// discards its token and shows `/login`.
+/// required and no session ends, because none exists on the server; the SPA
+/// discards its token and shows `/login`. The answer is the same with or
+/// without a bearer token, valid or not: a token that verifies only names
+/// its user in the server's trace span, and none is refused.
 // A plain function returning a ready future rather than an `async fn`: it
 // awaits nothing, and axum takes any function returning a future as a handler.
 #[utoipa::path(
@@ -174,7 +219,16 @@ fn outcome<T>(result: &Result<T, ApiError>) -> &'static str {
         ),
     )
 )]
-pub fn logout() -> Ready<Json<MessageResponse>> {
+#[tracing::instrument(
+    skip_all,
+    fields(transaction = "CC00", user_id = field::Empty, outcome = field::Empty)
+)]
+pub fn logout(BearerUser(user): BearerUser) -> Ready<Json<MessageResponse>> {
+    let span = Span::current();
+    if let Some(user) = user {
+        span.record("user_id", user.user_id.as_str());
+    }
+    span.record("outcome", OUTCOME_OK);
     ready(Json(MessageResponse::new(messages::CCDA_MSG_THANK_YOU)))
 }
 
@@ -250,15 +304,319 @@ async fn verify(check: SignonCheck) -> Result<SignonOutcome, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::header::AUTHORIZATION;
+    use axum::http::{HeaderValue, Request, StatusCode};
+    use axum::routing::post;
     use carddemo_domain::error::{DomainError, ErrorKind};
     use carddemo_domain::messages;
     use carddemo_domain::rules::signon::SignonInput;
+    use carddemo_runtime::telemetry::subscriber_with_writer;
     use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tracing::field;
 
-    use super::{OUTCOME_FAILED, OUTCOME_OK, OUTCOME_REJECTED, outcome, signon_input};
+    use super::{
+        OUTCOME_FAILED, OUTCOME_OK, OUTCOME_REJECTED, logout, outcome, record_attempted_user,
+        signon_input,
+    };
+    use crate::auth::{JwtKeys, UserType};
     use crate::dto::auth::LoginRequest;
     use crate::error::ApiError;
+
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `run` returns, and the JSON lines it writes through the API's
+    /// telemetry subscriber under the default filter `info`.
+    fn logged<T>(run: impl FnOnce() -> T) -> (T, Vec<Value>) {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let (subscriber, guard) =
+            subscriber_with_writer("api", "info", move || sink.clone()).expect("valid directives");
+        let result = tracing::subscriber::with_default(subscriber, run);
+        guard.shutdown().expect("the tracer provider shuts down");
+        let bytes = capture.0.lock().expect("capture buffer").clone();
+        let text = String::from_utf8(bytes).expect("JSON lines are UTF-8");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON line"))
+            .collect();
+        (result, lines)
+    }
+
+    /// One sign-on of [`ATTEMPTS`]: (case, user ID typed, password typed, the
+    /// `user_id` its span records).
+    type Attempt = (
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+
+    /// The sign-ons of
+    /// `a_sign_on_names_the_user_it_is_attempted_for_once_the_user_id_passes_its_edits`:
+    /// P-COSGN00C-005 and V-COSGN00C-001 (blank), P-COSGN00C-007 (the
+    /// upper-cased key). Each case names the answer its request gets; the
+    /// user ID is recorded before the sign-on runs, so that answer does not
+    /// change it.
+    const ATTEMPTS: [Attempt; 13] = [
+        (
+            "wrong password, 401",
+            Some("ADMIN001"),
+            Some("WRONGPW1"),
+            Some("ADMIN001"),
+        ),
+        (
+            "unknown user, 401",
+            Some("user0099"),
+            Some("PASSWORD"),
+            Some("USER0099"),
+        ),
+        (
+            "over-long password, 400",
+            Some("admin001"),
+            Some("WRONGPW123"),
+            Some("ADMIN001"),
+        ),
+        (
+            "blank password, 400",
+            Some("ADMIN001"),
+            Some("        "),
+            Some("ADMIN001"),
+        ),
+        (
+            "absent password, 400",
+            Some("uSeR0001"),
+            None,
+            Some("USER0001"),
+        ),
+        // The query string is not read: the body's password decides.
+        (
+            "password in the query string, 401",
+            Some("ADMIN001"),
+            Some("QAQUERY1"),
+            Some("ADMIN001"),
+        ),
+        (
+            "database down, 500",
+            Some("admin001"),
+            Some("PASSWORD"),
+            Some("ADMIN001"),
+        ),
+        (
+            "short user ID",
+            Some("user1"),
+            Some("PASSW0RD"),
+            Some("USER1"),
+        ),
+        (
+            "over-long user ID, 400",
+            Some("ADMIN0011"),
+            Some("PASSWORD"),
+            None,
+        ),
+        (
+            "both over-long, 400",
+            Some("ADMIN0011"),
+            Some("WRONGPW123"),
+            None,
+        ),
+        ("blank user ID, 400", Some("   "), Some("PASSWORD"), None),
+        (
+            "LOW-VALUES user ID, 400",
+            Some("\0\0\0\0\0\0\0\0"),
+            Some("PASSWORD"),
+            None,
+        ),
+        ("absent user ID, 400", None, Some("PASSWORD"), None),
+    ];
+
+    #[test]
+    fn a_sign_on_names_the_user_it_is_attempted_for_once_the_user_id_passes_its_edits() {
+        for (case, user_id, password, expected) in ATTEMPTS {
+            let body = LoginRequest {
+                user_id: user_id.map(str::to_owned),
+                password: password.map(str::to_owned),
+            };
+            let ((), lines) = logged(|| {
+                let span = tracing::info_span!(
+                    "login",
+                    transaction = "CC00",
+                    user_id = field::Empty,
+                    outcome = field::Empty,
+                );
+                record_attempted_user(&span, &body);
+            });
+            let [span] = lines.as_slice() else {
+                panic!("{case}: one span line expected, got {lines:?}");
+            };
+            assert_eq!(span["type"], "span", "{case}");
+            assert_eq!(span["name"], "login", "{case}");
+            let attributes = &span["attributes"];
+            assert_eq!(attributes["transaction"], "CC00", "{case}: {span}");
+            assert_eq!(
+                attributes.get("user_id").and_then(Value::as_str),
+                expected,
+                "{case}: {span}"
+            );
+            assert!(attributes.get("password").is_none(), "{case}: {span}");
+            if let Some(password) = password.filter(|typed| !typed.trim().is_empty()) {
+                let text = span.to_string();
+                assert!(!text.contains(password), "{case}: {text}");
+                let upper = password.to_ascii_uppercase();
+                assert!(!text.contains(&upper), "{case}: {text}");
+            }
+        }
+    }
+
+    /// The secret of the token keys the logout tests verify with.
+    const SECRET: &str = "test-secret";
+
+    /// `POST /auth/logout` with the `Authorization` value `credential`, if
+    /// any, through the API's layers over [`logout`] with `keys`: its status
+    /// and JSON body, and the JSON lines the API's telemetry subscriber writes
+    /// meanwhile.
+    fn logged_logout(
+        keys: Arc<JwtKeys>,
+        credential: Option<&str>,
+    ) -> ((StatusCode, Value), Vec<Value>) {
+        let routes = Router::new()
+            .route("/auth/logout", post(logout))
+            .with_state(keys);
+        let app = crate::with_layers(routes, HeaderValue::from_static("http://localhost:5173"));
+        let request = credential
+            .into_iter()
+            .fold(Request::post("/auth/logout"), |builder, value| {
+                builder.header(AUTHORIZATION, value)
+            })
+            .body(Body::empty())
+            .expect("a valid request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        logged(|| {
+            runtime.block_on(async {
+                let response = app
+                    .oneshot(request)
+                    .await
+                    .expect("the router is infallible");
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("the body is buffered");
+                (status, serde_json::from_slice(&bytes).expect("a JSON body"))
+            })
+        })
+    }
+
+    /// The span line named `name` among `lines`, the only one.
+    fn span_named<'a>(case: &str, lines: &'a [Value], name: &str) -> &'a Value {
+        let spans: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "span" && line["name"] == name)
+            .collect();
+        let [span] = spans.as_slice() else {
+            panic!("{case}: one {name} span expected, got {lines:?}");
+        };
+        span
+    }
+
+    #[test]
+    fn logout_names_the_user_of_a_verified_token_in_its_span_and_answers_alike() {
+        // P-COSGN00C-003, P-COSGN00C-016: the thank-you text for every
+        // request, and a CC00 span under the request span.
+        let keys = Arc::new(JwtKeys::new(SECRET, 3600));
+        let issue = |keys: &JwtKeys, user_id: &str, usr_type: UserType| {
+            keys.issue(user_id, usr_type).expect("issues").token
+        };
+        let admin = issue(&keys, "ADMIN001", UserType::Admin);
+        let user = issue(&keys, "USER0001", UserType::User);
+        let other = JwtKeys::new("other-secret", 3600);
+        let forged = issue(&other, "ADMIN001", UserType::Admin);
+        // (case, `Authorization`, the span's `user_id`)
+        let cases = [
+            ("no token", None, None),
+            (
+                "the ADMIN001 token",
+                Some(format!("Bearer {admin}")),
+                Some("ADMIN001"),
+            ),
+            (
+                "the USER0001 token",
+                Some(format!("bearer {user}")),
+                Some("USER0001"),
+            ),
+            (
+                "another key's token",
+                Some(format!("Bearer {forged}")),
+                None,
+            ),
+            (
+                "a bearer that does not verify",
+                Some("Bearer not-a-token".to_owned()),
+                None,
+            ),
+            ("another scheme", Some(format!("Basic {admin}")), None),
+        ];
+        let thank_you = json!({"message": messages::CCDA_MSG_THANK_YOU});
+        for (case, credential, user_id) in cases {
+            let (answer, lines) = logged_logout(Arc::clone(&keys), credential.as_deref());
+            assert_eq!(answer, (StatusCode::OK, thank_you.clone()), "{case}");
+            let handler = span_named(case, &lines, "logout");
+            let request = span_named(case, &lines, "request");
+            assert_eq!(handler["parent_span_id"], request["span_id"], "{case}");
+            assert_eq!(handler["trace_id"], request["trace_id"], "{case}");
+            let attributes = &handler["attributes"];
+            assert_eq!(attributes["transaction"], "CC00", "{case}: {handler}");
+            assert_eq!(attributes["outcome"], "ok", "{case}: {handler}");
+            assert_eq!(
+                attributes.get("user_id").and_then(Value::as_str),
+                user_id,
+                "{case}: {handler}"
+            );
+            // Logout refuses nothing, so the request span records no refusal
+            // and no warning or error is logged.
+            for field in ["transaction", "user_id", "outcome"] {
+                assert!(
+                    request["attributes"].get(field).is_none(),
+                    "{case}: {request}"
+                );
+            }
+            for line in &lines {
+                assert!(
+                    line["level"] != "WARN" && line["level"] != "ERROR",
+                    "{case}: {line}"
+                );
+                let text = line.to_string();
+                for withheld in [&admin, &user, &forged] {
+                    assert!(!text.contains(withheld.as_str()), "{case}: {text}");
+                }
+                for withheld in ["not-a-token", SECRET, "other-secret"] {
+                    assert!(!text.contains(withheld), "{case}: {text}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_sign_on_is_rejected_for_a_4xx_answer_and_failed_for_a_5xx_one() {

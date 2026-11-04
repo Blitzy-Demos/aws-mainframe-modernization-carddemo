@@ -165,7 +165,14 @@ use carddemo_domain::ports::{PortError, PortResult};
 use sqlx::postgres::PgTransactionManager;
 use sqlx::{PgConnection, Postgres, Transaction, TransactionManager};
 
-use crate::{PersistenceError, port_error_at};
+use crate::port_error_at;
+
+/// The pool a [`UnitOfWork`] is begun on, its connect functions, and the error
+/// of the crate's own operations, commit included, re-exported from
+/// [`crate::pool`] and the crate root so the adapters open, run and finish
+/// their units of work through `tx` alone (AAP 0.7.2).
+pub use crate::PersistenceError;
+pub use crate::pool::{Db, connect, connect_with_statement_timeout};
 
 /// One `PostgreSQL` transaction an adapter opens, works in and finishes.
 ///

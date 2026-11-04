@@ -92,7 +92,10 @@ export type TranTypeDeleteVariables = {
 
 const ALL = ["admin-transaction-types"] as const;
 
-/** Query keys; every write invalidates `all`. */
+/**
+ * Query keys. Every write invalidates `all`: the add and the update read the
+ * lists on screen again, while the delete leaves that read to its caller.
+ */
 export const tranTypeKeys = {
   all: ALL,
   lists: () => [...ALL, "list"] as const,
@@ -161,6 +164,11 @@ export function useTranTypeUpdateMutation() {
  * carries no type; with `origin: "form"` it is the CTTU F4 delete, whose
  * answer carries the deleted type and `Delete successful.`. The query string
  * carries `origin` only when given, as for the update.
+ *
+ * A success marks every cached list stale and reads none of them again: the
+ * caller reads the page it shows next. The CTLI list returns to its first
+ * page and the CTTU form leaves for its key entry, so a page the screen is
+ * about to discard is never requested, and a list shown later is read anew.
  */
 export function useTranTypeDeleteMutation() {
   const queryClient = useQueryClient();
@@ -178,6 +186,9 @@ export function useTranTypeDeleteMutation() {
         }),
       ),
     onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: tranTypeKeys.all }),
+      queryClient.invalidateQueries({
+        queryKey: tranTypeKeys.all,
+        refetchType: "none",
+      }),
   });
 }

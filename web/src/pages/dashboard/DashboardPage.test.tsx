@@ -5,7 +5,10 @@
 // F-COMEN01-001 to F-COMEN01-011); a number COACTVWC 2210-EDIT-ACCOUNT refuses
 // is rejected without a request (V-COACTVWC-001, V-COACTVWC-002); and a server
 // rejection at ACCTSID is shown as a toast, as the field error and with the
-// cursor on ACCTSID [app/cbl/COACTVWC.cbl:L545-552].
+// cursor on ACCTSID [app/cbl/COACTVWC.cbl:L545-552]. The page's status region
+// announces each lookup, a repeated one included, by its account number and
+// never by a figure, once the account and its reward balance have answered,
+// and is empty for a rejected key.
 //
 // The API is the stubbed global the client sends every Request through, so
 // each test sees the exact requests the page made.
@@ -32,6 +35,14 @@ type RewardBalanceResponse = components["schemas"]["RewardBalanceResponse"];
 type ErrorBody = components["schemas"]["ErrorBody"];
 
 const ACCOUNT_ID = "00000000001";
+
+/** The status region's texts while a lookup reads and once it has answered. */
+const ACCOUNT_LOADING = "Loading account";
+const SUMMARY_LOADED = `Account ${ACCOUNT_ID} summary loaded`;
+
+/** V-COACTVWC-003: no cross-reference for the account, 404 at ACCTSID. */
+const XREF_NOT_FOUND =
+  "Account:99999999999 not found in Cross ref file.  Resp:000000013  Reas:0000";
 
 /**
  * `GET /accounts/00000000001` on the seeded corpus: the account record
@@ -151,6 +162,9 @@ type FetchFn = (
 /** The requests the page sent, in order. */
 const requests: Request[] = [];
 
+/** Answers a test holds back, by pathname; each answers one request. */
+const heldReplies = new Map<string, Promise<Reply<StubBody>>>();
+
 let fetchMock: Mock<FetchFn>;
 
 function jsonResponse<B>([status, body]: Reply<B>): Response {
@@ -174,14 +188,38 @@ function replyFor(pathname: string, stubs: ApiStubs): Reply<StubBody> {
   return NO_ROUTE;
 }
 
-/** Installs the API stub: each request is logged, then answered by route. */
+/**
+ * Installs the API stub: each request is logged, then answered by a held
+ * answer for its path, when a test holds one, or else by route.
+ */
 function stubApi(stubs: ApiStubs): void {
   fetchMock = vi.fn<FetchFn>(async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init);
     requests.push(request);
-    return jsonResponse(replyFor(new URL(request.url).pathname, stubs));
+    const { pathname } = new URL(request.url);
+    const held = heldReplies.get(pathname);
+    if (held !== undefined) {
+      heldReplies.delete(pathname);
+      return jsonResponse(await held);
+    }
+    return jsonResponse(replyFor(pathname, stubs));
   });
   vi.stubGlobal("fetch", fetchMock);
+}
+
+/**
+ * Holds the next answer to `pathname` back; the returned function sends
+ * `reply` as that answer.
+ */
+function holdReply(pathname: string): (reply: Reply<StubBody>) => void {
+  let release: (reply: Reply<StubBody>) => void = () => undefined;
+  heldReplies.set(
+    pathname,
+    new Promise<Reply<StubBody>>((settle) => {
+      release = settle;
+    }),
+  );
+  return release;
 }
 
 /** The request sent to `pathname`; throws while there is none. */
@@ -232,10 +270,44 @@ async function summaryCard(title: string): Promise<HTMLElement> {
   return screen.findByRole("group", { name: title });
 }
 
+// The page's lookup status line. The transactions table has a status region
+// of its own, a div, so the page's paragraph is told apart by its element.
+function lookupStatus(): HTMLElement {
+  const regions = screen
+    .getAllByRole("status")
+    .filter((region) => region.tagName === "P");
+  expect(regions).toHaveLength(1);
+  return regions[0];
+}
+
+// The observers recordTexts started, disconnected after each test.
+const observers: MutationObserver[] = [];
+
+// Every text `region` takes from now on, in order, so the cleared state
+// between two announcements is seen although it lasts only the announcement
+// delay.
+function recordTexts(region: HTMLElement): string[] {
+  const texts: string[] = [];
+  const observer = new MutationObserver(() => {
+    texts.push(region.textContent ?? "");
+  });
+  observer.observe(region, {
+    childList: true,
+    characterData: true,
+    subtree: true,
+  });
+  observers.push(observer);
+  return texts;
+}
+
 afterEach(() => {
+  observers.splice(0).forEach((observer) => {
+    observer.disconnect();
+  });
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   requests.length = 0;
+  heldReplies.clear();
 });
 
 describe("DashboardPage", () => {
@@ -374,4 +446,125 @@ describe("DashboardPage", () => {
       screen.queryByRole("group", { name: "Current Balance" }),
     ).toBeNull();
   });
+
+  it("announces each lookup by its account once its reward balance has answered, a repeated one included", async () => {
+    stubApi(SUCCESS);
+    const user = userEvent.setup();
+    renderPage();
+
+    // Present and empty before any lookup, so assistive technology tracks the
+    // region before it first changes.
+    const region = lookupStatus();
+    expect(region.textContent).toBe("");
+
+    // With the reward balance held, the account's figures are shown and the
+    // lookup is still loading.
+    const releaseRewards = holdReply(`/api/rewards/balance/${ACCOUNT_ID}`);
+    await user.type(accountInput(), `${ACCOUNT_ID}{Enter}`);
+    await summaryCard("Current Balance");
+    await waitFor(() => {
+      expect(region.textContent).toBe(ACCOUNT_LOADING);
+    });
+    releaseRewards(SUCCESS.rewards);
+    await waitFor(() => {
+      expect(region.textContent).toBe(SUMMARY_LOADED);
+    });
+    // The same element throughout, naming the account and never a figure.
+    expect(lookupStatus()).toBe(region);
+    for (const figure of [
+      account.acct_curr_bal,
+      account.acct_credit_limit,
+      account.acct_cash_credit_limit,
+      rewardBalance.available_points,
+    ]) {
+      expect(region.textContent).not.toContain(figure);
+    }
+
+    // The same account again, its reward balance held once more.
+    const releaseRepeat = holdReply(`/api/rewards/balance/${ACCOUNT_ID}`);
+    const texts = recordTexts(region);
+    await user.click(screen.getByRole("button", { name: "Look up account" }));
+    await waitFor(() => {
+      expect(region.textContent).toBe(ACCOUNT_LOADING);
+    });
+    releaseRepeat(SUCCESS.rewards);
+    await waitFor(() => {
+      expect(region.textContent).toBe(SUMMARY_LOADED);
+    });
+    // Cleared before each text, so the unchanged result is announced again.
+    expect(texts).toEqual(["", ACCOUNT_LOADING, "", SUMMARY_LOADED]);
+    expect(requests).toHaveLength(6);
+  });
+
+  it.each<{
+    name: string;
+    entered: string;
+    rejection: Reply<ErrorBody> | null;
+    message: string;
+    texts: string[];
+  }>([
+    {
+      name: "a rejection by the server, V-COACTVWC-003",
+      entered: "99999999999",
+      rejection: [
+        404,
+        {
+          code: "NOT_FOUND",
+          message: XREF_NOT_FOUND,
+          fields: [{ field: "ACCTSID", message: XREF_NOT_FOUND }],
+        },
+      ],
+      message: XREF_NOT_FOUND,
+      texts: ["", ACCOUNT_LOADING, ""],
+    },
+    {
+      name: "a rejection by the schema, V-COACTVWC-002",
+      entered: "abc",
+      rejection: null,
+      message: ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit,
+      texts: [""],
+    },
+  ])(
+    "empties the status region for $name of a lookup after a found account",
+    async ({ entered, rejection, message, texts: expectedTexts }) => {
+      stubApi(SUCCESS);
+      const toastError = vi.spyOn(toast, "error");
+      const user = userEvent.setup();
+      renderPage();
+      await user.type(accountInput(), `${ACCOUNT_ID}{Enter}`);
+      const region = lookupStatus();
+      await waitFor(() => {
+        expect(region.textContent).toBe(SUMMARY_LOADED);
+      });
+
+      const texts = recordTexts(region);
+      await user.clear(accountInput());
+      if (rejection === null) {
+        await user.type(accountInput(), `${entered}{Enter}`);
+      } else {
+        // The rejection is held so that the lookup's progress is seen.
+        const release = holdReply(`/api/accounts/${entered}`);
+        await user.type(accountInput(), `${entered}{Enter}`);
+        await waitFor(() => {
+          expect(region.textContent).toBe(ACCOUNT_LOADING);
+        });
+        release(rejection);
+      }
+
+      // The field error and, for the server's answer, the toast report the
+      // rejection; the status region holds nothing for it.
+      const fieldError = await screen.findByRole("alert");
+      expect(fieldError.textContent).toBe(message);
+      await waitFor(() => {
+        expect(region.textContent).toBe("");
+      });
+      expect(texts).toEqual(expectedTexts);
+      expect(toastError.mock.calls).toEqual(
+        rejection === null ? [] : [[message]],
+      );
+      expect(
+        screen.queryByRole("group", { name: "Current Balance" }),
+      ).toBeNull();
+    },
+  );
 });

@@ -1,7 +1,8 @@
 // Tests of the API client's 401 handling (api/client.ts authMiddleware): which
 // session a 401 ends, that the caller still receives the server's error, and
 // that the way back to the sign-on page is RequireAuth's router redirect, which
-// keeps the requested location as `from`, never a document navigation. Also
+// keeps the requested location as `from`, never a document navigation, and
+// shows the server's message in a single toast. Also
 // which requests carry the session's token at all: only those for the page's
 // own origin under /api, whatever base URL a call gives.
 //
@@ -9,7 +10,7 @@
 // test releases each answer itself, so a sign-on can happen while a request is
 // in flight.
 import { render, screen } from "@testing-library/react";
-import { createElement, useEffect, type ReactNode } from "react";
+import { createElement, Fragment, useEffect, type ReactNode } from "react";
 import {
   MemoryRouter,
   Route,
@@ -17,16 +18,19 @@ import {
   useLocation,
   type Location as RouterLocation,
 } from "react-router";
+import { toast, Toaster } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, api, unwrap } from "@/api/client";
+import { showApiError } from "@/lib/api-errors";
 import {
   clearSession,
   getSession,
   setSession,
+  takeSessionEndCause,
   type Session,
 } from "@/lib/session";
-import { RequireAuth } from "@/routes/guards";
+import { RequireAdmin, RequireAuth } from "@/routes/guards";
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 
@@ -99,10 +103,24 @@ async function rejectionOf(call: Promise<unknown>): Promise<unknown> {
   return outcome.value;
 }
 
-function expectApiError(error: unknown, status: number, message: string): void {
+function expectApiError(
+  error: unknown,
+  status: number,
+  message: string,
+  endedSession = false,
+): void {
   expect(error).toBeInstanceOf(ApiError);
-  expect(error).toMatchObject({ status, message, body: { message } });
+  expect(error).toMatchObject({
+    status,
+    message,
+    body: { message },
+    endedSession,
+  });
 }
+
+// The toast id lib/api-errors.ts gives the error of a 401 that ended the
+// session.
+const SESSION_ENDED_TOAST = { id: "session-ended" };
 
 // jsdom performs no document navigation, so the document's location is
 // replaced by one that records every way of starting one.
@@ -161,7 +179,9 @@ afterEach(() => {
     expect(globalThis.location).toBe(documentLocation);
   } finally {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     clearSession();
+    takeSessionEndCause();
   }
 });
 
@@ -173,6 +193,7 @@ describe("a 401 to a protected request", () => {
       sentWith: EARLIER,
       signedOnMeanwhile: null,
       after: null,
+      endedSession: true,
     },
     {
       sender: "an earlier session",
@@ -180,6 +201,7 @@ describe("a 401 to a protected request", () => {
       sentWith: EARLIER,
       signedOnMeanwhile: LATER,
       after: LATER,
+      endedSession: false,
     },
     {
       sender: "no session",
@@ -187,6 +209,7 @@ describe("a 401 to a protected request", () => {
       sentWith: null,
       signedOnMeanwhile: LATER,
       after: LATER,
+      endedSession: false,
     },
     {
       sender: "an earlier session, its token reissued",
@@ -194,10 +217,11 @@ describe("a 401 to a protected request", () => {
       sentWith: EARLIER,
       signedOnMeanwhile: REISSUED,
       after: REISSUED,
+      endedSession: false,
     },
   ])(
     "sent with $sender $outcome, and the call rejects with the server's error",
-    async ({ sentWith, signedOnMeanwhile, after }) => {
+    async ({ sentWith, signedOnMeanwhile, after, endedSession }) => {
       if (sentWith !== null) {
         setSession(sentWith);
       }
@@ -212,10 +236,106 @@ describe("a 401 to a protected request", () => {
 
       answer(authenticationRequired());
 
-      expectApiError(await rejectionOf(call), 401, "Authentication required");
+      expectApiError(
+        await rejectionOf(call),
+        401,
+        "Authentication required",
+        endedSession,
+      );
       expect(getSession()).toEqual(after);
+      // The cause a guard shows as it redirects: only an ended session has one.
+      const cause = takeSessionEndCause();
+      if (endedSession) {
+        expectApiError(cause, 401, "Authentication required", true);
+      } else {
+        expect(cause).toBeUndefined();
+      }
     },
   );
+
+  it.each<{ body: string; respond: () => Response }>([
+    {
+      body: "text that is not JSON",
+      respond: () => new Response("Unauthorized", { status: 401 }),
+    },
+    {
+      body: "no body",
+      respond: () => new Response(null, { status: 401 }),
+    },
+    {
+      body: "JSON of another shape",
+      respond: () => Response.json({ error: "denied" }, { status: 401 }),
+    },
+  ])(
+    "with $body ends the session with the unexpected error the caller receives",
+    async ({ respond }) => {
+      setSession(EARLIER);
+      const call = viewAccount();
+      const { answer } = await nextRequest();
+
+      answer(respond());
+
+      expectApiError(await rejectionOf(call), 401, "Unexpected error", true);
+      expect(getSession()).toBeNull();
+      expectApiError(takeSessionEndCause(), 401, "Unexpected error", true);
+    },
+  );
+
+  it("sent by a session a 401 has already ended is marked as that session's end", async () => {
+    setSession(EARLIER);
+    const ending = viewAccount();
+    const first = await nextRequest();
+    const late = viewAccount();
+    const second = await nextRequest();
+
+    first.answer(authenticationRequired());
+
+    expectApiError(
+      await rejectionOf(ending),
+      401,
+      "Authentication required",
+      true,
+    );
+    expect(getSession()).toBeNull();
+
+    second.answer(authenticationRequired());
+
+    expectApiError(
+      await rejectionOf(late),
+      401,
+      "Authentication required",
+      true,
+    );
+    expectApiError(
+      takeSessionEndCause(),
+      401,
+      "Authentication required",
+      true,
+    );
+    expect(takeSessionEndCause()).toBeUndefined();
+  });
+
+  it("whose body cannot be read ends the session with the unexpected error, and the call rejects with the read failure", async () => {
+    setSession(EARLIER);
+    const call = viewAccount();
+    const { answer } = await nextRequest();
+    const failure = new TypeError("connection reset");
+
+    answer(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(failure);
+          },
+        }),
+        { status: 401 },
+      ),
+    );
+
+    expect(await rejectionOf(call)).toBe(failure);
+    expect(getSession()).toBeNull();
+    expectApiError(takeSessionEndCause(), 401, "Unexpected error", true);
+  });
 
   it("sent with the current session ends it after that session's other requests were answered", async () => {
     setSession(EARLIER);
@@ -232,7 +352,12 @@ describe("a 401 to a protected request", () => {
 
     second.answer(authenticationRequired());
 
-    expectApiError(await rejectionOf(call), 401, "Authentication required");
+    expectApiError(
+      await rejectionOf(call),
+      401,
+      "Authentication required",
+      true,
+    );
     expect(getSession()).toBeNull();
   });
 });
@@ -266,6 +391,7 @@ describe("a 401 to POST /auth/login", () => {
       "Wrong Password. Try again ...",
     );
     expect(getSession()).toEqual(EARLIER);
+    expect(takeSessionEndCause()).toBeUndefined();
   });
 });
 
@@ -290,7 +416,8 @@ describe("the sign-on redirect after a 401", () => {
     return createElement("h1", null, "Sign on");
   }
 
-  it("is RequireAuth's, carrying the requested path, query and fragment as `from`", async () => {
+  it("is RequireAuth's, carrying the requested path, query and fragment as `from`, and shows the server's message once", async () => {
+    const toastError = vi.spyOn(toast, "error");
     setSession(EARLIER);
     const onFailure = vi.fn<(error: unknown) => void>();
     const onLocation = vi.fn<(location: RouterLocation) => void>();
@@ -347,7 +474,108 @@ describe("the sign-on redirect after a 401", () => {
       onFailure.mock.calls[0]?.[0],
       401,
       "Authentication required",
+      true,
     );
+    // The page's caller shows nothing here; the guard shows the message.
+    expect(toastError).toHaveBeenCalledOnce();
+    expect(toastError).toHaveBeenCalledWith(
+      "Authentication required",
+      SESSION_ENDED_TOAST,
+    );
+  });
+
+  it("is RequireAdmin's as well when it guards the page alone, showing the server's message once", async () => {
+    const toastError = vi.spyOn(toast, "error");
+    setSession(LATER);
+    render(
+      createElement(
+        MemoryRouter,
+        { initialEntries: ["/admin/users"] },
+        createElement(
+          Routes,
+          null,
+          createElement(
+            Route,
+            { element: createElement(RequireAdmin) },
+            createElement(Route, {
+              path: "/admin/users",
+              element: createElement(AccountView, { onFailure: vi.fn() }),
+            }),
+          ),
+          createElement(Route, {
+            path: "/login",
+            element: createElement(SignOnScreen, { onLocation: vi.fn() }),
+          }),
+        ),
+      ),
+    );
+    await screen.findByRole("heading", { name: "Account 00000000001" });
+    const { answer } = await nextRequest();
+
+    answer(authenticationRequired());
+
+    await screen.findByRole("heading", { name: "Sign on" });
+    await vi.waitFor(() => {
+      expect(toastError).toHaveBeenCalledOnce();
+    });
+    expect(toastError).toHaveBeenCalledWith(
+      "Authentication required",
+      SESSION_ENDED_TOAST,
+    );
+  });
+
+  it("shows a single toast when the caller awaiting the answer shows its error as well", async () => {
+    const toastError = vi.spyOn(toast, "error");
+    setSession(EARLIER);
+    const onFailure = vi.fn((error: unknown) => {
+      showApiError(error);
+    });
+    render(
+      createElement(
+        Fragment,
+        null,
+        createElement(Toaster),
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/accounts/view"] },
+          createElement(
+            Routes,
+            null,
+            createElement(
+              Route,
+              { element: createElement(RequireAuth) },
+              createElement(Route, {
+                path: "/accounts/view",
+                element: createElement(AccountView, { onFailure }),
+              }),
+            ),
+            createElement(Route, {
+              path: "/login",
+              element: createElement(SignOnScreen, { onLocation: vi.fn() }),
+            }),
+          ),
+        ),
+      ),
+    );
+    await screen.findByRole("heading", { name: "Account 00000000001" });
+    const { answer } = await nextRequest();
+
+    answer(authenticationRequired());
+
+    await screen.findByRole("heading", { name: "Sign on" });
+    await vi.waitFor(() => {
+      expect(onFailure).toHaveBeenCalledOnce();
+    });
+    expect(toastError.mock.calls).toEqual([
+      ["Authentication required", SESSION_ENDED_TOAST],
+      ["Authentication required", SESSION_ENDED_TOAST],
+    ]);
+    // Sonner renders each toast call on a timer task of its own; one more
+    // task, queued after both, lets them land before the toasts are counted.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(screen.getAllByText("Authentication required")).toHaveLength(1);
   });
 });
 

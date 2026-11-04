@@ -42,6 +42,12 @@
 //! Each handler runs in one span with `transaction` (`CAVW` or `CAUP`),
 //! `user_id`, the account key and `outcome`.
 //!
+//! A `CAUP` body `account_update::validate` holds at `halt` is answered
+//! through [`ApiError::halted`]: its one ERROR event in the handler span
+//! carries `cause` `halt` and the `escalation_id` that holds the input class
+//! (E-26, E-40 or E-47), which the 500's [`messages::UNEXPECTED_ERROR`] does
+//! not state.
+//!
 //! The `{id}` segment reaches the span only through the program's key edit,
 //! `account_view::edit_account_id` for `CAVW` and
 //! `account_update::edit_account_id` for `CAUP`, which the handler applies
@@ -76,15 +82,15 @@
 use axum::Json;
 use axum::extract::State;
 use carddemo_domain::clock::Clock;
-use carddemo_domain::error::{DomainError, ErrorKind};
+use carddemo_domain::error::DomainError;
 use carddemo_domain::messages;
 use carddemo_domain::numeric::{AccountId, CustomerId};
 use carddemo_domain::rules::account_update::{
-    self, AccountEdit, AccountSnapshot, AccountUpdated, ValidatedAccountChanges,
+    self, AccountEdit, AccountSnapshot, AccountUpdated, EditRefusal, ValidatedAccountChanges,
 };
 use carddemo_domain::rules::account_view::{self, AccountView, AccountViewInput};
-use carddemo_domain::rules::{VersionKey, VersionToken};
-use carddemo_persistence::UnitOfWork;
+use carddemo_domain::rules::{ErrorKind, VersionKey, VersionToken};
+use carddemo_persistence::tx::UnitOfWork;
 use tracing::Span;
 use tracing::field::display;
 
@@ -369,7 +375,7 @@ async fn update(
                 message: messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED.to_owned(),
             }));
         }
-        Err(err) => return Err(refuse(uow, err).await),
+        Err(refusal) => return Err(refuse_edit(uow, refusal).await),
     };
     let updated = persist(uow, key, account_id, customer_id, &input.version, *changes).await?;
     let AccountUpdated {
@@ -500,6 +506,21 @@ async fn end_read_only(uow: UnitOfWork) {
 async fn refuse(uow: UnitOfWork, err: DomainError) -> ApiError {
     end_read_only(uow).await;
     rejected(err)
+}
+
+/// The answer to a request `account_update::validate` refused with
+/// `refusal`, before any write: the unit of work rolled back as [`refuse`]
+/// rolls it back, then an input class held at `halt` answered by
+/// [`ApiError::halted`], which logs the escalation that holds it, and any
+/// other refusal's error with its mapped status, `outcome` recorded as
+/// [`rejected`] records it.
+async fn refuse_edit(uow: UnitOfWork, refusal: EditRefusal) -> ApiError {
+    end_read_only(uow).await;
+    let error = match refusal.escalation_id() {
+        Some(escalation_id) => ApiError::halted(refusal.into(), escalation_id),
+        None => ApiError::from(DomainError::from(refusal)),
+    };
+    rejected(error)
 }
 
 /// `err` as the answer of a request that wrote nothing, with `outcome`

@@ -17,7 +17,9 @@
 //!    `5500-READ-AUTH-SUMMRY`, with the `9500-LOG-ERROR` records they raise;
 //! 3. [`decide`] and [`reply_body`], `6000-MAKE-DECISION` and its reply text;
 //! 4. [`write_plan`], what `8400-UPDATE-SUMMARY` and `8500-INSERT-AUTH` write,
-//!    and [`write_failure_entry`] for a write that fails.
+//!    [`locked_summary_write`], the summary write derived again on the summary
+//!    the write unit of work holds under its lock, and [`write_failure_entry`]
+//!    for a write that fails.
 //!
 //! `5600-READ-PROFILE-DATA` is `CONTINUE` only and has no counterpart
 //! (P-COPAUA0C-034). PSB scheduling, the per-task queue open and close and the
@@ -49,14 +51,25 @@ use std::iter::repeat;
 use chrono::{DateTime, Utc};
 
 use crate::clock;
-use crate::entities::{
-    Account, CardXref, Customer, FraudFlag, MatchStatus, NewPendingAuthDetail,
-    PA_ACCOUNT_STATUS_OCCURS, PendingAuthSummary,
-};
+use crate::entities::{FraudFlag, MatchStatus, PA_ACCOUNT_STATUS_OCCURS};
 use crate::format;
 use crate::messages;
-use crate::numeric::{Alnum, AuthCount, CardNumber, Money, NumericCode};
-use crate::ports::{AccountReader, AuthorizationStore, CustomerReader, PortError, XrefReader};
+use crate::numeric::{Alnum, AuthCount, NumericCode};
+
+/// The records, keys, amounts and ports [`gather`], [`decide`] and
+/// [`write_plan`] work with, and the ones the messaging adapter's store
+/// implements those ports with, re-exported from [`crate::entities`],
+/// [`crate::numeric`] and [`crate::ports`] for the CP00 flow and the store it
+/// shares with CDRA.
+pub use crate::entities::{
+    Account, AuthFraud, CardXref, Customer, NewPendingAuthDetail, PendingAuthDetail,
+    PendingAuthSummary,
+};
+pub use crate::numeric::{AccountId, AuthId, CardNumber, CustomerId, Money};
+pub use crate::ports::{
+    AccountReader, AuthorizationStore, Browse, CustomerReader, Direction, PortError, PortResult,
+    XrefReader,
+};
 
 /// `WS-CICS-TRANID PIC X(04) VALUE 'CP00'`
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L34], which
@@ -1090,12 +1103,17 @@ async fn read_customer<S: CustomerReader>(
 /// (ACCNTID = XREF-ACCT-ID)`; `GE` is no summary, any other failure is `I002`,
 /// keyed by the never-set `PA-CARD-NUM` (E-25)
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L616-640].
+///
+/// The `GU` runs with the update intent of `PSBPAUTB` (`PROCOPT=AP`), so a
+/// summary a running purge holds is waited for and the decision reads what
+/// the purge left, as IMS program isolation orders `COPAUA0C` after the
+/// `CBPAUP0C` BMP: [`AuthorizationStore::read_summary_for_update`].
 async fn read_summary<S: AuthorizationStore>(
     store: &mut S,
     xref: &CardXref,
     context: &mut AuthContext,
 ) {
-    context.summary = match store.read_summary(xref.xref_acct_id).await {
+    context.summary = match store.read_summary_for_update(xref.xref_acct_id).await {
         Ok(summary) => Lookup::Found(summary),
         Err(PortError::NotFound) => Lookup::NotFound,
         Err(error) => {
@@ -1260,6 +1278,76 @@ pub fn write_plan(
     decision: &AuthDecision,
     now: DateTime<Utc>,
 ) -> Result<Option<AuthWritePlan>, Unproven> {
+    let Some(xref) = approval_to_write(context, decision)? else {
+        return Ok(None);
+    };
+    let found = match &context.summary {
+        Lookup::Found(summary) => Some(summary),
+        Lookup::NotFound | Lookup::Failed => None,
+    };
+    let summary = approved_summary(xref, context, found, decision)?;
+    let detail = new_detail(req, amount, xref, decision, now)?;
+    Ok(Some(AuthWritePlan { summary, detail }))
+}
+
+/// COPAUA0C 8400-UPDATE-SUMMARY — P-COPAUA0C-008, P-COPAUA0C-013,
+/// P-COPAUA0C-019: the summary write of [`write_plan`] derived again on
+/// `locked`, the summary the `8000-WRITE-AUTH-TO-DB` unit of work read under
+/// its lock (`AuthorizationStore::read_summary_for_update`)
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L801-834].
+///
+/// `COPAUA0C` replaces or inserts the summary its update-intent `GU` holds,
+/// and IMS program isolation keeps the `CBPAUP0C` BMP away from it until the
+/// task's syncpoint. The replacement writes in a unit of work of its own,
+/// once the reply is confirmed and the request acknowledged, so a purge can
+/// change or delete the summary between the read that decided the request
+/// and the write. The write is therefore derived on the summary as the write
+/// unit holds it, by the same `8400` statements:
+///
+/// - `Some(summary)`, the `GU` found it: [`SummaryWrite::Replace`] of that
+///   summary with the account's limits stored into `S9(09)V99`, the approved
+///   count up by one, the approved total and the credit balance up by the
+///   approved amount and the cash balance zero;
+/// - `None`, the `GE` of a summary that is gone or was never written:
+///   [`SummaryWrite::Insert`] of the `INITIALIZE`d summary of the
+///   cross-reference with the same updates.
+///
+/// The decision and the detail stay those of the reply already sent; only
+/// the summary write follows what the lock found.
+///
+/// # Errors
+///
+/// [`Unproven`] exactly where [`write_plan`] reports it for the summary of
+/// `context` and `decision`: `E-41` for a declined request, `E-25` for an
+/// account not found, and `E-78` when `locked` already holds 9999
+/// approvals. `Ok(None)` exactly when [`write_plan`] plans nothing for
+/// `context`: a card the cross-reference lacks, or a context with a critical
+/// record.
+pub fn locked_summary_write(
+    context: &AuthContext,
+    decision: &AuthDecision,
+    locked: Option<&PendingAuthSummary>,
+) -> Result<Option<SummaryWrite>, Unproven> {
+    let Some(xref) = approval_to_write(context, decision)? else {
+        return Ok(None);
+    };
+    approved_summary(xref, context, locked, decision).map(Some)
+}
+
+/// COPAUA0C 8000-WRITE-AUTH-TO-DB — P-COPAUA0C-028, P-COPAUA0C-035: the
+/// cross-reference whose account `8400` and `8500` write under, `None` when
+/// the task writes nothing: a card the cross-reference lacks
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L463-465], or a context
+/// whose critical record ended the task before `8000`.
+///
+/// # Errors
+///
+/// `E-41` for a declined request: `8400` adds the detail area's
+/// `PA-TRANSACTION-AMT` to the declined total before `8500` sets it.
+fn approval_to_write<'c>(
+    context: &'c AuthContext,
+    decision: &AuthDecision,
+) -> Result<Option<&'c CardXref>, Unproven> {
     let Lookup::Found(xref) = &context.xref else {
         return Ok(None);
     };
@@ -1269,9 +1357,7 @@ pub fn write_plan(
     if !decision.approved {
         return Err(DECLINED_UPDATE);
     }
-    let summary = approved_summary(xref, context, decision)?;
-    let detail = new_detail(req, amount, xref, decision, now)?;
-    Ok(Some(AuthWritePlan { summary, detail }))
+    Ok(Some(xref))
 }
 
 /// COPAUA0C 8400-UPDATE-SUMMARY — P-COPAUA0C-013: `INITIALIZE
@@ -1302,26 +1388,25 @@ fn initialized_summary(xref: &CardXref) -> PendingAuthSummary {
 /// COPAUA0C 8400-UPDATE-SUMMARY — P-COPAUA0C-013, P-COPAUA0C-019: the summary
 /// of an approved request [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L801-834].
 ///
-/// The summary read by `5500` is replaced; without one, a new summary is
-/// inserted. The credit and cash limits are moved from the account's
-/// `S9(10)V99` limits into `S9(09)V99`, which drops high-order digits; the
-/// approved count goes up by one, the approved total and the credit balance
-/// by the approved amount (stored into `S9(09)V99`), and the cash balance is
-/// set to zero.
+/// `found` is the summary the `GU` found (`FOUND-PAUT-SMRY-SEG`), `None` for
+/// its `GE`: the summary `5500` read for [`write_plan`], or the one the write
+/// unit holds for [`locked_summary_write`]. A summary found is replaced;
+/// without one, a new summary is inserted. The credit and cash limits are
+/// moved from the account's `S9(10)V99` limits into `S9(09)V99`, which drops
+/// high-order digits; the approved count goes up by one, the approved total
+/// and the credit balance by the approved amount (stored into `S9(09)V99`),
+/// and the cash balance is set to zero.
 fn approved_summary(
     xref: &CardXref,
     context: &AuthContext,
+    found: Option<&PendingAuthSummary>,
     decision: &AuthDecision,
 ) -> Result<SummaryWrite, Unproven> {
     let Lookup::Found(account) = &context.account else {
         return Err(NEVER_SET);
     };
-    let found = match &context.summary {
-        Lookup::Found(summary) => Some(summary.clone()),
-        Lookup::NotFound | Lookup::Failed => None,
-    };
     let exists = found.is_some();
-    let mut summary = found.unwrap_or_else(|| initialized_summary(xref));
+    let mut summary = found.cloned().unwrap_or_else(|| initialized_summary(xref));
     summary.pa_credit_limit = account.acct_credit_limit.store::<9>();
     summary.pa_cash_limit = account.acct_cash_credit_limit.store::<9>();
     // `ADD 1` without `ON SIZE ERROR` into `S9(04) COMP`: past 9999 the TRUNC
@@ -1432,9 +1517,9 @@ mod tests {
     use super::{
         AuthContext, AuthDecision, AuthRequest, ERR_APPLICATION, ERR_PROGRAM, ErrorLevel,
         ErrorLogEntry, ErrorSource, Lookup, REQUEST_BUFFER_LEN, SummaryWrite, WriteStep,
-        convert_request, decidable, decide, gather, oversize_request_entry, parse_amount,
-        parse_request, reply_body, reply_failure_entry, request_read_failure_entry, storable,
-        write_failure_entry, write_plan, xref_read_failure_entry,
+        convert_request, decidable, decide, gather, locked_summary_write, oversize_request_entry,
+        parse_amount, parse_request, reply_body, reply_failure_entry, request_read_failure_entry,
+        storable, write_failure_entry, write_plan, xref_read_failure_entry,
     };
     use crate::entities::{
         Account, CardXref, Customer, FraudFlag, MatchStatus, PA_ACCOUNT_STATUS_OCCURS,
@@ -1945,7 +2030,7 @@ mod tests {
                     "read_xref_by_card",
                     "read_account",
                     "read_customer",
-                    "read_summary"
+                    "read_summary_for_update"
                 ]
             );
         }
@@ -2098,7 +2183,7 @@ mod tests {
             ),
             ("read_account", "C002", ErrorSource::Cics, "00000000050", 2),
             ("read_customer", "C003", ErrorSource::Cics, "000000050", 3),
-            ("read_summary", "I002", ErrorSource::Ims, "", 4),
+            ("read_summary_for_update", "I002", ErrorSource::Ims, "", 4),
         ];
         let texts = [
             messages::FAILED_TO_READ_XREF_FILE,
@@ -2252,6 +2337,124 @@ mod tests {
             ..summary(100_000, 20_000)
         };
         assert_eq!(plan.summary, SummaryWrite::Replace(expected));
+    }
+
+    #[test]
+    fn the_write_unit_derives_the_summary_write_again_on_the_summary_it_locked() {
+        // P-COPAUA0C-008, P-COPAUA0C-013, P-COPAUA0C-019, E-78: 5500 decided
+        // 300.00 on a summary of 2 approvals; under the write unit's lock the
+        // summary holds 4, or a purge deleted it, and 8400 applies to that.
+        let mut store = fixture_store().with_summary(summary(100_000, 20_000));
+        let body = request_text(FIXTURE_CARD, "300.00", "TXN000000000001");
+        let (request, amount, context, decision) = authorize(&mut store, &body);
+        let plan = write_plan(&request, amount, &context, &decision, at(PINNED))
+            .expect("a pinned plan")
+            .expect("a plan for a found card");
+        let SummaryWrite::Replace(stale) = &plan.summary else {
+            panic!("5500 found a summary: {plan:?}");
+        };
+        assert_eq!(
+            stale.pa_approved_auth_cnt.get(),
+            3,
+            "the plan of the 5500 read"
+        );
+
+        let fresh = PendingAuthSummary {
+            pa_approved_auth_cnt: AuthCount::new(4).expect("a count"),
+            pa_approved_auth_amt: cents(40_000),
+            ..summary(100_000, 40_000)
+        };
+        let replaced = PendingAuthSummary {
+            pa_credit_limit: cents(616_900),
+            pa_cash_limit: cents(458_700),
+            pa_credit_balance: cents(70_000),
+            pa_cash_balance: Money::ZERO,
+            pa_approved_auth_cnt: AuthCount::new(5).expect("a count"),
+            pa_approved_auth_amt: cents(70_000),
+            ..fresh.clone()
+        };
+        let inserted = PendingAuthSummary {
+            pa_acct_id: AccountId::new(50).expect("an account number"),
+            pa_cust_id: CustomerId::new(50).expect("a customer number"),
+            pa_auth_status: Alnum::spaces(),
+            pa_account_status: [Alnum::spaces(); PA_ACCOUNT_STATUS_OCCURS],
+            pa_credit_limit: cents(616_900),
+            pa_cash_limit: cents(458_700),
+            pa_credit_balance: cents(30_000),
+            pa_cash_balance: Money::ZERO,
+            pa_approved_auth_cnt: AuthCount::new(1).expect("a count"),
+            pa_declined_auth_cnt: AuthCount::ZERO,
+            pa_approved_auth_amt: cents(30_000),
+            pa_declined_auth_amt: Money::ZERO,
+        };
+        let at_9999 = PendingAuthSummary {
+            pa_approved_auth_cnt: AuthCount::new(9_999).expect("a count"),
+            ..fresh.clone()
+        };
+        let cases = [
+            (
+                "found",
+                Some(&fresh),
+                Ok(Some(SummaryWrite::Replace(replaced))),
+            ),
+            ("not found", None, Ok(Some(SummaryWrite::Insert(inserted)))),
+            ("9999 approvals", Some(&at_9999), Err("E-78")),
+        ];
+        for (label, locked, expected) in cases {
+            assert_eq!(
+                locked_summary_write(&context, &decision, locked)
+                    .map_err(|unproven| unproven.escalation_id),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_locked_summary_write_halts_and_plans_nothing_where_the_plan_does() {
+        // P-COPAUA0C-028 (E-41), E-25, P-COPAUA0C-008 (I002), P-COPAUA0C-026:
+        // whatever the lock finds, the write unit writes a summary only for
+        // the requests write_plan plans one for.
+        let no_account = FakeStore::default()
+            .with_xref(fixture_xref())
+            .with_customer(fixture_customer())
+            .with_summary(summary(100_000, 0));
+        let mut failing = fixture_store();
+        failing.fail_next(
+            "read_summary_for_update",
+            PortError::Unavailable("store down".to_owned()),
+        );
+        let found = request_text(FIXTURE_CARD, "100.00", "TXN000000000001");
+        let cases = [
+            (
+                fixture_store(),
+                request_text(FIXTURE_CARD, "5677.01", "TXN000000000001"),
+                Err("E-41"),
+            ),
+            (no_account, found.clone(), Err("E-25")),
+            (failing, found, Ok(None)),
+            (
+                fixture_store(),
+                request_text(UNKNOWN_CARD, "100.00", "TXN000000000002"),
+                Ok(None),
+            ),
+        ];
+        for (mut store, body, expected) in cases {
+            let (request, amount, context, decision) = authorize(&mut store, &body);
+            let planned = write_plan(&request, amount, &context, &decision, at(PINNED))
+                .map(|plan| plan.map(|_| ()))
+                .map_err(|unproven| unproven.escalation_id);
+            assert_eq!(planned, expected, "{body}");
+            for locked in [None, Some(&summary(100_000, 0))] {
+                assert_eq!(
+                    locked_summary_write(&context, &decision, locked)
+                        .map(|write| write.map(|_| ()))
+                        .map_err(|unproven| unproven.escalation_id),
+                    expected,
+                    "{body} with {locked:?}"
+                );
+            }
+        }
     }
 
     #[test]

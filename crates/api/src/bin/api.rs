@@ -55,7 +55,7 @@ use std::fmt::Display;
 use std::process::ExitCode;
 
 use carddemo_api::{PreparedState, app};
-use carddemo_persistence::connect;
+use carddemo_persistence::tx::connect;
 use carddemo_runtime::config::Settings;
 use carddemo_runtime::telemetry;
 use tokio::net::TcpListener;

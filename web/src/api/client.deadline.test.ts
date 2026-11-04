@@ -68,6 +68,83 @@ const STALLS = [
   ["a body that never ends", stalledBody],
 ] as const;
 
+const NETWORK_FAILURE = new TypeError("network error");
+
+// The status line and the start of the body arrive, then the connection
+// drops.
+const droppedBody: Network = async () => {
+  let started = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(stream) {
+      if (!started) {
+        started = true;
+        stream.enqueue(new TextEncoder().encode('{"acct_id":'));
+        return;
+      }
+      stream.error(NETWORK_FAILURE);
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+};
+
+const ACCOUNT_JSON = JSON.stringify(ACCOUNT_BODY);
+
+const NOT_FOUND_BODY = {
+  code: "NOT_FOUND",
+  message: "Account ID NOT found...",
+  fields: [],
+};
+
+// Answers that end, each read by openapi-fetch its own way, and one it never
+// reads: the status, the success body and the error body each yields.
+const COMPLETE = [
+  [
+    "a JSON body with its Content-Length, read by response.json()",
+    () =>
+      new Response(ACCOUNT_JSON, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(
+            new TextEncoder().encode(ACCOUNT_JSON).byteLength,
+          ),
+        },
+      }),
+    { status: 200, data: ACCOUNT_BODY, error: undefined },
+  ],
+  [
+    "a JSON body without a Content-Length, read by response.text()",
+    () =>
+      new Response(ACCOUNT_JSON, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    { status: 200, data: ACCOUNT_BODY, error: undefined },
+  ],
+  [
+    "an error body, read by response.text()",
+    () =>
+      new Response(JSON.stringify(NOT_FOUND_BODY), {
+        status: 404,
+        statusText: "Not Found",
+        headers: { "Content-Type": "application/json" },
+      }),
+    { status: 404, data: undefined, error: NOT_FOUND_BODY },
+  ],
+  [
+    "an empty 200 with Content-Length 0, never read",
+    () =>
+      new Response("", {
+        status: 200,
+        headers: { "Content-Length": "0" },
+      }),
+    { status: 200, data: undefined, error: undefined },
+  ],
+] as const;
+
 // A read, and a write that must never be sent twice.
 const CALLS = [
   [
@@ -187,6 +264,59 @@ describe("a call whose signal is aborted before it starts", () => {
   });
 });
 
+describe("an answer whose body fails mid-stream", () => {
+  it("rejects with the network error and leaves no deadline armed", async () => {
+    network.mockImplementation(droppedBody);
+    const outcome = track(
+      api.GET("/accounts/{id}", { params: { path: { id: ACCOUNT_ID } } }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(outcome.error).toBe(NETWORK_FAILURE);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(5 * REQUEST_TIMEOUT_MS);
+    const [, init] = network.mock.calls[0];
+    expect(init?.signal?.aborted).toBe(false);
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a body its reader cancels", () => {
+  it("disarms the deadline and passes the reason on to the network", async () => {
+    const reason = new Error("Screen left");
+    let cancelledWith: unknown;
+    network.mockImplementation(async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(stream) {
+          stream.enqueue(new TextEncoder().encode('{"acct_id":'));
+        },
+        cancel(cancelReason: unknown) {
+          cancelledWith = cancelReason;
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const { data } = await api.GET("/accounts/{id}", {
+      params: { path: { id: ACCOUNT_ID } },
+      parseAs: "stream",
+    });
+    expect(vi.getTimerCount()).toBe(1);
+
+    await data?.cancel(reason);
+
+    expect(cancelledWith).toBe(reason);
+    expect(vi.getTimerCount()).toBe(0);
+    const [, init] = network.mock.calls[0];
+    await vi.advanceTimersByTimeAsync(5 * REQUEST_TIMEOUT_MS);
+    expect(init?.signal?.aborted).toBe(false);
+  });
+});
+
 describe("a complete answer", () => {
   let seen: Request | undefined;
   const recorder: Middleware = {
@@ -228,4 +358,35 @@ describe("a complete answer", () => {
     await vi.advanceTimersByTimeAsync(5 * REQUEST_TIMEOUT_MS);
     expect(network).toHaveBeenCalledTimes(1);
   });
+
+  it.each(COMPLETE)(
+    "disarms the deadline and the caller's abort once the answer ends: %s",
+    async (_answer, answer, expected) => {
+      let answered = new Response();
+      network.mockImplementation(async () => {
+        answered = answer();
+        return answered;
+      });
+      const caller = new AbortController();
+
+      const result = await api.GET("/accounts/{id}", {
+        params: { path: { id: ACCOUNT_ID } },
+        signal: caller.signal,
+      });
+
+      expect(result.response.status).toBe(expected.status);
+      expect(result.data).toEqual(expected.data);
+      expect(result.error).toEqual(expected.error);
+      expect(result.response.statusText).toBe(answered.statusText);
+      expect([...result.response.headers]).toEqual([...answered.headers]);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const [, init] = network.mock.calls[0];
+      await vi.advanceTimersByTimeAsync(5 * REQUEST_TIMEOUT_MS);
+      expect(init?.signal?.aborted).toBe(false);
+      caller.abort();
+      expect(init?.signal?.aborted).toBe(false);
+      expect(network).toHaveBeenCalledTimes(1);
+    },
+  );
 });

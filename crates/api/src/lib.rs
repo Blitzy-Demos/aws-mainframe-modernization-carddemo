@@ -100,7 +100,10 @@ use tracing::{Level, Span};
 /// does not deserialize, never reaches its handler, so the request span
 /// records the handler's `transaction` and `outcome` itself, through
 /// `record_refusal`, with the `user_id` of its token once that token has
-/// verified. Both the span and the event are at INFO, not
+/// verified. A request whose verified token's user cannot be read is
+/// answered 500 before its handler too, and recorded the same way through
+/// `record_failure`, with that token's `user_id`. Both the span and the
+/// event are at INFO, not
 /// `tower-http`'s default DEBUG, because the default `RUST_LOG=info` filter
 /// would otherwise drop them, and with them the request span every API write
 /// must emit as a JSON line through `carddemo_runtime::telemetry`. Neither
@@ -185,9 +188,11 @@ const OTHER_METHOD: &str = "_OTHER";
 ///
 /// It also declares `transaction`, `user_id` and `outcome`, empty. They are
 /// recorded only by [`record_refusal`], for a request an extractor refuses
-/// before its handler span opens, and `user_id` only when the request's token
-/// verified before the refusal. A field never recorded is not exported, so
-/// the span of every other request carries the three fields above only.
+/// before its handler span opens, and by [`record_failure`], for one an
+/// extractor answers with a 5xx status then. `user_id` is recorded only when
+/// the request's token verified before the refusal or the failure. A field
+/// never recorded is not exported, so the span of every other request
+/// carries the three fields above only.
 ///
 /// The URI is never recorded: its path holds the resource keys, card numbers
 /// among them, and its query any text at all, before any authentication or
@@ -242,14 +247,17 @@ const OUTCOME_FAILED: &str = "failed";
 /// Records on the current span, as [`record_refusal`] does, that an extractor
 /// answered the request with a 5xx status before its handler span opened:
 /// [`auth::AuthUser`]'s read of the token's user failed, or its unit of work
-/// could not be opened or rolled back. `outcome` is [`OUTCOME_FAILED`] and no
-/// `user_id` is recorded, because the user was not confirmed.
+/// could not be opened or rolled back. `outcome` is [`OUTCOME_FAILED`] and
+/// `user_id` is `user_id`, the `sub` of the request's verified token, so the
+/// 500 names the user it was answered to. The token's signature is verified
+/// by then, so the value is a claim signed with the server's key, never a
+/// path key or other text the client wrote.
 ///
 /// It is recorded before the failure's detail is logged, so that event
 /// carries it in its span context. A rollback that fails after a refusal was
 /// recorded records `failed` over `rejected`, the 500 being the answer.
-pub(crate) fn record_failure(transaction: Option<&'static str>) {
-    record_unanswered(transaction, None, OUTCOME_FAILED);
+pub(crate) fn record_failure(transaction: Option<&'static str>, user_id: &str) {
+    record_unanswered(transaction, Some(user_id), OUTCOME_FAILED);
 }
 
 /// Records `transaction` and `user_id`, when given, and `outcome` on the

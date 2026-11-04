@@ -539,6 +539,12 @@ function AuthorizationResults({
     );
   }
 
+  // The list is busy while any read of the page shown is outstanding, so held
+  // rows are never presented as its result: a new page held over the previous
+  // one (placeholder data, kept too while that read waits offline), a
+  // same-account Search reading the first page again, or a page already read,
+  // shown from the cache and read again when Previous or Next returns to it.
+  const reading = isFetching || isPlaceholderData;
   const prevKey = data.prev_key;
   const nextKey = data.next_key;
   return (
@@ -561,7 +567,7 @@ function AuthorizationResults({
         }}
         emptyMessage={data.message}
         caption="Pending authorizations"
-        loading={isPlaceholderData}
+        loading={reading}
       />
     </>
   );

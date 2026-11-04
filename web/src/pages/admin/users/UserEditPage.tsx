@@ -10,8 +10,9 @@
 //   read-only. A route without the parameter goes back to the list.
 // - The keys are the map's controls: PF5 the form's submit "Save"
 //   (F-COUSR02-004); PF3 "Save and exit", the same save and then the list
-//   whatever its outcome, as COUSR02C XCTLs back after UPDATE-USER-INFO
-//   (F-COUSR02-002); PF4 "Reset" (F-COUSR02-003); PF12 "Cancel", which leaves
+//   whatever its outcome, input the schema rejects included, which is not
+//   sent, as COUSR02C XCTLs back after UPDATE-USER-INFO (F-COUSR02-002,
+//   P-COUSR02C-008); PF4 "Reset" (F-COUSR02-003); PF12 "Cancel", which leaves
 //   without a request (F-COUSR02-005). The map targets the list from both exits.
 // - The current password is never shown, since only its argon2 hash is stored
 //   (E-21). The password field starts empty and is disabled until "Change
@@ -324,9 +325,18 @@ function UserEditFormCard({
   const submit = form.handleSubmit((values) => {
     save(values, false);
   });
-  const submitAndExit = form.handleSubmit((values) => {
-    save(values, true);
-  });
+
+  // PF3 leaves for the list whatever the outcome (P-COUSR02C-008). Input the
+  // schema rejects is not sent, and the list replaces the screen that marks
+  // it, as the XCTL replaces the one UPDATE-USER-INFO sent.
+  const submitAndExit = form.handleSubmit(
+    (values) => {
+      save(values, true);
+    },
+    () => {
+      exitToList();
+    },
+  );
 
   // CLEAR-CURRENT-SCREEN: every input blank, the cursor on the user ID. The
   // field refs are kept so the focus can move before the form re-renders.

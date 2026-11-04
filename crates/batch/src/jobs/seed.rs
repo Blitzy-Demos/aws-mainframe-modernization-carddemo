@@ -16,8 +16,8 @@
 
 use std::path::Path;
 
-use carddemo_persistence::Db;
 use carddemo_persistence::seed::{self, SeedMode, SeedReport, SeedSources};
+use carddemo_persistence::tx::Db;
 use carddemo_runtime::config::Settings;
 use tracing::Span;
 

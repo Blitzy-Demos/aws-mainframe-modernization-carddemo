@@ -28,11 +28,10 @@ import {
 import { Link } from "react-router";
 import { Controller, useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import type { ColumnDef } from "@tanstack/react-table";
 
 import { useCards, type CardListParams } from "@/api/queries/cards";
 import type { components } from "@/api/schema";
-import { DataTable } from "@/components/data-table";
+import { DataTable, type DataTableProps } from "@/components/data-table";
 import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -137,7 +136,7 @@ function RowActions({
  * 'Active'), then the row actions that replace the 'Select' column. Values are
  * shown exactly as the server sent them.
  */
-function cardColumns(idPrefix: string): ColumnDef<CardSummary>[] {
+function cardColumns(idPrefix: string): DataTableProps<CardSummary>["columns"] {
   const cardCellId = (index: number): string => `${idPrefix}-card-${index}`;
   return [
     { accessorKey: "account_id", header: "Account Number" },

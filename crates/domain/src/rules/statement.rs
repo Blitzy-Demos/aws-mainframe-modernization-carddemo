@@ -28,14 +28,21 @@
 //! [`crate::format`]; this module decides which lines are written, in which
 //! order, and with which field contents.
 
-use crate::entities::{Account, CardXref, Customer, Transaction};
 use crate::format::{self, HtmlFixedLine};
 use crate::messages::{
     ABENDING_PROGRAM, ERROR_READING_ACCTFILE, ERROR_READING_CUSTFILE, ERROR_READING_TRNXFILE,
     ERROR_READING_XREFFILE, RETURN_CODE,
 };
 use crate::numeric::{Alnum, CardNumber, Money, TranId};
-use crate::ports::{AccountReader, CustomerReader, PortError};
+use crate::ports::PortError;
+
+/// The records, keys and ports [`load_table`] and [`create_statements`] take,
+/// and those the CREASTMT job reads around them, re-exported from
+/// [`crate::entities`], [`crate::numeric`] and [`crate::ports`] for the batch
+/// adapter.
+pub use crate::entities::{Account, CardXref, Customer, Transaction};
+pub use crate::numeric::{AccountId, CustomerId};
+pub use crate::ports::{AccountReader, CustomerReader, TransactionReader, XrefReader};
 
 /// The card slots of `WS-CARD-TBL OCCURS 51 TIMES` and of its counters
 /// `WS-TRN-TBL-CTR OCCURS 51 TIMES` [app/cbl/CBSTM03A.CBL:L225-233]

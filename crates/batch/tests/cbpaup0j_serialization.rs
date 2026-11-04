@@ -14,6 +14,18 @@
 //! E-35). Without the exclusion the run reads the held details, waits on their row locks, and
 //! abends with `CBPAUP0C ABENDING ...` on a `DLET` that finds no row once the holder commits
 //! (P-CBPAUP0C-005, P-CBPAUP0C-009).
+//!
+//! A CP00 write and a running purge give a serial result too: `COPAUA0C` runs under the same
+//! PSB `PSBPAUTB` with `PROCOPT=AP` [app/app-authorization-ims-db2-mq/ims/PSBPAUTB.psb:L17]. A
+//! second holder does what CP00's `8000-WRITE-AUTH-TO-DB` unit of work does: it reads a summary
+//! under its lock (`read_summary_for_update`), replaces it with one more approval and inserts
+//! that approval's unexpired detail under it, without committing (P-COPAUA0C-008,
+//! P-COPAUA0C-013, P-COPAUA0C-014). The run's sweep reads `FOR UPDATE`, so it waits on that row
+//! lock in its summary read, as `pg_stat_activity` shows, and then purges the summary as CP00
+//! committed it: its in-memory count stays above zero, so the summary is kept with its stored
+//! count (E-35) and the new detail, and the counts the run reports are the rows it deleted.
+//! Without the lock the sweep judges the summary on the count before the write, deletes it, and
+//! the cascade takes the committed detail with it, uncounted (P-CBPAUP0C-004, P-CBPAUP0C-006).
 
 pub mod common;
 
@@ -56,11 +68,42 @@ const AUTHORIZATIONS: [(u64, i16, &[i32]); 3] = [
 /// The account whose details the holder deletes.
 const HELD_ACCOUNT: u64 = 1;
 
+/// The summaries the CP00 case commits, as [`AUTHORIZATIONS`] gives them, under the clock's day
+/// 22182:
+///
+/// - Account 1: two expired approvals under an approved count of 2. CP00's write unit raises
+///   the count to 3 and inserts an approval dated [`CP00_DAY`]. A sweep of the summary as it
+///   stood before that write counts 2 - 2 = 0 and deletes it, the new detail with it
+///   (P-CBPAUP0C-006); a sweep of the summary CP00 committed counts 3 - 2 = 1 and keeps it with
+///   its stored count 3 (E-35) and the new detail.
+/// - Account 2: one expired approval under an approved count of 1. The run deletes the detail,
+///   then the summary (P-CBPAUP0C-005, P-CBPAUP0C-007).
+const CP00_AUTHORIZATIONS: [(u64, i16, &[i32]); 2] = [(1, 2, &[22_180, 22_181]), (2, 1, &[22_181])];
+
+/// The account whose summary CP00's write unit holds.
+const CP00_ACCOUNT: u64 = 1;
+
+/// The `YYDDD` of the approval CP00 writes: the day after the clock's, which never expires at
+/// expiry 0 (P-CBPAUP0C-004).
+const CP00_DAY: i32 = 22_183;
+
 /// The sessions of the test database waiting on an advisory lock: the run behind the holder's
 /// purge exclusion.
 const ADVISORY_WAITS: &str = "SELECT count(*) FROM pg_stat_activity \
      WHERE datname = current_database() \
        AND wait_event_type = 'Lock' AND wait_event = 'advisory'";
+
+/// The sessions of the test database whose locking summary read waits on a lock: the sweep's
+/// `GN`, `SELECT … FOR UPDATE` of `pending_auth_summaries`, behind the row lock of CP00's write
+/// unit. The session asking is left out, since its own statement names the same words.
+const SWEEP_WAITS: &str = "SELECT count(*) FROM pg_stat_activity \
+     WHERE datname = current_database() AND pid <> pg_backend_pid() \
+       AND wait_event_type = 'Lock' \
+       AND query LIKE '%FROM pending_auth_summaries%FOR UPDATE%'";
+
+/// The rows of both pending-authorization tables, summaries and details together.
+const ROWS_SQL: &str = "SELECT (SELECT count(*) FROM pending_auth_summaries) \
+     + (SELECT count(*) FROM pending_auth_details)";
 
 /// Every summary's account and stored approved count, in account order.
 const SUMMARIES_SQL: &str =
@@ -138,13 +181,17 @@ fn detail(account_id: u64, yyddd: i32) -> NewPendingAuthDetail {
     }
 }
 
-/// Commits [`AUTHORIZATIONS`] through the `AuthorizationStore` port, each summary before its
-/// details as CP00 writes them (P-COPAUA0C-013, P-COPAUA0C-014), and returns the identities of
-/// the [`HELD_ACCOUNT`] details.
-async fn commit_authorizations(db: &Db) -> Vec<AuthId> {
+/// Commits `authorizations`, each as its account, approved count and detail dates, through the
+/// `AuthorizationStore` port, each summary before its details as CP00 writes them
+/// (P-COPAUA0C-013, P-COPAUA0C-014), and returns the identities of the `held_account` details.
+async fn commit_authorizations(
+    db: &Db,
+    authorizations: &[(u64, i16, &[i32])],
+    held_account: u64,
+) -> Vec<AuthId> {
     let mut uow = db.begin().await.expect("a unit of work");
     let mut held = Vec::new();
-    for (account_id, approved, dates) in AUTHORIZATIONS {
+    for &(account_id, approved, dates) in authorizations {
         uow.store()
             .insert_summary(summary(account_id, approved))
             .await
@@ -155,7 +202,7 @@ async fn commit_authorizations(db: &Db) -> Vec<AuthId> {
                 .insert_detail(detail(account_id, yyddd))
                 .await
                 .expect("the detail is inserted");
-            if account_id == HELD_ACCOUNT {
+            if account_id == held_account {
                 held.push(auth_id);
             }
         }
@@ -182,14 +229,44 @@ async fn holding_purge(db: &Db, held: &[AuthId]) -> UnitOfWork {
     uow
 }
 
-/// Whether a session of the test database waits on an advisory lock within [`WAIT_LIMIT`].
+/// CP00's `8000-WRITE-AUTH-TO-DB` unit of work as the run under test meets it: it has read the
+/// [`CP00_ACCOUNT`] summary under its lock, replaced it with one more approval of the new
+/// detail's amount and inserted that detail, dated [`CP00_DAY`], without committing
+/// (P-COPAUA0C-008, P-COPAUA0C-013, P-COPAUA0C-014). It holds the summary's row lock.
+async fn holding_cp00_write(db: &Db) -> UnitOfWork {
+    let mut uow = db.begin().await.expect("a unit of work");
+    let mut held = uow
+        .store()
+        .read_summary_for_update(account(CP00_ACCOUNT))
+        .await
+        .expect("CP00 reads the summary under its lock");
+    let approval = detail(CP00_ACCOUNT, CP00_DAY);
+    held.pa_approved_auth_cnt = held
+        .pa_approved_auth_cnt
+        .checked_increment()
+        .expect("a count below 9999");
+    held.pa_approved_auth_amt = (held.pa_approved_auth_amt + approval.pa_approved_amt).store::<9>();
+    held.pa_credit_balance = (held.pa_credit_balance + approval.pa_approved_amt).store::<9>();
+    held.pa_cash_balance = Money::ZERO;
+    uow.store()
+        .update_summary(held)
+        .await
+        .expect("CP00 replaces the summary");
+    uow.store()
+        .insert_detail(approval)
+        .await
+        .expect("CP00 inserts the detail");
+    uow
+}
+
+/// Whether a session of the test database is one `waits` counts within [`WAIT_LIMIT`].
 ///
 /// The pause between two looks blocks the calling thread: the run under observation is a
 /// child process driven from a thread of its own.
-fn advisory_wait_seen(stack: &TestStack) -> bool {
+fn lock_wait_seen(stack: &TestStack, waits: &str) -> bool {
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {
-        let rows = block_on(stack.fetch_text_rows(ADVISORY_WAITS));
+        let rows = block_on(stack.fetch_text_rows(waits));
         let waiting = rows.first().and_then(|row| row.first()).cloned().flatten();
         if waiting.is_some_and(|sessions| sessions != "0") {
             return true;
@@ -226,13 +303,13 @@ fn a_run_started_during_another_purge_waits_and_then_ends_normally() {
     // P-CBPAUP0C-002 to P-CBPAUP0C-007, P-CBPAUP0C-009, E-16, E-35.
     let h = Harness::new();
     let db = h.db();
-    let held = block_on(commit_authorizations(&db));
+    let held = block_on(commit_authorizations(&db, &AUTHORIZATIONS, HELD_ACCOUNT));
     assert_eq!(held.len(), 2, "account 1 has two details");
     let holder = block_on(holding_purge(&db, &held));
 
     let (waited, finished_while_held, output) = thread::scope(|scope| {
         let run = scope.spawn(|| h.run(&CBPAUP0J, Some(TRANREPT_CLOCK)));
-        let waited = advisory_wait_seen(h.stack());
+        let waited = lock_wait_seen(h.stack(), ADVISORY_WAITS);
         let finished_while_held = run.is_finished();
         // The holder ends before any assertion, so a failed one never leaves the run waiting
         // on a lock the test still holds.
@@ -288,5 +365,89 @@ fn a_run_started_during_another_purge_waits_and_then_ends_normally() {
         text_rows(&h, DETAILS_SQL),
         [["3", "77816"]],
         "only account 3's unexpired detail remains"
+    );
+}
+
+#[test]
+fn a_cp00_write_held_during_the_sweep_is_purged_as_cp00_committed_it() {
+    // P-CBPAUP0C-002 to P-CBPAUP0C-007, E-35; P-COPAUA0C-008, P-COPAUA0C-013, P-COPAUA0C-014.
+    let h = Harness::new();
+    let db = h.db();
+    let held = block_on(commit_authorizations(
+        &db,
+        &CP00_AUTHORIZATIONS,
+        CP00_ACCOUNT,
+    ));
+    assert_eq!(held.len(), 2, "account 1 has two expired details");
+    let holder = block_on(holding_cp00_write(&db));
+
+    let (waited, finished_while_held, output) = thread::scope(|scope| {
+        let run = scope.spawn(|| h.run(&CBPAUP0J, Some(TRANREPT_CLOCK)));
+        let waited = lock_wait_seen(h.stack(), SWEEP_WAITS);
+        let finished_while_held = run.is_finished();
+        // The holder ends before any assertion, so a failed one never leaves the run waiting
+        // on a lock the test still holds.
+        block_on(holder.commit()).unwrap_or_else(|error| panic!("the CP00 commit: {error}"));
+        let output = run
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (waited, finished_while_held, output)
+    });
+
+    let stderr = lines(&output.stderr);
+    let stdout = lines(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the run behind CP00's write exits 0\n--- stderr ---\n{stderr:#?}\n--- stdout ---\n{stdout:#?}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "a normal end writes no stderr: {stderr:#?}"
+    );
+    assert!(
+        waited,
+        "the sweep's summary read never waited on CP00's row lock within {WAIT_LIMIT:?}"
+    );
+    assert!(
+        !finished_while_held,
+        "the run ended while CP00's write unit still held the summary"
+    );
+
+    // The counts and rows of a purge of the state CP00 committed: account 1 with count 3, its
+    // two expired details deleted, kept (3 - 2 > 0) with CP00's detail; account 2's detail and
+    // summary deleted.
+    assert!(
+        stdout.iter().any(|line| {
+            line.contains(r#""message":"expired pending authorizations purged""#)
+                && line.contains(r#""summaries_read":2"#)
+                && line.contains(r#""summaries_deleted":1"#)
+                && line.contains(r#""details_read":4"#)
+                && line.contains(r#""details_deleted":3"#)
+        }),
+        "the end-of-job counts are not those of the state CP00 committed: {stdout:#?}"
+    );
+    assert_eq!(
+        text_rows(&h, SUMMARIES_SQL),
+        [["1", "3"]],
+        "summary 1 stays with the count CP00 stored (E-35); summary 2 is deleted"
+    );
+    assert_eq!(
+        text_rows(&h, DETAILS_SQL),
+        [["1", "77816"]],
+        "only CP00's unexpired detail remains"
+    );
+    // Every row the run removed is one it counted: the summaries and details CP00's write left
+    // committed, less those remaining, are the one summary and three details deleted.
+    let committed: usize = CP00_AUTHORIZATIONS
+        .iter()
+        .map(|&(_, _, dates)| 1 + dates.len())
+        .sum::<usize>()
+        + 1;
+    let remaining: usize = text_rows(&h, ROWS_SQL)[0][0].parse().expect("a row count");
+    assert_eq!(
+        committed - remaining,
+        1 + 3,
+        "rows removed beyond the counted deletes"
     );
 }

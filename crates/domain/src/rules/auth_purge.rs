@@ -43,6 +43,10 @@ use crate::messages::{AUTH_SUMMARY_READ_FAILED, CBPAUP0C_ABENDING};
 use crate::numeric::{AccountId, AuthCount, AuthId, Overflow};
 use crate::ports::{AuthorizationStore, Browse, Direction, PortError};
 
+/// The fixed-width text the CBPAUP0J job keeps [`prm_info`] in, re-exported
+/// from [`crate::numeric`] for the batch adapter.
+pub use crate::numeric::Alnum;
+
 /// `PRM-INFO` [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L98-108]: the
 /// 17 bytes `ACCEPT PRM-INFO FROM SYSIN` fills.
 pub const PRM_INFO_LEN: usize = 17;

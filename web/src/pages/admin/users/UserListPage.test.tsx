@@ -191,7 +191,24 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+/** A promise and its resolver, so a test decides when an answer arrives. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+// While set, every request waits for it before the table answers, so a test
+// sees the page while a read is out and sets the answer that read gets before
+// releasing it. Each test starts with none.
+let hold: Promise<void> | null = null;
+
 const fetchMock = vi.fn(async (request: Request): Promise<Response> => {
+  if (hold !== null) {
+    await hold;
+  }
   const key = requestKey(request);
   const found = answers.get(key);
   if (found === undefined) {
@@ -233,6 +250,7 @@ let toastSuccess: MockInstance<typeof toast.success>;
 beforeEach(() => {
   answers = defaultAnswers();
   unmatched = [];
+  hold = null;
   fetchMock.mockClear();
   vi.stubGlobal("fetch", fetchMock);
   toastError = vi.spyOn(toast, "error");
@@ -249,13 +267,26 @@ afterEach(() => {
   expect(unmatched).toEqual([]);
 });
 
+function newQueryClient(): QueryClient {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+}
+
+// The page over a cache of its own.
+function renderPage() {
+  queryClient = newQueryClient();
+  return mountPage(queryClient);
+}
+
 // The page as App.tsx routes it, without RequireAdmin: the server's 403 is the
 // admin gate, and admin_gate.rs and admin-gate.spec.ts test it. The /admin
 // menu (PF3) and the CU02 edit route (selector U) are the page's link targets.
-function renderPage() {
-  queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
+// It reads `client`'s cache, so a later mount over the same client is a return
+// to the page that finds what the earlier one left there. `strict` mounts it
+// under StrictMode, as main.tsx mounts the app, which runs each mount effect
+// twice.
+function mountPage(client: QueryClient, strict = false) {
   const router = createMemoryRouter(
     [
       {
@@ -278,11 +309,12 @@ function renderPage() {
   );
   render(
     <ThemeProvider>
-      <QueryClientProvider client={queryClient}>
+      <QueryClientProvider client={client}>
         <RouterProvider router={router} />
       </QueryClientProvider>
       <Toaster />
     </ThemeProvider>,
+    { reactStrictMode: strict },
   );
   return { user: userEvent.setup() };
 }
@@ -561,6 +593,168 @@ describe("UserListPage server errors", () => {
         within(usersTable()).getByText(toastText).textContent,
       ).toBe(toastText);
       expect(listQueries().at(-1)?.get("start_key")).toBe(USER0003.user_id);
+    },
+  );
+
+  // The same request read again keeps the query's last page in its cache; a
+  // failure of that re-read must not leave the page shown as its answer.
+  it.each([
+    {
+      name: "a repeated Search from the top",
+      reread: async (user: ReturnType<typeof userEvent.setup>) => {
+        await user.click(screen.getByRole("button", { name: "Search" }));
+      },
+    },
+    {
+      name: "the re-read after a delete",
+      reread: async (user: ReturnType<typeof userEvent.setup>) => {
+        await user.click(
+          screen.getByRole("button", {
+            name: "Delete",
+            description: USER0001.user_id,
+          }),
+        );
+        const dialog = await screen.findByRole("alertdialog", {
+          name: "Delete User",
+        });
+        await user.click(
+          within(dialog).getByRole("button", { name: "Confirm" }),
+        );
+      },
+    },
+  ])(
+    "$name failing withholds the page it read before",
+    async ({ reread }) => {
+      const { user } = renderPage();
+      await firstPageShown();
+      expect(
+        screen.getByRole("button", { name: "Next" }).getAttribute(
+          "aria-disabled",
+        ),
+      ).toBeNull();
+
+      answer(`GET ${LIST_PATH}`, 500, LOOKUP_FAILED);
+      await reread(user);
+
+      const table = usersTable();
+      expect(
+        (await within(table).findByText(LOOKUP_FAILED.message)).textContent,
+      ).toBe(LOOKUP_FAILED.message);
+      expect(listQueries()).toHaveLength(2);
+      expect(listQueries()[1]?.toString()).toBe("");
+      for (const shown of FIRST_PAGE.items) {
+        expect(within(table).queryByText(shown.user_id)).toBeNull();
+      }
+      expect(within(table).queryByRole("link", { name: "Edit" })).toBeNull();
+      expect(within(table).queryByRole("button", { name: "Delete" })).toBeNull();
+      for (const control of ["Previous", "Next"]) {
+        expect(
+          screen
+            .queryAllByRole("button", { name: control })
+            .filter(
+              (button) => button.getAttribute("aria-disabled") !== "true",
+            ),
+        ).toEqual([]);
+      }
+      expect(toastError).toHaveBeenCalledWith(LOOKUP_FAILED.message);
+    },
+  );
+
+  // A return to the page and a repeated Search read a failed browse again
+  // while the query still holds that failure beside the page read before it.
+  // Until the re-read answers, the table is busy and shows neither the failure
+  // nor the old page, and nothing is toasted or set on USRIDIN. Its answer
+  // alone is then reported: the rows, with no toast and USRIDIN untouched,
+  // once the server has recovered; one new toast, set on USRIDIN, when it
+  // fails again. That failure carries a text of its own, so the toast names
+  // the read it reports. Every visit mounts under StrictMode, as main.tsx
+  // mounts the app, so a toast a mount effect repeats counts twice.
+  it.each([
+    { reread: "a return to the page", status: 200 },
+    { reread: "a return to the page", status: 500 },
+    { reread: "a repeated Search", status: 200 },
+    { reread: "a repeated Search", status: 500 },
+  ] as const)(
+    "$reread after a failed browse reports its own $status answer alone",
+    async ({ reread, status }) => {
+      queryClient = newQueryClient();
+      let { user } = mountPage(queryClient, true);
+      await firstPageShown();
+      answer(`GET ${LIST_PATH}`, 500, LOOKUP_FAILED);
+      await user.click(screen.getByRole("button", { name: "Search" }));
+      await within(usersTable()).findByText(LOOKUP_FAILED.message);
+      expect(toastError.mock.calls).toEqual([[LOOKUP_FAILED.message]]);
+
+      const readsBefore = listQueries().length;
+      const released = deferred<undefined>();
+      hold = released.promise;
+      if (reread === "a return to the page") {
+        cleanup();
+        ({ user } = mountPage(queryClient, true));
+      } else {
+        await user.click(screen.getByRole("button", { name: "Search" }));
+      }
+
+      await waitFor(() => {
+        expect(listQueries().length).toBeGreaterThan(readsBefore);
+      });
+      const busy = usersTable();
+      expect(busy.getAttribute("aria-busy")).toBe("true");
+      expect(within(busy).queryByText(LOOKUP_FAILED.message)).toBeNull();
+      for (const shown of FIRST_PAGE.items) {
+        expect(within(busy).queryByText(shown.user_id)).toBeNull();
+      }
+      for (const control of ["Previous", "Next"]) {
+        expect(
+          screen
+            .getByRole("button", { name: control })
+            .getAttribute("aria-disabled"),
+        ).toBe("true");
+      }
+      expect(toastError).toHaveBeenCalledTimes(1);
+      const input = startKeyInput();
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+      expect(document.activeElement).not.toBe(input);
+
+      const failedAgain = {
+        code: "UNEXPECTED",
+        message: "Read 2 failed",
+        fields: [{ field: USRIDIN, message: "Read 2 failed" }],
+      } satisfies ErrorBody;
+      answer(
+        `GET ${LIST_PATH}`,
+        status,
+        status === 200 ? FIRST_PAGE : failedAgain,
+      );
+      hold = null;
+      released.resolve(undefined);
+
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      if (status === 200) {
+        await firstPageShown();
+        expect(usersTable().hasAttribute("aria-busy")).toBe(false);
+        expect(input.getAttribute("aria-invalid")).toBe("false");
+        expect(fieldError(input)).toBeNull();
+        expect(document.activeElement).not.toBe(input);
+      } else {
+        const table = usersTable();
+        expect(
+          (await within(table).findByText(failedAgain.message)).textContent,
+        ).toBe(failedAgain.message);
+        for (const shown of FIRST_PAGE.items) {
+          expect(within(table).queryByText(shown.user_id)).toBeNull();
+        }
+        expect(input.getAttribute("aria-invalid")).toBe("true");
+        expect(fieldError(input)?.textContent).toBe(failedAgain.message);
+        await waitFor(() => {
+          expect(document.activeElement).toBe(input);
+        });
+      }
+      expect(toastError.mock.calls.slice(1)).toEqual(
+        status === 200 ? [] : [[failedAgain.message]],
+      );
     },
   );
 });

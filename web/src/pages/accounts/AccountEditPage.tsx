@@ -12,7 +12,8 @@
 //   too (3320-UNPROTECT-FEW-ATTRS leaves ACSTNUM and ACSCTRY protected), and
 //   all three travel back as fetched.
 // - ENTER's validation and the F5 write are one submit, "Save" (E-56).
-// - F12 "Cancel" re-reads the record and drops unsaved changes.
+// - F12 "Cancel" re-reads the record and drops unsaved changes. Save and
+//   Cancel take turns: neither acts while the other's request runs.
 // - F3 "Back" returns to the account view.
 // - COACTUP's legend offers no F4, so the page has no "Reset" control.
 import {
@@ -271,12 +272,18 @@ function FormSection({
   );
 }
 
+/** A failed save, and the account it was sent for. */
+type SaveFailure = { accountId: string; error: unknown };
+
 type AccountEditFormProps = {
   accountId: string;
   /** The record as last read or saved. */
   account: AccountResponse;
   /** Reads the record again: the reloaded record, or the cached one when the read fails. */
   reload: () => Promise<AccountResponse | undefined>;
+  /** A failed save not shown yet. */
+  failure: SaveFailure | null;
+  setFailure: (failure: SaveFailure | null) => void;
 };
 
 /** The COACTUP input fields of one fetched account, with Save and Cancel. */
@@ -284,6 +291,8 @@ function AccountEditForm({
   accountId,
   account,
   reload,
+  failure,
+  setFailure,
 }: AccountEditFormProps): JSX.Element {
   const form = useForm<AccountUpdateFormValues>({
     resolver: zodResolver(accountUpdateSchema),
@@ -291,24 +300,59 @@ function AccountEditForm({
   });
   const { control, reset } = form;
   const mutation = useAccountUpdateMutation(accountId);
+  // The record the form was last reset from.
+  const [formAccount, setFormAccount] = useState(account);
+  // Whether the form is on screen: a save can settle after it has left.
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   // A record that is not the one the form shows replaces the entries: the
   // reload after a 409 'Record changed by some one else. Please review'
   // brings its new values and token. A reload that returns identical data
   // keeps the same object (structural sharing), so the user's entries stay.
   useEffect(() => {
-    reset(toFormValues(account));
-  }, [account, reset]);
+    if (account !== formAccount) {
+      reset(toFormValues(account));
+      setFormAccount(account);
+    }
+  }, [account, formAccount, reset]);
 
-  // One save at a time, and no re-read while it runs. The ref closes the gap
-  // before `isPending` re-renders, so a second Enter cannot send a second PUT.
-  const saving = useRef(false);
-
-  const onSave = async (values: AccountUpdateFormValues): Promise<void> => {
-    if (saving.current) {
+  // A failed save marks its fields only once the form shows the record its
+  // reload brought, as COACTUPC redisplays the changed record with its
+  // message: a reset clears the errors and drops the inputs' registrations
+  // until they render again, so focus would find no input before it. A
+  // failure of another account, whose form the route replaced while the save
+  // ran, is still toasted.
+  useEffect(() => {
+    if (failure === null) {
       return;
     }
-    saving.current = true;
+    if (failure.accountId !== accountId) {
+      showApiError(failure.error);
+      setFailure(null);
+    } else if (account === formAccount) {
+      applyApiError(failure.error, form, accountUpdateBmsFieldMap);
+      setFailure(null);
+    }
+  }, [failure, accountId, account, formAccount, form, setFailure]);
+
+  // One request at a time, a save or Cancel's re-read: a read answered with
+  // the record as it stood before a save could otherwise land after it and
+  // bring back the old values and token. The ref closes the gap before the
+  // busy state re-renders, so a second Enter or click sends nothing.
+  const inFlight = useRef(false);
+  const [reading, setReading] = useState(false);
+
+  const onSave = async (values: AccountUpdateFormValues): Promise<void> => {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
     try {
       const response = await mutation.mutateAsync(
         toAccountUpdateRequest(values),
@@ -316,25 +360,41 @@ function AccountEditForm({
       showSuccess(response.message);
       reset(toFormValues(response.account));
     } catch (error) {
-      applyApiError(error, form, accountUpdateBmsFieldMap);
+      // Shown by the failure effect, or at once when the form has left.
+      if (mounted.current) {
+        setFailure({ accountId, error });
+      } else {
+        showApiError(error);
+      }
     } finally {
-      saving.current = false;
+      inFlight.current = false;
     }
   };
 
-  // F12: 9000-READ-ACCT reads the record again and the map is refilled.
+  // F12: 9000-READ-ACCT reads the record again and the map is refilled. The
+  // form is reset here, since an unchanged record keeps its object.
+  // `formAccount` is left to the record effect: the prop holds the earlier
+  // record until the page hears of the read, and the effect would reset the
+  // form back to it.
   const onCancel = async (): Promise<void> => {
-    if (saving.current) {
+    if (inFlight.current) {
       return;
     }
-    const reloaded = await reload();
-    reset(toFormValues(reloaded ?? account));
+    inFlight.current = true;
+    setReading(true);
+    try {
+      const reloaded = await reload();
+      reset(toFormValues(reloaded ?? account));
+    } finally {
+      inFlight.current = false;
+      setReading(false);
+    }
   };
 
   // aria-disabled rather than disabled: a focused button that becomes
   // disabled loses focus to the document, which would strand a keyboard user
-  // after Save; the guards above keep the inert buttons from acting.
-  const busy = mutation.isPending;
+  // after Save or Cancel; the guard above keeps the inert buttons from acting.
+  const busy = mutation.isPending || reading;
   const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
 
   return (
@@ -589,6 +649,11 @@ export default function AccountEditPage(): JSX.Element {
   const { accountId = "" } = useParams();
   const { data: account, error, refetch: reread } = useAccount(accountId);
   const loadMessage = useLoadErrorMessage(error);
+  // A failed save is held here rather than in the form. The save settles
+  // once its reload is in the cache, but TanStack Query tells this page about
+  // the new data only on a later timer task; a render of this page reads it
+  // at once, so the form gets the reloaded record with the failure.
+  const [failure, setFailure] = useState<SaveFailure | null>(null);
 
   let body: ReactNode = null;
   if (account !== undefined) {
@@ -598,6 +663,8 @@ export default function AccountEditPage(): JSX.Element {
         accountId={accountId}
         account={account}
         reload={async () => (await reread()).data}
+        failure={failure}
+        setFailure={setFailure}
       />
     );
   } else if (error !== null) {

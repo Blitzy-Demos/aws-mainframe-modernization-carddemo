@@ -44,7 +44,11 @@
 //! [`messages::UNEXPECTED_ERROR`]. The detail of a database, port or reward
 //! store failure goes to the log through `tracing`, never to the body, and a
 //! rule's `Unexpected` error is logged at ERROR with its code, message and
-//! fields in the span of the handler answering it.
+//! fields in the span of the handler answering it. An input class a rule holds
+//! at `halt` is answered through [`ApiError::halted`], whose one ERROR event
+//! also carries `cause` `halt` and the escalation ID that holds the class, the
+//! cause the answer's [`messages::UNEXPECTED_ERROR`] does not state. Every 500
+//! answering a rule's error is logged by exactly one event.
 //!
 //! # Extractors
 //!
@@ -94,11 +98,10 @@ use axum::http::header::WWW_AUTHENTICATE;
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use carddemo_domain::error::{DomainError, ErrorKind, FieldError};
+use carddemo_domain::error::DomainError;
 use carddemo_domain::messages;
-use carddemo_domain::ports::PortError;
-use carddemo_domain::rewards::RewardError;
-use carddemo_persistence::PersistenceError;
+use carddemo_domain::rules::{ErrorKind, FieldError, PortError, RewardError};
+use carddemo_persistence::tx::PersistenceError;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{DeserializeOwned, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -267,6 +270,50 @@ impl ApiError {
         Self::new(status_for(kind), kind.code(), message.to_owned(), fields)
     }
 
+    /// The answer to `err`, a rule's answer to an input class it holds at
+    /// `halt`, with `escalation_id`, the ID of the `docs/parity/escalations.md`
+    /// entry that holds it, for example `E-26`.
+    ///
+    /// The status, code, message and fields are those [`From<DomainError>`]
+    /// gives `err`, usually 500 with [`messages::UNEXPECTED_ERROR`] and no
+    /// fields; the escalation never reaches the body. The answer is logged by
+    /// one ERROR event, `unexpected failure answered`, inside the span of the
+    /// handler converting it, with the fields of the event [`From<DomainError>`]
+    /// writes (`code`, `reason`, `fields`) plus `cause` `halt` and
+    /// `escalation_id`, whatever `err`'s kind, because the answer never states
+    /// the halt's cause.
+    #[must_use]
+    pub fn halted(err: DomainError, escalation_id: &'static str) -> Self {
+        tracing::error!(
+            code = err.kind.code(),
+            reason = err.message.trim_end_matches(' '),
+            fields = field_names(&err.fields).as_str(),
+            cause = "halt",
+            escalation_id,
+            "unexpected failure answered"
+        );
+        Self::answer(err)
+    }
+
+    /// `err` answered with its kind's status and code, and its message and
+    /// fields unchanged, without a log event.
+    fn answer(err: DomainError) -> Self {
+        let DomainError {
+            kind,
+            message,
+            fields,
+            ..
+        } = err;
+        // The code is taken from the kind, as the status is, so the two can
+        // never disagree; `DomainError::code` holds the same text.
+        Self::new(
+            status_for(kind),
+            kind.code(),
+            message,
+            fields.into_iter().map(ErrorFieldBody::from).collect(),
+        )
+    }
+
     /// 400 for a request body, query or path that does not deserialize, with
     /// the extractor's rejection text as `message` and no fields.
     ///
@@ -306,34 +353,27 @@ impl ApiError {
 /// joined with commas). The message is a `carddemo_domain::messages` text the
 /// response body carries as well, never request input, so the event holds
 /// nothing the answer does not. Every other kind answers the request's own
-/// input and is not logged.
+/// input and is not logged. An input class held at `halt` is answered through
+/// [`ApiError::halted`] instead, which writes the one event of its answer.
 impl From<DomainError> for ApiError {
     fn from(err: DomainError) -> Self {
-        let DomainError {
-            kind,
-            message,
-            fields,
-            ..
-        } = err;
-        if kind == ErrorKind::Unexpected {
-            let field_names: Vec<&str> = fields.iter().map(|entry| entry.field).collect();
-            let field_names = field_names.join(",");
+        if err.kind == ErrorKind::Unexpected {
             tracing::error!(
-                code = kind.code(),
-                reason = message.trim_end_matches(' '),
-                fields = field_names.as_str(),
+                code = err.kind.code(),
+                reason = err.message.trim_end_matches(' '),
+                fields = field_names(&err.fields).as_str(),
                 "unexpected failure answered"
             );
         }
-        // The code is taken from the kind, as the status is, so the two can
-        // never disagree; `DomainError::code` holds the same text.
-        Self::new(
-            status_for(kind),
-            kind.code(),
-            message,
-            fields.into_iter().map(ErrorFieldBody::from).collect(),
-        )
+        Self::answer(err)
     }
+}
+
+/// The BMS names of `fields`, in order, joined with commas: the `fields` of
+/// an `unexpected failure answered` event.
+fn field_names(fields: &[FieldError]) -> String {
+    let names: Vec<&str> = fields.iter().map(|entry| entry.field).collect();
+    names.join(",")
 }
 
 impl From<PersistenceError> for ApiError {
@@ -906,10 +946,20 @@ mod tests {
     /// telemetry subscriber and its default filter `info`, with every JSON line
     /// the subscriber wrote: the event lines and the span line.
     fn converted_in_handler_span(error: DomainError) -> (ApiError, Vec<Value>) {
+        answered_in_handler_span("info", || ApiError::from(error))
+    }
+
+    /// The error `answer` builds inside a `CAUP` handler span under the API's
+    /// telemetry subscriber and the filter `directives`, with every JSON line
+    /// the subscriber wrote: the event lines and any span line.
+    fn answered_in_handler_span(
+        directives: &str,
+        answer: impl FnOnce() -> ApiError,
+    ) -> (ApiError, Vec<Value>) {
         let capture = Capture::default();
         let sink = capture.clone();
         let (subscriber, guard) =
-            carddemo_runtime::telemetry::subscriber_with_writer("api", "info", move || {
+            carddemo_runtime::telemetry::subscriber_with_writer("api", directives, move || {
                 sink.clone()
             })
             .expect("valid directives");
@@ -920,7 +970,7 @@ mod tests {
                 user_id = "ADMIN001",
                 account_id = "00000000001",
             )
-            .in_scope(|| ApiError::from(error))
+            .in_scope(answer)
         });
         guard.shutdown().expect("the tracer provider shuts down");
         let bytes = capture.0.lock().expect("capture buffer").clone();
@@ -1015,6 +1065,54 @@ mod tests {
                 "{reason}"
             );
             assert_eq!(span_status(&lines)["code"], "error", "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_halt_is_answered_unchanged_and_logged_once_with_its_escalation_in_its_handler_span() {
+        // The CAUP answer to a change held at the E-26 halt, under the default
+        // filter, which exports the handler span, and under `warn`, which does
+        // not: the event still carries the span's fields.
+        let expected = ApiError::unexpected();
+        for (directives, exported) in [("info", 1), ("warn", 0)] {
+            let (answered, lines) = answered_in_handler_span(directives, || {
+                ApiError::halted(DomainError::unexpected(messages::UNEXPECTED_ERROR), "E-26")
+            });
+            assert_eq!(answered.status(), expected.status(), "{directives}");
+            assert_eq!(answered.body(), expected.body(), "{directives}");
+            let events = events(&lines);
+            let [event] = events.as_slice() else {
+                panic!("{directives}: one event expected, got {lines:?}");
+            };
+            assert_eq!(event["level"], "ERROR", "{directives}");
+            assert_eq!(event["target"], "carddemo_api::error", "{directives}");
+            assert_eq!(
+                event["fields"],
+                json!({
+                    "message": "unexpected failure answered",
+                    "code": "UNEXPECTED",
+                    "reason": messages::UNEXPECTED_ERROR,
+                    "fields": "",
+                    "cause": "halt",
+                    "escalation_id": "E-26",
+                }),
+                "{directives}"
+            );
+            assert_eq!(
+                event["span"],
+                json!({
+                    "name": "update_account",
+                    "transaction": "CAUP",
+                    "user_id": "ADMIN001",
+                    "account_id": "00000000001",
+                }),
+                "{directives}"
+            );
+            let spans: Vec<&Value> = lines.iter().filter(|line| line["type"] == "span").collect();
+            assert_eq!(spans.len(), exported, "{directives}: {lines:?}");
+            if let [span] = spans.as_slice() {
+                assert_eq!(span["status"]["code"], "error", "{directives}");
+            }
         }
     }
 

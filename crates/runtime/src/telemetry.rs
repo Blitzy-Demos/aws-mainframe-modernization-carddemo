@@ -4,9 +4,10 @@
 //!
 //! - log events, written by the `tracing-subscriber` JSON formatter with the
 //!   current span (`span`) and the list of entered spans (`spans`). An event
-//!   inside a span also carries that span's OpenTelemetry `trace_id` and
-//!   `span_id`, equal to the IDs of that span's line, so every event joins the
-//!   span it was emitted in; an event outside every span carries neither;
+//!   inside an exported span also carries that span's OpenTelemetry `trace_id`
+//!   and `span_id`, equal to the IDs of that span's line, so every such event
+//!   joins the span it was emitted in; an event outside every exported span
+//!   carries neither (see Filtering);
 //! - finished spans, which pass through `tracing-opentelemetry` into an
 //!   OpenTelemetry SDK tracer provider whose simple span processor hands each one
 //!   to [`JsonSpanExporter`], which writes it as one `"type":"span"` line.
@@ -17,13 +18,28 @@
 //!
 //! # Filtering
 //!
-//! The filter directives (`RUST_LOG`, default `info`) gate events and spans alike:
-//! a span below the filter level is neither formatted nor exported. A span meant
-//! to reach the span lines under the default filter must be created at INFO level
-//! or above, for example with `tracing::info_span!`.
+//! The filter directives (`RUST_LOG`, default `info`) decide what each of the
+//! two writers writes, each through a filter of its own:
 //!
-//! A second, fixed filter drops two kinds of output of lapin, the AMQP client,
-//! whatever the directives say:
+//! - span lines: the spans the directives enable are exported, and no other.
+//!   A span meant to reach the span lines under the default filter must be
+//!   created at INFO level or above, for example with `tracing::info_span!`;
+//! - event lines: the events the directives enable are written, and no other.
+//!   The JSON formatter also keeps, whatever the directives say, every INFO,
+//!   WARN and ERROR span of a workspace library crate (a target starting with
+//!   `carddemo_`) as the context of the events inside it, for example the
+//!   API's request and handler spans with their `transaction`, `user_id` and
+//!   resource keys.
+//!
+//! Under directives that enable those spans, such as `info`, `debug` or
+//! `trace`, both writers see the same spans. Under `warn` or `error` they are
+//! not exported, and no INFO event is written, but a WARN or ERROR event
+//! inside one still carries it as `span` and `spans`, with its fields. Such a
+//! span writes no line of its own and has no OpenTelemetry IDs, so the event
+//! carries no `trace_id` or `span_id`.
+//!
+//! A further, fixed filter ahead of both drops two kinds of output of lapin,
+//! the AMQP client, whatever the directives say:
 //!
 //! - every TRACE-level span and event: there lapin writes every outgoing frame,
 //!   the one carrying the broker username and password included;
@@ -36,9 +52,10 @@
 //! lapin's other output at DEBUG level and above stays subject to the
 //! directives alone.
 //!
-//! Every span the filters enable is exported with its attributes: the tracer
-//! provider samples all spans and keeps the SDK's default span limits, whatever
-//! the `OTEL_TRACES_SAMPLER` and `OTEL_SPAN_*_COUNT_LIMIT` variables say.
+//! Every span the filters of the span lines enable is exported with its
+//! attributes: the tracer provider samples all spans and keeps the SDK's
+//! default span limits, whatever the `OTEL_TRACES_SAMPLER` and
+//! `OTEL_SPAN_*_COUNT_LIMIT` variables say.
 //!
 //! # Spans the consumers emit
 //!
@@ -78,13 +95,13 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{Sampler, SpanLimits, TracerProvider};
 use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_opentelemetry::OtelData;
-use tracing_subscriber::filter::{EnvFilter, ParseError, filter_fn};
+use tracing_subscriber::filter::{EnvFilter, FilterExt as _, ParseError, filter_fn};
 use tracing_subscriber::fmt::format::{
     Format, FormatEvent, FormatFields, Json, JsonFields, Writer,
 };
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::fmt::{self, FmtContext, MakeWriter};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer as _, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
 
@@ -134,18 +151,51 @@ fn is_in_module(target: &str, module: &str) -> bool {
 /// lapin's other output at DEBUG level and above carries neither credentials
 /// nor message bodies, so it is left to the filter directives.
 ///
-/// The predicate runs as a filter layer of its own, and the subscriber enables a
-/// span or event only when every filter layer does. No `RUST_LOG` directive can
-/// therefore re-enable this output, neither a target directive such as
-/// `lapin::returned_messages=warn` nor a span directive such as
-/// `[outer]=trace`, which enables every event inside `outer` whatever the target
-/// directives say. Targets are matched by module, as [`is_in_module`] describes.
+/// The predicate runs as a global filter layer, ahead of the filters of the
+/// two writers, and the subscriber enables a span or event only when this
+/// layer does and at least one writer's filter does. No `RUST_LOG` directive
+/// and no context span ([`is_context_span`]) can therefore re-enable this
+/// output, neither a target directive such as `lapin::returned_messages=warn`
+/// nor a span directive such as `[outer]=trace`, which enables every event
+/// inside `outer` whatever the target directives say. Targets are matched by
+/// module, as [`is_in_module`] describes.
 fn carries_no_sensitive_data(metadata: &Metadata<'_>) -> bool {
     let target = metadata.target();
     if is_in_module(target, LAPIN_RETURNED_MESSAGES_TARGET) {
         return false;
     }
     !is_in_module(target, LAPIN_TARGET) || *metadata.level() != Level::TRACE
+}
+
+/// The start of every target in a workspace library crate: the packages are
+/// named `carddemo-*`, so their crates, and the module paths that are their
+/// targets, are named `carddemo_*`.
+const WORKSPACE_CRATE_PREFIX: &str = "carddemo_";
+
+/// Whether `target` is in a workspace library crate: its crate, the first
+/// segment of the module path, starts with [`WORKSPACE_CRATE_PREFIX`]. The
+/// binaries' own crates (`api`, `batch`, `mq`, `openapi`) do not.
+fn is_in_workspace_crate(target: &str) -> bool {
+    target.starts_with(WORKSPACE_CRATE_PREFIX)
+}
+
+/// Whether a span is a context span, one the JSON formatter keeps as the
+/// context of the events inside it whatever the filter directives say: a span,
+/// never an event, at INFO level or above, of a workspace library crate
+/// ([`is_in_workspace_crate`]).
+///
+/// These are the spans that hold what an operation is and whom it serves: the
+/// API's request and handler spans with `transaction`, `user_id`, the
+/// resource keys and `outcome`, and the message spans of `mq`. Under
+/// directives above INFO, such as `warn`, a WARN or ERROR event inside one
+/// still carries it as `span` and `spans`. The predicate enables no event, so
+/// it adds no event line, and the JSON formatter writes no line for a span, so
+/// it adds no span line either. Its result depends on the metadata alone, so
+/// each callsite's interest is decided once and cached.
+fn is_context_span(metadata: &Metadata<'_>) -> bool {
+    metadata.is_span()
+        && *metadata.level() <= Level::INFO
+        && is_in_workspace_crate(metadata.target())
 }
 
 /// Failure to set up or shut down telemetry.
@@ -254,9 +304,11 @@ where
 /// trace ID and span ID ([`span_trace_ids`]), they become the last two keys of
 /// the line's object: `"trace_id"` as 32 and `"span_id"` as 16 lowercase
 /// hexadecimal digits, the IDs that span's own line carries. Otherwise the JSON
-/// formatter's line is written unchanged: for an event outside every span, and
-/// for one under a subscriber without the OpenTelemetry layer, such as the
-/// drop-time failure reporter of [`TelemetryGuard`].
+/// formatter's line is written unchanged: for an event outside every span, for
+/// one inside a context span the OpenTelemetry layer's filter did not enable
+/// (see [`subscriber_with_writer`]), and for one under a subscriber without the
+/// OpenTelemetry layer, such as the drop-time failure reporter of
+/// [`TelemetryGuard`].
 #[derive(Debug)]
 struct JsonWithTraceIds(Format<Json>);
 
@@ -322,22 +374,33 @@ fn span_trace_ids(otel: &OtelData) -> Option<(TraceId, SpanId)> {
 ///
 /// The layers, in order:
 ///
-/// 1. an `EnvFilter` parsed from `directives`, which gates events and spans for
-///    the layers after it;
-/// 2. a fixed filter that drops, for the layers after it and whatever
+/// 1. a fixed global filter that drops, for both layers after it and whatever
 ///    `directives` say, lapin's TRACE-level spans and events, whose outgoing
 ///    `connection.start-ok` frame holds the broker credentials, and every span
 ///    and event of `lapin::returned_messages`, whose WARN dump of a returned
 ///    message holds its whole body;
-/// 3. the `tracing-subscriber` JSON formatter, with the current span and the
+/// 2. the `tracing-subscriber` JSON formatter, with the current span and the
 ///    span list on every event line, that span's `trace_id` and `span_id` on an
-///    event inside one, and no ANSI colour codes;
-/// 4. the `tracing-opentelemetry` layer, on a tracer named `service_name` from a
+///    event inside one the OpenTelemetry layer exports, and no ANSI colour
+///    codes. Its own filter is an `EnvFilter` parsed from `directives` or the
+///    context-span rule: it writes the events the directives enable, and it
+///    keeps every INFO, WARN and ERROR span whose target starts with
+///    `carddemo_` as the context of the events inside it, so that under `warn`
+///    or `error` such an event still carries the span's fields;
+/// 3. the `tracing-opentelemetry` layer, on a tracer named `service_name` from a
 ///    tracer provider of its own whose simple span processor feeds a
 ///    [`JsonSpanExporter`] on `writer`, with `service_name` as the resource's
-///    `service.name`. The provider samples every span (`Sampler::AlwaysOn`)
-///    and keeps the SDK's default span limits (128 attributes, events and
-///    links per span), both set explicitly.
+///    `service.name`. Its own filter is a second `EnvFilter` parsed from
+///    `directives`, so the span lines are the spans the directives enable. The
+///    provider samples every span (`Sampler::AlwaysOn`) and keeps the SDK's
+///    default span limits (128 attributes, events and links per span), both
+///    set explicitly.
+///
+/// A span the directives enable reaches both layers, so its events carry its
+/// IDs, as under `info`, `debug` and `trace`. A context span the directives
+/// do not enable reaches the JSON formatter alone: it has no span line and no
+/// OpenTelemetry IDs, and the events inside it carry no `trace_id` or
+/// `span_id`.
 ///
 /// No global state is touched: the tracer provider is not registered globally,
 /// so tests can build several subscribers side by side and install each one
@@ -368,7 +431,10 @@ pub fn subscriber_with_writer<W>(
 where
     W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
 {
-    let filter = EnvFilter::try_new(directives)?;
+    // `EnvFilter` is not `Clone`, so each layer's filter parses the directives.
+    let event_filter = EnvFilter::try_new(directives)?
+        .or(filter_fn(is_context_span).with_max_level_hint(Level::INFO));
+    let span_filter = EnvFilter::try_new(directives)?;
     let provider = TracerProvider::builder()
         .with_sampler(Sampler::AlwaysOn)
         .with_span_limits(SpanLimits::default())
@@ -384,10 +450,13 @@ where
         writer: Some(BoxMakeWriter::new(writer.clone())),
     };
     let subscriber = tracing_subscriber::registry()
-        .with(filter)
         .with(filter_fn(carries_no_sensitive_data))
-        .with(json_log_layer(writer))
-        .with(tracing_opentelemetry::layer().with_tracer(tracer));
+        .with(json_log_layer(writer).with_filter(event_filter))
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(span_filter),
+        );
     Ok((subscriber, guard))
 }
 
@@ -601,6 +670,60 @@ mod tests {
             .filter_map(|line| line["fields"]["message"].as_str())
             .collect();
         assert_eq!(messages, ["inside hidden"], "{lines:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn events_above_info_keep_the_context_of_their_application_spans() -> TestResult {
+        let capture = Capture::default();
+        let (subscriber, guard) = subscriber_with_writer("test-svc", "warn", capture.clone())?;
+        tracing::subscriber::with_default(subscriber, || {
+            // Neither another crate's INFO span nor an application DEBUG span
+            // is a context span.
+            let foreign = tracing::info_span!(target: "tower_http::trace", "foreign");
+            let _foreign = foreign.enter();
+            let request = tracing::info_span!("request", route = "/accounts/{id}");
+            let _request = request.enter();
+            let handler = tracing::info_span!(
+                "update_account",
+                transaction = "CAUP",
+                account_id = "00000000001",
+                outcome = tracing::field::Empty,
+            );
+            let _handler = handler.enter();
+            handler.record("outcome", "failed");
+            tracing::debug_span!("detail").in_scope(|| {
+                tracing::info!("below the directives");
+                tracing::error!(code = "UNEXPECTED", "unexpected failure answered");
+            });
+        });
+        guard.shutdown()?;
+
+        let lines = capture.json_lines()?;
+        assert!(span_lines(&lines).is_empty(), "{lines:?}");
+        let [event] = &lines[..] else {
+            return Err(format!("expected exactly the ERROR event line: {lines:?}").into());
+        };
+        assert_eq!(event["level"], "ERROR", "{event}");
+        assert_eq!(
+            event["fields"],
+            serde_json::json!({"message": "unexpected failure answered", "code": "UNEXPECTED"}),
+            "{event}"
+        );
+        let handler = serde_json::json!({
+            "name": "update_account",
+            "transaction": "CAUP",
+            "account_id": "00000000001",
+            "outcome": "failed",
+        });
+        assert_eq!(event["span"], handler, "{event}");
+        assert_eq!(
+            event["spans"],
+            serde_json::json!([{"name": "request", "route": "/accounts/{id}"}, handler]),
+            "{event}"
+        );
+        assert!(event.get("trace_id").is_none(), "{event}");
+        assert!(event.get("span_id").is_none(), "{event}");
         Ok(())
     }
 

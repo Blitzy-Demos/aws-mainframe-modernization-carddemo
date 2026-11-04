@@ -10,11 +10,12 @@
  */
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
-import { api, unwrapWithStatus } from "@/api/client";
+import { ApiError, api, unwrapWithStatus } from "@/api/client";
 import type { components } from "@/api/schema";
+import { isSpacesOrLowValues } from "@/schemas/primitives";
 
 import { accountKeys } from "./accounts";
-import { transactionKeys } from "./transactions";
+import { listsShowingAccount, transactionKeys } from "./transactions";
 
 /** The key root of the bill-payment mutation. */
 export const paymentKeys = { all: ["payments"] } as const;
@@ -32,6 +33,53 @@ export type PaymentBody = components["schemas"]["PaymentRequest"];
  */
 export type PaymentResult = components["schemas"]["PaymentResponse"];
 
+// The status of a completed payment: the transaction written and the balance
+// reduced.
+const CREATED = 201;
+
+// The confirmations COBIL00C pays on. A blank one only asks
+// (V-COBIL00C-008) and `N` or `n` cancels (V-COBIL00C-002); any other value
+// is refused (V-COBIL00C-003). None of them reaches a write.
+const PAYING_CONFIRMATIONS: readonly string[] = ["Y", "y"];
+
+// The failures of a confirmed payment that can follow a persisted write
+// (E-19): 404 'Account ID NOT found...' when the account rewrite finds no
+// record after the transaction write (V-COBIL00C-016) and 409 'Tran ID
+// already exist...' with the balance still rewritten (V-COBIL00C-014). A
+// 5xx can too: 'Unable to Add Bill pay Transaction...' (V-COBIL00C-015) and
+// 'Unable to Update Account...' (V-COBIL00C-017) are among them. Every other
+// 4xx refuses the request before any write.
+const FAILURES_AFTER_A_WRITE: readonly number[] = [404, 409];
+
+/**
+ * Whether a settled CB00 request may have changed a record. Only a confirmed
+ * one can. Of its answers, a 201 wrote, and so may have:
+ * - a 201 whose body did not arrive, an ApiError with that status;
+ * - a failure in FAILURES_AFTER_A_WRITE or any 5xx;
+ * - a request without a complete answer (the client's RequestTimeoutError, a
+ *   network failure), which may have reached the server.
+ */
+function mayHaveWritten(
+  confirm: PaymentBody["confirm"],
+  result: { status: number } | undefined,
+  error: Error | null,
+): boolean {
+  if (typeof confirm !== "string" || !PAYING_CONFIRMATIONS.includes(confirm)) {
+    return false;
+  }
+  if (result !== undefined) {
+    return result.status === CREATED;
+  }
+  if (error instanceof ApiError) {
+    return (
+      error.status === CREATED ||
+      FAILURES_AFTER_A_WRITE.includes(error.status) ||
+      error.status >= 500
+    );
+  }
+  return true;
+}
+
 /**
  * Pays an account's balance in full (CB00). The body is sent as the page
  * built it, `confirm` included as entered (`Y`, `N` or blank), and the answer
@@ -47,15 +95,23 @@ export type PaymentResult = components["schemas"]["PaymentResponse"];
  * 'Tran ID already exist...', 500 'Unable to Add Bill pay Transaction...' or
  * 'Unable to Update Account...'.
  *
- * The caches are refreshed once the request settles, failures included:
- * COBIL00C rewrites the balance whatever the transaction write answered, and
- * the server runs each write under its own savepoint (E-19), so a 500 can
- * follow a persisted write. The entered account's record and every
- * transaction query are therefore reloaded whatever the answer; the account
- * only when an account ID was sent, since an empty one names no cache entry.
- * Reward caches are left alone, because a bill payment accrues no points:
- * only CT02 and POSTTRAN call the reward engine. The refresh is returned, so
- * the mutation settles once the active queries have reloaded.
+ * The caches are refreshed once a request that may have written settles
+ * (`mayHaveWritten`), failures included: COBIL00C rewrites the balance
+ * whatever the transaction write answered, and the server runs each write
+ * under its own savepoint (E-19), so a 404, 409 or 500 can follow a persisted
+ * write. What is reloaded then:
+ * - the paid account's record;
+ * - the transaction lists that can show the payment's transaction
+ *   (`listsShowingAccount`);
+ * - the new TRAN-ID's detail, once a 201 names it.
+ *
+ * Other transactions' details are left alone, since an insert changes no
+ * other record, and so are reward caches, because a bill payment accrues no
+ * points: only CT02 and POSTTRAN call the reward engine. A request that
+ * cannot have written refreshes nothing: the 200 prompt, the `N` cancel, a
+ * blank account ID and every refusal before the writes. The refresh is
+ * returned, so the mutation settles once the active queries it reaches have
+ * reloaded.
  */
 export function usePaymentMutation() {
   const queryClient = useQueryClient();
@@ -65,15 +121,30 @@ export function usePaymentMutation() {
       body: PaymentBody,
     ): Promise<{ data: PaymentResult; status: number }> =>
       unwrapWithStatus(await api.POST("/payments", { body })),
-    onSettled: (_data, _error, variables) => {
-      const accountId = variables.account_id;
+    onSettled: (result, error, variables) => {
+      // An answer names the account as its 11 digits; a failure leaves the
+      // account ID as entered.
+      const accountId = result?.data.account_id ?? variables.account_id;
+      // A blank account ID is refused before any read (V-COBIL00C-001).
+      if (
+        typeof accountId !== "string" ||
+        isSpacesOrLowValues(accountId) ||
+        !mayHaveWritten(variables.confirm, result, error)
+      ) {
+        return undefined;
+      }
+      const tranId = result?.data.tran_id;
       return Promise.all([
-        typeof accountId === "string" && accountId !== ""
-          ? queryClient.invalidateQueries({
-              queryKey: accountKeys.detail(accountId),
-            })
-          : undefined,
-        queryClient.invalidateQueries({ queryKey: transactionKeys.all }),
+        queryClient.invalidateQueries({
+          queryKey: accountKeys.detail(accountId),
+        }),
+        queryClient.invalidateQueries(listsShowingAccount(accountId)),
+        tranId === undefined
+          ? undefined
+          : queryClient.invalidateQueries({
+              queryKey: transactionKeys.detail(tranId),
+              exact: true,
+            }),
       ]);
     },
   });

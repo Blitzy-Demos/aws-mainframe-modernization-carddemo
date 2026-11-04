@@ -4,14 +4,15 @@
 // F-COACTUP-005) sends the COACTUP fields as split on the map with the
 // record's `version` token; a value the form schema rejects is never sent; a
 // server rejection marks its BMS fields and puts the cursor on the first; a
-// 409 'Record changed by some one else. Please review' reloads the record, so
-// the next save echoes the reloaded token (AAP 0.3.7); and "Cancel"
-// (F-COACTUP-006) re-reads the record and drops unsaved entries.
+// 409 'Record changed by some one else. Please review' reloads the record,
+// keeps the message and the cursor on ACCTSID, and the next save echoes the
+// reloaded token (AAP 0.3.7); and "Cancel" (F-COACTUP-006) re-reads the
+// record and drops unsaved entries, Save acting only once that read is done.
 //
 // The network is the stubbed global the API client looks up on every request,
 // answering by method: GET with the test's records, PUT with its answers.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
@@ -38,6 +39,9 @@ const VERSION = "0123456789abcdef";
 
 /** The token of the record after a save, or after another writer's change. */
 const NEXT_VERSION = "fedcba9876543210";
+
+/** The token of a record saved after Cancel re-read it at NEXT_VERSION. */
+const SAVED_VERSION = "00112233445566ff";
 
 /**
  * Account 00000000001 as `GET /accounts/{id}` returns it from the seeded
@@ -196,9 +200,12 @@ const CHANGED_ELSEWHERE: AccountResponse = {
   version: NEXT_VERSION,
 };
 
+/** A GET answer; a promise holds the GET until the test settles it. */
+type Read = AccountResponse | Promise<AccountResponse>;
+
 /** The answers of one test: GETs take `reads` in turn, the last repeating. */
 type Network = {
-  reads: readonly [AccountResponse, ...AccountResponse[]];
+  reads: readonly [Read, ...Read[]];
   writes?: readonly Response[];
 };
 
@@ -209,7 +216,7 @@ function stubNetwork({ reads, writes = [] }: Network) {
     if (request.method === "GET") {
       const account = reads[Math.min(read, reads.length - 1)];
       read += 1;
-      return Response.json(account);
+      return Response.json(await account);
     }
     if (request.method === "PUT") {
       const answer = writes[write];
@@ -312,6 +319,16 @@ function errorOf(field: HTMLInputElement): string | null {
   const message = document.getElementById(id);
   expect(message?.getAttribute("role")).toBe("alert");
   return message?.textContent ?? null;
+}
+
+/**
+ * Lets every effect, microtask and zero-delay timer scheduled so far run,
+ * among them TanStack Query's notification of the page about new data.
+ */
+async function settle(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 }
 
 async function replace(
@@ -460,6 +477,20 @@ describe("AccountEditPage (CAUP, COACTUPC)", () => {
     await screen.findAllByText(RECORD_CHANGED);
     expect(error).toHaveBeenCalledWith(RECORD_CHANGED);
     expect(input("Credit Limit").value).toBe("2021.00");
+    // The changed record is shown with the message on ACCTSID and the cursor
+    // there, as COACTUPC redisplays it.
+    const accountNumber = input("Account Number");
+    await waitFor(() => {
+      expect(errorOf(accountNumber)).toBe(RECORD_CHANGED);
+      expect(document.activeElement).toBe(accountNumber);
+    });
+    expect(accountNumber.getAttribute("aria-invalid")).toBe("true");
+    // The page hears of the reloaded record on a later timer task than the
+    // failed save; the error and the cursor outlast that.
+    await settle();
+    expect(errorOf(accountNumber)).toBe(RECORD_CHANGED);
+    expect(accountNumber.getAttribute("aria-invalid")).toBe("true");
+    expect(document.activeElement).toBe(accountNumber);
     expect(network.sent("GET").map(pathOf)).toEqual([
       ACCOUNT_PATH,
       ACCOUNT_PATH,
@@ -492,5 +523,82 @@ describe("AccountEditPage (CAUP, COACTUPC)", () => {
     await screen.findByDisplayValue(ACCOUNT.cust_first_name);
     expect(network.sent("GET")).toHaveLength(2);
     expect(network.sent("PUT")).toEqual([]);
+  });
+
+  it("holds Save while Cancel reads the record again, then saves the re-read version", async () => {
+    const success = vi.spyOn(toast, "success");
+    let release: (account: AccountResponse) => void = () => undefined;
+    const reread = new Promise<AccountResponse>((resolve) => {
+      release = resolve;
+    });
+    const savedAfterReread: AccountResponse = {
+      ...CHANGED_ELSEWHERE,
+      cust_first_name: NEW_FIRST_NAME,
+      version: SAVED_VERSION,
+    };
+    const network = stubNetwork({
+      reads: [ACCOUNT, reread],
+      writes: [
+        saved(savedAfterReread, CHANGES_COMMITTED),
+        saved(savedAfterReread, NO_CHANGE_DETECTED),
+      ],
+    });
+    const user = await renderPage();
+
+    await replace(user, "First Name", NEW_FIRST_NAME);
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      expect(network.sent("GET")).toHaveLength(2);
+    });
+
+    // While the re-read is held, neither button acts, by click or by Enter.
+    const save = screen.getByRole("button", { name: "Save" });
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(save.getAttribute("aria-disabled")).toBe("true");
+    expect(cancel.getAttribute("aria-disabled")).toBe("true");
+    await user.click(save);
+    await user.click(input("First Name"));
+    await user.keyboard("{Enter}");
+    await user.click(cancel);
+    await settle();
+    expect(network.sent("PUT")).toEqual([]);
+    expect(network.sent("GET")).toHaveLength(2);
+
+    release(CHANGED_ELSEWHERE);
+    await screen.findByDisplayValue("Elsewhere");
+    expect(input("Credit Limit").value).toBe("2021.00");
+    await waitFor(() => {
+      expect(save.getAttribute("aria-disabled")).toBe("false");
+    });
+    expect(cancel.getAttribute("aria-disabled")).toBe("false");
+    // The page hears of the re-read record on a later timer task and resets
+    // the form to the same values then, so entries wait for that.
+    await settle();
+
+    await replace(user, "First Name", NEW_FIRST_NAME);
+    await user.click(save);
+    await waitFor(() => {
+      expect(success).toHaveBeenCalledWith(CHANGES_COMMITTED);
+    });
+    await settle();
+    expect(input("First Name").value).toBe(NEW_FIRST_NAME);
+    expect(input("Credit Limit").value).toBe("2021.00");
+
+    // The next save echoes the saved record's token.
+    await user.click(save);
+    await waitFor(() => {
+      expect(success).toHaveBeenCalledWith(NO_CHANGE_DETECTED);
+    });
+    const savedBody: AccountUpdateRequest = {
+      ...UNCHANGED_BODY,
+      acct_credit_limit: "2021.00",
+      cust_first_name: NEW_FIRST_NAME,
+      version: NEXT_VERSION,
+    };
+    expect(await Promise.all(network.sent("PUT").map(contentOf))).toEqual([
+      { path: ACCOUNT_PATH, body: savedBody },
+      { path: ACCOUNT_PATH, body: { ...savedBody, version: SAVED_VERSION } },
+    ]);
+    expect(network.sent("GET")).toHaveLength(2);
   });
 });

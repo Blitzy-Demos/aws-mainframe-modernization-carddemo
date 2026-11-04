@@ -38,7 +38,7 @@ use carddemo_testkit::block_on;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-use common::{Resp, TestApp, assert_error};
+use common::{Resp, TestApp, assert_error, fixture_records};
 
 /// The processing clock of the adds, inside the active period of the seeded
 /// retail reward rule.
@@ -51,16 +51,16 @@ const ADD_DATE: &str = "2022-07-01";
 /// The CT00 list route, also the CT02 add route.
 const TRANSACTIONS: &str = "/transactions";
 
-/// Account 1 of the seed (P-CVACT01Y-015), added to by its account ID.
+/// Account 1 of the seed (P-CVACT01Y-015), added to by its account ID. The
+/// card its adds answer with is decoded from its cross-reference.
 const ACCOUNT_ONE: &str = "00000000001";
-
-/// The card the cross-reference gives account 1 [app/data/ASCII/cardxref.txt:L49].
-const ACCOUNT_ONE_CARD: &str = "9680294154603697";
 
 /// Account 2 of the seed, added to by its card number.
 const ACCOUNT_TWO: &str = "00000000002";
 
-/// The card of account 2 [app/data/ASCII/cardxref.txt:L3].
+/// The card number the account 2 adds enter as `CARDNIN`
+/// [app/data/ASCII/cardxref.txt:L3]; its decoded cross-reference must give
+/// account 2.
 const ACCOUNT_TWO_CARD: &str = "0923877193247330";
 
 /// The CT02 adds for account 1.
@@ -496,12 +496,28 @@ async fn add_transaction(
 /// Each add takes the highest live TRAN-ID plus one, so the adds follow the
 /// higher base row with consecutive keys, and each answers with its success
 /// text (P-COTRN02C-024).
+///
+/// An add by account ID writes the card of the account's cross-reference
+/// (P-COTRN02C-023): the `xref_card_num` of the one `cardxref.txt` record
+/// whose `xref_acct_id` is account 1, decoded at its reviewed section A
+/// offsets (P-CVACT03Y-001, P-CVACT03Y-003). The card the account 2 adds
+/// name is checked to cross-reference account 2 the same way, so the account
+/// 2 filter holds exactly those adds.
 async fn load_master(app: &TestApp, token: &str, audits: &Audits) -> Loaded {
     audits.parity("P-COTRN02C-024", &[]);
+    audits.parity("P-COTRN02C-023", &[]);
     assert_eq!(
         audits.fixture_value("P-CVACT01Y-015", "existing_account"),
         ACCOUNT_ONE,
         "the seeded account the adds name"
+    );
+    let account_one_xref = fixture_records::account_xref(&audits.parity, ACCOUNT_ONE);
+    let account_one_card = account_one_xref.value("xref_card_num");
+    assert_eq!(
+        fixture_records::card_xref(&audits.parity, ACCOUNT_TWO_CARD).value("xref_acct_id"),
+        ACCOUNT_TWO,
+        "P-CVACT03Y-001, P-CVACT03Y-003: the cross-reference of the card the account 2 adds \
+         name gives account 2"
     );
     app.stack().exec_sql(BASE_ROWS).await;
     let mut loaded = Loaded {
@@ -516,10 +532,13 @@ async fn load_master(app: &TestApp, token: &str, audits: &Audits) -> Loaded {
         let (key, card) = if for_two {
             (AddKey::Card(ACCOUNT_TWO_CARD), ACCOUNT_TWO_CARD)
         } else {
-            (AddKey::Account(ACCOUNT_ONE), ACCOUNT_ONE_CARD)
+            (AddKey::Account(ACCOUNT_ONE), account_one_card)
         };
         let added = add_transaction(app, token, key, &amount(index)).await;
-        assert_eq!(added.tran_card_num, card, "the card of the add for {key:?}");
+        assert_eq!(
+            added.tran_card_num, card,
+            "P-COTRN02C-023: the card of the add for {key:?} is the card of its cross-reference"
+        );
         let tran_id = added.tran_id.clone();
         if for_two {
             loaded.account_two.push(tran_id.clone());

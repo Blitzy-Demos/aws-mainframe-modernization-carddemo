@@ -74,6 +74,11 @@ use crate::numeric::{
     TransactionRowId, UserId,
 };
 
+/// The check a port writer applies to an instant before storing it: a stored
+/// instant is a whole microsecond of UTC time. Re-exported from
+/// [`crate::clock`] for the persistence adapters that implement these ports.
+pub use crate::clock::is_whole_microsecond;
+
 /// Why a port call failed, in the terms the COBOL programs test.
 ///
 /// Each variant is the outcome a program branches on, whatever store answered:
@@ -997,6 +1002,30 @@ pub trait AuthorizationStore {
         id: AccountId,
     ) -> impl Future<Output = PortResult<PendingAuthSummary>> + Send + '_;
 
+    /// DL/I `GU PAUTSUM0 WHERE (ACCNTID = :id)` with the update intent of the
+    /// PSB `PSBPAUTB` (`PROCOPT=AP`), SQL `SELECT … FOR UPDATE`: `COPAUA0C`
+    /// `5500-READ-AUTH-SUMMRY` (P-COPAUA0C-008), and the summary the
+    /// `8000-WRITE-AUTH-TO-DB` unit of work replaces or inserts under
+    /// (`8400-UPDATE-SUMMARY`, P-COPAUA0C-013).
+    ///
+    /// IMS program isolation orders `COPAUA0C` and the `CBPAUP0C` BMP, both
+    /// scheduled on `PSBPAUTB`, one after the other. The call therefore waits
+    /// for a unit of work that holds the summary, a running purge sweep
+    /// included ([`Self::summaries_after`]), and then reads what that unit
+    /// left: the summary it committed, or no summary when it deleted it. The
+    /// lock is held until the caller's transaction commits or rolls back, so
+    /// a sweep that reaches the summary meanwhile waits for that end in turn.
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::NotFound`] when the account has no summary (status `GE`);
+    /// [`PortError::Contention`] when the wait ends in a lock timeout or a
+    /// deadlock; [`PortError::Unavailable`] on any other failure.
+    fn read_summary_for_update(
+        &mut self,
+        id: AccountId,
+    ) -> impl Future<Output = PortResult<PendingAuthSummary>> + Send + '_;
+
     /// DL/I `GU PAUTSUM0 WHERE (ACCNTID = :account)` for the account of the
     /// detail `id`: `COPAUS1C` `READ-AUTH-RECORD`, the summary read ENTER, PF5
     /// and PF8 issue before the detail read (P-COPAUS1C-003, P-COPAUS1C-004).
@@ -1064,10 +1093,19 @@ pub trait AuthorizationStore {
     /// whose account is greater than `after`, in `ACCNTID` order, from the first
     /// summary when `after` is `None`.
     ///
+    /// The sweep holds each summary it returns until the purge's unit of work
+    /// commits or rolls back, as the BMP's update-intent `GN` holds it under
+    /// IMS program isolation. A summary another unit of work holds, through
+    /// [`Self::read_summary_for_update`], is waited for and returned as that
+    /// unit left it; one it deleted is not returned. A pending authorization
+    /// is therefore written either before the sweep reads its summary or after
+    /// the purge ends, never under a summary the purge has already judged.
+    ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; the end of the database
-    /// (status `GB`) is `Ok` with no rows.
+    /// [`PortError::Contention`] when the wait for a held summary ends in a
+    /// lock timeout or a deadlock; [`PortError::Unavailable`] on any other
+    /// failure. The end of the database (status `GB`) is `Ok` with no rows.
     fn summaries_after(
         &mut self,
         after: Option<AccountId>,

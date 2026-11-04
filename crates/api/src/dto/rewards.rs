@@ -21,8 +21,8 @@
 
 use std::fmt;
 
-use carddemo_domain::entities::{RewardAccrual, RewardBalance};
 use carddemo_domain::numeric::{AccrualId, RewardPoints};
+use carddemo_domain::rules::{RewardAccrual, RewardBalance};
 use chrono::{DateTime, Utc};
 use serde::de::{self, Error as _, Unexpected};
 use serde::{Deserialize, Serialize};

@@ -71,7 +71,7 @@
 
 use std::fmt;
 
-use carddemo_domain::ports::Direction;
+use carddemo_domain::rules::Direction;
 use serde::de::{self, Deserializer, Unexpected, Visitor};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};

@@ -64,12 +64,19 @@ function unexpectedErrorBody(): ErrorBody {
 export class ApiError extends Error {
   readonly status: number;
   readonly body: ErrorBody;
+  /**
+   * True for the 401 answer that ended the signed-on session, and for any
+   * other 401 to a request of that session, whose message the sign-on
+   * redirect already shows; false for every other answer.
+   */
+  readonly endedSession: boolean;
 
-  constructor(status: number, body: ErrorBody) {
+  constructor(status: number, body: ErrorBody, endedSession = false) {
     super(body.message);
     this.name = "ApiError";
     this.status = status;
     this.body = body;
+    this.endedSession = endedSession;
   }
 }
 
@@ -164,6 +171,32 @@ function isApiRequest(url: string): boolean {
   );
 }
 
+// The sessions a 401 ended, and the 401 answers to their requests: the one
+// that ended the session and any that arrived for it afterwards. The ApiError
+// unwrapWithStatus raises for such an answer is marked endedSession. Entries
+// go away with their session or answer.
+const sessionsEndedBy401 = new WeakSet<Session>();
+const sessionEndingAnswers = new WeakSet<Response>();
+
+// The error body of an answer, read from a copy so that openapi-fetch still
+// reads the original for the caller: the parsed JSON, the raw text when it is
+// not JSON (openapi-fetch's own rule), or undefined when the body cannot be
+// read. toErrorBody turns each into the body unwrap raises.
+async function readErrorBody(response: Response): Promise<unknown> {
+  let text: string;
+  try {
+    text = await response.clone().text();
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed;
+  } catch {
+    return text;
+  }
+}
+
 // The session's token is attached only to a request for the API
 // (isApiRequest). openapi-fetch accepts a `baseUrl` option on every call and
 // builds the Request from it before this middleware runs, so the client's own
@@ -190,18 +223,38 @@ const authMiddleware: Middleware = {
   // the user and the second of issue, so a user signing on twice within one
   // second receives the same token. A request sent with no session ends none.
   //
-  // Ending the session notifies useSession, and RequireAuth then redirects to
-  // the sign-on page with the requested location as `from`; a document
-  // navigation from here would lose that location. The answer reaches the
-  // caller unchanged, whose unwrap raises the server's
-  // 'Authentication required'. A 403 ('Admin access required') is left to the
-  // caller, which shows it.
-  onResponse({ request, response, schemaPath }) {
-    if (response.status === 401 && schemaPath !== LOGIN_PATH) {
-      const sentBy = sentBySession.get(request);
-      if (sentBy !== undefined && getSession() === sentBy) {
-        clearSession();
+  // The session ends with the server's error as its cause: the body is read
+  // from a copy first, and the session checked again afterwards, since a
+  // sign-on may have happened during the read. Ending the session notifies
+  // useSession, and RequireAuth then redirects to the sign-on page with the
+  // requested location as `from`; a document navigation from here would lose
+  // that location. The redirect unmounts the page and cancels its queries, so
+  // the guard shows the cause's message, the server's
+  // 'Authentication required'. The answer reaches the caller unchanged, whose
+  // unwrap raises the same error marked endedSession, so a caller that still
+  // shows it adds no second toast (lib/api-errors.ts). A 403
+  // ('Admin access required') is left to the caller, which shows it.
+  async onResponse({ request, response, schemaPath }) {
+    if (response.status !== 401 || schemaPath === LOGIN_PATH) {
+      return response;
+    }
+    const sentBy = sentBySession.get(request);
+    if (sentBy === undefined) {
+      return response;
+    }
+    if (getSession() === sentBy) {
+      const cause = new ApiError(
+        401,
+        toErrorBody(await readErrorBody(response)),
+        true,
+      );
+      if (getSession() === sentBy) {
+        sessionsEndedBy401.add(sentBy);
+        clearSession(cause);
       }
+    }
+    if (sessionsEndedBy401.has(sentBy)) {
+      sessionEndingAnswers.add(response);
     }
     return response;
   },
@@ -209,17 +262,23 @@ const authMiddleware: Middleware = {
 
 /**
  * The deadline of every request, from sending it to the last byte of its
- * answer. No API operation streams or runs long, so a live server answers well
- * within it; it ends a request whose connection has stalled, which would
- * otherwise leave the call, and the screen waiting on it, pending forever.
+ * answer: the server's processing and the download of the body both count
+ * against it. It is the client's fixed policy, not a measure of the server,
+ * whose operations can legitimately take longer: the transaction report (CR00,
+ * `GET /reports/transactions`) is built over the whole selected range before
+ * the server sends any byte of its answer. At the deadline the request is
+ * abandoned, which establishes neither that the server failed nor that a
+ * write was not applied. The deadline ends a request whose connection has
+ * stalled, which would otherwise leave the call, and the screen waiting on
+ * it, pending forever.
  */
 export const REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * The rejection of a request whose answer was still incomplete when
  * REQUEST_TIMEOUT_MS elapsed: its status line, or the end of its body, had
- * not arrived. The request is abandoned, never retried, so a write may or may
- * not have reached the server.
+ * not arrived. The request is abandoned, never retried: the server may still
+ * be working on it, and a write may or may not have been applied.
  */
 export class RequestTimeoutError extends Error {
   constructor() {
@@ -228,6 +287,47 @@ export class RequestTimeoutError extends Error {
     );
     this.name = "RequestTimeoutError";
   }
+}
+
+// `body`, passed through unchanged, calling `onEnd` once the body is over
+// for whichever reason comes first: its last chunk has been read; a read of it
+// fails, which errors the stream with that same reason; or its reader cancels
+// it, which passes the cancellation and its reason on to `body`. The stream
+// keeps the default strategy, one chunk read ahead, so its first pull runs
+// before anyone reads it: an empty body that is never read, as openapi-fetch
+// leaves one whose Content-Length is 0, is over at once.
+function passThrough<T>(
+  body: ReadableStream<T>,
+  onEnd: () => void,
+): ReadableStream<T> {
+  const reader = body.getReader();
+  // A read still pending when the reader cancels settles after the stream has
+  // closed, which then takes neither a chunk nor a close.
+  let cancelled = false;
+  return new ReadableStream<T>({
+    async pull(stream) {
+      let chunk: ReadableStreamReadResult<T>;
+      try {
+        chunk = await reader.read();
+      } catch (error: unknown) {
+        onEnd();
+        throw error;
+      }
+      if (chunk.done) {
+        onEnd();
+        if (!cancelled) {
+          stream.close();
+        }
+      } else if (!cancelled) {
+        stream.enqueue(chunk.value);
+      }
+    },
+    cancel(reason: unknown) {
+      cancelled = true;
+      onEnd();
+      return reader.cancel(reason);
+    },
+  });
 }
 
 // Sends one request, bounded by REQUEST_TIMEOUT_MS and by the caller's
@@ -240,8 +340,11 @@ export class RequestTimeoutError extends Error {
 //   second argument, requestInitExt, is never configured here.
 // - The controller stays armed after the headers arrive, because openapi-fetch
 //   reads the body afterwards and a stalled body is cut off the same way.
-//   Aborting once the body has been read changes nothing, so the deadline is
-//   disarmed early only when the call fails or the answer has no body.
+//   Both the deadline and the caller's abort are disarmed once the answer is
+//   over: when the call fails, at once when the answer has no body, and
+//   otherwise when its body ends, is cancelled or fails (passThrough). A
+//   finished request therefore holds no timer or listener and is never
+//   aborted afterwards.
 // - Nothing is retried: a write that timed out may already have been applied,
 //   so the caller sees the rejection and the request is sent exactly once.
 function fetchWithDeadline(request: Request): Promise<Response> {
@@ -270,8 +373,16 @@ function fetchWithDeadline(request: Request): Promise<Response> {
     (response) => {
       if (response.body === null) {
         disarm();
+        return response;
       }
-      return response;
+      // Only the status, the status text and the headers carry over to the
+      // answer handed back; its url, redirected and type take their defaults,
+      // which neither openapi-fetch nor any caller reads.
+      return new Response(passThrough(response.body, disarm), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
     },
     (error: unknown) => {
       disarm();
@@ -300,8 +411,9 @@ api.use(authMiddleware);
  * statuses mean different things: `POST /payments` answers 200 with the
  * confirm prompt, writing nothing, and 201 once the payment is made.
  *
- * @throws ApiError for a non-2xx answer, with the server's error body, and for
- * a 2xx answer without a body, with UNEXPECTED_ERROR_BODY. A request without a
+ * @throws ApiError for a non-2xx answer, with the server's error body and,
+ * for a 401 that ended the signed-on session, `endedSession` set, and for a
+ * 2xx answer without a body, with UNEXPECTED_ERROR_BODY. A request without a
  * complete answer never gets here, because the call itself rejects: with a
  * RequestTimeoutError once REQUEST_TIMEOUT_MS has elapsed, with the abort
  * reason of its `signal` option (an AbortError by default) when the caller
@@ -313,7 +425,11 @@ export function unwrapWithStatus<D>(result: ApiResult<D>): {
 } {
   const { data, error, response } = result;
   if (error !== undefined || !response.ok) {
-    throw new ApiError(response.status, toErrorBody(error));
+    throw new ApiError(
+      response.status,
+      toErrorBody(error),
+      sessionEndingAnswers.has(response),
+    );
   }
   if (data === undefined) {
     throw new ApiError(response.status, unexpectedErrorBody());

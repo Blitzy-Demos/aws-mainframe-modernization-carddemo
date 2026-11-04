@@ -24,8 +24,18 @@ import {
 import { api, unwrap } from "@/api/client";
 import type { components } from "@/api/schema";
 
-/** One stored reward rule, as every reward-rule endpoint answers it. */
+/**
+ * One stored reward rule, as every reward-rule endpoint answers it, with its
+ * `status` at the server's processing clock.
+ */
 export type RewardRule = components["schemas"]["RewardRuleResponse"];
+
+/**
+ * The answer of `DELETE /admin/reward-rules/{id}`: the rule afterwards, plus
+ * the `outcome` saying whether the delete ended it or found it already ended.
+ */
+export type RewardRuleDeletion =
+  components["schemas"]["RewardRuleDeleteResponse"];
 
 /** The body of `POST /admin/reward-rules` and `PUT /admin/reward-rules/{id}`. */
 export type RewardRuleBody = components["schemas"]["RewardRuleRequest"];
@@ -119,13 +129,14 @@ export function useRewardRuleUpdateMutation(
 
 /**
  * `DELETE /admin/reward-rules/{id}`: the soft delete, resolving to the rule
- * afterwards. The server ends a rule that is open-ended or ends later at the
- * processing clock's instant, and answers a rule that has already ended
- * unchanged, also with 200; both are success. The row is never removed,
- * because accruals reference its `rule_id`, so the list keeps showing it.
+ * afterwards with the server's `outcome`. The server ends a rule that is
+ * open-ended or ends later at the processing clock's instant (`deleted`), and
+ * answers a rule that has already ended unchanged (`unchanged`), also with
+ * 200; both are success. The row is never removed, because accruals reference
+ * its `rule_id`, so the list keeps showing it.
  */
 export function useRewardRuleDeleteMutation(): UseMutationResult<
-  RewardRule,
+  RewardRuleDeletion,
   Error,
   string
 > {

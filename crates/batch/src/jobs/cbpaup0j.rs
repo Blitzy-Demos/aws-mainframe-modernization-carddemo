@@ -14,6 +14,16 @@
 //! otherwise abend with `CBPAUP0C ABENDING ...` on the `DLET` of a detail the other run had
 //! already deleted.
 //!
+//! The sweep's `GN` row-locks each summary it reads until the unit of work commits
+//! (`AuthorizationStore::summaries_after`), and CP00 reads the summary it writes under the same
+//! lock (`AuthorizationStore::read_summary_for_update`), as IMS program isolation orders
+//! `COPAUA0C` and the BMP, both scheduled on `PSBPAUTB` with `PROCOPT=AP`
+//! [app/app-authorization-ims-db2-mq/ims/PSBPAUTB.psb:L17]. A CP00 write therefore either
+//! commits before the sweep reads its summary, which the sweep then judges with the count and
+//! the detail that write left, or waits until the purge commits and writes on what it left. No
+//! authorization CP00 commits is deleted by a sweep that never read it, and the counts the job
+//! reports are the rows it deleted (P-CBPAUP0C-004 to P-CBPAUP0C-007).
+//!
 //! `DISPLAY` output becomes `tracing` events inside the job span: the parameters, the day, then
 //! either the four end-of-job counts or the abend. The span's `read` field carries the
 //! summaries and details read, its `deleted` field those deleted once the deletes are
@@ -24,11 +34,10 @@
 //! length and whether the receiver left any of it out, as [`BoundedSysin`] defines them.
 
 use carddemo_domain::clock::{Clock, yyddd};
-use carddemo_domain::numeric::Alnum;
 use carddemo_domain::rules::auth_purge::{
-    self, PRM_INFO_LEN, PurgeAbend, PurgeCounts, PurgeParams,
+    self, Alnum, PRM_INFO_LEN, PurgeAbend, PurgeCounts, PurgeParams,
 };
-use carddemo_persistence::Db;
+use carddemo_persistence::tx::Db;
 use tracing::Span;
 
 use super::{JobContext, setup_failure, span_count};
@@ -47,7 +56,11 @@ use crate::exit::ExitStatus;
 ///    a segment another program has deleted. A run started while another is purging waits
 ///    until that run commits or rolls back, then sweeps the rows it left and ends normally
 ///    instead of abending on a detail that is already gone.
-/// 3. The rule sweeps every summary and its details in that unit of work.
+/// 3. The rule sweeps every summary and its details in that unit of work. Each summary the
+///    sweep's `GN` reads stays row-locked until the commit, so a CP00 write either commits
+///    before the sweep reads that summary, and the sweep sees its count and detail, or waits
+///    until the purge commits, as IMS program isolation orders `COPAUA0C` and the BMP under
+///    `PSBPAUTB` (`PROCOPT=AP`).
 /// 4. The unit of work is committed whether the sweep ends normally or abends. `EXEC DLI CHKP`
 ///    (P-CBPAUP0C-008), the normal end and the `GOBACK` of `9999-ABEND` all commit the deletes
 ///    made so far (P-CBPAUP0C-005, P-CBPAUP0C-009), so one commit after the rule returns leaves

@@ -71,7 +71,7 @@ use axum::http::StatusCode;
 use carddemo_domain::error::DomainError;
 use carddemo_domain::numeric::TranTypeCode;
 use carddemo_domain::rules::{tran_type_list, tran_type_update};
-use carddemo_persistence::UnitOfWork;
+use carddemo_persistence::tx::UnitOfWork;
 use tracing::{Instrument, Span};
 
 use crate::auth::AdminUser;

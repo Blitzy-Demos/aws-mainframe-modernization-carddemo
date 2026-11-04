@@ -36,13 +36,12 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
-use carddemo_codec::CodecError;
-use carddemo_codec::framing::pad;
+use carddemo_codec::layouts::{CodecError, pad};
 use carddemo_domain::messages::OPEN_FILE_NOT_OK;
 use carddemo_domain::rules::tran_type_batch::{
     self, INPUT_REC_LEN, MaintRecord, MaintRun, RecordOutcome,
 };
-use carddemo_persistence::{Db, UnitOfWork};
+use carddemo_persistence::tx::{Db, UnitOfWork};
 use tracing::Span;
 
 use super::{JobContext, count_of, setup_failure, span_count};

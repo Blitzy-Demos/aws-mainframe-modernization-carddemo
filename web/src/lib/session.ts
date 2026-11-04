@@ -7,11 +7,14 @@
 // The session lives in memory and is mirrored to sessionStorage, the
 // session-scoped store, so a reload in the same tab keeps the user signed on
 // and a new browser session starts signed out. Nothing is written to any store
-// that outlives the browser session.
+// that outlives the browser session. A page restored from the back/forward
+// cache, or told of a change to the store, checks the store again, so a
+// sign-off in a later page of the tab ends its session too.
 //
 // Consumers: api/client.ts reads the token for the Authorization header and
-// clears the session on a 401 to a request that session sent;
-// routes/guards.tsx and the app shell read it through useSession. usr_type and
+// clears the session on a 401 to a request that session sent, naming that
+// answer as the cause; routes/guards.tsx and the app shell read it through
+// useSession, and the guards show the cause (takeSessionEndCause). usr_type and
 // user_id serve navigation and display only. The server takes the acting user
 // from the verified token, so neither value is ever sent as request data, and
 // a 401 or 403 from the server overrides whatever this copy says.
@@ -44,9 +47,26 @@ const listeners = new Set<() => void>();
 
 let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 
+// What readStoredSession returns when the browser refuses the read, which
+// tells nothing about whether the tab holds a session.
+const UNREADABLE = Symbol("sessionStorage unreadable");
+
 // Rehydrated when the module loads, so the first render after a reload
-// already sees the session the tab signed on with.
-let current: Session | null = readStoredSession();
+// already sees the session the tab signed on with. A store the browser blocks
+// (sandboxed frames, some privacy settings) starts the tab signed out.
+const rehydrated = readStoredSession();
+let current: Session | null = rehydrated === UNREADABLE ? null : rehydrated;
+
+// Whether sessionStorage holds the copy of `current`: true for a rehydrated
+// session and for one whose write succeeded. A session whose write the
+// browser rejected lives in this page only, so no stored value speaks for it.
+let mirrored = current !== null;
+
+// What ended the last session, when the code ending it named a cause: the API
+// client's 401 answer. Every other end (sign-off, expiry, a resync) and every
+// sign-on leave it undefined. takeSessionEndCause hands it out once.
+let endCause: unknown;
+
 if (current !== null) {
   scheduleExpiryCheck(current);
 }
@@ -98,15 +118,16 @@ function parseStoredSession(text: string): Session | null {
   }
 }
 
-// Reading sessionStorage throws where the browser blocks storage (sandboxed
-// frames, some privacy settings); the tab then starts signed out. Stored text
-// that is malformed or has expired is removed, so it is not read again.
-function readStoredSession(): Session | null {
+// The live session sessionStorage holds, null when it holds none, or
+// UNREADABLE when reading throws, as it does where the browser blocks storage.
+// Stored text that is malformed or has expired is removed, so it is not read
+// again.
+function readStoredSession(): Session | null | typeof UNREADABLE {
   let text: string | null;
   try {
     text = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
   } catch {
-    return null;
+    return UNREADABLE;
   }
   if (text === null) {
     return null;
@@ -121,16 +142,19 @@ function readStoredSession(): Session | null {
 
 // A blocked or full sessionStorage only loses the session on the next reload;
 // the in-memory copy keeps the tab signed on. Any earlier stored session is
-// removed so that a reload cannot restore it in place of this one.
-function writeStoredSession(session: Session): void {
+// removed so that a reload cannot restore it in place of this one. Returns
+// whether the session was written.
+function writeStoredSession(session: Session): boolean {
   try {
     window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+    return true;
   } catch (error) {
     console.warn(
       `The session applies to this page only: sessionStorage rejected ${SESSION_STORAGE_KEY}.`,
       error,
     );
     removeStoredSession();
+    return false;
   }
 }
 
@@ -185,27 +209,104 @@ function checkExpiry(): void {
   }
 }
 
+// Ends the session in memory only, leaving sessionStorage as it is.
+function endSessionInMemory(): void {
+  cancelExpiryTimer();
+  current = null;
+  endCause = undefined;
+  notifyListeners();
+}
+
+// sessionStorage is the one record of the session that every document of the
+// tab shares. A document the browser restores from its back/forward cache
+// resumes with the in-memory session it was frozen with, even when a later
+// document of the tab has signed off since; the server keeps no session, so
+// that token would still be accepted until it expires. A restored document,
+// and one told that another document changed the record, therefore checks the
+// record and ends its in-memory session unless the record still holds the
+// same token.
+//
+// The session stays when the record cannot be read, which proves nothing, and
+// when it never reached the record (writeStoredSession's rejection), since
+// this page holds its only copy. The record is left as found: an empty one
+// needs no clearing, and a session it holds belongs to the document that
+// signed it on.
+function resyncWithStore(): void {
+  if (current === null || !mirrored) {
+    return;
+  }
+  const stored = readStoredSession();
+  if (stored === UNREADABLE) {
+    return;
+  }
+  if (stored !== null && stored.token === current.token) {
+    return;
+  }
+  endSessionInMemory();
+}
+
+// Whether a storage event reports a change to the session in this tab's
+// sessionStorage: its key, or a clear(), which reports a null key. Reading
+// sessionStorage throws where the browser blocks storage, and then no event
+// concerns it.
+function isSessionStoreChange(event: StorageEvent): boolean {
+  if (event.key !== null && event.key !== SESSION_STORAGE_KEY) {
+    return false;
+  }
+  try {
+    return event.storageArea === window.sessionStorage;
+  } catch {
+    return false;
+  }
+}
+
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) {
+    resyncWithStore();
+  }
+});
+
+window.addEventListener("storage", (event) => {
+  if (isSessionStoreChange(event)) {
+    resyncWithStore();
+  }
+});
+
 /** Starts the session from a login response, replacing any earlier one. */
 export function setSession(session: Session): void {
   const next = copyOf(session);
   current = next;
-  writeStoredSession(next);
+  mirrored = writeStoredSession(next);
+  endCause = undefined;
   scheduleExpiryCheck(next);
   notifyListeners();
 }
 
 /**
  * Ends the session in memory and in storage. Listeners are notified only when
- * a session was present.
+ * a session was present, and only then is `cause`, what ended it, recorded for
+ * takeSessionEndCause; without a cause none is recorded.
  */
-export function clearSession(): void {
+export function clearSession(cause?: unknown): void {
   cancelExpiryTimer();
   removeStoredSession();
   if (current === null) {
     return;
   }
   current = null;
+  endCause = cause;
   notifyListeners();
+}
+
+/**
+ * What ended the last session, as clearSession recorded it, or undefined; the
+ * cause is forgotten once taken, so it is shown once. RequireAuth takes it to
+ * show the server's 401 message as it sends the user to sign on.
+ */
+export function takeSessionEndCause(): unknown {
+  const cause = endCause;
+  endCause = undefined;
+  return cause;
 }
 
 /**

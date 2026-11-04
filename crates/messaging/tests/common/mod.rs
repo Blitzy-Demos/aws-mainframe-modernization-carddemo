@@ -1,6 +1,8 @@
 //! Shared harness of the `carddemo-messaging` integration tests. The targets
 //! `cdrd_date.rs`, `cdra_account.rs`, `cp00_authorization.rs` and
-//! `ack_after_confirm.rs` each include it with `mod common;`.
+//! `ack_after_confirm.rs` each include it with `pub mod common;`, so the public
+//! items a target leaves unused, those of [`audit_tables`] included, raise no
+//! `dead_code` warning.
 //!
 //! [`Harness`] starts a seeded `PostgreSQL` and a `RabbitMQ` broker loaded with
 //! `infra/rabbitmq/definitions.json`, runs the CDRD, CDRA and CP00 consumers on
@@ -17,9 +19,9 @@
 //! [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L411-413].
 //!
 //! [`audit_row`] and [`audit_texts`] read `docs/parity/parity-oracle-audit.md`,
-//! where every expected value of these tests comes from, through
-//! `carddemo_audit`: a row is the data table row its parser finds, so the review
-//! logs, which repeat row IDs, are never read.
+//! where every expected value of these tests comes from, through the audit
+//! parser in [`audit_tables`]: a row is the data table row the parser finds, so
+//! the review logs, which repeat row IDs, are never read.
 //!
 //! Every broker operation the harness awaits is bounded: by the caller's
 //! deadline where there is one, by `READY_TIMEOUT` while the consumers
@@ -29,13 +31,18 @@
 //! bound is a blocking thread that waits out the remaining time unless the
 //! operation completes first and wakes it.
 
+// The std-only audit-table parser of `crates/audit`, shared by source: the
+// `carddemo-audit` package is a dev-dependency of the api and batch crates only,
+// so these tests read the audit through the same parser without depending on
+// it. The parser's own unit tests come with it and run in every test target
+// that includes this harness.
+#[path = "../../../audit/src/lib.rs"]
+pub mod audit_tables;
+
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
-use carddemo_audit::{
-    CodeSpan, Document, PARITY_AUDIT_PATH, PARITY_COMMON_COLUMNS, Repo, Row, Table,
-};
 use carddemo_domain::clock::AnyClock;
 use carddemo_messaging::Running;
 use carddemo_persistence::Db;
@@ -52,6 +59,10 @@ use lapin::publisher_confirm::Confirmation;
 use lapin::types::FieldTable;
 use lapin::{BasicProperties, Channel, Connection, Queue};
 use tracing::instrument::WithSubscriber;
+
+use self::audit_tables::{
+    CodeSpan, Document, PARITY_AUDIT_PATH, PARITY_COMMON_COLUMNS, Repo, Row, Table,
+};
 
 /// Interval between two attempts of every polling helper.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -590,7 +601,7 @@ impl Harness {
 /// The line of `docs/parity/parity-oracle-audit.md` that holds the row `id`,
 /// for example `P-CODATE01-013`, as stored.
 ///
-/// The row is the data table row `carddemo_audit` finds with
+/// The row is the data table row the audit parser finds with
 /// `Document::find_row`; review logs, which repeat the ID, are never searched.
 ///
 /// # Panics
@@ -613,7 +624,7 @@ pub fn audit_row(id: &str) -> String {
 /// The exact texts of the "Expected result" cell of the audit row `id`, in
 /// cell order, as the audit's conventions define them.
 ///
-/// The row, its cell and the cell's code spans come from `carddemo_audit`:
+/// The row, its cell and the cell's code spans come from the audit parser:
 /// review logs are never searched, and a code span's `width=<n>` is the first
 /// one after it and before the next span (`cell_code_spans`).
 ///
@@ -644,7 +655,7 @@ pub fn audit_texts(id: &str) -> Vec<String> {
     let cell = table
         .cell(row, EXPECTED_RESULT)
         .unwrap_or_else(|| panic!("audit row {id} has no {EXPECTED_RESULT:?} cell"));
-    let spans = carddemo_audit::cell_code_spans(cell);
+    let spans = audit_tables::cell_code_spans(cell);
     assert!(
         !spans.is_empty(),
         "the {EXPECTED_RESULT:?} cell of audit row {id} holds no code span"
@@ -652,7 +663,7 @@ pub fn audit_texts(id: &str) -> Vec<String> {
     spans.iter().map(|span| exact_text(span, id)).collect()
 }
 
-/// The parity oracle audit as stored, with the tables `carddemo_audit` parses
+/// The parity oracle audit as stored, with the tables the audit parser reads
 /// from it.
 struct Audit {
     /// The file's text.

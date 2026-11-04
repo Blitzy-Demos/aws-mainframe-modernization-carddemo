@@ -3,9 +3,11 @@
 //
 // - ENTER becomes the form's submit: Enter in either field, or the "Sign on"
 //   button, sends POST /auth/login once loginSchema accepts the values.
-// - The user ID and password are sent exactly as typed. COSGN00C upper-cases
-//   both before it reads the user [app/cbl/COSGN00C.cbl:L132-136]; doing it
-//   here would sign on a user whose password was stored in lower case (E-20).
+// - The user ID and password are sent exactly as typed, and the server
+//   normalizes them: like COSGN00C [app/cbl/COSGN00C.cbl:L132-136], it
+//   upper-cases and pads both before it reads the user and verifies the
+//   password. A user ID or password an admin stored in lower or mixed case
+//   therefore never signs on, whatever case is typed, as in the COBOL (E-20).
 // - A failed sign-on keeps both values, as COSGN00C resends the map with the
 //   fields it received. applyApiError toasts the COSGN00C message, marks the
 //   field the server names and puts the cursor there, the `MOVE -1 TO
@@ -123,7 +125,9 @@ export default function LoginPage(): JSX.Element {
         <PageHeader description={BANNER} />
         <Card>
           <CardHeader>
-            <CardTitle id={titleId}>Sign on to CardDemo</CardTitle>
+            <CardTitle>
+              <h2 id={titleId}>Sign on to CardDemo</h2>
+            </CardTitle>
             <CardDescription>
               Type your User ID and Password, then press Enter.
             </CardDescription>

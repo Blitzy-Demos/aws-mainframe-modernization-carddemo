@@ -322,7 +322,9 @@ function TranTypeAddForm(): JSX.Element {
           onSubmit={onSubmit}
         >
           <CardHeader>
-            <CardTitle id={titleId}>Transaction type</CardTitle>
+            <CardTitle>
+              <h2 id={titleId}>Transaction type</h2>
+            </CardTitle>
             <CardDescription>
               {adding
                 ? "Enter the description of the new type, then add it."
@@ -401,7 +403,9 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
         : { type_code: record.type_code, description: record.description },
   });
 
-  // A delete's own success refetches this type, which is then gone: that
+  // A delete's success marks this read stale without repeating it, and the
+  // page then leaves for the key entry. A read of the type that still fails
+  // while the delete runs or after it succeeded finds the type gone: that
   // answer is the delete's outcome, not an error of this page, so it is not
   // shown. Each other failure of the read is shown once.
   const deleting = deleteMutation.isPending || deleteMutation.isSuccess;
@@ -485,7 +489,9 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
           onSubmit={onSubmit}
         >
           <CardHeader>
-            <CardTitle id={titleId}>Transaction type</CardTitle>
+            <CardTitle>
+              <h2 id={titleId}>Transaction type</h2>
+            </CardTitle>
             {record === undefined ? null : (
               <CardDescription>
                 Change the description and save it, or delete the type.

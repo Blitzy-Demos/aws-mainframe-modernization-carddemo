@@ -31,7 +31,15 @@
 //! | Lock failed; rewrite failed | `Unexpected` | `ACCTSID` | V-COACTUPC-124, V-COACTUPC-125, V-COACTUPC-127, V-COACTUPC-128 |
 //! | Record changed since it was fetched | `Conflict` | `ACCTSID` | V-COACTUPC-126 |
 //! | Rewritten | none: [`AccountUpdated`], 200 | — | P-COACTUPC-015 |
-//! | Input class held at `halt` | `Unexpected`, [`UNEXPECTED_ERROR`] | — | E-26, E-40, E-47, E-74 |
+//! | Input class held at `halt` | `Unexpected`, [`UNEXPECTED_ERROR`] | — | E-26, E-40, E-47; E-74 answers as V-COACTUPC-128 |
+//!
+//! [`validate`] returns its refusals as an [`EditRefusal`]: a key or field
+//! edit's [`DomainError`], or, for an input class it holds at `halt`,
+//! [`EditRefusal::Halted`] with the escalation that holds it (E-26, E-40,
+//! E-47). The escalation is the cause an adapter logs beside the answer and
+//! is never answered: the refusal converts into the [`DomainError`] the
+//! request is answered with, for a halt the unexpected-error outcome with no
+//! fields. [`update`] answers that conversion.
 //!
 //! Every edit of `1200-EDIT-MAP-INPUTS` runs, and each writes its text only
 //! `IF WS-RETURN-MSG-OFF` [app/cbl/COACTUPC.cbl:L479-480], so the first failing
@@ -43,7 +51,8 @@
 //! # Input classes held at `halt`
 //!
 //! No code guesses an outcome the audit does not pin. These answer the
-//! unexpected-error outcome:
+//! unexpected-error outcome, and [`validate`] refuses each of the first two
+//! with [`EditRefusal::Halted`] and the escalation named here:
 //!
 //! - A date whose outcome `super::date_edit` reports unproven: every date that
 //!   reaches `CSUTLDTC` (E-26), a month holding a non-digit (E-47) and a day of
@@ -221,6 +230,10 @@ const CURRENCY_SIGN: u8 = b'$';
 
 /// The escalation that holds every `CSUTLDTC` call of `CSUTLDPY` at `halt`.
 const E_CSUTLDPY_LINKAGE: &str = "E-26";
+
+/// The escalation that holds at `halt` the `NUMVAL-C` arguments and values
+/// the audit does not pin (P-COACTUPC-049).
+const E_NUMVAL_C: &str = "E-40";
 
 /// The integer digits of the `S9(10)V99` receivers of `NUMVAL-C`: a value of
 /// `10^10` or more does not fit (E-40).
@@ -572,6 +585,60 @@ pub enum AccountEdit {
     NoChange,
 }
 
+/// Why [`validate`] refused a request: an error to answer as it is, or an
+/// input class held at `halt` with the escalation that holds it.
+///
+/// The escalation is the cause of a halt's answer, for the adapter's log; it
+/// is never answered. Every refusal converts into the [`DomainError`] the
+/// request is answered with, a halt into the unexpected-error outcome every
+/// `halt` answers: [`ErrorKind::Unexpected`], [`UNEXPECTED_ERROR`] and no
+/// fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditRefusal {
+    /// A rule's error, answered unchanged: a failed key or field edit, or the
+    /// unexpected-error outcome of a value the edits that passed should have
+    /// proved, which no escalation holds.
+    Error(DomainError),
+    /// An input class held at `halt` (see the module notes): no code guesses
+    /// its outcome, and the request is answered with the unexpected-error
+    /// outcome.
+    Halted {
+        /// The ID of the `docs/parity/escalations.md` entry that holds the
+        /// input class at `halt`, for example `E-26`: logged by the adapter,
+        /// never part of the answer.
+        escalation_id: &'static str,
+    },
+}
+
+impl EditRefusal {
+    /// The escalation ID of a halted input class, `None` for an error.
+    #[must_use]
+    pub const fn escalation_id(&self) -> Option<&'static str> {
+        match self {
+            Self::Error(_) => None,
+            Self::Halted { escalation_id } => Some(*escalation_id),
+        }
+    }
+}
+
+impl From<DomainError> for EditRefusal {
+    /// `error` answered unchanged.
+    fn from(error: DomainError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl From<EditRefusal> for DomainError {
+    /// The answer to `refusal`: its error, or for a halt the unexpected-error
+    /// outcome, which carries nothing of the escalation.
+    fn from(refusal: EditRefusal) -> Self {
+        match refusal {
+            EditRefusal::Error(error) => error,
+            EditRefusal::Halted { .. } => halt(),
+        }
+    }
+}
+
 /// A request that succeeded: the records as they now stand and the
 /// information text the program shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -700,9 +767,9 @@ impl NewDetails {
     ///
     /// # Errors
     ///
-    /// The unexpected-error outcome for an amount whose `TEST-NUMVAL-C` or
-    /// `NUMVAL-C` result the audit does not pin (E-40).
-    fn receive(input: &AccountUpdateInput) -> Result<Self, DomainError> {
+    /// [`EditRefusal::Halted`] with E-40 for an amount whose `TEST-NUMVAL-C`
+    /// or `NUMVAL-C` result the audit does not pin.
+    fn receive(input: &AccountUpdateInput) -> Result<Self, EditRefusal> {
         Ok(Self {
             acct_id: receive(&input.account_id),
             active_status: receive(&input.active_status),
@@ -816,18 +883,21 @@ fn receive_phone(area: &str, prefix: &str, line: &str) -> PhoneParts {
 ///
 /// # Errors
 ///
-/// The unexpected-error outcome when the text is a `NUMVAL-C` argument only
-/// under a reading the audit does not record, or its value is a midpoint
-/// beyond the cent or exceeds the 10 integer digits of `S9(10)V99` (E-40).
-fn receive_amount(text: &str) -> Result<SignedAmount, DomainError> {
+/// [`EditRefusal::Halted`] with E-40 when the text is a `NUMVAL-C` argument
+/// only under a reading the audit does not record, or its value is a midpoint
+/// beyond the cent or exceeds the 10 integer digits of `S9(10)V99`.
+fn receive_amount(text: &str) -> Result<SignedAmount, EditRefusal> {
+    let unpinned = EditRefusal::Halted {
+        escalation_id: E_NUMVAL_C,
+    };
     let text = receive::<15>(text);
     let value = if text.is_blank() {
         None
     } else {
         match read_numval_c(text.as_bytes()) {
             NumvalC::Invalid => None,
-            NumvalC::Valid(number) => Some(number.store().ok_or_else(halt)?),
-            NumvalC::Unpinned => return Err(halt()),
+            NumvalC::Valid(number) => Some(number.store().ok_or(unpinned)?),
+            NumvalC::Unpinned => return Err(unpinned),
         }
     };
     Ok(SignedAmount { text, value })
@@ -1715,15 +1785,16 @@ impl Edits {
     ///
     /// # Errors
     ///
-    /// The unexpected-error outcome for a date `CSUTLDTC` would decide while
-    /// no message is set (E-26), and for a month holding a non-digit (E-47)
-    /// or a day of exactly one half (E-40).
+    /// [`EditRefusal::Halted`] with the escalation `super::date_edit` reports:
+    /// for a date `CSUTLDTC` would decide while no message is set (E-26), and
+    /// for a month holding a non-digit (E-47) or a day of exactly one half
+    /// (E-40).
     fn date(
         &mut self,
         label: &'static str,
         parts: DateParts,
         fields: DateBmsFields,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<bool, EditRefusal> {
         let mut own = ReturnMsg::default();
         match edit_date_ccyymmdd(label, &parts, &mut own, fields) {
             Ok(flags) => {
@@ -1735,7 +1806,9 @@ impl Edits {
             {
                 Ok(true)
             }
-            Err(DateValidationError::Unproven { .. }) => Err(halt()),
+            Err(DateValidationError::Unproven { escalation_id }) => {
+                Err(EditRefusal::Halted { escalation_id })
+            }
         }
     }
 
@@ -1835,13 +1908,13 @@ const FICO_MAX: u16 = 850;
 ///
 /// # Errors
 ///
-/// The first failing edit's text and kind with every flagged field, or the
-/// unexpected-error outcome of a date held at `halt`.
-fn edit_map_inputs(new: &NewDetails, today: NaiveDate) -> Result<(), DomainError> {
+/// [`EditRefusal::Error`] with the first failing edit's text and kind and
+/// every flagged field, or [`EditRefusal::Halted`] for a date held at `halt`.
+fn edit_map_inputs(new: &NewDetails, today: NaiveDate) -> Result<(), EditRefusal> {
     let mut edits = Edits::default();
     edit_account_fields(&mut edits, new)?;
     edit_customer_fields(&mut edits, new, today)?;
-    edits.finish()
+    edits.finish().map_err(EditRefusal::from)
 }
 
 /// COACTUPC 1200-EDIT-MAP-INPUTS — P-COACTUPC-006
@@ -1852,8 +1925,8 @@ fn edit_map_inputs(new: &NewDetails, today: NaiveDate) -> Result<(), DomainError
 ///
 /// # Errors
 ///
-/// The unexpected-error outcome of a date held at `halt`.
-fn edit_account_fields(edits: &mut Edits, new: &NewDetails) -> Result<(), DomainError> {
+/// [`EditRefusal::Halted`] for a date held at `halt`.
+fn edit_account_fields(edits: &mut Edits, new: &NewDetails) -> Result<(), EditRefusal> {
     edits.yes_no(FIELD_ACCOUNT_STATUS, new.active_status, FIELD_ACSTTUS);
     edits.date(FIELD_OPEN_DATE, new.open_date, DateBmsFields::OPEN_DATE)?;
     edits.signed_9v2(FIELD_CREDIT_LIMIT, &new.credit_limit, FIELD_ACRDLIM);
@@ -1896,12 +1969,12 @@ fn edit_account_fields(edits: &mut Edits, new: &NewDetails) -> Result<(), Domain
 ///
 /// # Errors
 ///
-/// The unexpected-error outcome of a date held at `halt`.
+/// [`EditRefusal::Halted`] for a date held at `halt`.
 fn edit_customer_fields(
     edits: &mut Edits,
     new: &NewDetails,
     today: NaiveDate,
-) -> Result<(), DomainError> {
+) -> Result<(), EditRefusal> {
     edits.ssn(new);
     if edits.date(FIELD_DATE_OF_BIRTH, new.dob, DateBmsFields::DATE_OF_BIRTH)? {
         edits.date_of_birth(new.dob, today);
@@ -2198,17 +2271,23 @@ fn date_parts(date: &Alnum<10>) -> [Vec<u8>; 3] {
 ///
 /// # Errors
 ///
-/// - The key edit's error, as [`edit_account_id`] returns it.
-/// - The first failing field edit in `1200-EDIT-MAP-INPUTS` order, with its
-///   kind ([`ErrorKind::Empty`] for a field not supplied,
-///   [`ErrorKind::Invalid`] otherwise) and every flagged field.
-/// - [`ErrorKind::Unexpected`] with [`UNEXPECTED_ERROR`] for an input class
-///   held at `halt` (see the module notes).
+/// - [`EditRefusal::Error`] with the key edit's error, as
+///   [`edit_account_id`] returns it.
+/// - [`EditRefusal::Error`] with the first failing field edit in
+///   `1200-EDIT-MAP-INPUTS` order, with its kind ([`ErrorKind::Empty`] for a
+///   field not supplied, [`ErrorKind::Invalid`] otherwise) and every flagged
+///   field.
+/// - [`EditRefusal::Error`] with [`ErrorKind::Unexpected`] and
+///   [`UNEXPECTED_ERROR`] for a received value the edits that passed should
+///   have proved.
+/// - [`EditRefusal::Halted`] with its escalation ID (E-26, E-40 or E-47) for
+///   an input class held at `halt` (see the module notes); it converts into
+///   [`ErrorKind::Unexpected`] with [`UNEXPECTED_ERROR`] and no fields.
 pub fn validate(
     snapshot: &AccountSnapshot,
     input: &AccountUpdateInput,
     today: NaiveDate,
-) -> Result<AccountEdit, DomainError> {
+) -> Result<AccountEdit, EditRefusal> {
     let account_id = edit_account_id(&input.account_id)?;
     edit_changes(account_id, snapshot, input, today)
 }
@@ -2228,17 +2307,21 @@ pub fn validate(
 ///
 /// # Errors
 ///
-/// - The first failing field edit in `1200-EDIT-MAP-INPUTS` order, with its
-///   kind ([`ErrorKind::Empty`] for a field not supplied,
-///   [`ErrorKind::Invalid`] otherwise) and every flagged field.
-/// - [`ErrorKind::Unexpected`] with [`UNEXPECTED_ERROR`] for an input class
-///   held at `halt` (see the module notes).
+/// - [`EditRefusal::Error`] with the first failing field edit in
+///   `1200-EDIT-MAP-INPUTS` order, with its kind ([`ErrorKind::Empty`] for a
+///   field not supplied, [`ErrorKind::Invalid`] otherwise) and every flagged
+///   field.
+/// - [`EditRefusal::Error`] with [`ErrorKind::Unexpected`] and
+///   [`UNEXPECTED_ERROR`] for a received value the edits that passed should
+///   have proved ([`update_records`]).
+/// - [`EditRefusal::Halted`] with its escalation ID for an input class held
+///   at `halt` (see the module notes).
 fn edit_changes(
     account_id: AccountId,
     snapshot: &AccountSnapshot,
     input: &AccountUpdateInput,
     today: NaiveDate,
-) -> Result<AccountEdit, DomainError> {
+) -> Result<AccountEdit, EditRefusal> {
     let new = NewDetails::receive(input)?;
     if no_changes_found(&new, snapshot) {
         return Ok(AccountEdit::NoChange);
@@ -2246,6 +2329,7 @@ fn edit_changes(
     edit_map_inputs(&new, today)?;
     update_records(account_id, &new, &snapshot.customer)
         .map(|changes| AccountEdit::Changed(Box::new(changes)))
+        .map_err(EditRefusal::from)
 }
 
 /// COACTUPC 9600-WRITE-PROCESSING, 9700-CHECK-CHANGE-IN-REC,
@@ -2352,7 +2436,8 @@ fn write_failure(message: &'static str) -> DomainError {
 ///
 /// # Errors
 ///
-/// The first error of those steps, as each documents it.
+/// The first error of those steps, as each documents it; a refusal of the
+/// edits as the [`DomainError`] its [`EditRefusal`] converts into.
 pub async fn update<S>(
     store: &mut S,
     key: &VersionKey,
@@ -2364,7 +2449,7 @@ where
 {
     let account_id = edit_account_id(&input.account_id)?;
     let snapshot = read_snapshot(store, account_id).await?;
-    match edit_changes(account_id, &snapshot, input, today)? {
+    match edit_changes(account_id, &snapshot, input, today).map_err(DomainError::from)? {
         AccountEdit::NoChange => Ok(AccountUpdated {
             account: snapshot.account,
             customer: snapshot.customer,
@@ -2392,7 +2477,7 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::{
-        AccountEdit, AccountSnapshot, AccountUpdateInput, CustomerKey, NewDetails,
+        AccountEdit, AccountSnapshot, AccountUpdateInput, CustomerKey, EditRefusal, NewDetails,
         VALID_EASY_RECOG_AREA_CODE, VALID_GENERAL_PURP_CODE, VALID_PHONE_AREA_CODE,
         VALID_US_STATE_CODE, VALID_US_STATE_ZIP_CD2_COMBO, ValidatedAccountChanges, apply,
         edit_account_id, read_snapshot, receive_amount, record_version, update, update_records,
@@ -2593,21 +2678,23 @@ mod tests {
             .collect()
     }
 
-    /// The rejection [`validate`] gives `input` against the fixture.
+    /// The rejection [`validate`] gives `input` against the fixture, as the
+    /// error it is answered with.
     fn rejection(input: &AccountUpdateInput) -> DomainError {
         match validate(&snapshot(), input, today()) {
-            Err(error) => error,
+            Err(refusal) => DomainError::from(refusal),
             Ok(edit) => panic!("expected a rejection, got {edit:?}"),
         }
     }
 
-    /// Asserts that `result` is the rejection `kind`, `message` at `field`.
+    /// Asserts that `result` is the rejection `kind`, `message` at `field`,
+    /// as the error it is answered with.
     fn assert_rejected<T: Debug>(
-        result: Result<T, DomainError>,
+        result: Result<T, impl Into<DomainError>>,
         (kind, message, field): (ErrorKind, &str, Option<&str>),
         case: &str,
     ) {
-        match result {
+        match result.map_err(Into::<DomainError>::into) {
             Err(error) => {
                 assert_eq!(error.kind, kind, "{case}");
                 assert_eq!(error.code, kind.code(), "{case}");
@@ -2676,8 +2763,8 @@ mod tests {
     }
 
     /// The `-N` value 1100-RECEIVE-MAP keeps for `text` in cents, `None` when
-    /// `TEST-NUMVAL-C` rejects it, or the halt outcome.
-    fn received_cents(text: &str) -> Result<Option<i64>, DomainError> {
+    /// `TEST-NUMVAL-C` rejects it, or the halt refusal.
+    fn received_cents(text: &str) -> Result<Option<i64>, EditRefusal> {
         receive_amount(text).map(|amount| amount.value.map(Money::cents))
     }
 
@@ -2737,6 +2824,11 @@ mod tests {
             "12cr",
             "12.00db",
         ] {
+            assert_eq!(
+                received_cents(text).map_err(|refusal| refusal.escalation_id()),
+                Err(Some("E-40")),
+                "{text:?}"
+            );
             assert_rejected(
                 received_cents(text),
                 (ErrorKind::Unexpected, messages::UNEXPECTED_ERROR, None),
@@ -3122,6 +3214,53 @@ mod tests {
                 "halt",
             );
         }
+    }
+
+    #[test]
+    fn a_halted_input_class_reports_its_escalation_and_answers_the_halt() {
+        // E-26: the status and open date pass, so the open date reaches
+        // CSUTLDTC with no message set; E-47: a month holding a non-digit;
+        // E-40: an amount NUMVAL-C converts to a midpoint beyond the cent.
+        let cases = [
+            (
+                AccountUpdateInput {
+                    active_status: "Y".to_owned(),
+                    ..clean_input()
+                },
+                "E-26",
+            ),
+            (
+                AccountUpdateInput {
+                    open_month: "1A".to_owned(),
+                    ..clean_input()
+                },
+                "E-47",
+            ),
+            (
+                AccountUpdateInput {
+                    credit_limit: "10.005".to_owned(),
+                    ..clean_input()
+                },
+                "E-40",
+            ),
+        ];
+        for (input, escalation_id) in cases {
+            let refusal = validate(&snapshot(), &input, today()).expect_err(escalation_id);
+            assert_eq!(refusal, EditRefusal::Halted { escalation_id });
+            assert_eq!(refusal.escalation_id(), Some(escalation_id));
+            assert_eq!(
+                DomainError::from(refusal),
+                DomainError::unexpected(messages::UNEXPECTED_ERROR),
+                "{escalation_id}"
+            );
+        }
+        // An edit's error names no escalation and is answered unchanged.
+        let refusal = validate(&snapshot(), &clean_input(), today()).expect_err("the status");
+        let EditRefusal::Error(error) = refusal.clone() else {
+            panic!("the status edit halted: {refusal:?}");
+        };
+        assert_eq!(refusal.escalation_id(), None);
+        assert_eq!(DomainError::from(refusal), error);
     }
 
     /// Asserts that `change` to [`clean_input`] adds `expected` to the

@@ -64,13 +64,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use carddemo_domain::clock::Clock;
-use carddemo_domain::entities::{Account, CardXref, Customer, Transaction};
-use carddemo_domain::numeric::{AccountId, CustomerId};
-use carddemo_domain::ports::{
-    AccountReader, CustomerReader, PortError, PortResult, TransactionReader, XrefReader,
+use carddemo_domain::rules::statement::{
+    self, Account, AccountId, AccountReader, CardXref, Customer, CustomerId, CustomerReader,
+    StatementError, StatementOutput, Transaction, TransactionReader, XrefReader,
 };
-use carddemo_domain::rules::statement::{self, StatementError, StatementOutput};
-use carddemo_persistence::{Db, PgStore, UnitOfWork};
+use carddemo_domain::rules::{PortError, PortResult};
+use carddemo_persistence::tx::{Db, PgStore, UnitOfWork};
 use chrono::{DateTime, Utc};
 use printpdf::lopdf;
 use tracing::Span;

@@ -12,8 +12,20 @@
 // Every value is shown as the string the API wrote (rule IDs, codes, the
 // NUMERIC(9,4) rate, the S9(09)V99 bounds, RFC 3339 instants): no value passes
 // through a JavaScript number, and none is reformatted.
+//
+// The whole list arrives in one answer and soft delete never shrinks it, so
+// the table shows it WINDOW_SIZE rules at a time: Previous and Next move the
+// window along the list the page already holds, in `rule_id` order, and send
+// no request. Only the window's rows are rendered.
 import { Plus } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type JSX } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type JSX,
+} from "react";
 import { Link } from "react-router";
 
 import type { components } from "@/api/schema";
@@ -40,16 +52,45 @@ const NONE = "—";
 // as if no rule existed.
 const LOAD_FAILED = "Reward rules could not be loaded";
 
-// The whole list arrives in one answer, so Previous and Next never page.
-const noop = (): void => undefined;
+// The rules one window shows: the ten rows of an admin list page.
+const WINDOW_SIZE = 10;
 
-/**
- * Whether a rule has ended: its exclusive `active_to` lies at or before the
- * browser's current instant. A rule that starts in the future still counts as
- * active, since it has not ended.
- */
-function isEnded(activeTo: string | null | undefined): boolean {
-  return activeTo != null && new Date(activeTo).getTime() <= Date.now();
+// The keys that enable Previous and Next while an adjacent window exists. The
+// table reads a key only to enable its control; the page moves the window
+// itself, so the keys name no rule.
+const PREVIOUS_WINDOW = "previous-window";
+const NEXT_WINDOW = "next-window";
+
+// The list while none is shown (loading, or a failed read): one array, so the
+// window over it keeps its identity across renders.
+const NO_RULES: RewardRuleResponse[] = [];
+
+// Where the window over `count` rules starts when asked to start at `start`:
+// at most at the last window that holds a rule, so a list that shrank (a
+// refetch after rules were removed) still shows rows.
+function windowStartFor(start: number, count: number): number {
+  if (count === 0) {
+    return 0;
+  }
+  const lastStart = Math.floor((count - 1) / WINDOW_SIZE) * WINDOW_SIZE;
+  return Math.min(start, lastStart);
+}
+
+// The rule's state as the server judged it at its processing clock
+// (CARDDEMO_CLOCK_OVERRIDE pins that clock), the instant the reward engine
+// matches transactions against. The browser's clock is never consulted.
+type RuleStatus = RewardRuleResponse["status"];
+
+// The badge's text, not its colour, carries the state.
+function statusBadge(status: RuleStatus): JSX.Element {
+  switch (status) {
+    case "active":
+      return <Badge>Active</Badge>;
+    case "scheduled":
+      return <Badge variant="outline">Scheduled</Badge>;
+    case "ended":
+      return <Badge variant="secondary">Ended</Badge>;
+  }
 }
 
 function orNone(value: string | null): string {
@@ -109,13 +150,7 @@ function ruleColumns(
     {
       id: "status",
       header: "Status",
-      // The badge's text, not its colour, carries the state.
-      cell: ({ row }) =>
-        isEnded(row.original.active_to) ? (
-          <Badge variant="secondary">Ended</Badge>
-        ) : (
-          <Badge>Active</Badge>
-        ),
+      cell: ({ row }) => statusBadge(row.original.status),
     },
     {
       id: "actions",
@@ -156,15 +191,25 @@ function ruleColumns(
   ];
 }
 
-// What confirming the delete of `rule` does. The server ends an open-ended or
-// later-ending rule at its current instant and leaves an ended one unchanged.
+// What confirming the delete of `rule` does, by the status the server gave it.
+// The server ends an open-ended or later-ending rule at its current instant
+// and leaves an ended one unchanged; a rule that has not started is ended
+// before its Active from, so it never matches.
 function deleteDescription(rule: RewardRuleResponse | null): JSX.Element {
   if (rule === null) {
     return <p />;
   }
   const subject = `Rule ${rule.rule_id} (type ${rule.transaction_type_cd}, category ${rule.transaction_category_cd})`;
-  if (isEnded(rule.active_to)) {
+  if (rule.status === "ended") {
     return <p>{`${subject} has already ended, so deleting it changes nothing.`}</p>;
+  }
+  if (rule.status === "scheduled") {
+    return (
+      <div className="flex flex-col gap-2">
+        <p>{`${subject} has not started yet. Deleting it ends it now, before its Active from, so it never matches a transaction.`}</p>
+        <p>The rule stays listed as Ended.</p>
+      </div>
+    );
   }
   return (
     <div className="flex flex-col gap-2">
@@ -179,6 +224,11 @@ function deleteDescription(rule: RewardRuleResponse | null): JSX.Element {
 
 export default function RewardRuleListPage(): JSX.Element {
   const rules = useRewardRules();
+  // A failed read keeps the query's last list; it is not shown, because it
+  // does not answer the read that failed (a refresh after a delete, say), so
+  // its rows and their Edit and Delete leave with it and LOAD_FAILED stands in
+  // the table in their place.
+  const loaded = rules.isError ? undefined : rules.data;
   const deleteMutation = useRewardRuleDeleteMutation();
 
   // The rule whose delete awaits confirmation; null while the dialog is
@@ -188,11 +238,23 @@ export default function RewardRuleListPage(): JSX.Element {
   // keeps its text while it animates closed.
   const [named, setNamed] = useState<RewardRuleResponse | null>(null);
 
+  // Each failed read is toasted once, when it settles. The query keeps a
+  // failed read's error beside the rows read before it, so a return to the
+  // page finds that error while its own read of the list is still out; that
+  // read's answer, the rows or a new error, is what the page reports, so no
+  // error is toasted while a read is out, fetching or paused offline. The ref
+  // keeps one error from being toasted twice: by StrictMode's re-run of
+  // effects, or by its return when a cancelled read reverts the query to it.
+  const listError = rules.error;
+  const reading = rules.fetchStatus !== "idle";
+  const shownError = useRef<unknown>(null);
   useEffect(() => {
-    if (rules.error) {
-      showApiError(rules.error);
+    if (listError === null || reading || listError === shownError.current) {
+      return;
     }
-  }, [rules.error]);
+    shownError.current = listError;
+    showApiError(listError);
+  }, [listError, reading]);
 
   const requestDelete = useCallback((rule: RewardRuleResponse) => {
     setNamed(rule);
@@ -200,6 +262,62 @@ export default function RewardRuleListPage(): JSX.Element {
   }, []);
 
   const columns = useMemo(() => ruleColumns(requestDelete), [requestDelete]);
+
+  // The window over the list. `requestedStart` is the index Previous or Next
+  // last moved its first rule to; `windowStart` is where it starts as shown,
+  // held to the last window that still holds a rule. The window's rows keep
+  // their array identity until the list or the window changes, as the table
+  // requires of one result.
+  const all = loaded ?? NO_RULES;
+  const [requestedStart, setRequestedStart] = useState(0);
+  const windowStart = windowStartFor(requestedStart, all.length);
+  const shown = useMemo(
+    () => all.slice(windowStart, windowStart + WINDOW_SIZE),
+    [all, windowStart],
+  );
+  const prevKey = windowStart > 0 ? PREVIOUS_WINDOW : null;
+  const nextKey = windowStart + WINDOW_SIZE < all.length ? NEXT_WINDOW : null;
+  const showPrevious = useCallback(() => {
+    setRequestedStart(Math.max(0, windowStart - WINDOW_SIZE));
+  }, [windowStart]);
+  const showNext = useCallback(() => {
+    setRequestedStart(windowStart + WINDOW_SIZE);
+  }, [windowStart]);
+
+  // The table element changes only with what it shows, so opening, closing
+  // or confirming the delete dialog re-renders none of its rows. It waits for
+  // the read that is out: the first one, or a re-read of a list whose last
+  // read failed. That failure stays in the query until the re-read answers,
+  // but it does not answer the re-read, so LOAD_FAILED does not stand in the
+  // table, and Previous and Next stay disabled, until the re-read's own
+  // answer arrives.
+  const loadFailed = rules.isError;
+  const loading = rules.isPending || (loadFailed && reading);
+  const table = useMemo(
+    () => (
+      <DataTable
+        data={shown}
+        columns={columns}
+        prevKey={prevKey}
+        nextKey={nextKey}
+        onPrevious={showPrevious}
+        onNext={showNext}
+        emptyMessage={loadFailed ? LOAD_FAILED : undefined}
+        caption="Reward rules"
+        loading={loading}
+      />
+    ),
+    [
+      shown,
+      columns,
+      prevKey,
+      nextKey,
+      showPrevious,
+      showNext,
+      loadFailed,
+      loading,
+    ],
+  );
 
   // Closes the dialog only while it still asks about `rule`, so a request
   // that settles after another row's dialog was opened leaves that one open.
@@ -215,16 +333,15 @@ export default function RewardRuleListPage(): JSX.Element {
       return;
     }
     // The hook refetches the list before it settles, so the row shows its
-    // new Active to and status without a refetch here. The DELETE answer is
-    // the rule itself and carries no message, hence the page's own text,
-    // which tells apart a rule that had already ended and stayed unchanged.
-    const alreadyEnded = isEnded(rule.active_to);
+    // new Active to and status without a refetch here. The DELETE answer
+    // carries no message, hence the page's own text, chosen by the answer's
+    // outcome: what the server did, not what the row showed before.
     deleteMutation.mutate(rule.rule_id, {
-      onSuccess: () => {
+      onSuccess: (deletion) => {
         showSuccess(
-          alreadyEnded
-            ? `Reward rule ${rule.rule_id} had already ended`
-            : `Reward rule ${rule.rule_id} ended`,
+          deletion.outcome === "unchanged"
+            ? `Reward rule ${deletion.rule_id} had already ended`
+            : `Reward rule ${deletion.rule_id} ended`,
         );
         settle(rule);
       },
@@ -249,17 +366,7 @@ export default function RewardRuleListPage(): JSX.Element {
           </Button>
         }
       />
-      <DataTable
-        data={rules.data ?? []}
-        columns={columns}
-        prevKey={null}
-        nextKey={null}
-        onPrevious={noop}
-        onNext={noop}
-        emptyMessage={rules.isError ? LOAD_FAILED : undefined}
-        caption="Reward rules"
-        loading={rules.isPending}
-      />
+      {table}
       <ConfirmDialog
         open={pending !== null}
         onOpenChange={(open) => {

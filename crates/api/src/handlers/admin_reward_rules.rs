@@ -16,7 +16,11 @@
 //!   passes it through that check, writes and answers; it repeats none of it.
 //! - A delete is soft: it ends the rule's active window at the processing
 //!   clock's instant (`CARDDEMO_CLOCK_OVERRIDE` pins it, AAP 0.6.4) and never
-//!   removes the row, because reward accruals reference its `rule_id`.
+//!   removes the row, because reward accruals reference its `rule_id`. Its
+//!   answer names the `outcome`, `deleted` or `unchanged`.
+//! - Every rule answered carries its `status` (`scheduled`, `active` or
+//!   `ended`) at the processing clock's instant, which each handler reads once
+//!   per request, so the client never judges a rule by its own clock.
 //! - Points are only earned. Redemption, tiers and external loyalty
 //!   integrations are out of scope, so nothing here touches balances.
 //!
@@ -53,15 +57,16 @@ use carddemo_domain::clock::Clock;
 use carddemo_domain::error::DomainError;
 use carddemo_domain::messages;
 use carddemo_domain::numeric::RuleId;
-use carddemo_domain::ports::PortError;
-use carddemo_domain::rewards::validate_rule;
-use carddemo_persistence::UnitOfWork;
+use carddemo_domain::rules::{PortError, validate_rule};
 use carddemo_persistence::repos::SoftDeleteOutcome;
+use carddemo_persistence::tx::UnitOfWork;
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
 use crate::auth::AdminUser;
-use crate::dto::admin_reward_rules::{RewardRuleRequest, RewardRuleResponse};
+use crate::dto::admin_reward_rules::{
+    RewardRuleDeleteOutcome, RewardRuleDeleteResponse, RewardRuleRequest, RewardRuleResponse,
+};
 use crate::error::{ApiError, ApiJson, ApiPath, Created, ErrorBody};
 use crate::state::AppState;
 
@@ -77,13 +82,6 @@ const CREATED: &str = "created";
 
 /// The `outcome` of a replaced rule.
 const UPDATED: &str = "updated";
-
-/// The `outcome` of a delete that ended the rule's active window.
-const DELETED: &str = "deleted";
-
-/// The `outcome` of a delete of a rule that had already ended: nothing
-/// written.
-const UNCHANGED: &str = "unchanged";
 
 /// The 404 answer for a rule ID that names no rule: code `NOT_FOUND`,
 /// [`messages::REWARD_RULE_NOT_FOUND`].
@@ -164,7 +162,8 @@ async fn roll_back<T>(uow: UnitOfWork, error: PortError) -> Result<T, ApiError> 
 /// endpoints, AAP 0.3.5).
 ///
 /// No rules is 200 with an empty list. A soft-deleted rule shows the
-/// `active_to` its delete set.
+/// `active_to` its delete set. Every rule's `status` is taken at one reading
+/// of the processing clock.
 ///
 /// # Errors
 ///
@@ -192,13 +191,17 @@ pub async fn list_reward_rules(
     admin: AdminUser,
 ) -> Result<Json<Vec<RewardRuleResponse>>, ApiError> {
     traced(request_span("list", &admin), async move {
+        let now = state.clock().now();
         let mut uow = state.db().begin().await?;
         let rules = match uow.store().list_reward_rules().await {
             Ok(rules) => rules,
             Err(error) => return roll_back(uow, error).await,
         };
         uow.rollback().await?;
-        let body = rules.iter().map(RewardRuleResponse::from).collect();
+        let body = rules
+            .iter()
+            .map(|rule| RewardRuleResponse::at(rule, now))
+            .collect();
         Ok((Json(body), LISTED))
     })
     .await
@@ -245,6 +248,7 @@ pub async fn create_reward_rule(
 ) -> Result<Created<RewardRuleResponse>, ApiError> {
     traced(request_span("create", &admin), async move {
         let rule = validate_rule(body.into_draft()?)?;
+        let now = state.clock().now();
         let mut uow = state.db().begin().await?;
         let saved = match uow.store().insert_reward_rule(rule).await {
             Ok(saved) => saved,
@@ -252,7 +256,7 @@ pub async fn create_reward_rule(
         };
         uow.commit().await?;
         record_rule_id(saved.rule_id);
-        Ok((Created(RewardRuleResponse::from(&saved)), CREATED))
+        Ok((Created(RewardRuleResponse::at(&saved, now)), CREATED))
     })
     .await
 }
@@ -302,6 +306,7 @@ pub async fn update_reward_rule(
         let rule_id = parse_rule_id(&id)?;
         record_rule_id(rule_id);
         let rule = validate_rule(body.into_draft()?)?;
+        let now = state.clock().now();
         let mut uow = state.db().begin().await?;
         let updated = match uow.store().update_reward_rule(rule_id, rule).await {
             Ok(updated) => updated,
@@ -312,17 +317,20 @@ pub async fn update_reward_rule(
             return Err(rule_not_found());
         };
         uow.commit().await?;
-        Ok((Json(RewardRuleResponse::from(&saved)), UPDATED))
+        Ok((Json(RewardRuleResponse::at(&saved, now)), UPDATED))
     })
     .await
 }
 
 /// `DELETE /admin/reward-rules/{id}`: soft-deletes the rule and answers 200
-/// with it (Request › Rewards system › Admin endpoints, AAP 0.3.5).
+/// with it and the `outcome` (Request › Rewards system › Admin endpoints,
+/// AAP 0.3.5).
 ///
 /// The rule's `active_to` becomes the processing clock's instant when it is
-/// absent or later; a rule that has already ended is answered unchanged. The
-/// row is never removed, because accruals reference its `rule_id`.
+/// absent or later (`outcome` `deleted`); a rule that has already ended is
+/// answered unchanged (`outcome` `unchanged`). Either way the rule's `status`
+/// at that instant is `ended`. The row is never removed, because accruals
+/// reference its `rule_id`.
 ///
 /// # Errors
 ///
@@ -338,8 +346,9 @@ pub async fn update_reward_rule(
     responses(
         (
             status = 200,
-            description = "The rule after the soft delete, or unchanged when it had already ended",
-            body = RewardRuleResponse,
+            description = "The rule after the soft delete, or unchanged when it had already ended, \
+                with the outcome",
+            body = RewardRuleDeleteResponse,
         ),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an admin's", body = ErrorBody),
@@ -352,7 +361,7 @@ pub async fn delete_reward_rule(
     State(state): State<AppState>,
     admin: AdminUser,
     ApiPath(id): ApiPath<String>,
-) -> Result<Json<RewardRuleResponse>, ApiError> {
+) -> Result<Json<RewardRuleDeleteResponse>, ApiError> {
     traced(request_span("delete", &admin), async move {
         let rule_id = parse_rule_id(&id)?;
         record_rule_id(rule_id);
@@ -363,15 +372,19 @@ pub async fn delete_reward_rule(
             Err(error) => return roll_back(uow, error).await,
         };
         let (rule, outcome) = match deleted {
-            SoftDeleteOutcome::Deleted(rule) => (rule, DELETED),
-            SoftDeleteOutcome::Unchanged(rule) => (rule, UNCHANGED),
+            SoftDeleteOutcome::Deleted(rule) => (rule, RewardRuleDeleteOutcome::Deleted),
+            SoftDeleteOutcome::Unchanged(rule) => (rule, RewardRuleDeleteOutcome::Unchanged),
             SoftDeleteOutcome::NotFound => {
                 uow.rollback().await?;
                 return Err(rule_not_found());
             }
         };
         uow.commit().await?;
-        Ok((Json(RewardRuleResponse::from(&rule)), outcome))
+        let answer = RewardRuleDeleteResponse {
+            rule: RewardRuleResponse::at(&rule, now),
+            outcome,
+        };
+        Ok((Json(answer), outcome.as_str()))
     })
     .await
 }
@@ -498,10 +511,13 @@ mod tests {
             json_schema(&rules["post"]["responses"]["201"])["$ref"],
             reference("RewardRuleResponse")
         );
-        for (method, success) in [("put", "200"), ("delete", "200")] {
+        for (method, success, body) in [
+            ("put", "200", "RewardRuleResponse"),
+            ("delete", "200", "RewardRuleDeleteResponse"),
+        ] {
             assert_eq!(
                 json_schema(&rule[method]["responses"][success])["$ref"],
-                reference("RewardRuleResponse"),
+                reference(body),
                 "{method}"
             );
             let params = rule[method]["parameters"].as_array().expect("parameters");

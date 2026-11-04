@@ -72,8 +72,11 @@ use carddemo_domain::rules::date_edit::{
 };
 use carddemo_domain::rules::date_validation::{DatePicture, DateValidationError};
 use carddemo_testkit::{block_on, fixtures};
-use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
+use common::{
+    Resp, TestApp, assert_error, fixture_records, parity_audit, validation_audit, validation_ids,
+};
 use reqwest::StatusCode;
+use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 
 /// The program whose validation rows this file exercises.
@@ -476,17 +479,22 @@ const DELETE_ACCOUNT_2: &str = "DELETE FROM accounts WHERE account_id = 2";
 /// The account number of [`DELETE_ACCOUNT_2`], as `ACCTSID` holds it.
 const ACCOUNT_2: &str = "00000000002";
 
-/// Customer 3, the cross-reference customer of account 3
-/// [app/data/ASCII/cardxref.txt:L17], loses its master record
-/// (V-COACTUPC-008).
-const DELETE_CUSTOMER_3: &str = "DELETE FROM customers WHERE customer_id = 3";
+/// The customer the cross-reference of account 3 names loses its master
+/// record while the cross-reference stays (V-COACTUPC-008). The statement
+/// follows the seeded `card_xref` row of the account rather than a customer
+/// number, so the customer it removes is the one the test decodes from the
+/// `cardxref.txt` record of [`ACCOUNT_3`].
+const DELETE_CUSTOMER_OF_ACCOUNT_3: &str = "DELETE FROM customers WHERE customer_id IN \
+     (SELECT xref_cust_id FROM card_xref WHERE xref_acct_id = 3)";
 
-/// The account number whose customer [`DELETE_CUSTOMER_3`] removes.
+/// The account number whose customer [`DELETE_CUSTOMER_OF_ACCOUNT_3`]
+/// removes, as `ACCTSID` holds it.
 const ACCOUNT_3: &str = "00000000003";
 
-/// The customer ID of [`DELETE_CUSTOMER_3`], as `WS-CARD-RID-CUST-ID-X`
-/// holds it.
-const CUSTOMER_3: &str = "000000003";
+/// The column of a decoded cross-reference holding its customer,
+/// `XREF-CUST-ID 9(09)` (P-CVACT03Y-002): the nine digits
+/// `WS-CARD-RID-CUST-ID-X` holds.
+const XREF_CUSTOMER: &str = "xref_cust_id";
 
 /// Hides the cross-reference: its read then fails with SQLSTATE `42P01`
 /// (V-COACTUPC-005).
@@ -510,9 +518,12 @@ const ACCOUNT_CHANGED_ELSEWHERE: &str =
 const CUSTOMER_CHANGED_ELSEWHERE: &str =
     "UPDATE customers SET cust_first_name = 'Elsewhere' WHERE customer_id = 1";
 
-/// The values [`ACCOUNT_CHANGED_ELSEWHERE`] and [`CUSTOMER_CHANGED_ELSEWHERE`]
-/// leave: the fixture credit limit 2020.00 plus 1, and the new first name.
-const CHANGED_ELSEWHERE_VALUES: [&str; 2] = ["2021.00", "Elsewhere"];
+/// The first name [`CUSTOMER_CHANGED_ELSEWHERE`] stores.
+const FIRST_NAME_CHANGED_ELSEWHERE: &str = "Elsewhere";
+
+/// The section D row recording the seeded state of account 1, its credit
+/// limit included.
+const SEEDED_ACCOUNT_ROW: &str = "P-CVACT01Y-015";
 
 /// A test-only trigger function that fails every customer rewrite, as a
 /// `CUSTDAT` `REWRITE` that does not return `NORMAL` (V-COACTUPC-128).
@@ -1510,19 +1521,32 @@ fn assert_file_error(resp: &Resp, row: &AuditRow) {
 /// V-COACTUPC-008, V-COACTUPC-009, E-45
 ///
 /// Account 2 without its master record keeps the account text, because the
-/// customer read that still runs finds customer 2; a failing customer read
-/// replaces that text with the `CUSTDAT` file error. Customer 3 without its
-/// master record answers the customer text.
+/// customer read that still runs finds the customer its cross-reference
+/// names; a failing customer read replaces that text with the `CUSTDAT` file
+/// error. The customer of account 3 without its master record answers the
+/// customer text, naming that customer as the `cardxref.txt` record of
+/// account 3 holds it, decoded at its reviewed section A offsets
+/// (P-CVACT03Y-002, P-CVACT03Y-003). The two accounts' decoded customers
+/// differ, so the deleted customer is not the one account 2 still finds.
 async fn missing_records(app: &TestApp, token: &str, doc: &Document, body: &Value) {
     let account_row = audit_row(doc, "V-COACTUPC-006");
     let customer_row = audit_row(doc, "V-COACTUPC-008");
     let customer_failure = audit_row(doc, "V-COACTUPC-009");
+    let parity = parity_audit();
+    let account_3_xref = fixture_records::account_xref(&parity, ACCOUNT_3);
+    let missing_customer = account_3_xref.value(XREF_CUSTOMER);
+    assert_ne!(
+        fixture_records::account_xref(&parity, ACCOUNT_2).value(XREF_CUSTOMER),
+        missing_customer,
+        "P-CVACT03Y-002, P-CVACT03Y-003: account 2 and account 3 cross-reference different \
+         customers"
+    );
     app.stack().exec_sql(DELETE_ACCOUNT_2).await;
-    app.stack().exec_sql(DELETE_CUSTOMER_3).await;
+    app.stack().exec_sql(DELETE_CUSTOMER_OF_ACCOUNT_3).await;
     let account_text =
         messages::account_master_not_found_message(ACCOUNT_2, RESP_NOTFND.0, RESP_NOTFND.1);
     let customer_text =
-        messages::customer_master_not_found_message(CUSTOMER_3, RESP_NOTFND.0, RESP_NOTFND.1);
+        messages::customer_master_not_found_message(missing_customer, RESP_NOTFND.0, RESP_NOTFND.1);
     let missing = [
         (ACCOUNT_2, &account_row, account_text),
         (ACCOUNT_3, &customer_row, customer_text),
@@ -1596,12 +1620,29 @@ fn a_change_that_passes_every_edit_is_held_at_the_csutldtc_halt() {
         let stored = app.stack().fetch_text_rows(CHANGED_FIELDS_ROW).await;
         assert_eq!(
             stored,
-            [CHANGED_ELSEWHERE_VALUES
-                .map(|value| Some(value.to_owned()))
-                .to_vec()],
+            [changed_elsewhere_values().map(Some).to_vec()],
             "only the other writer's change is stored"
         );
     });
+}
+
+/// The values [`CHANGED_FIELDS_ROW`] reads once [`ACCOUNT_CHANGED_ELSEWHERE`]
+/// and [`CUSTOMER_CHANGED_ELSEWHERE`] have run: the seeded credit limit of
+/// account 1 that [`SEEDED_ACCOUNT_ROW`] records, plus 1 in exact decimal
+/// arithmetic, and [`FIRST_NAME_CHANGED_ELSEWHERE`].
+///
+/// The sum keeps the two decimals the audit writes the limit with, so it
+/// reads as the `NUMERIC(12,2)` text of the stored `acct_credit_limit`.
+fn changed_elsewhere_values() -> [String; 2] {
+    let seeded =
+        fixture_records::section_d_value(&parity_audit(), SEEDED_ACCOUNT_ROW, "acct_credit_limit");
+    let seeded: Decimal = seeded.parse().unwrap_or_else(|error| {
+        panic!("{SEEDED_ACCOUNT_ROW} records acct_credit_limit={seeded}, no decimal: {error}")
+    });
+    [
+        (seeded + Decimal::ONE).to_string(),
+        FIRST_NAME_CHANGED_ELSEWHERE.to_owned(),
+    ]
 }
 
 /// COACTUPC 9600-WRITE-PROCESSING after a failed customer rewrite —

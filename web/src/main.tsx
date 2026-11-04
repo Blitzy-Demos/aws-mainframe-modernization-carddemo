@@ -5,7 +5,8 @@
 // - ThemeProvider wraps everything, so the Toaster and every page read the one
 //   light/dark theme it keeps in sessionStorage.
 // - QueryClientProvider holds the single query cache the pages' TanStack Query
-//   hooks share. Nothing persists it: data is fetched on navigation or action.
+//   hooks share. Nothing persists it; QUERY_STALE_TIME_MS states when a cached
+//   entry is read again.
 // - TooltipProvider gives every tooltip one context, including those outside
 //   the sidebar's own provider.
 // - The Toaster, the only one in the app, is App's sibling rather than part of
@@ -41,11 +42,30 @@ function shouldRetryQuery(failureCount: number, error: Error): boolean {
   return failureCount < QUERY_RETRY_LIMIT;
 }
 
+// How long, in milliseconds, a cached query result counts as current. It is
+// zero: every screen reads its records again when it is entered or when the
+// user acts on it (Enter, Previous/Next in place of PF7/PF8, an explicit
+// refresh), as each COBOL screen re-reads its file on entry. Nothing pushes
+// changes to the browser, and records change outside this tab's own writes:
+// the batch jobs (POSTTRAN, INTCALC, TRANBKP and COMBTRAN), the CP00 queue
+// consumer recording authorizations, and other signed-on users. A cached entry
+// is therefore never taken as current without a read. After a write, its query
+// module under src/api/queries invalidates the entries that write changed,
+// which covers only this tab's writes.
+//
+// The cache still does three things. A screen shows the entry it already holds
+// while the new read runs, observers of one key share a single in-flight
+// request, and keepPreviousData keeps a list page on screen while Previous or
+// Next loads the adjacent one. Reads happen only on navigation or action:
+// window focus and network reconnection start none.
+const QUERY_STALE_TIME_MS = 0;
+
 // Mutations are never retried: a write the server may already have applied is
 // sent exactly once, and its answer, success or COBOL message, is shown.
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
+      staleTime: QUERY_STALE_TIME_MS,
       retry: shouldRetryQuery,
       refetchOnWindowFocus: false,
       refetchOnReconnect: false,

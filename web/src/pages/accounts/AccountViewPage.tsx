@@ -12,7 +12,14 @@
 // The form schema mirrors the key edits, so the form never sends a key the
 // server is certain to refuse; a key that reaches the server through the URL
 // gets the same text back, shown at ACCTSID with the cursor there.
-import { useEffect, useId, useRef, type JSX, type ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type JSX,
+  type ReactNode,
+} from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { ArrowLeft } from "lucide-react";
 import { Controller, useForm } from "react-hook-form";
@@ -44,6 +51,11 @@ const INFO_MESSAGE = "Enter or update id of account to display";
 
 /** ACCTSID `LENGTH=11`, `PICIN='99999999999'` [app/bms/COACTVW.bms:L84-90]. */
 const ACCOUNT_ID_LENGTH = 11;
+
+// How long the read's status stays empty before it announces. The region is
+// cleared and then refilled, so the identical result of a repeated lookup is
+// still announced as a change; the delay is the one DataTable uses.
+const STATUS_ANNOUNCE_DELAY_MS = 150;
 
 /** One label and value of a read-only detail list. */
 type Detail = { label: string; value: ReactNode };
@@ -208,11 +220,13 @@ function AccountDetails({ account }: { account: Account }): JSX.Element {
   );
 }
 
-/** Placeholder blocks while the account is read. */
+/**
+ * Placeholder blocks while the account is read, hidden from assistive
+ * technology: the page's status region announces the read.
+ */
 function AccountDetailsSkeleton(): JSX.Element {
   return (
-    <div role="status" aria-busy="true" className="flex flex-col gap-6">
-      <span className="sr-only">Loading account</span>
+    <div aria-hidden="true" className="flex flex-col gap-6">
       <Skeleton className="h-56 w-full rounded-xl" />
       <Skeleton className="h-96 w-full rounded-xl" />
       <Skeleton className="h-24 w-full rounded-xl" />
@@ -265,6 +279,33 @@ export default function AccountViewPage(): JSX.Element {
     }
     void navigate(`/accounts/${encodeURIComponent(account_id)}`);
   };
+
+  // The read as one polite status line: its progress, then the account it
+  // answered for, never a detail value such as the SSN. It is empty without a
+  // route key and after a failed read, whose toast and field error report it.
+  let statusText = "";
+  if (accountId !== "" && isFetching) {
+    statusText = "Loading account";
+  } else if (account.isSuccess && !isFetching) {
+    statusText = `Account ${account.data.account_id} loaded`;
+  }
+
+  // Each change of the text, and each new answer of a repeated lookup even
+  // when its text is unchanged, clears the region and fills it after the
+  // delay.
+  const [announcement, setAnnouncement] = useState("");
+  useEffect(() => {
+    setAnnouncement("");
+    if (statusText === "") {
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      setAnnouncement(statusText);
+    }, STATUS_ANNOUNCE_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [statusText, account.dataUpdatedAt]);
 
   let details: ReactNode = null;
   if (accountId !== "") {
@@ -322,6 +363,12 @@ export default function AccountViewPage(): JSX.Element {
           Look up account
         </Button>
       </form>
+      {/* Always rendered, across reads and outside every busy element, so
+          assistive technology tracks the region from the start and announces
+          its changes politely. */}
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
       {details}
     </div>
   );

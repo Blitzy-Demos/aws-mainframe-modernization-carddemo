@@ -33,11 +33,11 @@
 
 use axum::Json;
 use axum::extract::State;
-use carddemo_domain::entities::{RewardAccrual, RewardBalance};
 use carddemo_domain::error::DomainError;
 use carddemo_domain::messages;
 use carddemo_domain::numeric::{AccountId, AccrualId};
-use carddemo_domain::ports::{AccountReader, PortError};
+use carddemo_domain::rules::account_view::AccountReader;
+use carddemo_domain::rules::{PortError, RewardAccrual, RewardBalance};
 use tracing::{Instrument, Span};
 
 use crate::auth::AuthUser;

@@ -53,7 +53,11 @@ use crate::messages::{
     USER_NOT_FOUND_TRY_AGAIN, WRONG_PASSWORD_TRY_AGAIN,
 };
 use crate::numeric::{Alnum, UserId};
-use crate::ports::{PortError, UserStore};
+use crate::ports::PortError;
+
+/// The user store [`sign_on`] reads, re-exported from [`crate::ports`] for the
+/// API adapter, which reads the signed-on user through it.
+pub use crate::ports::UserStore;
 
 /// The BMS field of the user ID: `USERIDL OF COSGN0AI`, where the COBOL puts
 /// the cursor with `MOVE -1` [app/cpy-bms/COSGN00.CPY:L67].
@@ -207,8 +211,9 @@ impl SignonCheck {
 ///    are the edits of [`edit_blank_fields`], which an adapter runs before it
 ///    opens the store; they are repeated here with the same answer.
 /// 2. The user ID is upper-cased and padded to 8, giving the `USRSEC` key
-///    [app/cbl/COSGN00C.cbl:L132-134]; the password is upper-cased and padded
-///    when it is verified [app/cbl/COSGN00C.cbl:L135-136] (E-20).
+///    of [`entered_user_key`] [app/cbl/COSGN00C.cbl:L132-134]; the password
+///    is upper-cased and padded when it is verified
+///    [app/cbl/COSGN00C.cbl:L135-136] (E-20).
 /// 3. The user record is read by that key (`READ-USER-SEC-FILE`
 ///    [app/cbl/COSGN00C.cbl:L209-219, L247-256]).
 ///
@@ -241,7 +246,9 @@ pub async fn sign_on<S: UserStore>(
 ) -> Result<SignonCheck, DomainError> {
     edit_blank_fields(&input)?;
     let SignonInput { user_id, password } = input;
-    let key = UserId::move_from(&normalize_signon_user_id(&user_id));
+    // `edit_blank_fields` has refused a blank user ID, so the key exists; the
+    // refusal is repeated with the same answer rather than assumed away.
+    let key = entered_user_key(&user_id).ok_or_else(please_enter_user_id)?;
     let user = read_user_sec_file(store, key).await?;
     Ok(SignonCheck {
         user_id: key,
@@ -272,12 +279,39 @@ pub async fn sign_on<S: UserStore>(
 ///   the password is blank (V-COSGN00C-002, order 2).
 pub fn edit_blank_fields(input: &SignonInput) -> Result<(), DomainError> {
     if is_spaces_or_low_values(&input.user_id, USERIDI_LEN) {
-        return Err(DomainError::empty(PLEASE_ENTER_USER_ID).with_field(USERID));
+        return Err(please_enter_user_id());
     }
     if is_spaces_or_low_values(&input.password, PASSWDI_LEN) {
         return Err(DomainError::empty(PLEASE_ENTER_PASSWORD).with_field(PASSWD));
     }
     Ok(())
+}
+
+/// COSGN00C PROCESS-ENTER-KEY — P-COSGN00C-005, V-COSGN00C-001.
+///
+/// `WHEN USERIDI OF COSGN0AI = SPACES OR LOW-VALUES`: 'Please enter User ID
+/// ...' with the cursor on the user ID [app/cbl/COSGN00C.cbl:L118-122].
+fn please_enter_user_id() -> DomainError {
+    DomainError::empty(PLEASE_ENTER_USER_ID).with_field(USERID)
+}
+
+/// COSGN00C PROCESS-ENTER-KEY — P-COSGN00C-005, P-COSGN00C-007,
+/// V-COSGN00C-001.
+///
+/// The `USRSEC` key of the user ID typed as `user_id`: `MOVE FUNCTION
+/// UPPER-CASE(USERIDI OF COSGN0AI) TO WS-USER-ID`, the `PIC X(08)` record key
+/// [app/cbl/COSGN00C.cbl:L132-134], or `None` for a user ID of
+/// `SPACES OR LOW-VALUES` over its 8 bytes, which V-COSGN00C-001 refuses
+/// before any key is read [app/cbl/COSGN00C.cbl:L118-122].
+///
+/// [`sign_on`] reads the user by this key and a successful sign-on names it
+/// as [`SignonOutcome::user_id`], so an adapter that names the user a sign-on
+/// was attempted for, a failed one included, names the same user ID.
+/// Synchronous and pure: it reads no store.
+#[must_use]
+pub fn entered_user_key(user_id: &str) -> Option<UserId> {
+    (!is_spaces_or_low_values(user_id, USERIDI_LEN))
+        .then(|| UserId::move_from(&normalize_signon_user_id(user_id)))
 }
 
 /// COSGN00C PROCESS-ENTER-KEY — P-COSGN00C-005, P-COSGN00C-006,
@@ -344,7 +378,10 @@ mod tests {
     use std::sync::OnceLock;
     use std::thread;
 
-    use super::{Landing, SignonCheck, SignonInput, SignonOutcome, edit_blank_fields, sign_on};
+    use super::{
+        Landing, SignonCheck, SignonInput, SignonOutcome, edit_blank_fields, entered_user_key,
+        sign_on,
+    };
     use crate::auth::hash_stored_password;
     use crate::entities::UserSecurity;
     use crate::error::{DomainError, ErrorKind, FieldError};
@@ -524,6 +561,49 @@ mod tests {
             };
             let case = format!("{typed_id:?} {typed_password:?}");
             assert_eq!(edit_blank_fields(&input), *expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn the_entered_user_key_is_the_key_sign_on_reads_by() {
+        // P-COSGN00C-007: the user ID upper-cased and moved to X(08), cut on
+        // the right; V-COSGN00C-001 (P-COSGN00C-005): no key for a user ID
+        // that is SPACES or LOW-VALUES over its 8 bytes, the entry the blank
+        // edit refuses.
+        let cases = [
+            ("ADMIN001", Some("ADMIN001")),
+            ("admin001", Some("ADMIN001")),
+            ("uSeR01", Some("USER01")),
+            ("abcdefghi", Some("ABCDEFGH")),
+            ("\0 ", Some("\0 ")),
+            ("", None),
+            ("        ", None),
+            ("\0\0\0\0\0\0\0\0", None),
+            ("\0", None),
+            ("        x", None),
+        ];
+        for (typed_id, expected) in cases {
+            let key = entered_user_key(typed_id);
+            assert_eq!(key, expected.map(UserId::move_from), "{typed_id:?}");
+            let input = SignonInput {
+                user_id: typed_id.to_owned(),
+                password: "PASSWORD".to_owned(),
+            };
+            assert_eq!(
+                edit_blank_fields(&input).is_err(),
+                key.is_none(),
+                "{typed_id:?}"
+            );
+        }
+        // A successful sign-on names the user by the same key.
+        for typed_id in ["ADMIN001", "admin001", "aDmIn001"] {
+            let outcome = run(&mut seeded(), typed_id, "PASSWORD")
+                .unwrap_or_else(|error| panic!("{typed_id}: {error:?}"));
+            assert_eq!(
+                Some(outcome.user_id),
+                entered_user_key(typed_id),
+                "{typed_id}"
+            );
         }
     }
 

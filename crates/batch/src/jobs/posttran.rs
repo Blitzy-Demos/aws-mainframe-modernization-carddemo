@@ -75,20 +75,20 @@ use std::io::{self, Read};
 use std::iter;
 use std::path::Path;
 
-use carddemo_codec::framing::{Framed, decode_ascii_file};
-use carddemo_codec::layouts::{DailyTranLayout, DailyTranRecord, RejectRecord, RejectRecordLayout};
+use carddemo_codec::layouts::{
+    DailyTranLayout, DailyTranRecord, Framed, RejectRecord, RejectRecordLayout, decode_ascii_file,
+};
 use carddemo_domain::clock::{Clock, FixedClock};
-use carddemo_domain::entities::{Account, CardXref, DailyTran};
 use carddemo_domain::messages::{
     ACCOUNT_RECORD_NOT_FOUND, transactions_processed_message, transactions_rejected_message,
 };
-use carddemo_domain::numeric::{AccountId, Alnum, CardNumber, NumericCode};
-use carddemo_domain::ports::{
-    AccountReader, PortError, PortResult, TranCatBalanceStore, TransactionReader, XrefReader,
+use carddemo_domain::rewards::RewardEngine;
+use carddemo_domain::rules::posting::{
+    self, Account, AccountId, AccountReader, Alnum, CardNumber, CardXref, DailyTran, NumericCode,
+    PostingAbend, PostingCounts, TranCatBalanceStore, TransactionReader, Validation, XrefReader,
 };
-use carddemo_domain::rewards::{AccrualInput, RewardEngine, RewardError};
-use carddemo_domain::rules::posting::{self, PostingAbend, PostingCounts, Validation};
-use carddemo_persistence::{Db, UnitOfWork};
+use carddemo_domain::rules::{AccrualInput, PortError, PortResult, RewardError};
+use carddemo_persistence::tx::{Db, UnitOfWork};
 use tracing::field::display;
 
 use super::{JobContext, JobCounts, setup_failure};

@@ -266,10 +266,13 @@ function AuthorizationCard({ detail }: { detail: AuthDetail }): JSX.Element {
   );
 }
 
-/** Skeleton blocks in place of the card's fields while the record is read. */
+/**
+ * Skeleton blocks in place of the card's fields while the record is read,
+ * hidden from assistive technology: the page's status announces the read.
+ */
 function AuthorizationSkeleton(): JSX.Element {
   return (
-    <Card role="status" aria-label="Loading authorization" aria-busy="true">
+    <Card aria-hidden="true">
       <CardHeader>
         <Skeleton className="h-4 w-32" />
       </CardHeader>
@@ -288,6 +291,28 @@ function AuthorizationSkeleton(): JSX.Element {
       </CardContent>
     </Card>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Read status
+// ---------------------------------------------------------------------------
+
+/**
+ * How long the read's status stays empty before it announces the read's
+ * progress, DataTable's delay. The cleared status is committed first, so the
+ * identical result of a repeated read is still announced as a change.
+ */
+const STATUS_ANNOUNCE_DELAY_MS = 150;
+
+/**
+ * The completed read as the status announces it: the authorization's identity,
+ * its transaction ID, or the authorization's own ID when the record carries no
+ * transaction ID, never its amount or card number.
+ */
+function loadedText(detail: AuthDetail): string {
+  return detail.pa_transaction_id.trim() === ""
+    ? `Authorization ${detail.auth_id} loaded`
+    : `Authorization of transaction ${detail.pa_transaction_id} loaded`;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +453,32 @@ export default function AuthorizationDetailPage(): JSX.Element {
     showApiError(query.error);
   }, [query.error]);
 
+  // The read's progress for assistive technology, the reads of PF8 Next and
+  // of a PF5 result included. A failed read announces nothing here, as its
+  // toast carries it. The status is emptied on every change of the text and
+  // on every completed read, then filled after STATUS_ANNOUNCE_DELAY_MS, as
+  // DataTable does.
+  const statusText =
+    authId !== "" && query.isFetching
+      ? "Loading authorization"
+      : detail !== undefined && !query.isError
+        ? loadedText(detail)
+        : "";
+  const { dataUpdatedAt } = query;
+  const [announcement, setAnnouncement] = useState("");
+  useEffect(() => {
+    setAnnouncement("");
+    if (statusText === "") {
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      setAnnouncement(statusText);
+    }, STATUS_ANNOUNCE_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [statusText, dataUpdatedAt]);
+
   // The detail's `message` is only ever `Already at the last Authorization...`,
   // which COPAUS1C shows after PF8 at the last record. Here Next is disabled
   // there instead and the text is not shown (E-59), so the page never toasts
@@ -480,6 +531,8 @@ export default function AuthorizationDetailPage(): JSX.Element {
     </>
   );
 
+  // The status stays mounted from the first render, before any record exists,
+  // and outside the cards, so it announces every read of the route.
   return (
     <>
       <PageHeader actions={actions} />
@@ -488,6 +541,9 @@ export default function AuthorizationDetailPage(): JSX.Element {
       ) : query.isPending ? (
         <AuthorizationSkeleton />
       ) : null}
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
       <ConfirmDialog
         open={dialog.open}
         onOpenChange={(open) => setDialog((shown) => ({ ...shown, open }))}

@@ -10,7 +10,10 @@
 //   are the server's, and come back as `fields[]` entries that applyApiError
 //   places on `reward_rate`, `min_transaction_amount` or `active_to`.
 // - Every value stays the string typed into its field; the schema turns the
-//   `YYYY-MM-DD` dates into RFC 3339 instants and omits blank bounds.
+//   `YYYY-MM-DD` dates into RFC 3339 instants and omits blank bounds. A new
+//   rule's dates are sent as midnight UTC. An edit validates with the stored
+//   rule's schema, which sends a date left unchanged as the stored instant,
+//   time of day included, and only a changed date as midnight UTC.
 // - The former PF keys are buttons in DOM order after the fields: Save (PF5),
 //   Reset (PF4) and Back (PF3). Enter in any field submits through
 //   handleSubmit.
@@ -48,6 +51,7 @@ import { applyApiError, showApiError } from "@/lib/api-errors";
 import {
   REWARD_RULE_MESSAGES,
   rewardRuleBmsFieldMap,
+  rewardRuleEditSchema,
   rewardRuleSchema,
   rewardRuleToFormInput,
   type RewardRuleFormInput,
@@ -147,6 +151,11 @@ type RewardRuleFormProps = {
   ruleId: string | undefined;
   /** The values the form starts from and Reset restores. */
   initialValues: RewardRuleFormInput;
+  /**
+   * The resolver's schema: `rewardRuleSchema` for a new rule, the edited
+   * rule's `rewardRuleEditSchema` in edit mode.
+   */
+  schema: typeof rewardRuleSchema;
   /** The form's accessible name: the page heading. */
   label: string;
 };
@@ -157,6 +166,7 @@ type RewardRuleFormProps = {
 function RewardRuleForm({
   ruleId,
   initialValues,
+  schema,
   label,
 }: RewardRuleFormProps): JSX.Element {
   const navigate = useNavigate();
@@ -167,7 +177,7 @@ function RewardRuleForm({
   const mutation = ruleId === undefined ? createMutation : updateMutation;
 
   const form = useForm<RewardRuleFormInput, unknown, RewardRuleFormValues>({
-    resolver: zodResolver(rewardRuleSchema),
+    resolver: zodResolver(schema),
     defaultValues: initialValues,
     mode: "onSubmit",
   });
@@ -317,6 +327,12 @@ export default function RewardRuleFormPage(): JSX.Element {
     () => (rule === undefined ? EMPTY : rewardRuleToFormInput(rule)),
     [rule],
   );
+  // Built from the same rule as initialValues: a date the admin leaves
+  // unchanged is sent as that rule's stored instant.
+  const editSchema = useMemo(
+    () => (rule === undefined ? rewardRuleSchema : rewardRuleEditSchema(rule)),
+    [rule],
+  );
 
   // Each failed load is toasted once, also across StrictMode's re-run of
   // effects, and its text stays on the page after the toast has gone.
@@ -339,6 +355,7 @@ export default function RewardRuleFormPage(): JSX.Element {
         key="new"
         ruleId={undefined}
         initialValues={EMPTY}
+        schema={rewardRuleSchema}
         label={title}
       />
     );
@@ -348,6 +365,7 @@ export default function RewardRuleFormPage(): JSX.Element {
         key={ruleId}
         ruleId={ruleId}
         initialValues={initialValues}
+        schema={editSchema}
         label={title}
       />
     );

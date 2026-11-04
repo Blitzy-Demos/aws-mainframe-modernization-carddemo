@@ -7,7 +7,9 @@
 // is answered 401 'Authentication required' and a regular user's token on
 // /admin/** 403 'Admin access required', and api/client.ts clears the session
 // on a 401 to a request that session sent, which brings RequireAuth back to
-// the sign-on screen.
+// the sign-on screen. That redirect unmounts the page and cancels its
+// queries, so the guard shows the server's 401 message, once, as it sends the
+// user to sign on.
 //
 // The landing after sign-on is not chosen here: LoginPage navigates to the
 // login response's `landing`, the counterpart of COSGN00C's XCTL split.
@@ -15,7 +17,13 @@ import { useEffect, type ReactNode } from "react";
 import { Navigate, Outlet, useLocation } from "react-router";
 import { toast } from "sonner";
 
-import { isAdmin, useSession, type Session } from "@/lib/session";
+import { showApiError } from "@/lib/api-errors";
+import {
+  isAdmin,
+  takeSessionEndCause,
+  useSession,
+  type Session,
+} from "@/lib/session";
 
 // Byte-identical to ADMIN_ACCESS_REQUIRED in crates/domain/src/messages.rs, the
 // `message` of the server's 403. It takes the place of COMEN01C's menu text
@@ -38,6 +46,22 @@ function isLive(session: Session | null): session is Session {
   return Number.isFinite(expiresAtMs) && expiresAtMs > Date.now();
 }
 
+// Once the session has ended, shows what ended it, when that was a server
+// answer (the API client's 401), through the application's error display.
+// The cause is taken, so it is shown once: by whichever guard sees the end
+// first, and not again on StrictMode's second effect run. A sign-off or an
+// expiry records no cause and shows nothing.
+function useSessionEndNotice(live: boolean): void {
+  useEffect(() => {
+    if (!live) {
+      const cause = takeSessionEndCause();
+      if (cause !== undefined) {
+        showApiError(cause);
+      }
+    }
+  }, [live]);
+}
+
 type GuardProps = {
   /** The guarded content; omitted when the guard is a layout route. */
   children?: ReactNode;
@@ -46,7 +70,8 @@ type GuardProps = {
 /**
  * Requires a live session, as every CardDemo transaction is reached only
  * through COSGN00C sign-on. Without one it redirects to /login, carrying the
- * requested location in the navigation state as `from`.
+ * requested location in the navigation state as `from`. When the server's 401
+ * ended the session, its message ('Authentication required') is shown once.
  *
  * Renders `children` when given, otherwise the matched child route. The
  * server's 401 'Authentication required' is authoritative.
@@ -54,8 +79,10 @@ type GuardProps = {
 export function RequireAuth({ children }: GuardProps): ReactNode {
   const session = useSession();
   const location = useLocation();
+  const live = isLive(session);
+  useSessionEndNotice(live);
 
-  if (!isLive(session)) {
+  if (!live) {
     return <Navigate to="/login" replace state={{ from: location }} />;
   }
   return children ?? <Outlet />;
@@ -68,16 +95,18 @@ export function RequireAuth({ children }: GuardProps): ReactNode {
  * [app/cbl/COMEN01C.cbl:L136-143]: a regular user is sent to the main menu at
  * / with an 'Admin access required' toast.
  *
- * Without a live session it redirects to /login and shows no toast, the
- * server's order as well (no token is a 401, not a 403), so the guard also
- * holds outside RequireAuth. Renders `children` when given, otherwise the
- * matched child route. The server's 401 and 403 are authoritative.
+ * Without a live session it redirects to /login and shows no admin toast,
+ * the server's order as well (no token is a 401, not a 403), so the guard also
+ * holds outside RequireAuth; as there, the message of a 401 that ended the
+ * session is shown once. Renders `children` when given, otherwise the matched
+ * child route. The server's 401 and 403 are authoritative.
  */
 export function RequireAdmin({ children }: GuardProps): ReactNode {
   const session = useSession();
   const location = useLocation();
   const live = isLive(session);
   const admin = live && isAdmin(session);
+  useSessionEndNotice(live);
 
   // Toasting is a side effect, so it runs after the commit, never in render.
   useEffect(() => {

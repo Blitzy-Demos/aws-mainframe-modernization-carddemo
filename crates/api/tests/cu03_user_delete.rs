@@ -46,7 +46,7 @@ use carddemo_audit::{
 use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages;
 use carddemo_testkit::{block_on, fixtures};
-use common::{Resp, TestApp, assert_error, parity_audit, validation_audit};
+use common::{Resp, TestApp, assert_error, parity_audit, seeded_user_count, validation_audit};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -80,9 +80,10 @@ const SEEDED_USER_ROW: &str = "SELECT user_id, sec_usr_fname, sec_usr_lname, sec
 /// The number of stored users.
 const USER_COUNT: &str = "SELECT count(*) FROM users";
 
-/// The number of `DUSRSECJ` `SYSUT1` rows the seed loads
-/// [app/jcl/DUSRSECJ.jcl:L35-44].
-const SEEDED_USERS: &str = "10";
+/// The count row of the `DUSRSECJ` `SYSUT1` users the seed loads
+/// [app/jcl/DUSRSECJ.jcl:L35-44]: every user count this file expects is
+/// derived from its reviewed `rows=`.
+const SEEDED_USERS_ROW: &str = "P-CSUSR01Y-007";
 
 /// A test-only trigger that makes every user delete fail on the server: the
 /// `WHEN OTHER` response of the CICS `DELETE`.
@@ -283,6 +284,16 @@ async fn scalar(app: &TestApp, sql: &str) -> Option<String> {
     }
 }
 
+/// The number of stored users, as [`USER_COUNT`] reads it.
+async fn user_count(app: &TestApp) -> usize {
+    let count = scalar(app, USER_COUNT)
+        .await
+        .unwrap_or_else(|| panic!("{USER_COUNT} read NULL"));
+    count
+        .parse()
+        .unwrap_or_else(|error| panic!("{USER_COUNT} read {count:?}, not a count: {error}"))
+}
+
 /// The CU01 body of [`ADDED_USER`], a regular user.
 fn added_user_body() -> Value {
     json!({
@@ -295,8 +306,8 @@ fn added_user_body() -> Value {
 }
 
 /// The blank and unknown user IDs, of the fetch and of the delete; nothing is
-/// deleted.
-async fn blank_and_unknown_ids(app: &TestApp, token: &str, doc: &Document) {
+/// deleted, so the `seeded` users remain.
+async fn blank_and_unknown_ids(app: &TestApp, token: &str, doc: &Document, seeded: usize) {
     // P-COUSR03C-002: a blank ENTER fetch is the empty-field error.
     let fetched = app.get(BLANK_USER_PATH, Some(token)).await;
     let row = audited(doc, "V-COUSR03C-001");
@@ -337,20 +348,31 @@ async fn blank_and_unknown_ids(app: &TestApp, token: &str, doc: &Document) {
         messages::UNABLE_TO_UPDATE_USER,
     );
     assert_eq!(
-        scalar(app, USER_COUNT).await.as_deref(),
-        Some(SEEDED_USERS),
-        "a refused delete must delete nothing"
+        user_count(app).await,
+        seeded,
+        "{SEEDED_USERS_ROW}: a refused delete must delete nothing"
     );
 }
 
-/// A user added through CU01, fetched, deleted, then gone: the fetch answers
-/// `NOTFND` and a repeat delete the audited `INVREQ` text.
-async fn delete_an_added_user(app: &TestApp, token: &str, doc: &Document) {
+/// A user added through CU01 beside the `seeded` users, fetched, deleted,
+/// then gone: the fetch answers `NOTFND` and a repeat delete the audited
+/// `INVREQ` text.
+async fn delete_an_added_user(app: &TestApp, token: &str, doc: &Document, seeded: usize) {
+    assert_eq!(
+        user_count(app).await,
+        seeded,
+        "{SEEDED_USERS_ROW}: the seeded users before the add of {ADDED_USER}"
+    );
     let (status, _, raw) = app.post(USERS_PATH, Some(token), &added_user_body()).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
         "the CU01 add of {ADDED_USER}: {raw}"
+    );
+    assert_eq!(
+        user_count(app).await,
+        seeded + 1,
+        "{SEEDED_USERS_ROW}: the seeded users and {ADDED_USER}"
     );
 
     // P-COUSR03C-002, P-COUSR03C-003: READ NORMAL shows the names and type,
@@ -396,9 +418,9 @@ async fn delete_an_added_user(app: &TestApp, token: &str, doc: &Document) {
         "{ADDED_USER} must be gone from users"
     );
     assert_eq!(
-        scalar(app, USER_COUNT).await.as_deref(),
-        Some(SEEDED_USERS),
-        "only {ADDED_USER} may be deleted"
+        user_count(app).await,
+        seeded,
+        "{SEEDED_USERS_ROW}: only {ADDED_USER} may be deleted"
     );
 
     // P-COUSR03C-003: the fetch of the deleted user answers NOTFND.
@@ -457,11 +479,12 @@ fn blank_unknown_and_deleted_users_answer_the_audited_outcomes() {
         "P-COUSR03C-011",
         &[messages::USER_LABEL, messages::HAS_BEEN_DELETED],
     );
+    let seeded = seeded_user_count(&parity, SEEDED_USERS_ROW);
     let app = TestApp::start();
     block_on(async {
         let token = app.admin_token().await;
-        blank_and_unknown_ids(&app, &token, &validation).await;
-        delete_an_added_user(&app, &token, &validation).await;
+        blank_and_unknown_ids(&app, &token, &validation, seeded).await;
+        delete_an_added_user(&app, &token, &validation, seeded).await;
     });
 }
 
@@ -869,13 +892,24 @@ impl Header {
     }
 }
 
-/// Adds [`ADDED_USER`] through CU01 and keeps the answer in `bodies`.
-async fn add_user(app: &TestApp, token: &str, bodies: &mut Vec<String>) {
+/// Adds [`ADDED_USER`] through CU01 beside the `seeded` users, which alone are
+/// stored before it and joined by it after, and keeps the answer in `bodies`.
+async fn add_user(app: &TestApp, token: &str, seeded: usize, bodies: &mut Vec<String>) {
+    assert_eq!(
+        user_count(app).await,
+        seeded,
+        "{SEEDED_USERS_ROW}: the seeded users before the add of {ADDED_USER}"
+    );
     let (status, _, raw) = app.post(USERS_PATH, Some(token), &added_user_body()).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
         "the add of {ADDED_USER}: {raw}"
+    );
+    assert_eq!(
+        user_count(app).await,
+        seeded + 1,
+        "{SEEDED_USERS_ROW}: the seeded users and {ADDED_USER}"
     );
     bodies.push(raw);
 }
@@ -887,11 +921,12 @@ async fn add_user(app: &TestApp, token: &str, bodies: &mut Vec<String>) {
 /// name is the dialog's Cancel, which sends no request. The entry without a
 /// COMMAREA (`EIBCALEN = 0`) is a request without a session: the fetch and
 /// the delete answer 401 `Authentication required` with no field, and
-/// nothing is deleted.
+/// nothing is deleted: the `seeded` users remain.
 async fn return_and_clear_keys(
     app: &TestApp,
     parity: &Document,
     map_doc: &Document,
+    seeded: usize,
     bodies: &mut Vec<String>,
 ) {
     for row in [RETURN_ROW, CLEAR_ROW] {
@@ -919,9 +954,9 @@ async fn return_and_clear_keys(
     let after = app.stack().fetch_text_rows(SEEDED_USER_ROW).await;
     assert_eq!(after, before, "{RETURN_ROW}: USER0005 was deleted");
     assert_eq!(
-        scalar(app, USER_COUNT).await.as_deref(),
-        Some(SEEDED_USERS),
-        "{RETURN_ROW}: a request without a session deleted a user"
+        user_count(app).await,
+        seeded,
+        "{RETURN_ROW} {SEEDED_USERS_ROW}: a request without a session deleted a user"
     );
 }
 
@@ -931,12 +966,13 @@ async fn return_and_clear_keys(
 /// function map rows the row names are the fetch the row action runs, and
 /// the fetch and the delete each publish exactly the `id` path parameter,
 /// the delete no body. The delete removes the user of its `{id}` and no
-/// other, answering with the user as fetched.
+/// other, answering with the user as fetched: the `seeded` users remain.
 async fn received_key(
     app: &TestApp,
     token: &str,
     parity: &Document,
     map_doc: &Document,
+    seeded: usize,
     bodies: &mut Vec<String>,
 ) {
     let read = parity_cell(parity, RECEIVE_ROW, "Expected result");
@@ -957,14 +993,18 @@ async fn received_key(
     let body = &spec["paths"][ID_PATH]["delete"]["requestBody"];
     assert!(body.is_null(), "{RECEIVE_ROW}: the delete takes no body");
 
-    add_user(app, token, bodies).await;
+    add_user(app, token, seeded, bodies).await;
     let fetched = app.get(ADDED_USER_PATH, Some(token)).await;
     assert_eq!(fetched.0, StatusCode::OK, "{}", fetched.2);
     let deleted = app.delete(ADDED_USER_PATH, Some(token)).await;
     assert_eq!(deleted.0, StatusCode::OK, "{}", deleted.2);
     assert_eq!(deleted.1["user"], fetched.1, "{RECEIVE_ROW}: {}", deleted.2);
     assert!(app.stack().fetch_text_rows(ADDED_USER_ROW).await.is_empty());
-    assert_eq!(scalar(app, USER_COUNT).await.as_deref(), Some(SEEDED_USERS));
+    assert_eq!(
+        user_count(app).await,
+        seeded,
+        "{RECEIVE_ROW} {SEEDED_USERS_ROW}"
+    );
     bodies.extend([fetched.2, deleted.2]);
 }
 
@@ -975,12 +1015,13 @@ async fn received_key(
 /// invalid-key error send no request. Neither operation takes key input, so
 /// a fetch naming any other AID key answers as without it, a delete naming
 /// one deletes as PF5 does, and none answers the invalid-key text, whose
-/// audited 49 bytes fit its `X(50)`.
+/// audited 49 bytes fit its `X(50)`. The `seeded` users remain.
 async fn aid_keys_map_to_requests(
     app: &TestApp,
     token: &str,
     parity: &Document,
     map_doc: &Document,
+    seeded: usize,
     bodies: &mut Vec<String>,
 ) {
     let spec = spec();
@@ -1020,7 +1061,7 @@ async fn aid_keys_map_to_requests(
         );
         answers.push(fetch);
     }
-    add_user(app, token, bodies).await;
+    add_user(app, token, seeded, bodies).await;
     let path = format!("{ADDED_USER_PATH}?{AID_MEMBER}={}", OTHER_KEYS[0]);
     let deleted = app.delete(&path, Some(token)).await;
     assert_eq!(deleted.0, StatusCode::OK, "{AID_ROW}: {}", deleted.2);
@@ -1030,7 +1071,11 @@ async fn aid_keys_map_to_requests(
         "{AID_ROW}: {}",
         deleted.2
     );
-    assert_eq!(scalar(app, USER_COUNT).await.as_deref(), Some(SEEDED_USERS));
+    assert_eq!(
+        user_count(app).await,
+        seeded,
+        "{AID_ROW} {SEEDED_USERS_ROW}"
+    );
     answers.extend([fetched, deleted]);
     for (_, _, raw) in answers {
         let text = messages::CCDA_MSG_INVALID_KEY.trim_end();
@@ -1067,14 +1112,15 @@ fn the_delete_keys_and_the_header_have_their_rest_replacements() {
     for id in [AID_ROW, RETURN_ROW, RECEIVE_ROW, HEADER_ROW, CLEAR_ROW] {
         assert_reviewed(&parity, id);
     }
+    let seeded = seeded_user_count(&parity, SEEDED_USERS_ROW);
     let map_doc = function_map();
     let app = TestApp::start();
     let bodies = block_on(async {
         let token = app.admin_token().await;
         let mut bodies = Vec::new();
-        return_and_clear_keys(&app, &parity, &map_doc, &mut bodies).await;
-        received_key(&app, &token, &parity, &map_doc, &mut bodies).await;
-        aid_keys_map_to_requests(&app, &token, &parity, &map_doc, &mut bodies).await;
+        return_and_clear_keys(&app, &parity, &map_doc, seeded, &mut bodies).await;
+        received_key(&app, &token, &parity, &map_doc, seeded, &mut bodies).await;
+        aid_keys_map_to_requests(&app, &token, &parity, &map_doc, seeded, &mut bodies).await;
         bodies
     });
     assert_no_header(&bodies, &parity);

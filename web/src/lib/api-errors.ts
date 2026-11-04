@@ -17,8 +17,11 @@
 //   confirm 'Confirm to make a bill payment...' [app/cbl/COBIL00C.cbl:L237],
 //   COUSR02C 'Please modify to update ...' [app/cbl/COUSR02C.cbl:L239]), goes
 //   to showMessage.
-// - A 401 is shown like any other error. The API client has already ended the
-//   session, and RequireAuth then redirects to the sign-on page.
+// - A 401 that ended the session (ApiError.endedSession) is shown by the
+//   guard that sends the user to the sign-on page, and may also be shown by a
+//   caller still awaiting that answer. Its toast carries one fixed id, so
+//   Sonner updates the shown toast instead of adding a second one. Every other
+//   error is a plain `toast.error(message)`.
 //
 // Every text is shown exactly as the server sent it, never trimmed, rewritten
 // or prefixed: it is byte-identical to the audited COBOL message, and the
@@ -76,21 +79,27 @@ function hasText(message: unknown): message is string {
   return typeof message === "string" && message.trim() !== "";
 }
 
+// The id of the toast for a 401 that ended the session; see the header.
+const SESSION_ENDED_TOAST_ID = "session-ended";
+
 /**
  * Shows a failed request's message with `toast.error`: the server's message
- * for an ApiError, otherwise UNEXPECTED_ERROR.
+ * for an ApiError, otherwise UNEXPECTED_ERROR. The error of a 401 that ended
+ * the session is toasted under one fixed id, so it is shown once however many
+ * callers show it.
  */
 export function showApiError(error: unknown): ShownApiError {
-  if (error instanceof ApiError && hasText(error.body.message)) {
-    const { message } = error.body;
+  const apiError = error instanceof ApiError ? error : null;
+  const message =
+    apiError !== null && hasText(apiError.body.message)
+      ? apiError.body.message
+      : UNEXPECTED_ERROR;
+  if (apiError?.endedSession === true) {
+    toast.error(message, { id: SESSION_ENDED_TOAST_ID });
+  } else {
     toast.error(message);
-    return { status: error.status, message };
   }
-  toast.error(UNEXPECTED_ERROR);
-  return {
-    status: error instanceof ApiError ? error.status : null,
-    message: UNEXPECTED_ERROR,
-  };
+  return { status: apiError?.status ?? null, message };
 }
 
 // Places the cursor on the first errored field, as the COBOL `MOVE -1 TO

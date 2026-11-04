@@ -106,7 +106,8 @@ export interface paths {
          *     soft-deleted alike, in `rule_id` order (Request › Rewards system › Admin
          *     endpoints, AAP 0.3.5).
          * @description No rules is 200 with an empty list. A soft-deleted rule shows the
-         *     `active_to` its delete set.
+         *     `active_to` its delete set. Every rule's `status` is taken at one reading
+         *     of the processing clock.
          *
          *     # Errors
          *
@@ -168,10 +169,13 @@ export interface paths {
         post?: never;
         /**
          * `DELETE /admin/reward-rules/{id}`: soft-deletes the rule and answers 200
-         *     with it (Request › Rewards system › Admin endpoints, AAP 0.3.5).
+         *     with it and the `outcome` (Request › Rewards system › Admin endpoints,
+         *     AAP 0.3.5).
          * @description The rule's `active_to` becomes the processing clock's instant when it is
-         *     absent or later; a rule that has already ended is answered unchanged. The
-         *     row is never removed, because accruals reference its `rule_id`.
+         *     absent or later (`outcome` `deleted`); a rule that has already ended is
+         *     answered unchanged (`outcome` `unchanged`). Either way the rule's `status`
+         *     at that instant is `ended`. The row is never removed, because accruals
+         *     reference its `rule_id`.
          *
          *     # Errors
          *
@@ -578,8 +582,10 @@ export interface paths {
          * @description `POST /auth/logout`: PF3 on the sign-on screen, answered with the
          *     `CCDA-MSG-THANK-YOU` text of `CSMSG01Y` byte for byte, trailing spaces
          *     included [app/cpy/CSMSG01Y.cpy:L18-19]. Public and stateless: no token is
-         *     read and no session ends, because none exists on the server; the SPA
-         *     discards its token and shows `/login`.
+         *     required and no session ends, because none exists on the server; the SPA
+         *     discards its token and shows `/login`. The answer is the same with or
+         *     without a bearer token, valid or not: a token that verifies only names
+         *     its user in the server's trace span, and none is refused.
          */
         post: operations["logout"];
         delete?: never;
@@ -2211,6 +2217,21 @@ export interface components {
             total_points_redeemed: string;
         };
         /**
+         * @description What a `DELETE /admin/reward-rules/{id}` of an existing rule did.
+         * @enum {string}
+         */
+        RewardRuleDeleteOutcome: "deleted" | "unchanged";
+        /**
+         * @description The 200 answer of `DELETE /admin/reward-rules/{id}`: the rule after the
+         *     soft delete, under the same top-level keys as `RewardRuleResponse`, with
+         *     `outcome` beside them, so a client reports what the server did rather than
+         *     guess it from the rule it showed before.
+         */
+        RewardRuleDeleteResponse: components["schemas"]["RewardRuleResponse"] & {
+            /** @description Whether the delete ended the rule or found it already ended. */
+            outcome: components["schemas"]["RewardRuleDeleteOutcome"];
+        };
+        /**
          * @description A field a reward-rule rejection names in `fields[].field`: exactly the
          *     fields `carddemo_domain::rewards::validate_rule` reports, under the
          *     request's own JSON names.
@@ -2280,7 +2301,8 @@ export interface components {
             transaction_type_cd: string;
         };
         /**
-         * @description One stored reward rule: every column of a `reward_rules` row, as the list,
+         * @description One stored reward rule: every column of a `reward_rules` row, plus its
+         *     `status` at the processing clock's instant of the answer, as the list,
          *     create, update and soft-delete endpoints answer it.
          *
          *     The list returns active and soft-deleted rules alike, ordered by
@@ -2324,6 +2346,12 @@ export interface components {
              */
             rule_id: string;
             /**
+             * @description The rule's state at the processing clock's instant of this answer:
+             *     `scheduled`, `active` or `ended`. The instant is the server's, never
+             *     the client's.
+             */
+            status: components["schemas"]["RewardRuleStatus"];
+            /**
              * @description The transaction category code the rule matches, zero-padded to the
              *     four digits of `TRAN-CAT-CD PIC 9(04)`.
              * @example 0001
@@ -2335,6 +2363,17 @@ export interface components {
              */
             transaction_type_cd: string;
         };
+        /**
+         * @description Where the processing clock's instant of an answer lies against a rule's
+         *     active window, from `active_from` (inclusive) to `active_to` (exclusive)
+         *     (AAP 0.3.5).
+         *
+         *     The instant is the server's processing clock (`CARDDEMO_CLOCK_OVERRIDE`
+         *     pins it, AAP 0.6.4), the one the reward engine matches transactions
+         *     against, so a client never has to judge a rule by a clock of its own.
+         * @enum {string}
+         */
+        RewardRuleStatus: "scheduled" | "active" | "ended";
         /**
          * @description The body of `POST /admin/transaction-types`, the `COTRTUP` add: the type
          *     code `TRTYPCD` and the description `TRTYDSC`, as entered.
@@ -3085,13 +3124,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The rule after the soft delete, or unchanged when it had already ended */
+            /** @description The rule after the soft delete, or unchanged when it had already ended, with the outcome */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RewardRuleResponse"];
+                    "application/json": components["schemas"]["RewardRuleDeleteResponse"];
                 };
             };
             /** @description No valid bearer token */

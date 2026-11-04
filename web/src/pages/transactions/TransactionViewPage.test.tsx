@@ -8,7 +8,9 @@
 // "Tran ID" without a request (V-COTRN01C-001); and every server rejection
 // (V-COTRN01C-001 to V-COTRN01C-003) reaches the user as a toast and as the
 // card's message line, with the display fields cleared. With no input on the
-// screen, the server's TRNIDIN entry marks no field and moves no cursor.
+// screen, the server's TRNIDIN entry marks no field and moves no cursor. A
+// polite status beside the card announces each read and the transaction's
+// identity, and nothing for a key that is not read or a read that fails.
 //
 // The network is the global the API client looks up on every request, stubbed
 // per test, and the assertions read the Request objects it received.
@@ -98,6 +100,15 @@ const OVER_LENGTH = "String must contain at most 16 character(s)";
 /** The live transaction the view reads: the first key CT02 allocates (E-09). */
 const TRAN_ID = "0000000000000001";
 
+/** The status text while the transaction is read. */
+const LOADING = "Loading transaction";
+
+/** The status text once TRAN_ID is read: its identity alone. */
+const LOADED = `Transaction ${TRAN_ID} loaded`;
+
+/** Longer than the page's 150 ms announce delay, so a due announcement is shown. */
+const ANNOUNCE_WAIT_MS = 300;
+
 /**
  * Record 1 of app/data/ASCII/dailytran.txt (CVTRA06Y) as the transaction
  * master holds it once posted: `DALYTRAN-AMT` `0000005047G` decoded from its
@@ -160,7 +171,7 @@ function jsonResponse(status: number, body: TransactionResponse | ErrorBody): Re
 }
 
 let fetchMock: Mock<FetchImpl>;
-let answer: (request: Request) => Response;
+let answer: (request: Request) => Response | Promise<Response>;
 let unexpected: string[];
 let queryClient: QueryClient;
 let toastError: MockInstance<typeof toast.error>;
@@ -177,6 +188,17 @@ function readMaster(request: Request): Response {
   }
   unexpected.push(`${request.method} ${url.pathname}${url.search}`);
   return jsonResponse(500, UNEXPECTED);
+}
+
+/** A response held until the test sends it, so a read stays in flight. */
+type HeldResponse = { reply: Promise<Response>; send: (response: Response) => void };
+
+function holdResponse(): HeldResponse {
+  let send: (response: Response) => void = () => undefined;
+  const reply = new Promise<Response>((resolve) => {
+    send = resolve;
+  });
+  return { reply, send };
 }
 
 /** Every request the page sent, in the order sent. */
@@ -199,6 +221,20 @@ function expectOneRead(tranId: string): void {
 /** The card that holds the key and the display fields. */
 function panel(): Promise<HTMLElement> {
   return screen.findByRole("region", { name: PANEL_NAME });
+}
+
+/** The polite status beside the card that announces the read. */
+function readStatus(): HTMLElement {
+  return screen.getByRole("status");
+}
+
+/** Waits out the announce delay, so a status still empty announces nothing. */
+async function afterAnnounceDelay(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, ANNOUNCE_WAIT_MS);
+    });
+  });
 }
 
 /** The captions the card shows, in screen order. */
@@ -307,6 +343,78 @@ describe("TransactionViewPage (CT01, COTRN01)", () => {
     expect(toastError).not.toHaveBeenCalled();
   });
 
+  // The read's progress reaches assistive technology through a polite status
+  // that stays mounted beside the card, outside its busy subtree: the read in
+  // flight, then the transaction's identity alone, without its amount or card
+  // number.
+  it("announces the read in flight, then the transaction read, in a status outside the card", async () => {
+    const held = holdResponse();
+    answer = (request) =>
+      new URL(request.url).pathname === `${VIEW_PATH_PREFIX}${TRAN_ID}`
+        ? held.reply
+        : readMaster(request);
+    renderAt(`${LIST_ROUTE}/${TRAN_ID}`);
+
+    const region = await panel();
+    const status = readStatus();
+    expect(status.classList.contains("sr-only")).toBe(true);
+    expect(region.contains(status)).toBe(false);
+    await waitFor(() => {
+      expect(status.textContent).toBe(LOADING);
+    });
+    expect(region.getAttribute("aria-busy")).toBe("true");
+    expect(status.closest("[aria-busy='true']")).toBeNull();
+
+    held.send(jsonResponse(200, TRANSACTION));
+    await waitFor(() => {
+      expect(status.textContent).toBe(LOADED);
+    });
+    expect(region.getAttribute("aria-busy")).toBe("false");
+    // The one status, mounted from the read's start to its end.
+    expect(readStatus()).toBe(status);
+    expectOneRead(TRAN_ID);
+  });
+
+  // A repeated read of the key, such as the refetch when the window regains
+  // focus, empties the status, announces the read in flight and then the
+  // same transaction again, though the record read is unchanged.
+  it("empties the status and announces a repeated read of the same key again", async () => {
+    renderAt(`${LIST_ROUTE}/${TRAN_ID}`);
+    await panel();
+    const status = readStatus();
+    await waitFor(() => {
+      expect(status.textContent).toBe(LOADED);
+    });
+
+    const held = holdResponse();
+    answer = (request) =>
+      new URL(request.url).pathname === `${VIEW_PATH_PREFIX}${TRAN_ID}`
+        ? held.reply
+        : readMaster(request);
+    let refetched: Promise<void> = Promise.resolve();
+    await act(async () => {
+      refetched = queryClient.refetchQueries();
+    });
+    await waitFor(() => {
+      expect(status.textContent).toBe("");
+    });
+    await waitFor(() => {
+      expect(status.textContent).toBe(LOADING);
+    });
+
+    held.send(jsonResponse(200, TRANSACTION));
+    await act(async () => {
+      await refetched;
+    });
+    await waitFor(() => {
+      expect(status.textContent).toBe(LOADED);
+    });
+    expect(requests().map((read) => `${read.method} ${new URL(read.url).pathname}`)).toEqual([
+      `GET ${VIEW_PATH_PREFIX}${TRAN_ID}`,
+      `GET ${VIEW_PATH_PREFIX}${TRAN_ID}`,
+    ]);
+  });
+
   // V-COTRN01C-001 (blank or LOW-VALUES) and TRNIDIN's 16-character width: the
   // edit rejects the key under its caption, as the COBOL message line and
   // `MOVE -1 TO TRNIDINL` mark it, and nothing is read.
@@ -347,6 +455,9 @@ describe("TransactionViewPage (CT01, COTRN01)", () => {
     expect(region.getAttribute("aria-busy")).toBe("false");
     expect(fetchMock).not.toHaveBeenCalled();
     expect(toastError).not.toHaveBeenCalled();
+    // Nothing is read, so the status beside the card announces nothing.
+    await afterAnnounceDelay();
+    expect(readStatus().textContent).toBe("");
   });
 
   // Every audited COTRN01C rejection the server answers: a toast and the
@@ -397,6 +508,10 @@ describe("TransactionViewPage (CT01, COTRN01)", () => {
     expect(region.getAttribute("aria-busy")).toBe("false");
     // One toast per failed read, however often the page renders.
     expect(toastError).toHaveBeenCalledTimes(1);
+    // The toast and the message line carry the failure; the status announces
+    // no transaction.
+    await afterAnnounceDelay();
+    expect(readStatus().textContent).toBe("");
   });
 
   // A later read of the same key, such as the refetch when the window regains
@@ -408,6 +523,9 @@ describe("TransactionViewPage (CT01, COTRN01)", () => {
     const region = await panel();
     await waitFor(() => {
       expect(captionedValues(region)).toEqual([[KEY_CAPTION, TRAN_ID], ...DISPLAY_FIELDS]);
+    });
+    await waitFor(() => {
+      expect(readStatus().textContent).toBe(LOADED);
     });
 
     const failure = viewError("UNEXPECTED", UNABLE_TO_LOOKUP);
@@ -429,6 +547,9 @@ describe("TransactionViewPage (CT01, COTRN01)", () => {
       "card-description",
     );
     expect(captionedValues(region)).toEqual([[KEY_CAPTION, TRAN_ID]]);
+    // The cleared record is no longer announced.
+    await afterAnnounceDelay();
+    expect(readStatus().textContent).toBe("");
   });
 
   // E-61: the route table gives the view no key-less route. Rendered without
@@ -447,6 +568,9 @@ describe("TransactionViewPage (CT01, COTRN01)", () => {
     ).toBe(LIST_ROUTE);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(toastError).not.toHaveBeenCalled();
+    // No read starts, so no read status is shown or announced.
+    await afterAnnounceDelay();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
   // F-COTRN01-002 (F3=Back) and F-COTRN01-004 (F5=Browse Tran.) both return to

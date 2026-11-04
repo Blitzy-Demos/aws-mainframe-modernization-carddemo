@@ -51,16 +51,12 @@ use std::future::Future;
 use std::panic::Location;
 use std::time::Duration;
 
-use carddemo_domain::entities::{
-    Account, AuthFraud, CardXref, Customer, NewPendingAuthDetail, PendingAuthDetail,
-    PendingAuthSummary,
+use carddemo_domain::rules::auth_decision::{
+    Account, AccountId, AccountReader, AuthFraud, AuthId, AuthorizationStore, Browse, CardNumber,
+    CardXref, Customer, CustomerId, CustomerReader, Direction, NewPendingAuthDetail,
+    PendingAuthDetail, PendingAuthSummary, PortError, PortResult, XrefReader,
 };
-use carddemo_domain::numeric::{AccountId, AuthId, CardNumber, CustomerId};
-use carddemo_domain::ports::{
-    AccountReader, AuthorizationStore, Browse, CustomerReader, Direction, PortError, PortResult,
-    XrefReader,
-};
-use carddemo_persistence::PersistenceError;
+use carddemo_persistence::tx::PersistenceError;
 
 /// How long one database call may take: the pool's own acquire timeout, so a
 /// call waits no longer for the database than `Db::begin` waits for a
@@ -150,8 +146,10 @@ where
 /// the cause of its failure.
 ///
 /// It wraps the `PgStore` of a unit of work for the domain rules that take a
-/// store: CP00's reads (`auth_decision::gather`) and writes
-/// (`8400-UPDATE-SUMMARY`, `8500-INSERT-AUTH`).
+/// store: CP00's reads (`auth_decision::gather`) and writes (the locked
+/// summary read, `8400-UPDATE-SUMMARY`, `8500-INSERT-AUTH`). A locked read
+/// that waits for a lock another session holds, such as a running purge's, is
+/// bounded like any other call.
 #[derive(Debug)]
 pub(crate) struct BoundedStore<S> {
     /// The transaction ID of the flow, the `flow` field of the log line.
@@ -228,6 +226,7 @@ impl<S: CustomerReader + Send> CustomerReader for BoundedStore<S> {
 impl<S: AuthorizationStore + Send> AuthorizationStore for BoundedStore<S> {
     bounded_calls! {
         read_summary(id: AccountId) -> PendingAuthSummary;
+        read_summary_for_update(id: AccountId) -> PendingAuthSummary;
         read_summary_of_detail(id: AuthId) -> PendingAuthSummary;
         insert_summary(summary: PendingAuthSummary) -> ();
         update_summary(summary: PendingAuthSummary) -> ();

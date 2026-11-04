@@ -15,6 +15,12 @@
 //! from `carddemo_domain::messages`. Each `P-` row cited is checked to have
 //! passed its review in `docs/parity/parity-oracle-audit.md`.
 //!
+//! The seeded master is the Db2 initial load, decoded at run time from the
+//! `DB2LTTYP.ctl` lines P-TRNTYPE-003 cites, and checked against the table
+//! and the row count P-TRNTYPE-003 records and the type and the code range
+//! P-TRNTYPE-004 records; every expected row of a seeded type, in a list, a
+//! filter or a page, is taken from it.
+//!
 //! The Db2 failures the fixtures cannot reach are injected with test-only SQL
 //! on the test's own database: a trigger that fails an `UPDATE` or `DELETE`
 //! with a chosen `SQLSTATE`, and views standing in for the master whose rows,
@@ -37,6 +43,7 @@
 pub mod common;
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::future::ready;
 
 use axum::extract::State;
@@ -51,7 +58,7 @@ use carddemo_api::handlers::admin_transaction_types::{
     delete_tran_type, list_tran_types, update_tran_type,
 };
 use carddemo_api::pagination::Page;
-use carddemo_audit::Document;
+use carddemo_audit::{Document, Repo};
 use carddemo_domain::entities::TranTypeMaster;
 use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages;
@@ -63,6 +70,7 @@ use carddemo_domain::ports::{
 use carddemo_domain::rules::tran_type_list::{self, TranTypeListInput};
 use carddemo_persistence::Db;
 use carddemo_runtime::config::Settings;
+use carddemo_testkit::fixtures;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -80,18 +88,28 @@ const TRTYPE: &str = TranTypeListField::TrType.as_str();
 /// The description filter field `TRDESC`.
 const TRDESC: &str = TranTypeListField::TrDesc.as_str();
 
-/// The Db2 load of the type master, upper case and `REVERAL` included
-/// [app/app-transaction-type-db2/ctl/DB2LTTYP.ctl:L17-23]: codes 01 to 07
-/// ("P-TRNTYPE-004").
-const DB2_TYPES: [(&str, &str); 7] = [
-    ("01", "PURCHASE"),
-    ("02", "PAYMENT"),
-    ("03", "CREDIT"),
-    ("04", "AUTHORIZATION"),
-    ("05", "REFUND"),
-    ("06", "REVERAL"),
-    ("07", "ADJUSTMENT"),
-];
+/// The parity row of the Db2 initial load of the type master: its
+/// `Paragraph` cell cites the load's lines, its `Expected result` the table
+/// and the row count.
+const DB2_LOAD_ROW: &str = "P-TRNTYPE-003";
+
+/// The parity row of the seeded master type: its code, its description and
+/// the range of the loaded codes.
+const SEEDED_TYPE_ROW: &str = "P-TRNTYPE-004";
+
+/// The parity row of `TR_DESCRIPTION VARCHAR(50)`, stored right-trimmed.
+const DESCRIPTION_COLUMN_ROW: &str = "P-TRNTYPE-002";
+
+/// The parity row of the seeded processing copy `TRANTYPE` of one type, whose
+/// description differs from the Db2 master's until TRANEXTR runs.
+const PROCESSING_TYPE_ROW: &str = "P-CVTRA03Y-005";
+
+/// The control file of the Db2 load among the citations of
+/// [`DB2_LOAD_ROW`].
+const DB2_LOAD_FILE: &str = "DB2LTTYP.ctl";
+
+/// The table the Db2 load fills, as [`DB2_LOAD_ROW`] names it.
+const MASTER_TABLE: &str = "transaction_types";
 
 /// The types the paging phase adds through `POST`, so the master holds a
 /// second page. None has a category, and every description holds `FEE`,
@@ -264,11 +282,15 @@ const RESTORE_ROW_READS: &str = r"
     DROP TABLE ctli_test_unreadable";
 
 /// The codes the master holds when [`failed_fetches`] places its unreadable
-/// rows: the Db2 load and the added types, less 08, which the delete phase
-/// removed.
-const MASTER_AFTER_DELETES: [&str; 11] = [
-    "01", "02", "03", "04", "05", "06", "07", "09", "10", "11", "12",
-];
+/// rows: the Db2 load ([`db2_load`]) and the added types, less 08, which the
+/// delete phase removed.
+fn master_after_deletes(audits: &Audits) -> Vec<String> {
+    with_added_types(&audits.db2_types)
+        .into_iter()
+        .map(|(code, _)| code)
+        .filter(|code| code != "08")
+        .collect()
+}
 
 /// F7 from type 11, the first code of the fourth page of three rows: the
 /// page reached holds 07, 09 and 10, and the backward cursor reads them,
@@ -287,18 +309,35 @@ struct Audited {
     kind: Option<ErrorKind>,
 }
 
-/// The two audits, parsed once per test.
+/// The two audits, parsed once per test, and the Db2 load they direct.
 struct Audits {
     validation: Document,
     parity: Document,
+    /// The rows of the Db2 initial load of the type master, each its
+    /// `TR_TYPE` and its `TR_DESCRIPTION`, in load order, as [`db2_load`]
+    /// decodes them.
+    db2_types: Vec<(String, String)>,
 }
 
 impl Audits {
     fn load() -> Self {
+        let parity = common::parity_audit();
+        let db2_types = db2_load(&parity);
         Self {
             validation: common::validation_audit(),
-            parity: common::parity_audit(),
+            parity,
+            db2_types,
         }
+    }
+
+    /// The description the Db2 load gives the type `code`.
+    fn db2_description(&self, code: &str) -> &str {
+        let (_, description) = self
+            .db2_types
+            .iter()
+            .find(|(loaded, _)| loaded == code)
+            .unwrap_or_else(|| panic!("the Db2 load holds no type {code}: {:?}", self.db2_types));
+        description
     }
 
     /// The outcome of the validation row `id`, once its review has passed.
@@ -411,6 +450,194 @@ fn unquote(id: &str, text: &str) -> String {
         }
     }
     plain
+}
+
+/// The `key=` value of the `Expected result` cell of the parity row `id`, as
+/// written: a quoted value keeps its backticks.
+fn expected_entry(parity: &Document, id: &str, key: &str) -> String {
+    let (table, row) = parity
+        .find_row(id)
+        .unwrap_or_else(|| panic!("the parity audit defines no {id} row"));
+    let result = table
+        .cell(row, "Expected result")
+        .unwrap_or_else(|| panic!("{id} has no Expected result cell"));
+    carddemo_audit::key_values(result)
+        .into_iter()
+        .find(|pair| pair.key == key)
+        .unwrap_or_else(|| panic!("{id} records no {key}=: {result:?}"))
+        .value
+}
+
+/// The quoted `key=` value of the `Expected result` cell of the parity row
+/// `id`: the text of its first code span, without its quotes.
+fn expected_text(parity: &Document, id: &str, key: &str) -> String {
+    let entry = expected_entry(parity, id, key);
+    let span = carddemo_audit::code_span(&entry)
+        .unwrap_or_else(|| panic!("{id} quotes no {key}: {entry:?}"));
+    unquote(id, &span.text)
+}
+
+/// The Db2 initial load of the type master, decoded from the lines of
+/// `DB2LTTYP.ctl` that the `Paragraph` cell of P-TRNTYPE-003 cites, once
+/// P-TRNTYPE-002, P-TRNTYPE-003 and P-TRNTYPE-004 have passed their review.
+///
+/// Each cited line that holds SQL string literals holds exactly two, the
+/// `TR_TYPE` and the `TR_DESCRIPTION` of one row; a line with none (the
+/// `INSERT INTO`, its column list, the `COMMIT`) loads no row. The
+/// description is right-trimmed, as `TR_DESCRIPTION VARCHAR(50)` is stored
+/// (P-TRNTYPE-002), and otherwise kept as the bytes say, `REVERAL` included.
+/// The rows are checked to fill the `table=` P-TRNTYPE-003 names with its
+/// `rows=` count, and to hold the type P-TRNTYPE-004 records
+/// ([`assert_seeded_type`]).
+fn db2_load(parity: &Document) -> Vec<(String, String)> {
+    for id in [DESCRIPTION_COLUMN_ROW, DB2_LOAD_ROW, SEEDED_TYPE_ROW] {
+        assert_review_passed(parity, id);
+    }
+    let (table, row) = parity
+        .find_row(DB2_LOAD_ROW)
+        .unwrap_or_else(|| panic!("the parity audit defines no {DB2_LOAD_ROW} row"));
+    let paragraph = table
+        .cell(row, "Paragraph")
+        .unwrap_or_else(|| panic!("{DB2_LOAD_ROW} has no Paragraph cell"));
+    let cited = carddemo_audit::citations(paragraph)
+        .into_iter()
+        .find(|citation| citation.path.ends_with(DB2_LOAD_FILE))
+        .unwrap_or_else(|| panic!("{DB2_LOAD_ROW} cites no {DB2_LOAD_FILE}: {paragraph:?}"));
+    let path = Repo::new(fixtures::repo_root())
+        .resolve(&cited.path)
+        .unwrap_or_else(|| panic!("{} is not in the repository", cited.path));
+    let control = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{} cannot be read: {error}", path.display()));
+    let lines: Vec<&str> = control.lines().collect();
+    let cited_lines = cited
+        .start
+        .checked_sub(1)
+        .and_then(|first| lines.get(first..cited.end))
+        .unwrap_or_else(|| panic!("{} has no lines L{}-{}", cited.path, cited.start, cited.end));
+    let rows: Vec<(String, String)> = cited_lines
+        .iter()
+        .zip(cited.start..)
+        .filter_map(|(line, number)| {
+            let at = format!("{}:L{number}", cited.path);
+            let literals = sql_literals(line)
+                .unwrap_or_else(|| panic!("{at} leaves a string literal open: {line:?}"));
+            match literals.as_slice() {
+                [] => None,
+                [code, description] => {
+                    Some((code.clone(), description.trim_end_matches(' ').to_owned()))
+                }
+                other => panic!(
+                    "{at} holds {} literals, not a code and a description: {line:?}",
+                    other.len()
+                ),
+            }
+        })
+        .collect();
+    assert_eq!(
+        expected_entry(parity, DB2_LOAD_ROW, "table"),
+        MASTER_TABLE,
+        "the table {DB2_LOAD_ROW} loads"
+    );
+    let count = expected_entry(parity, DB2_LOAD_ROW, "rows");
+    let count: usize = count
+        .parse()
+        .unwrap_or_else(|_| panic!("{DB2_LOAD_ROW} counts no rows: {count:?}"));
+    assert_eq!(
+        rows.len(),
+        count,
+        "{DB2_LOAD_ROW}: the rows of {}: {rows:?}",
+        cited.path
+    );
+    assert_seeded_type(parity, &rows);
+    rows
+}
+
+/// The SQL string literals of `line`, in order, each without its quotes and
+/// with each doubled `''` read as one `'`; `None` when the last one is not
+/// closed.
+fn sql_literals(line: &str) -> Option<Vec<String>> {
+    let mut literals = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\'' {
+            continue;
+        }
+        let mut literal = String::new();
+        loop {
+            let next = chars.next()?;
+            match next {
+                '\'' if chars.next_if_eq(&'\'').is_some() => literal.push('\''),
+                '\'' => break,
+                other => literal.push(other),
+            }
+        }
+        literals.push(literal);
+    }
+    Some(literals)
+}
+
+/// Asserts that `rows`, the decoded Db2 load, start with the type
+/// P-TRNTYPE-004 records (its `value=` and `tr_description=`), and that its
+/// `codes=` range, `first-last`, is their codes: every code from the first
+/// to the last, in order, each written in the width of the range's bounds.
+fn assert_seeded_type(parity: &Document, rows: &[(String, String)]) {
+    let code = expected_text(parity, SEEDED_TYPE_ROW, "value");
+    let description = expected_text(parity, SEEDED_TYPE_ROW, "tr_description");
+    assert_eq!(
+        rows.first(),
+        Some(&(code, description)),
+        "{SEEDED_TYPE_ROW}: the first row of the Db2 load"
+    );
+    let range = expected_entry(parity, SEEDED_TYPE_ROW, "codes");
+    let (first, last) = range
+        .split_once('-')
+        .unwrap_or_else(|| panic!("{SEEDED_TYPE_ROW}: codes={range} is no range"));
+    let bound = |text: &str| -> u8 {
+        text.parse()
+            .unwrap_or_else(|_| panic!("{SEEDED_TYPE_ROW}: codes={range} has the bound {text:?}"))
+    };
+    let width = first.len();
+    let expected: Vec<String> = (bound(first)..=bound(last))
+        .map(|code| format!("{code:0width$}"))
+        .collect();
+    let loaded: Vec<&str> = rows.iter().map(|(code, _)| code.as_str()).collect();
+    assert_eq!(
+        loaded, expected,
+        "{SEEDED_TYPE_ROW}: the codes {range} of the Db2 load"
+    );
+}
+
+/// `types`, the Db2 load, followed by [`ADDED_TYPES`]: the master once
+/// [`add_types`] has run.
+fn with_added_types(types: &[(String, String)]) -> Vec<(String, String)> {
+    types.iter().cloned().chain(owned(&ADDED_TYPES)).collect()
+}
+
+/// The rows of `types` the cursors' conditions pass (P-COTRTLIC-003):
+/// `TR_TYPE = type_code` when one is given, and `TR_DESCRIPTION LIKE` `%`,
+/// the trimmed `description`, `%` when that is not blank, matched by
+/// [`like`]; checked to hold a row, so no case built on them is vacuous.
+fn filtered_rows(
+    types: &[(String, String)],
+    type_code: Option<&str>,
+    description: &str,
+) -> Vec<(String, String)> {
+    let text = description.trim_matches(' ');
+    let pattern: Vec<char> = format!("%{text}%").chars().collect();
+    let rows: Vec<(String, String)> = types
+        .iter()
+        .filter(|(code, _)| type_code.is_none_or(|wanted| code == wanted))
+        .filter(|(_, stored)| {
+            let stored: Vec<char> = stored.chars().collect();
+            text.is_empty() || like(&pattern, &stored)
+        })
+        .cloned()
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "no type of {types:?} passes the type {type_code:?} and the description {description:?}"
+    );
+    rows
 }
 
 /// The Db2 text the validation row `id` records, with `edited`, the
@@ -657,20 +884,51 @@ fn ctli_lists_updates_and_deletes_the_type_master() {
     });
 }
 
-/// The seeded master, unfiltered: the seven Db2 types in `TR_TYPE` order on
-/// one page, with no page before or after it and no page text.
+/// The seeded master, unfiltered: the rows of the Db2 load ([`db2_load`],
+/// P-TRNTYPE-003 and P-TRNTYPE-004) in `TR_TYPE` order on one page, with no
+/// page before or after it and no page text.
+///
+/// The master is a version of its own: the processing copy `TRANTYPE`, which
+/// the seed loads from `trantype.txt`, holds the description P-CVTRA03Y-005
+/// records for its type, which differs from the Db2 load's until TRANEXTR
+/// runs, so the expected master is the Db2 load and never the copy.
 ///
 /// The first request of a session is the entry from the admin menu: no
 /// filter applies and the list starts at the first type. The page is the
 /// JSON answer of the HTTP response, which carries the rows and the page
 /// keys and none of the `CTRTLIA` header fields or the page number.
 async fn seeded_first_page(app: &TestApp, token: &str, audits: &Audits) {
-    audits.reviewed(&["P-TRNTYPE-004", "P-COTRTLIC-003", "P-COTRTLIC-030"]);
+    audits.reviewed(&[
+        DB2_LOAD_ROW,
+        SEEDED_TYPE_ROW,
+        "P-COTRTLIC-003",
+        "P-COTRTLIC-030",
+    ]);
     assert_eq!(
         rows(app, MASTER_ROWS).await,
-        owned(&DB2_TYPES),
+        audits.db2_types,
         "the seeded Db2 master"
     );
+
+    audits.reviewed(&[PROCESSING_TYPE_ROW]);
+    let code = expected_text(&audits.parity, PROCESSING_TYPE_ROW, "value");
+    let copy = expected_text(&audits.parity, PROCESSING_TYPE_ROW, "tran_type_desc");
+    let processing = rows(app, PROCESSING_ROWS).await;
+    let stored = processing
+        .iter()
+        .find(|(stored, _)| *stored == code)
+        .map(|(_, description)| description.as_str());
+    assert_eq!(
+        stored,
+        Some(copy.as_str()),
+        "{PROCESSING_TYPE_ROW}: the processing copy of type {code}"
+    );
+    assert_ne!(
+        audits.db2_description(&code),
+        copy,
+        "{PROCESSING_TYPE_ROW}: the Db2 master of type {code} is not its processing copy"
+    );
+
     let page = list(app, token, "").await;
     insta::assert_yaml_snapshot!("first_page", page);
     assert_eq!(
@@ -680,9 +938,10 @@ async fn seeded_first_page(app: &TestApp, token: &str, audits: &Audits) {
     );
 
     audits.reviewed(&["P-COTRTLIC-012"]);
+    let (first_code, first_description) = &audits.db2_types[0];
     assert_eq!(
         page["items"][0],
-        item(DB2_TYPES[0].0, DB2_TYPES[0].1),
+        item(first_code, first_description),
         "the entry lists from the first type"
     );
     assert_eq!(
@@ -714,14 +973,16 @@ async fn other_keys_act_as_enter(app: &TestApp, token: &str, audits: &Audits) {
 }
 
 /// `1220-EDIT-TYPECD`: blank or `00` sets no type condition, two digits select
-/// that type, and anything else is refused on `TRTYPE`.
+/// that type, and anything else is refused on `TRTYPE`. The rows expected
+/// are those of the Db2 load ([`db2_load`]) the condition passes.
 async fn type_code_filters(app: &TestApp, token: &str, audits: &Audits) {
     audits.reviewed(&["P-COTRTLIC-018"]);
-    let all = page(&DB2_TYPES, None, None, None);
+    let types = &audits.db2_types;
+    let all = page(&filtered_rows(types, None, ""), None, None, None);
     for query in ["?type_code=", "?type_code=%20%20", "?type_code=00"] {
         assert_page(app, token, query, &all).await;
     }
-    let credit = page(&DB2_TYPES[2..3], None, None, None);
+    let credit = page(&filtered_rows(types, Some("03"), ""), None, None, None);
     assert_page(app, token, "?type_code=03", &credit).await;
 
     // The query of every request is edited as `1200-EDIT-INPUTS` edits the
@@ -736,33 +997,29 @@ async fn type_code_filters(app: &TestApp, token: &str, audits: &Audits) {
 
 /// `1230-EDIT-DESC`: the filter is searched as `TR_DESCRIPTION LIKE` `%`, the
 /// trimmed text, `%`, case-sensitive and with `_` matching any one
-/// character; blank sets no condition. It combines with a type filter.
+/// character; blank sets no condition. It combines with a type filter. The
+/// rows expected are those of the Db2 load ([`db2_load`]) the conditions
+/// pass.
 async fn description_filters(app: &TestApp, token: &str, audits: &Audits) {
     audits.reviewed(&["P-COTRTLIC-003", "P-COTRTLIC-020"]);
-    let payment = page(&DB2_TYPES[1..2], None, None, None);
-    for query in [
-        "?description=PAY",
-        "?description=%20PAY%20",
-        "?description=P_Y",
-        "?type_code=02&description=PAY",
-    ] {
-        assert_page(app, token, query, &payment).await;
+    let types = &audits.db2_types;
+    let cases = [
+        ("?description=PAY", None, "PAY"),
+        ("?description=%20PAY%20", None, " PAY "),
+        ("?description=P_Y", None, "P_Y"),
+        ("?type_code=02&description=PAY", Some("02"), "PAY"),
+        ("?description=RE", None, "RE"),
+        ("?description=%20%20", None, "  "),
+    ];
+    for (query, type_code, description) in cases {
+        let expected = page(
+            &filtered_rows(types, type_code, description),
+            None,
+            None,
+            None,
+        );
+        assert_page(app, token, query, &expected).await;
     }
-    let with_re = [DB2_TYPES[2], DB2_TYPES[4], DB2_TYPES[5]];
-    assert_page(
-        app,
-        token,
-        "?description=RE",
-        &page(&with_re, None, None, None),
-    )
-    .await;
-    assert_page(
-        app,
-        token,
-        "?description=%20%20",
-        &page(&DB2_TYPES, None, None, None),
-    )
-    .await;
 }
 
 /// `1290-CROSS-EDITS`: valid filters that no type passes are refused, the
@@ -843,7 +1100,7 @@ async fn pages(app: &TestApp, token: &str, audits: &Audits) {
         "P-COTRTLIC-031",
         "P-COTRTLIC-033",
     ]);
-    let all: Vec<(&str, &str)> = DB2_TYPES.iter().chain(&ADDED_TYPES).copied().collect();
+    let all = with_added_types(&audits.db2_types);
     let (first, second) = all.split_at(SCREEN_ROWS);
     assert_page(app, token, "", &page(first, Some("08"), None, None)).await;
 
@@ -874,10 +1131,11 @@ async fn pages(app: &TestApp, token: &str, audits: &Audits) {
 
     // Three-row pages backward from 08: each starts F8 at the code it came
     // from, and the page with no type before it is the first.
+    let code = |at: usize| all[at].0.as_str();
     let backward = [
-        ("08", &all[4..7], Some("05"), None),
-        ("05", &all[1..4], Some("02"), None),
-        ("02", &all[0..1], None, no_previous),
+        ("08", &all[4..7], Some(code(4)), None),
+        (code(4), &all[1..4], Some(code(1)), None),
+        (code(1), &all[0..1], None, no_previous),
     ];
     for (start_key, items, prev_key, message) in backward {
         let query = format!("?start_key={start_key}&direction=backward&page_size=3");
@@ -890,7 +1148,7 @@ async fn pages(app: &TestApp, token: &str, audits: &Audits) {
     audits.reviewed(&["P-COTRTLIC-006"]);
     assert_eq!(
         rows(app, MASTER_ROWS).await,
-        owned(&all),
+        all,
         "the browse writes nothing"
     );
 }
@@ -935,7 +1193,8 @@ async fn filtered_pages(app: &TestApp, token: &str, audits: &Audits) {
     // A changed filter resets the paging: the request that carries it reads
     // from the first type it matches, the first page.
     audits.reviewed(&["P-COTRTLIC-019"]);
-    let payment = page(&DB2_TYPES[1..2], None, None, None);
+    let master = with_added_types(&audits.db2_types);
+    let payment = page(&filtered_rows(&master, None, "PAY"), None, None, None);
     assert_page(app, token, "?description=PAY&page_size=2", &payment).await;
 }
 
@@ -959,10 +1218,14 @@ async fn inline_updates(app: &TestApp, token: &str, audits: &Audits) {
     // both answer the no-change text, yet the save stores the entered text,
     // so a change of case alone is written (E-73).
     audits.ok_row("V-COTRTLIC-012");
-    let resp = put_row(app, token, "02", &json!({ "description": "PAYMENT" })).await;
-    assert_updated(&resp, "02", "PAYMENT", no_change);
-    let resp = put_row(app, token, "01", &json!({ "description": "purchase" })).await;
-    assert_updated(&resp, "01", "purchase", no_change);
+    let listed = audits.db2_description("02");
+    let resp = put_row(app, token, "02", &json!({ "description": listed })).await;
+    assert_updated(&resp, "02", listed, no_change);
+    let listed = audits.db2_description("01");
+    let recased = listed.to_ascii_lowercase();
+    assert_ne!(recased, listed, "the case of type 01 of the Db2 load");
+    let resp = put_row(app, token, "01", &json!({ "description": recased })).await;
+    assert_updated(&resp, "01", &recased, no_change);
 
     // Absent, empty, spaces and `*`, which the screen shows for a blank
     // description, are not supplied. The edits name no field: the
@@ -991,14 +1254,15 @@ async fn inline_updates(app: &TestApp, token: &str, audits: &Audits) {
     let updated = messages::HIGHLIGHTED_ROW_WAS_UPDATED;
     assert_updated(&resp, "02", "ELECTRONIC PAYMENT", updated);
 
-    let mut expected = vec![("01", "purchase"), ("02", "ELECTRONIC PAYMENT")];
-    expected.extend_from_slice(&DB2_TYPES[2..]);
-    expected.extend_from_slice(&ADDED_TYPES);
-    assert_eq!(
-        rows(app, MASTER_ROWS).await,
-        owned(&expected),
-        "the Db2 master"
-    );
+    let expected: Vec<(String, String)> = with_added_types(&audits.db2_types)
+        .into_iter()
+        .map(|(code, description)| match code.as_str() {
+            "01" => (code, recased.clone()),
+            "02" => (code, "ELECTRONIC PAYMENT".to_owned()),
+            _ => (code, description),
+        })
+        .collect();
+    assert_eq!(rows(app, MASTER_ROWS).await, expected, "the Db2 master");
     assert_eq!(
         rows(app, PROCESSING_ROWS).await,
         processing,
@@ -1041,7 +1305,8 @@ async fn inline_update_failures(app: &TestApp, token: &str, audits: &Audits) {
     let resp = put_row(app, token, "03", &body).await;
     assert_row_error(audits, &resp, "V-COTRTLIC-017", &deadlock, &[]);
     let no_change = messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_DATABASE_VALUES;
-    let resp = put_row(app, token, "03", &json!({ "description": "credit" })).await;
+    let recased = audits.db2_description("03").to_ascii_lowercase();
+    let resp = put_row(app, token, "03", &json!({ "description": recased })).await;
     assert_row_error(audits, &resp, "V-COTRTLIC-017", no_change, &[]);
     app.stack().exec_sql(DROP_UPDATE_TRIGGER).await;
 
@@ -1198,8 +1463,12 @@ async fn failed_reads(app: &TestApp, token: &str, audits: &Audits) {
 /// again, so does the list.
 async fn failed_fetches(app: &TestApp, token: &str, audits: &Audits) {
     let master = rows(app, MASTER_ROWS).await;
-    let codes: Vec<&str> = master.iter().map(|(code, _)| code.as_str()).collect();
-    assert_eq!(codes, MASTER_AFTER_DELETES, "the master the failures read");
+    let codes: Vec<String> = master.iter().map(|(code, _)| code.clone()).collect();
+    assert_eq!(
+        codes,
+        master_after_deletes(audits),
+        "the master the failures read"
+    );
     let page_back = list(app, token, BACK_FROM_11).await;
     app.stack().exec_sql(FAIL_ROW_READS).await;
 
@@ -1354,10 +1623,10 @@ const PRIMING_NOT_REPRODUCED: &str = "replacement: not reproduced (E-83)";
 /// for the token of [`TestApp::admin_token`].
 const SIGNED_ON_ADMIN: &str = "ADMIN001";
 
-/// The type the update and the delete of [`unreachable_database`] address,
-/// 02 of the Db2 load: valid input, so each request gets as far as the
-/// database, whose content no request then reads.
-const UNREACHED_TYPE: (&str, &str) = DB2_TYPES[1];
+/// The type the update and the delete of [`unreachable_database`] address
+/// with its description in the Db2 load ([`db2_load`]): valid input, so each
+/// request gets as far as the database, whose content no request then reads.
+const UNREACHED_TYPE: &str = "02";
 
 /// COTRTLIC 9998-PRIMING-QUERY, SEND-LONG-TEXT — P-COTRTLIC-042 (E-83): with
 /// the database out of reach, the list, the inline update and the row
@@ -1395,7 +1664,7 @@ async fn unreachable_database(app: &TestApp, token: &str, audits: &Audits) {
     )
     .unwrap_or_else(|error| panic!("the default settings were rejected: {error}"));
     state.db().close().await;
-    let (code, description) = UNREACHED_TYPE;
+    let (code, description) = (UNREACHED_TYPE, audits.db2_description(UNREACHED_TYPE));
     let body = json!({ "description": description });
     let mut answers = vec![
         list_error(app, token, "").await,
@@ -1644,13 +1913,34 @@ const COUNT_WARNING_ROW: &str = "V-COTRTLIC-003";
 /// The disposition [`COUNT_WARNING_ROW`] records: no warning reaches the count.
 const COUNT_WARNING_NOT_REPRODUCED: &str = "not reproduced (E-82)";
 
-/// One filter at a time, as `9100-CHECK-FILTERS` counts it: a value the one
-/// seeded type listed passes, a value no type passes, and the filter's BMS
-/// field.
-const COUNTED_FILTERS: [(&str, (&str, &str), &str, &str); 2] = [
-    ("?type_code=03", DB2_TYPES[2], "?type_code=99", TRTYPE),
-    ("?description=PAY", DB2_TYPES[1], "?description=pay", TRDESC),
-];
+/// One filter as `9100-CHECK-FILTERS` counts it: a value some seeded type
+/// passes, the rows that pass it, a value no type passes, and the filter's
+/// BMS field.
+type CountedFilter = (
+    &'static str,
+    Vec<(String, String)>,
+    &'static str,
+    &'static str,
+);
+
+/// The filters counted one at a time, each a [`CountedFilter`] whose rows
+/// are those of the Db2 load `types` ([`db2_load`]) its value passes.
+fn counted_filters(types: &[(String, String)]) -> [CountedFilter; 2] {
+    [
+        (
+            "?type_code=03",
+            filtered_rows(types, Some("03"), ""),
+            "?type_code=99",
+            TRTYPE,
+        ),
+        (
+            "?description=PAY",
+            filtered_rows(types, None, "PAY"),
+            "?description=pay",
+            TRDESC,
+        ),
+    ]
+}
 
 /// Takes the master away, so the count fails with no Db2 code.
 const HIDE_COUNTED_MASTER: &str = "ALTER TABLE transaction_types RENAME TO ctli_test_counted_types";
@@ -1705,8 +1995,8 @@ fn the_filter_count_answers_a_count_or_a_failure_never_the_warning_text() {
     carddemo_testkit::block_on(async {
         let token = app.admin_token().await;
         let mut answers = Vec::new();
-        for (passing, (code, description), passing_none, field) in COUNTED_FILTERS {
-            let counted = page(&[(code, description)], None, None, None);
+        for (passing, passed, passing_none, field) in counted_filters(&audits.db2_types) {
+            let counted = page(&passed, None, None, None);
             let resp = list_error(&app, &token, passing).await;
             assert_eq!((resp.0, &resp.1), (StatusCode::OK, &counted), "{passing}");
             answers.push(resp);
@@ -1750,11 +2040,11 @@ const DESCRIPTION_OF_ELEVEN: &str = "E";
 /// The adapter reads a cursor as one statement whose rows all arrive before
 /// it completes, and no test SQL fails that statement only after its last
 /// row, so no request provokes the `CLOSE` step. This store answers the
-/// rows of the `COTRTLIC` cursors on the Db2 load and the added types, codes
-/// 01 to 12, with the cursors' type and description conditions, up to the
-/// read's limit; the next read that returns at least the count `failure`
-/// names fails right after that many rows, at the step
-/// [`CursorError::after`] gives.
+/// rows of the `COTRTLIC` cursors on the Db2 load it is given
+/// ([`db2_load`]) and the added types, with the cursors' type and
+/// description conditions, up to the read's limit; the next read that
+/// returns at least the count `failure` names fails right after that many
+/// rows, at the step [`CursorError::after`] gives.
 struct CursorStore {
     /// The master, in `TR_TYPE` order.
     types: Vec<TranTypeMaster>,
@@ -1768,13 +2058,13 @@ struct CursorStore {
 }
 
 impl CursorStore {
-    /// The store with `failure` queued.
-    fn new(failure: Option<(usize, PortError)>) -> Self {
-        let types = DB2_TYPES
-            .iter()
-            .chain(&ADDED_TYPES)
+    /// The store of `db2_types`, the Db2 load, and [`ADDED_TYPES`], with
+    /// `failure` queued.
+    fn new(db2_types: &[(String, String)], failure: Option<(usize, PortError)>) -> Self {
+        let types = with_added_types(db2_types)
+            .into_iter()
             .map(|(code, description)| {
-                TranTypeMaster::try_new(TranTypeCode::move_from(code), (*description).to_owned())
+                TranTypeMaster::try_new(TranTypeCode::move_from(&code), description)
                     .unwrap_or_else(|error| panic!("type {code} is no master row: {error}"))
             })
             .collect();
@@ -2009,6 +2299,7 @@ fn forward_close_failures(audits: &Audits) {
         desc_filter: Some(DESCRIPTION_OF_ELEVEN.to_owned()),
         ..TranTypeListInput::default()
     };
+    let types = &audits.db2_types;
     let unexpected = messages::UNEXPECTED_ERROR;
     for input in [
         read_from("", Direction::Forward),
@@ -2016,14 +2307,14 @@ fn forward_close_failures(audits: &Audits) {
         filtered,
     ] {
         let case = format!("{input:?}");
-        let mut store = CursorStore::new(Some((CLOSE_AFTER, PortError::Contention)));
+        let mut store = CursorStore::new(types, Some((CLOSE_AFTER, PortError::Contention)));
         let resp = listed(&mut store, input.clone());
         assert_cursor_answer(audits, &resp, "V-COTRTLIC-025", action);
         assert_eq!(store.failed, [CursorPhase::Close], "{case}");
         let reads = [(Direction::Forward, input.start_key)];
         assert_eq!(store.reads, reads, "{case}: the CLOSE ends the read");
 
-        let mut store = CursorStore::new(Some((CLOSE_AFTER, unavailable())));
+        let mut store = CursorStore::new(types, Some((CLOSE_AFTER, unavailable())));
         let resp = listed(&mut store, input);
         assert_row_error(
             audits,
@@ -2044,7 +2335,7 @@ fn forward_close_failures(audits: &Audits) {
         (3, "V-COTRTLIC-007", action),
     ];
     for (fetched, id, step) in first_fetches {
-        let mut store = CursorStore::new(Some((fetched, PortError::Contention)));
+        let mut store = CursorStore::new(types, Some((fetched, PortError::Contention)));
         let resp = listed(&mut store, read_from("", Direction::Forward));
         assert_cursor_answer(audits, &resp, id, step);
         assert_eq!(store.failed, [CursorPhase::Fetch], "{id}");
@@ -2052,7 +2343,7 @@ fn forward_close_failures(audits: &Audits) {
 
     audits.ok_row("V-COTRTLIC-008");
     let no_more_pages = audited_message(audits, "V-COTRTLIC-008");
-    let mut store = CursorStore::new(Some((CLOSE_AFTER, PortError::Contention)));
+    let mut store = CursorStore::new(types, Some((CLOSE_AFTER, PortError::Contention)));
     let resp = listed(&mut store, read_from("13", Direction::Forward));
     let expected = page::<&str>(&[], None, None, Some(&no_more_pages));
     assert_eq!((resp.0, &resp.1), (StatusCode::OK, &expected), "{}", resp.2);
@@ -2064,17 +2355,19 @@ fn forward_close_failures(audits: &Audits) {
 }
 
 /// F7 on the first page re-reads it forward (P-COTRTLIC-004): from the start
-/// of the table, and from 01, the first code, before which no type stands.
-/// The `CLOSE` fails after the page and the look-ahead row, which stay shown
-/// (P-COTRTLIC-038), and `2500-SETUP-MESSAGE` replaces the close text with
-/// that of V-COTRTLIC-009: 200, the seven Db2 types and the next key 08.
+/// of the table, and from the first code of the Db2 load ([`db2_load`]),
+/// before which no type stands. The `CLOSE` fails after the page and the
+/// look-ahead row, which stay shown (P-COTRTLIC-038), and
+/// `2500-SETUP-MESSAGE` replaces the close text with that of
+/// V-COTRTLIC-009: 200, the rows of the Db2 load and the next key 08.
 fn first_page_close_failures(audits: &Audits) {
     audits.reviewed(&["P-COTRTLIC-004", "P-COTRTLIC-038"]);
     audits.ok_row("V-COTRTLIC-009");
     let first_page = audited_message(audits, "V-COTRTLIC-009");
-    let expected = page(&DB2_TYPES, Some(ADDED_TYPES[0].0), None, Some(&first_page));
-    for start in ["", DB2_TYPES[0].0] {
-        let mut store = CursorStore::new(Some((CLOSE_AFTER, PortError::Contention)));
+    let types = &audits.db2_types;
+    let expected = page(types, Some(ADDED_TYPES[0].0), None, Some(&first_page));
+    for start in ["", types[0].0.as_str()] {
+        let mut store = CursorStore::new(types, Some((CLOSE_AFTER, PortError::Contention)));
         let resp = listed(&mut store, read_from(start, Direction::Backward));
         assert_eq!(
             (resp.0, &resp.1),
@@ -2112,7 +2405,8 @@ fn backward_close_failures(audits: &Audits) {
         "the text of P-COTRTLIC-040"
     );
     let from_10 = || read_from("10", Direction::Backward);
-    let mut store = CursorStore::new(Some((CLOSE_AFTER, PortError::Contention)));
+    let types = &audits.db2_types;
+    let mut store = CursorStore::new(types, Some((CLOSE_AFTER, PortError::Contention)));
     let resp = listed(&mut store, from_10());
     assert_cursor_answer(audits, &resp, "V-COTRTLIC-027", action);
     assert_eq!(store.failed, [CursorPhase::Close]);
@@ -2123,7 +2417,7 @@ fn backward_close_failures(audits: &Audits) {
     );
 
     let unexpected = messages::UNEXPECTED_ERROR;
-    let mut store = CursorStore::new(Some((CLOSE_AFTER, unavailable())));
+    let mut store = CursorStore::new(types, Some((CLOSE_AFTER, unavailable())));
     let resp = listed(&mut store, from_10());
     assert_row_error(
         audits,
@@ -2148,7 +2442,7 @@ fn backward_close_failures(audits: &Audits) {
         ),
     ];
     for (fetched, phase, id, step) in first_steps {
-        let mut store = CursorStore::new(Some((fetched, PortError::Contention)));
+        let mut store = CursorStore::new(types, Some((fetched, PortError::Contention)));
         let resp = listed(&mut store, from_10());
         assert_cursor_answer(audits, &resp, id, step);
         assert_eq!(store.failed, [phase], "{id}");
@@ -2157,9 +2451,9 @@ fn backward_close_failures(audits: &Audits) {
     audits.ok_row("V-COTRTLIC-009");
     let first_page = audited_message(audits, "V-COTRTLIC-009");
     let next = ADDED_TYPES[0].0;
-    let mut store = CursorStore::new(Some((SCREEN_ROWS, PortError::Contention)));
+    let mut store = CursorStore::new(types, Some((SCREEN_ROWS, PortError::Contention)));
     let resp = listed(&mut store, read_from(next, Direction::Backward));
-    let expected = page(&DB2_TYPES, Some(next), None, Some(&first_page));
+    let expected = page(types, Some(next), None, Some(&first_page));
     assert_eq!((resp.0, &resp.1), (StatusCode::OK, &expected), "{}", resp.2);
     assert_eq!(store.failed, [CursorPhase::Fetch]);
 }

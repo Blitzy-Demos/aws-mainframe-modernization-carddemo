@@ -34,11 +34,17 @@
 //! slots, cut at a character boundary.
 
 use super::mq_date_reply::{self, ErrorRecordSpec};
-use crate::entities::Account;
 use crate::format::{self, AccountResponse};
 use crate::messages;
-use crate::numeric::{AccountId, Alnum};
-use crate::ports::{AccountReader, PortError};
+use crate::numeric::Alnum;
+
+/// The account record, its key, the reader [`process`] reads it through and
+/// that reader's outcome, re-exported from [`crate::entities`],
+/// [`crate::numeric`] and [`crate::ports`] for the CDRA flow of the messaging
+/// adapter.
+pub use crate::entities::Account;
+pub use crate::numeric::AccountId;
+pub use crate::ports::{AccountReader, PortError, PortResult};
 
 /// `WS-FUNC PIC X(04)`, bytes 1-4 of `REQUEST-MSG-COPY`
 /// [app/app-vsam-mq/cbl/COACCT01.cbl:L110] — P-COACCT01-011.

@@ -25,7 +25,7 @@
 //
 // Every outcome text is the server's and is shown through lib/api-errors.
 // Amounts stay the decimal strings the API sends.
-import { useEffect, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 import { Link } from "react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm, type UseFormReturn } from "react-hook-form";
@@ -54,7 +54,12 @@ import {
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { applyApiError, showMessage, showSuccess } from "@/lib/api-errors";
+import {
+  applyApiError,
+  showApiError,
+  showMessage,
+  showSuccess,
+} from "@/lib/api-errors";
 import {
   billPaymentBmsFieldMap,
   paymentSchema,
@@ -98,19 +103,22 @@ type BalancePreviewProps = {
   accountId: string;
   paid: Paid | null;
   form: UseFormReturn<PaymentFormValues>;
+  /** Whether the form still holds the entry this account was reviewed from. */
+  ownsEntry: () => boolean;
 };
 
 /**
  * The CURBAL line of COBIL00, "Your current balance is", for the account
  * under review: `GET /accounts/{id}` through the account cache the dashboard
- * shares. The payment hook reloads that entry once a payment settles, failures
- * included (E-19), so the card follows the balance on file; after a completed
- * payment it shows the balance the 201 answered with.
+ * shares. The payment hook reloads that entry once a confirmed payment
+ * settles, failures included (E-19), so the card follows the balance on file;
+ * after a completed payment it shows the balance the 201 answered with.
  */
 function BalancePreview({
   accountId,
   paid,
   form,
+  ownsEntry,
 }: BalancePreviewProps): JSX.Element | null {
   const account = useAccount(accountId);
   const accountError = account.error;
@@ -123,8 +131,15 @@ function BalancePreview({
       return;
     }
     shownError.current = accountError;
-    applyApiError(accountError, form, previewFieldMap);
-  }, [accountError, form]);
+    // A read that fails once the entry was replaced (the reload after a
+    // payment, say) concerns this card's account, not the entry now on the
+    // form, so it is only toasted.
+    if (ownsEntry()) {
+      applyApiError(accountError, form, previewFieldMap);
+    } else {
+      showApiError(accountError);
+    }
+  }, [accountError, form, ownsEntry]);
 
   let balance: string;
   if (paid !== null && paid.accountId === accountId) {
@@ -194,6 +209,31 @@ export default function BillPaymentPage(): JSX.Element {
   // synchronous focus a review answer needs (see reviewPayment).
   const accountInputRef = useRef<HTMLInputElement | null>(null);
 
+  // Counts the replacements of the entry: each user edit of the account ID
+  // and each clearing of the screen (Reset, Cancel, Escape), whose reset
+  // fires no change event. The blanking after a payment is not counted. The
+  // account ID and Reset stay usable while a review or a payment runs, so
+  // reviewPayment, pay and the balance card compare it to tell whether the
+  // form still holds the entry their request was made for.
+  const entryRevision = useRef(0);
+  useEffect(() => {
+    const subscription = form.watch((_values, { type }) => {
+      if (type === "change") {
+        entryRevision.current += 1;
+      }
+    });
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [form]);
+  // The revision of the entry the reviewed account (the balance card's and
+  // the dialog's) was sent from.
+  const previewRevision = useRef(0);
+  const ownsPreviewEntry = useCallback(
+    (): boolean => entryRevision.current === previewRevision.current,
+    [],
+  );
+
   // INITIALIZE-ALL-FIELDS: the account ID and the confirmation blanked.
   // keepFieldsRef keeps the input's registered ref, which a plain reset drops
   // until the next render, so a later setFocus still finds it.
@@ -205,6 +245,7 @@ export default function BillPaymentPage(): JSX.Element {
   // balance. A review still in flight is dropped, so its answer opens no
   // dialog over the cleared screen.
   function clearScreen(): void {
+    entryRevision.current += 1;
     review.reset();
     blankEntry();
     setPreviewId(null);
@@ -222,6 +263,10 @@ export default function BillPaymentPage(): JSX.Element {
       return;
     }
     const accountId = values.account_id;
+    // The entry this review was sent from. An answer that arrives after it
+    // was replaced concerns the reviewed account, not the entry now on the
+    // form.
+    const sentRevision = entryRevision.current;
     // A new ENTER sends a new screen: the previous balance goes until this
     // one is read.
     setPreviewId(null);
@@ -232,6 +277,7 @@ export default function BillPaymentPage(): JSX.Element {
         onSuccess: ({ data }) => {
           showMessage(data.message);
           setReviewed({ accountId, balance: data.current_balance });
+          previewRevision.current = sentRevision;
           setPreviewId(accountId);
           // Every way out of the dialog leaves the cursor on ACTIDIN (MOVE -1
           // TO ACTIDINL): Cancel and Escape clear the screen, a payment
@@ -246,7 +292,11 @@ export default function BillPaymentPage(): JSX.Element {
           setConfirmOpen(true);
         },
         onError: (error) => {
-          applyApiError(error, form, billPaymentBmsFieldMap);
+          if (entryRevision.current === sentRevision) {
+            applyApiError(error, form, billPaymentBmsFieldMap);
+          } else {
+            showApiError(error);
+          }
         },
       },
     );
@@ -258,6 +308,14 @@ export default function BillPaymentPage(): JSX.Element {
       return;
     }
     const { accountId } = reviewed;
+    // An answer that arrives after the entry was replaced belongs to the
+    // account paid, not to the one on the form: its text is still shown and
+    // the card still takes the paid balance (it names the paid account), but
+    // the newer entry is neither blanked, marked nor focused. The entry paid
+    // is the one the review was sent from, so one typed while the review ran
+    // is newer too.
+    const sentRevision = previewRevision.current;
+    const ownsEntry = (): boolean => entryRevision.current === sentRevision;
     payment.mutate(
       { account_id: accountId, confirm: CONFIRM_YES },
       {
@@ -270,13 +328,19 @@ export default function BillPaymentPage(): JSX.Element {
             // the paid account's new balance.
             showSuccess(data.message);
             setPaid({ accountId, balance: data.current_balance });
-            blankEntry();
+            if (ownsEntry()) {
+              blankEntry();
+            }
           } else {
             showMessage(data.message);
           }
         },
         onError: (error) => {
-          applyApiError(error, form, billPaymentBmsFieldMap);
+          if (ownsEntry()) {
+            applyApiError(error, form, billPaymentBmsFieldMap);
+          } else {
+            showApiError(error);
+          }
         },
       },
     );
@@ -304,7 +368,9 @@ export default function BillPaymentPage(): JSX.Element {
         <form noValidate onSubmit={form.handleSubmit(reviewPayment)}>
           <Card>
             <CardHeader>
-              <CardTitle>Account</CardTitle>
+              <CardTitle>
+                <h2>Account</h2>
+              </CardTitle>
               <CardDescription>
                 Enter the account whose balance you want to pay.
               </CardDescription>
@@ -358,7 +424,12 @@ export default function BillPaymentPage(): JSX.Element {
           </Card>
         </form>
         {previewId === null ? null : (
-          <BalancePreview accountId={previewId} paid={paid} form={form} />
+          <BalancePreview
+            accountId={previewId}
+            paid={paid}
+            form={form}
+            ownsEntry={ownsPreviewEntry}
+          />
         )}
       </div>
       <ConfirmDialog

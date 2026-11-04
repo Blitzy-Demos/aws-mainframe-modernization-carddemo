@@ -13,12 +13,16 @@
 // - a server error is toasted, set on the field its `fields[]` names and puts
 //   the cursor there, as `MOVE -1 TO ACTIDINL` does;
 // - "Copy last transaction" (PF5) reads the highest-keyed transaction, copies
-//   its data fields with the screen edit of the amount, and keeps the keys.
+//   its data fields with the screen edit of the amount, and keeps the keys;
+// - the keyboard locks while a PF5 copy or a confirmed add runs: the inputs
+//   are read-only, Reset is disabled and ENTER does nothing, so the answer
+//   lands on the entry its request was built from, and every way the task
+//   ends unlocks it.
 //
 // The network is the stubbed global the API client looks up on every request.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryRouter, RouterProvider } from "react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
@@ -177,9 +181,58 @@ const COPIED_ENTRY = {
   MZIP: "93329",
 } as const satisfies Entry;
 
+// The cleared screen: every input SPACES.
+const BLANK_ENTRY = {
+  ACTIDIN: "",
+  CARDNIN: "",
+  TTYPCD: "",
+  TCATCD: "",
+  TRNSRC: "",
+  TDESC: "",
+  TRNAMT: "",
+  TORIGDT: "",
+  TPROCDT: "",
+  MID: "",
+  MNAME: "",
+  MCITY: "",
+  MZIP: "",
+} as const satisfies Entry;
+
+// PF5's PROCESS-ENTER-KEY on the copy with CONFIRMI blank: the keys as typed
+// before the press and the copied data fields, checked, not written.
+const COPIED_CHECK_BODY = {
+  ...EXPECTED_ADD_BODY,
+  tran_type_cd: COPIED_ENTRY.TTYPCD,
+  tran_cat_cd: COPIED_ENTRY.TCATCD,
+  tran_source: COPIED_ENTRY.TRNSRC,
+  tran_desc: COPIED_ENTRY.TDESC,
+  tran_amt: COPIED_ENTRY.TRNAMT,
+  tran_orig_date: COPIED_ENTRY.TORIGDT,
+  tran_proc_date: COPIED_ENTRY.TPROCDT,
+  tran_merchant_id: COPIED_ENTRY.MID,
+  tran_merchant_name: COPIED_ENTRY.MNAME,
+  tran_merchant_city: COPIED_ENTRY.MCITY,
+  tran_merchant_zip: COPIED_ENTRY.MZIP,
+  confirm: "",
+} satisfies AddBody;
+
 // V-COTRN02C-027: every edit passed and CONFIRMI blank, so PROCESS-ENTER-KEY
 // asks for the confirmation and writes nothing (400, cursor on CONFIRM).
 const CONFIRM_PROMPT = "Confirm to add this transaction...";
+
+const CONFIRM_ASKED = {
+  code: "INVALID",
+  message: CONFIRM_PROMPT,
+  fields: [{ field: "CONFIRM", message: CONFIRM_PROMPT }],
+} satisfies ErrorBody;
+
+// What a user tries to type while the entry is locked: a key field and a data
+// field, the card cross-referenced to account 00000000001
+// [app/data/ASCII/cardxref.txt:L49] and a description of its own.
+const TYPED_WHILE_LOCKED = {
+  CARDNIN: "9680294154603697",
+  TDESC: "Typed while locked",
+} as const satisfies Partial<Entry>;
 
 const ADD_TRANSACTION_HANDLE = {
   title: "Add Transaction",
@@ -188,7 +241,9 @@ const ADD_TRANSACTION_HANDLE = {
 
 type FetchFn = typeof globalThis.fetch;
 
-type Answer = (request: Request) => Response;
+type Answer = (request: Request) => Response | Promise<Response>;
+
+type AnswerBody = TransactionAddResponse | TransactionPage | ErrorBody;
 
 // The answers of the stubbed network, keyed by method and pathname.
 let answers: Map<string, Answer>;
@@ -197,12 +252,24 @@ let sent: Request[];
 let fetchMock: Mock<FetchFn>;
 let queryClient: QueryClient;
 
-function answerWith(
-  method: "GET" | "POST",
-  body: TransactionAddResponse | TransactionPage | ErrorBody,
-  status: number,
-): void {
+function answerWith(method: "GET" | "POST", body: AnswerBody, status: number): void {
   answers.set(`${method} /api/transactions`, () => Response.json(body, { status }));
+}
+
+// Like answerWith, but the answer is held back until the returned function
+// releases it, so the request stays pending meanwhile.
+function holdAnswer(method: "GET" | "POST", body: AnswerBody, status: number): () => void {
+  let release = (): void => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  answers.set(`${method} /api/transactions`, async () => {
+    await held;
+    return Response.json(body, { status });
+  });
+  return () => {
+    release();
+  };
 }
 
 function renderPage(): UserEvent {
@@ -294,6 +361,38 @@ async function openConfirmation(user: UserEvent): Promise<HTMLElement> {
   await fill(user, VALID_ENTRY);
   await pressEnter(user);
   return screen.findByRole("alertdialog", { name: "Confirm the transaction" });
+}
+
+function buttonOf(name: string): HTMLButtonElement {
+  return screen.getByRole<HTMLButtonElement>("button", { name });
+}
+
+// The keyboard lock of a running PF5 copy or confirmed add: every input
+// read-only and Reset (F4) disabled.
+function expectLocked(locked: boolean): void {
+  for (const { bms } of FIELDS) {
+    expect(inputOf(bms).readOnly, bms).toBe(locked);
+  }
+  expect(buttonOf("Reset").disabled).toBe(locked);
+}
+
+// What a user may try on a locked entry: typing into a key field and a data
+// field, ENTER from the last of them, then Reset.
+async function tryToChangeEntry(user: UserEvent): Promise<void> {
+  await user.type(inputOf("CARDNIN"), TYPED_WHILE_LOCKED.CARDNIN);
+  await user.type(inputOf("TDESC"), TYPED_WHILE_LOCKED.TDESC);
+  await pressEnter(user);
+  await user.click(buttonOf("Reset"));
+}
+
+// Nothing the user tried changed the entry, ran the edits or opened the
+// confirmation.
+function expectUntouched(entry: Entry): void {
+  expectEntry(entry);
+  for (const { bms } of FIELDS) {
+    expect(inputOf(bms).getAttribute("aria-invalid"), bms).toBe("false");
+  }
+  expect(screen.queryByRole("alertdialog")).toBeNull();
 }
 
 beforeEach(() => {
@@ -504,15 +603,7 @@ describe("TransactionAddPage (CT02, COTRN02)", () => {
     "copies the last transaction into the data fields and keeps the keys (F-COTRN02-006)",
     async () => {
       answerWith("GET", LAST_PAGE, 200);
-      answerWith(
-        "POST",
-        {
-          code: "INVALID",
-          message: CONFIRM_PROMPT,
-          fields: [{ field: "CONFIRM", message: CONFIRM_PROMPT }],
-        } satisfies ErrorBody,
-        400,
-      );
+      answerWith("POST", CONFIRM_ASKED, 400);
       const user = renderPage();
 
       await user.type(inputOf("ACTIDIN"), VALID_ENTRY.ACTIDIN);
@@ -534,21 +625,7 @@ describe("TransactionAddPage (CT02, COTRN02)", () => {
 
       // PROCESS-ENTER-KEY on the copy with CONFIRMI blank: checked, not written.
       const [check] = requestsOf("POST");
-      expect(await check?.clone().json()).toEqual({
-        ...EXPECTED_ADD_BODY,
-        tran_type_cd: COPIED_ENTRY.TTYPCD,
-        tran_cat_cd: COPIED_ENTRY.TCATCD,
-        tran_source: COPIED_ENTRY.TRNSRC,
-        tran_desc: COPIED_ENTRY.TDESC,
-        tran_amt: COPIED_ENTRY.TRNAMT,
-        tran_orig_date: COPIED_ENTRY.TORIGDT,
-        tran_proc_date: COPIED_ENTRY.TPROCDT,
-        tran_merchant_id: COPIED_ENTRY.MID,
-        tran_merchant_name: COPIED_ENTRY.MNAME,
-        tran_merchant_city: COPIED_ENTRY.MCITY,
-        tran_merchant_zip: COPIED_ENTRY.MZIP,
-        confirm: "",
-      } satisfies AddBody);
+      expect(await check?.clone().json()).toEqual(COPIED_CHECK_BODY);
 
       // The answer asks for the confirmation: its text is shown, and the cursor
       // goes where CONFIRM was, the submit that opens the dialog.
@@ -563,6 +640,208 @@ describe("TransactionAddPage (CT02, COTRN02)", () => {
       }
       expect(screen.queryByRole("alertdialog")).toBeNull();
       expect(toast.success).not.toHaveBeenCalled();
+    },
+  );
+
+  // PF5 locks the keyboard from the press until its check answers, whichever
+  // of its two requests is still running.
+  const COPY_HOLDS: readonly {
+    request: string;
+    method: "GET" | "POST";
+    body: AnswerBody;
+    status: number;
+    sentWhileHeld: readonly ("GET" | "POST")[];
+  }[] = [
+    { request: "read", method: "GET", body: LAST_PAGE, status: 200, sentWhileHeld: ["GET"] },
+    {
+      request: "check",
+      method: "POST",
+      body: CONFIRM_ASKED,
+      status: 400,
+      sentWhileHeld: ["GET", "POST"],
+    },
+  ];
+
+  it.each(COPY_HOLDS)(
+    "locks the entry until the copy's $request answers, then copies onto it (F-COTRN02-006)",
+    async ({ method, body, status, sentWhileHeld }) => {
+      answerWith("GET", LAST_PAGE, 200);
+      answerWith("POST", CONFIRM_ASKED, 400);
+      const release = holdAnswer(method, body, status);
+      const user = renderPage();
+
+      await user.type(inputOf("ACTIDIN"), VALID_ENTRY.ACTIDIN);
+      await user.click(buttonOf("Copy last transaction"));
+      await waitFor(() => {
+        expect(requestsOf(method)).toHaveLength(1);
+      });
+
+      expectLocked(true);
+      // The submit is disabled during PF5, whose own button holds the focus.
+      expect(buttonOf("Add transaction").disabled).toBe(true);
+      await tryToChangeEntry(user);
+      expectUntouched({ ...BLANK_ENTRY, ACTIDIN: VALID_ENTRY.ACTIDIN });
+      expect(sent.map((request) => request.method)).toEqual(sentWhileHeld);
+
+      release();
+
+      // The copy lands on the entry the press found, and the cursor goes to
+      // the submit that takes CONFIRM's place.
+      await waitFor(() => {
+        expectEntry(COPIED_ENTRY);
+        expect(document.activeElement).toBe(buttonOf("Add transaction"));
+      });
+      expect(sent.map((request) => request.method)).toEqual(["GET", "POST"]);
+      expect(await requestsOf("POST")[0]?.clone().json()).toEqual(COPIED_CHECK_BODY);
+      expect(toast.error).toHaveBeenCalledWith(CONFIRM_PROMPT);
+      expectLocked(false);
+    },
+  );
+
+  // Every other way PF5 ends copies nothing, keeps the entry and unlocks it.
+  const COPY_ENDINGS: readonly {
+    ending: string;
+    account: string;
+    stubs: readonly { method: "GET" | "POST"; body: AnswerBody; status: number }[];
+    methods: readonly ("GET" | "POST")[];
+    invalid: InputField | null;
+  }[] = [
+    // VALIDATE-INPUT-KEY-FIELDS: neither key entered.
+    { ending: "keys the form rejects", account: "", stubs: [], methods: [], invalid: "ACTIDIN" },
+    {
+      ending: "a failed read",
+      account: VALID_ENTRY.ACTIDIN,
+      stubs: [
+        {
+          method: "GET",
+          body: { code: "UNEXPECTED", message: "Unexpected error" } satisfies ErrorBody,
+          status: 500,
+        },
+      ],
+      methods: ["GET"],
+      invalid: null,
+    },
+    // The STARTBR NOTFND page of an empty master (V-COTRN00C-005).
+    {
+      ending: "an empty master",
+      account: VALID_ENTRY.ACTIDIN,
+      stubs: [
+        {
+          method: "GET",
+          body: {
+            items: [],
+            next_key: null,
+            prev_key: null,
+            message: "You are at the top of the page...",
+          } satisfies TransactionPage,
+          status: 200,
+        },
+      ],
+      methods: ["GET"],
+      invalid: null,
+    },
+    // V-COTRN02C-004: the check's cross-reference look-up rejects the key.
+    {
+      ending: "a key the check rejects",
+      account: VALID_ENTRY.ACTIDIN,
+      stubs: [
+        { method: "GET", body: LAST_PAGE, status: 200 },
+        {
+          method: "POST",
+          body: {
+            code: "NOT_FOUND",
+            message: "Account ID NOT found...",
+            fields: [{ field: "ACTIDIN", message: "Account ID NOT found..." }],
+          } satisfies ErrorBody,
+          status: 404,
+        },
+      ],
+      methods: ["GET", "POST"],
+      invalid: "ACTIDIN",
+    },
+  ];
+
+  it.each(COPY_ENDINGS)(
+    "copies nothing and unlocks the entry after $ending (F-COTRN02-006)",
+    async ({ account, stubs, methods, invalid }) => {
+      for (const { method, body, status } of stubs) {
+        answerWith(method, body, status);
+      }
+      const user = renderPage();
+
+      if (account !== "") {
+        await user.type(inputOf("ACTIDIN"), account);
+      }
+      await user.click(buttonOf("Copy last transaction"));
+
+      await waitFor(() => {
+        expect(sent.map((request) => request.method)).toEqual(methods);
+        expectLocked(false);
+      });
+      expectEntry({ ...BLANK_ENTRY, ACTIDIN: account });
+      for (const { bms } of FIELDS) {
+        expect(inputOf(bms).getAttribute("aria-invalid"), bms).toBe(String(bms === invalid));
+      }
+      expect(toast.success).not.toHaveBeenCalled();
+    },
+  );
+
+  it("starts one copy when Copy last transaction is pressed twice (F-COTRN02-006)", async () => {
+    answerWith("GET", LAST_PAGE, 200);
+    answerWith("POST", CONFIRM_ASKED, 400);
+    const user = renderPage();
+
+    await user.type(inputOf("ACTIDIN"), VALID_ENTRY.ACTIDIN);
+    // The second press comes while the first one's key edits still run, before
+    // any request is pending.
+    const copy = buttonOf("Copy last transaction");
+    fireEvent.click(copy);
+    fireEvent.click(copy);
+
+    await waitFor(() => {
+      expectEntry(COPIED_ENTRY);
+      expect(document.activeElement).toBe(buttonOf("Add transaction"));
+      expectLocked(false);
+    });
+    expect(sent.map((request) => request.method)).toEqual(["GET", "POST"]);
+  });
+
+  it(
+    "locks the entry while the confirmed add runs, then clears it (F-COTRN02-002)",
+    async () => {
+      const release = holdAnswer("POST", ADDED_REPLY, 201);
+      const user = renderPage();
+
+      const dialog = await openConfirmation(user);
+      await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      expect(requestsOf("POST")).toHaveLength(1);
+
+      // The closed dialog gives the focus back to the input ENTER was pressed
+      // in, which keeps it while read-only; the submit stays enabled for the
+      // same reason.
+      await waitFor(() => {
+        expect(document.activeElement).toBe(inputOf("MZIP"));
+      });
+      expectLocked(true);
+      expect(buttonOf("Add transaction").disabled).toBe(false);
+      await tryToChangeEntry(user);
+      expectUntouched(VALID_ENTRY);
+      expect(sent).toHaveLength(1);
+
+      release();
+
+      // INITIALIZE-ALL-FIELDS on the entry confirmed, the cursor on ACTIDIN.
+      await waitFor(() => {
+        expect(toast.success).toHaveBeenCalledWith(ADDED_MESSAGE);
+        expectEntry(BLANK_ENTRY);
+        expect(document.activeElement).toBe(inputOf("ACTIDIN"));
+      });
+      expectLocked(false);
+      expect(await requestsOf("POST")[0]?.clone().json()).toEqual(EXPECTED_ADD_BODY);
+      expect(toast.error).not.toHaveBeenCalled();
     },
   );
 });

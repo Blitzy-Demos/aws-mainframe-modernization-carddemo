@@ -72,8 +72,8 @@ use std::borrow::Cow;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
 
-use carddemo_codec::CodecError;
-use carddemo_domain::auth::PasswordError;
+use carddemo_codec::layouts::CodecError;
+use carddemo_domain::entities::user_security::PasswordError;
 use carddemo_domain::ports::PortError;
 use sqlx::error::DatabaseError;
 

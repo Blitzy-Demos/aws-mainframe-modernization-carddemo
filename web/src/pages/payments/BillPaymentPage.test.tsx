@@ -13,6 +13,9 @@
 // - a blank account ID never reaches the network (V-COBIL00C-001);
 // - a server refusal, of the review or of the payment, is toasted, set on
 //   ACTIDIN and puts the cursor there, as `MOVE -1 TO ACTIDINL` does;
+// - an answer to the review or to the payment, or a failed balance reload,
+//   that arrives after the entry was replaced is still toasted but neither
+//   blanks nor marks the newer entry;
 // - "Reset" (F4) clears the screen and "Back" (F3) leaves it, sending nothing
 //   (F-COBIL00-005, F-COBIL00-004).
 //
@@ -20,6 +23,7 @@
 // so each test sees the exact requests the page made.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  act,
   getDefaultNormalizer,
   render,
   screen,
@@ -130,6 +134,8 @@ const PAY_BODY = { account_id: ACCOUNT_ID, confirm: "Y" } satisfies PaymentReque
 const ACCOUNT_NOT_FOUND = "Account ID NOT found...";
 const NOTHING_TO_PAY = "You have nothing to pay...";
 const TRAN_ID_EXISTS = "Tran ID already exist...";
+const UNABLE_TO_ADD = "Unable to Add Bill pay Transaction...";
+const UNABLE_TO_UPDATE = "Unable to Update Account...";
 
 /** A COBIL00C refusal whose cursor field is ACTIDIN. */
 function refusal(code: string, message: string): ErrorBody {
@@ -148,10 +154,20 @@ type Reply<B> = readonly [status: number, body: B];
 type Stubs = {
   /** `GET /accounts/00000000001`, the balance card. */
   account: Reply<AccountResponse | ErrorBody>;
-  /** `POST /payments` with any confirmation but `Y`: the review. */
-  review: Reply<PaymentResponse | ErrorBody>;
-  /** `POST /payments` with `confirm: "Y"`: the payment. */
-  pay: Reply<PaymentResponse | ErrorBody>;
+  /**
+   * `POST /payments` with any confirmation but `Y`: the review, or a promise
+   * of its answer while a test holds it.
+   */
+  review:
+    | Reply<PaymentResponse | ErrorBody>
+    | Promise<Reply<PaymentResponse | ErrorBody>>;
+  /**
+   * `POST /payments` with `confirm: "Y"`: the payment, or a promise of its
+   * answer while a test holds it.
+   */
+  pay:
+    | Reply<PaymentResponse | ErrorBody>
+    | Promise<Reply<PaymentResponse | ErrorBody>>;
 };
 
 type FetchFn = typeof globalThis.fetch;
@@ -173,7 +189,7 @@ function isPayment(body: unknown): boolean {
 
 // Answers by method and pathname, and a POST by its confirmation. Every GET
 // of the account is answered alike, because the payment hook reloads it after
-// each payment settles.
+// a confirmed payment that may have written settles.
 async function answer(request: Request): Promise<Response> {
   const { pathname } = new URL(request.url);
   let reply: Reply<AccountResponse | PaymentResponse | ErrorBody>;
@@ -181,7 +197,7 @@ async function answer(request: Request): Promise<Response> {
     reply = stubs.account;
   } else if (request.method === "POST" && pathname === PAYMENTS_PATH) {
     const body: unknown = await request.clone().json();
-    reply = isPayment(body) ? stubs.pay : stubs.review;
+    reply = await (isPayment(body) ? stubs.pay : stubs.review);
   } else {
     throw new Error(`No answer stubbed for ${request.method} ${pathname}`);
   }
@@ -268,6 +284,27 @@ function findBalanceCard(): Promise<HTMLElement> {
 async function review(user: UserEvent, entry: string = ACCOUNT_ID): Promise<HTMLElement> {
   await user.type(accountInput(), `${entry}{Enter}`);
   return screen.findByRole("alertdialog", { name: DIALOG_TITLE });
+}
+
+// Holds the answer to the review or to the payment until the returned
+// function releases it.
+function hold(request: "review" | "pay"): (reply: Reply<PaymentResponse | ErrorBody>) => void {
+  let release: (reply: Reply<PaymentResponse | ErrorBody>) => void = () => undefined;
+  stubs[request] = new Promise((resolve) => {
+    release = resolve;
+  });
+  return (reply) => {
+    release(reply);
+  };
+}
+
+// Lets the timer task pass on which react-hook-form's setFocus moves focus.
+async function nextTask(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
 }
 
 beforeEach(() => {
@@ -494,21 +531,63 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
     },
   );
 
+  it.each(REVIEW_REFUSALS)(
+    "keeps an account typed while $entry is reviewed when its $status answer arrives ($row)",
+    async ({ entry, status, code, message }) => {
+      const release = hold("review");
+      const user = renderPage();
+
+      await user.type(accountInput(), `${entry}{Enter}`);
+      await waitFor(() => {
+        expect(requestsOf("POST")).toHaveLength(1);
+      });
+      await user.clear(accountInput());
+      await user.type(accountInput(), ACCOUNT_ID);
+      release([status, refusal(code, message)]);
+
+      // The refusal is still toasted.
+      await waitFor(() => {
+        expect(toast.error).toHaveBeenCalledWith(message);
+      });
+      await nextTask();
+      // The newer entry is neither changed nor marked.
+      const input = accountInput();
+      expect(input.value).toBe(ACCOUNT_ID);
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+      expect(fieldErrorOf(input)).toBeNull();
+      expect(document.activeElement).toBe(input);
+      expect(await bodiesOf(sent)).toEqual([
+        { account_id: entry, confirm: "" } satisfies PaymentRequest,
+      ]);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(screen.queryByRole("group", { name: BALANCE_TITLE })).toBeNull();
+    },
+  );
+
   // The ACTIDIN refusals of the confirmed payment: the balance paid off since
-  // the review (the guard runs on every ENTER), or a TRAN-ID collision.
+  // the review (the guard runs on every ENTER), which writes nothing, and the
+  // failed writes after which the other write still stands (E-19): a TRAN-ID
+  // collision, the transaction insert failing, the account rewrite finding no
+  // record or failing. `reads` is the account reads: the card's first read,
+  // then, after a refusal that may follow a write, the reload of the balance
+  // on file.
   const PAYMENT_REFUSALS: readonly {
     row: string;
     status: number;
     code: string;
     message: string;
+    reads: number;
   }[] = [
-    { row: "V-COBIL00C-007", status: 400, code: "INVALID", message: NOTHING_TO_PAY },
-    { row: "V-COBIL00C-014", status: 409, code: "DUPLICATE", message: TRAN_ID_EXISTS },
+    { row: "V-COBIL00C-007", status: 400, code: "INVALID", message: NOTHING_TO_PAY, reads: 1 },
+    { row: "V-COBIL00C-014", status: 409, code: "DUPLICATE", message: TRAN_ID_EXISTS, reads: 2 },
+    { row: "V-COBIL00C-015", status: 500, code: "UNEXPECTED", message: UNABLE_TO_ADD, reads: 2 },
+    { row: "V-COBIL00C-016", status: 404, code: "NOT_FOUND", message: ACCOUNT_NOT_FOUND, reads: 2 },
+    { row: "V-COBIL00C-017", status: 500, code: "UNEXPECTED", message: UNABLE_TO_UPDATE, reads: 2 },
   ];
 
   it.each(PAYMENT_REFUSALS)(
     "shows a $status answer to Confirm at the account ID and keeps the entry ($row)",
-    async ({ status, code, message }) => {
+    async ({ status, code, message, reads }) => {
       stubs.pay = [status, refusal(code, message)];
       const user = renderPage();
 
@@ -528,12 +607,188 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
       expect(fieldErrorOf(input)?.textContent).toBe(message);
       expect(input.value).toBe(ACCOUNT_ID);
       expect(await bodiesOf(requestsOf("POST"))).toEqual([REVIEW_BODY, PAY_BODY]);
-      // A refused payment may still have written (E-19), so the balance on
-      // file is read again: the card's first read, then the reload.
-      expect(requestsOf("GET").map(pathnameOf)).toEqual([ACCOUNT_PATH, ACCOUNT_PATH]);
+      expect(requestsOf("GET").map(pathnameOf)).toEqual(
+        Array.from({ length: reads }, () => ACCOUNT_PATH),
+      );
       expect(toast.success).not.toHaveBeenCalled();
     },
   );
+
+  // The entry typed while the review or the confirmed payment is still running.
+  const NEWER_ACCOUNT = "00000000002";
+
+  // Ways the entry is replaced while the payment runs. Reset also clears the
+  // balance card, so only a typed entry still shows it.
+  const ENTRY_CHANGES: readonly {
+    how: string;
+    change: (user: UserEvent) => Promise<void>;
+    cards: number;
+  }[] = [
+    {
+      how: "an account typed over the paid one",
+      change: async (user) => {
+        await user.clear(accountInput());
+        await user.type(accountInput(), NEWER_ACCOUNT);
+      },
+      cards: 1,
+    },
+    {
+      how: "an account typed after Reset",
+      change: async (user) => {
+        await user.click(screen.getByRole("button", { name: "Reset" }));
+        await user.type(accountInput(), NEWER_ACCOUNT);
+      },
+      cards: 0,
+    },
+  ];
+
+  // Answers to the confirmed payment: the toast each still raises and the
+  // balance a shown card then holds (the 201's, or the reloaded record's).
+  const LATE_PAYMENT_ANSWERS: readonly {
+    outcome: string;
+    reply: Reply<PaymentResponse | ErrorBody>;
+    toast: "success" | "error";
+    message: string;
+    balance: string;
+  }[] = [
+    {
+      outcome: "201",
+      reply: [201, paid],
+      toast: "success",
+      message: PAID_MESSAGE,
+      balance: paid.current_balance,
+    },
+    {
+      outcome: "409 refusal (V-COBIL00C-014)",
+      reply: [409, refusal("DUPLICATE", TRAN_ID_EXISTS)],
+      toast: "error",
+      message: TRAN_ID_EXISTS,
+      balance: account.acct_curr_bal,
+    },
+  ];
+
+  it.each(
+    ENTRY_CHANGES.flatMap((change) =>
+      LATE_PAYMENT_ANSWERS.map((late) => ({ ...change, ...late })),
+    ),
+  )(
+    "keeps $how while the payment runs when its $outcome arrives",
+    async ({ change, cards, reply, toast: kind, message, balance }) => {
+      const release = hold("pay");
+      const user = renderPage();
+
+      const dialog = await review(user);
+      await findBalanceCard();
+      await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+        expect(requestsOf("POST")).toHaveLength(2);
+      });
+      await change(user);
+      release(reply);
+
+      // The payment's outcome is still shown.
+      await waitFor(() => {
+        expect(toast[kind]).toHaveBeenCalledWith(message);
+      });
+      await nextTask();
+      expect(await bodiesOf(requestsOf("POST"))).toEqual([REVIEW_BODY, PAY_BODY]);
+      // The newer entry is neither blanked nor marked.
+      const input = accountInput();
+      expect(input.value).toBe(NEWER_ACCOUNT);
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+      expect(fieldErrorOf(input)).toBeNull();
+      expect(document.activeElement).toBe(input);
+      // A card still shown names the paid account, not the newer entry.
+      const shown = screen.queryAllByRole("group", { name: BALANCE_TITLE });
+      expect(shown).toHaveLength(cards);
+      for (const card of shown) {
+        expect(within(card).getByText(balance)).toBeTruthy();
+        expect(within(card).getByText(`Account ${ACCOUNT_ID}`)).toBeTruthy();
+      }
+    },
+  );
+
+  it.each(LATE_PAYMENT_ANSWERS)(
+    "keeps an account typed while the review ran when the reviewed account's $outcome arrives",
+    async ({ reply, toast: kind, message, balance }) => {
+      const releaseReview = hold("review");
+      stubs.pay = reply;
+      const user = renderPage();
+
+      await user.type(accountInput(), `${ACCOUNT_ID}{Enter}`);
+      await waitFor(() => {
+        expect(requestsOf("POST")).toHaveLength(1);
+      });
+      await user.clear(accountInput());
+      await user.type(accountInput(), NEWER_ACCOUNT);
+      releaseReview([200, reviewed]);
+
+      // The dialog asks about the reviewed account, which Confirm pays.
+      const dialog = await screen.findByRole("alertdialog", { name: DIALOG_TITLE });
+      expect(within(dialog).getByText(ACCOUNT_ID)).toBeTruthy();
+      await findBalanceCard();
+      await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+      await waitFor(() => {
+        expect(toast[kind]).toHaveBeenCalledWith(message);
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      await nextTask();
+      expect(await bodiesOf(requestsOf("POST"))).toEqual([REVIEW_BODY, PAY_BODY]);
+      // The entry typed during the review is neither blanked nor marked.
+      const input = accountInput();
+      expect(input.value).toBe(NEWER_ACCOUNT);
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+      expect(fieldErrorOf(input)).toBeNull();
+      expect(document.activeElement).toBe(input);
+      const card = screen.getByRole("group", { name: BALANCE_TITLE });
+      expect(within(card).getByText(balance)).toBeTruthy();
+      expect(within(card).getByText(`Account ${ACCOUNT_ID}`)).toBeTruthy();
+    },
+  );
+
+  it("keeps an account typed while the payment runs unmarked when the balance reload fails", async () => {
+    // V-COACTVWC-005 at ACCTSID, as the reload after the payment answers it.
+    const reloadFailure =
+      "Account:00000000001 not found in Acct Master file.Resp:000000013  Reas:0000";
+    const release = hold("pay");
+    const user = renderPage();
+
+    const dialog = await review(user);
+    await findBalanceCard();
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(requestsOf("POST")).toHaveLength(2);
+    });
+    await user.clear(accountInput());
+    await user.type(accountInput(), NEWER_ACCOUNT);
+    stubs.account = [
+      404,
+      {
+        code: "NOT_FOUND",
+        message: reloadFailure,
+        fields: [{ field: "ACCTSID", message: reloadFailure }],
+      },
+    ];
+    release([201, paid]);
+
+    // The reload's failure is still toasted, after the card's first read.
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith(PAID_MESSAGE);
+      expect(toast.error).toHaveBeenCalledWith(reloadFailure);
+    });
+    await nextTask();
+    expect(requestsOf("GET").map(pathnameOf)).toEqual([ACCOUNT_PATH, ACCOUNT_PATH]);
+    const input = accountInput();
+    expect(input.value).toBe(NEWER_ACCOUNT);
+    expect(input.getAttribute("aria-invalid")).toBe("false");
+    expect(fieldErrorOf(input)).toBeNull();
+    expect(document.activeElement).toBe(input);
+    const card = screen.getByRole("group", { name: BALANCE_TITLE });
+    expect(within(card).getByText(paid.current_balance)).toBeTruthy();
+  });
 
   it("clears the entry, its error and the balance on Reset and sends nothing (F-COBIL00-005)", async () => {
     stubs.pay = [409, refusal("DUPLICATE", TRAN_ID_EXISTS)];
@@ -566,6 +821,7 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
     const user = renderPage();
 
     expect(screen.getByRole("heading", { level: 1, name: "Bill Payment" })).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 2, name: "Account" })).toBeTruthy();
     await user.click(screen.getByRole("link", { name: "Back" }));
 
     expect(await screen.findByText("Home")).toBeTruthy();

@@ -25,6 +25,11 @@ use core::fmt;
 
 use crate::numeric::{Alnum, UserId};
 
+/// The hasher that produces [`UserSecurity::password_hash`] and the error it
+/// reports, re-exported from [`crate::auth`] for the persistence seed, which
+/// hashes the fixture passwords it loads. Hashing stays in `crate::auth`.
+pub use crate::auth::{PasswordError, hash_stored_password};
+
 /// The `SEC-USR-TYPE` value of an administrator: the 88-level
 /// `CDEMO-USRTYP-ADMIN VALUE 'A'` [app/cpy/COCOM01Y.cpy:L27].
 const ADMIN_USER_TYPE: &[u8; 1] = b"A";

@@ -11,8 +11,8 @@
 //! [`fixture_lines`] and [`split_records`] read repository files only, so
 //! `parity_audit_coverage.rs` starts no container.
 //!
-//! The CT00, CT01, CT02 and CTTU helpers drive the same domain rules and persistence adapters
-//! the `carddemo-api` handlers drive, because `carddemo-batch` cannot depend on that crate.
+//! The CT00, CT01 and CT02 helpers drive the same domain rules and persistence adapters the
+//! `carddemo-api` handlers drive, because `carddemo-batch` cannot depend on that crate.
 //! Each runs in one `UnitOfWork`, so a test can interleave online changes with batch runs.
 
 use std::borrow::Cow;
@@ -31,9 +31,6 @@ use carddemo_domain::numeric::TranId;
 use carddemo_domain::ports::{Direction, TransactionWriter};
 use carddemo_domain::rewards::{AccrualInput, RewardEngine};
 use carddemo_domain::rules::Confirm;
-use carddemo_domain::rules::tran_type_update::{
-    self, TranTypeEdit, TranTypeSaved, TranTypeUpsertInput,
-};
 use carddemo_domain::rules::transaction_add::{self, TransactionAddInput};
 use carddemo_domain::rules::transaction_list::{self, TransactionListInput, TransactionListPage};
 use carddemo_domain::rules::transaction_view::{self, TransactionViewInput};
@@ -194,8 +191,7 @@ impl Harness {
         &self.statement_dir
     }
 
-    /// The persistence handle on the test database, for the CT00, CT01, CT02 and CTTU
-    /// helpers.
+    /// The persistence handle on the test database, for the CT00, CT01 and CT02 helpers.
     #[must_use]
     pub fn db(&self) -> Db {
         Db::from_pool(self.stack.pool().clone())
@@ -806,39 +802,6 @@ pub fn ct01_view(db: &Db, tran_id: &str) -> Result<Transaction, DomainError> {
         let viewed = transaction_view::view(&mut uow.store(), input).await;
         roll_back(uow, "CT01").await;
         viewed
-    })
-}
-
-/// COTRTUPC 1200-EDIT-MAP-INPUTS and 9600-WRITE-PROCESSING: writes the type `code` with
-/// `description` to the Db2 master `transaction_types` and commits. Only the master changes;
-/// the processing copy that `batch tranrept` reads follows after `batch seed --only tranextr`.
-///
-/// The edits run without a fetched type, so the no-change compare of `1205-COMPARE-OLD-NEW`
-/// never applies and the change is always written: an update of an existing code, or an
-/// insert when no row has it.
-///
-/// # Panics
-///
-/// Panics, naming the step and its error, if an edit rejects `code` or `description`, or if
-/// the begin, the write or the commit fails.
-#[must_use]
-pub fn cttu_upsert(db: &Db, code: &str, description: &str) -> TranTypeSaved {
-    let input = TranTypeUpsertInput {
-        type_code: code.to_owned(),
-        description: description.to_owned(),
-    };
-    let edited = tran_type_update::edit(&input, None)
-        .unwrap_or_else(|error| panic!("CTTU edit of type {code:?} failed: {error}"));
-    let TranTypeEdit::Changed(master) = edited else {
-        panic!("CTTU edit of type {code:?} reported no change without a fetched type");
-    };
-    block_on(async {
-        let mut uow = begin(db, "CTTU").await;
-        let saved = tran_type_update::upsert(&mut uow.store(), master)
-            .await
-            .unwrap_or_else(|error| panic!("CTTU write of type {code:?} failed: {error}"));
-        commit(uow, "CTTU").await;
-        saved
     })
 }
 

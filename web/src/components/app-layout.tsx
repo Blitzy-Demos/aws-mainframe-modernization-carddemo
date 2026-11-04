@@ -9,7 +9,12 @@
 //   (the generated SidebarProvider's shortcut) still toggle it in between.
 //   Below 768px the generated sidebar switches to its Sheet on its own.
 // - Keyboard path, in DOM order: the "Skip to content" link, the sidebar
-//   links, the header controls, then the page content.
+//   links, the header controls, then the page content. A route change other
+//   than the document load moves focus to the page content, unless the new
+//   page has already focused one of its own controls (an autofocused filter,
+//   a form's first field, the field an error names), and a visually hidden
+//   status region announces the new page's title. A change of the search
+//   string alone does neither.
 // - The user menu replaces PF3 on COMEN01 and COADM01 ('F3=Exit'
 //   [app/bms/COMEN01.bms:L162] [app/bms/COADM01.bms:L162]), which returns to
 //   the sign-on screen [app/cbl/COMEN01C.cbl:L96-98], and the sign-on screen's
@@ -27,13 +32,21 @@ import {
   useState,
   type JSX,
   type MouseEvent,
+  type RefObject,
 } from "react";
 import { CircleUserRound, LogOut } from "lucide-react";
-import { Outlet, useNavigate } from "react-router";
+import {
+  NavigationType,
+  Outlet,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+} from "react-router";
 
 import { useLogoutMutation } from "@/api/queries/auth";
 import { AppSidebar } from "@/components/app-sidebar";
 import { ModeToggle } from "@/components/mode-toggle";
+import { usePageTitle } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -142,6 +155,80 @@ function UserMenu({ session }: { session: Session }): JSX.Element {
   );
 }
 
+// The latest route-change announcement: the destination's title, and the
+// count of route changes so far, which keys the node that holds the title.
+type RouteAnnouncement = { id: number; title: string };
+
+// The shell's response to a route change, a change of the location's
+// pathname. A change of the search string alone is an update within the page
+// (AuthorizationSummaryPage writes its account filter there) and gets none.
+//
+// - Focus moves to the page content, so the keyboard continues from the top
+//   of the new page instead of the sidebar link that was activated, or the
+//   body when the activated link left with the old page (a crumb, a row
+//   link). Focus the new page has placed inside the content stands: React
+//   applies autoFocus while it commits, and runs the effects of the earlier
+//   siblings' trees, the page's mount-time setFocus among them, before this
+//   component's, which is rendered after the page content. preventScroll
+//   keeps the scroll position as it was.
+// - The status region announces the destination's title, the heading
+//   PageHeader shows (usePageTitle), also when the new page keeps its own
+//   focus. Each announcement is a new node, so two destinations with the same
+//   title (the two TranTypeFormPage routes, AuthorizationDetailPage's
+//   Next/Previous) are each announced.
+//
+// The document load is no route change: focus stays on the body, so the
+// first Tab reaches the skip link, and the region stays empty. A shell first
+// rendered by an in-app navigation, the landing after sign-on, is one. The
+// handled pathname also makes StrictMode's second run of the effect a no-op.
+function RouteChangeAnnouncer({
+  mainRef,
+}: {
+  mainRef: RefObject<HTMLElement | null>;
+}): JSX.Element {
+  const { pathname } = useLocation();
+  const navigationType = useNavigationType();
+  const title = usePageTitle();
+  const handledPathname = useRef<string | null>(null);
+  const [announcement, setAnnouncement] = useState<RouteAnnouncement | null>(
+    null,
+  );
+
+  useEffect(() => {
+    const previous = handledPathname.current;
+    if (previous === pathname) {
+      return;
+    }
+    handledPathname.current = pathname;
+    if (previous === null && navigationType === NavigationType.Pop) {
+      return;
+    }
+    const main = mainRef.current;
+    const active = document.activeElement;
+    if (
+      main !== null &&
+      (active === null || active === main || !main.contains(active))
+    ) {
+      main.focus({ preventScroll: true });
+    }
+    setAnnouncement((current) => ({
+      id: (current?.id ?? 0) + 1,
+      title: title ?? "",
+    }));
+  }, [mainRef, navigationType, pathname, title]);
+
+  // Always rendered, outside the page content and never focusable, so
+  // assistive technology tracks the region from the shell's first render and
+  // the Tab order and the single main landmark are unchanged.
+  return (
+    <p role="status" className="sr-only">
+      {announcement !== null && announcement.title !== "" ? (
+        <span key={announcement.id}>{announcement.title}</span>
+      ) : null}
+    </p>
+  );
+}
+
 export function AppLayout(): JSX.Element {
   const [open, setOpen] = useExpandedSidebarState();
   const session = useSession();
@@ -195,6 +282,7 @@ export function AppLayout(): JSX.Element {
           </SidebarInset>
         </div>
       </SidebarProvider>
+      <RouteChangeAnnouncer mainRef={mainRef} />
     </>
   );
 }

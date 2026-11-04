@@ -9,8 +9,9 @@
 //   transactions, with links to the full view (F-COACTVW-002) and the update
 //   screen (F-COACTUP-001). The Account View and Account Update options link
 //   here for that key entry (E-61).
-// - The menu: every COMEN02Y option in COBOL order, then Rewards. nav/menu.ts
-//   supplies each label, route and icon (F-COMEN01-001 to F-COMEN01-011).
+// - The menu: every COMEN02Y option in COBOL order, then Rewards. The shared
+//   MenuOptionList (components/app-sidebar.tsx) renders them, each label,
+//   route and icon from nav/menu.ts (F-COMEN01-001 to F-COMEN01-011).
 //   Choosing a link replaces typing the option number and pressing ENTER
 //   [app/cbl/COMEN01C.cbl:L94-95], so there is no OPTION field, and the
 //   option-number, admin-only and not-installed messages have no counterpart
@@ -41,6 +42,7 @@ import type { components } from "@/api/schema";
 import { useAccount } from "@/api/queries/accounts";
 import { useRewardBalance } from "@/api/queries/rewards";
 import { useRecentTransactions } from "@/api/queries/transactions";
+import { MenuOptionList } from "@/components/app-sidebar";
 import { DataTable, type DataTableProps } from "@/components/data-table";
 import { PageHeader } from "@/components/page-header";
 import { SummaryCard } from "@/components/summary-card";
@@ -55,7 +57,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { applyApiError, showApiError } from "@/lib/api-errors";
-import { userMenu } from "@/nav/menu";
 import {
   accountKeySchema,
   accountViewBmsFieldMap,
@@ -83,6 +84,24 @@ const MENU_TITLE = "Main Menu";
 
 /** The account submitted for lookup, and which submission it was. */
 type Lookup = { accountId: string; count: number };
+
+/**
+ * What the page's status region is to announce for a lookup: `text`, and
+ * `token`, which changes with each new answer, so the unchanged text of a
+ * repeated lookup is announced again.
+ */
+type OverviewStatus = { text: string; token: number };
+
+/** The status of no lookup, of a rejected key and of a failed account read. */
+const NO_STATUS: OverviewStatus = { text: "", token: 0 };
+
+/** The status text while the account or its reward balance is read. */
+const LOADING_TEXT = "Loading account";
+
+// How long the status region stays empty before it announces. The region is
+// cleared and then refilled, so the identical result of a repeated lookup is
+// still announced as a change; the delay is the one DataTable uses.
+const STATUS_ANNOUNCE_DELAY_MS = 150;
 
 // Every cell renders the API string as sent. The date is the first ten
 // characters of the TRAN-ORIG-TS text, `YYYY-MM-DD`, cut as text and never
@@ -134,11 +153,13 @@ function useSettledError(
   }, [error, isFetching, show]);
 }
 
-/** Placeholder blocks while the account is read. */
+/**
+ * Placeholder blocks while the account is read, hidden from assistive
+ * technology: the page's status region announces the read.
+ */
 function OverviewSkeleton(): JSX.Element {
   return (
-    <div role="status" aria-busy="true" className="flex flex-col gap-4">
-      <span className="sr-only">Loading account</span>
+    <div aria-hidden="true" className="flex flex-col gap-4">
       <Skeleton className="h-7 w-48" />
       <div className="grid gap-4 lg:grid-cols-3">
         <Skeleton className="h-32 rounded-xl" />
@@ -154,15 +175,20 @@ function OverviewSkeleton(): JSX.Element {
 type AccountOverviewProps = {
   accountId: string;
   form: UseFormReturn<AccountKeyValues>;
+  /** Receives the lookup's status each time it changes. */
+  onStatus: (status: OverviewStatus) => void;
 };
 
 /**
  * The summary of a submitted account: `GET /accounts/{id}`, then the reward
- * balance and the five most recent transactions of the account found.
+ * balance and the five most recent transactions of the account found. It is
+ * remounted for every lookup, so it reports the lookup's status to the page,
+ * whose status region stays mounted across lookups.
  */
 function AccountOverview({
   accountId,
   form,
+  onStatus,
 }: AccountOverviewProps): JSX.Element | null {
   const headingId = useId();
   const account = useAccount(accountId);
@@ -185,6 +211,31 @@ function AccountOverview({
   useSettledError(account.error, account.isFetching, showAccountError);
   useSettledError(transactions.error, transactions.isFetching, showApiError);
   useSettledError(rewards.error, rewards.isFetching, showApiError);
+
+  // The lookup's status: loading until the account and its reward balance
+  // have both answered (the reward read starts only once the account is
+  // found), then the account's number, never a figure. A failed account read
+  // reports nothing here: its toast and field error carry it. The token is
+  // set on the loaded text only, so a repeated lookup announces that text
+  // again, and an account answer ahead of the reward one does not repeat the
+  // loading text.
+  let statusText = "";
+  let statusToken = NO_STATUS.token;
+  if (account.isFetching) {
+    statusText = LOADING_TEXT;
+  } else if (account.isSuccess) {
+    const rewardsSettled =
+      (rewards.isSuccess || rewards.isError) && !rewards.isFetching;
+    if (rewardsSettled) {
+      statusText = `Account ${account.data.account_id} summary loaded`;
+      statusToken = account.dataUpdatedAt;
+    } else {
+      statusText = LOADING_TEXT;
+    }
+  }
+  useEffect(() => {
+    onStatus({ text: statusText, token: statusToken });
+  }, [onStatus, statusText, statusToken]);
 
   if (account.isError) {
     return null;
@@ -291,12 +342,17 @@ export default function DashboardPage(): JSX.Element {
   // The last submitted account; null before the first lookup, so no account
   // hook runs with an empty key.
   const [lookup, setLookup] = useState<Lookup | null>(null);
+  // The status the summary last reported for the current lookup.
+  const [overviewStatus, setOverviewStatus] =
+    useState<OverviewStatus>(NO_STATUS);
 
   // ENTER (F-COACTVW-001): each submission remounts the summary, which reads
   // the account again even when the same number is resubmitted, as COACTVWC
-  // reads on every ENTER.
+  // reads on every ENTER. The new lookup starts from an empty status, so the
+  // previous lookup's result is never announced for it.
   const onSubmit = (values: AccountKeyValues): void => {
     form.clearErrors();
+    setOverviewStatus(NO_STATUS);
     setLookup((previous) => ({
       accountId: values[ACCOUNT_FIELD],
       count: (previous?.count ?? 0) + 1,
@@ -311,10 +367,25 @@ export default function DashboardPage(): JSX.Element {
     setLookup(null);
   };
 
-  // BLITZY [A11Y]: the menu links keep the generated Button focus ring, the
-  // built-in `ring-ring/50` token of index.css, about 1.5:1 against the card
-  // background, below the WCAG AA 3:1 non-text minimum. Kept as the shadcn
-  // token set defines it; flagged for designer review.
+  // A rejected key shows no summary, so the status region is empty for it.
+  // Each change of the text, and each new answer of a repeated lookup even
+  // when its text is unchanged, clears the region and fills it after the
+  // delay.
+  const statusText = lookup === null ? "" : overviewStatus.text;
+  const [announcement, setAnnouncement] = useState("");
+  useEffect(() => {
+    setAnnouncement("");
+    if (statusText === "") {
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      setAnnouncement(statusText);
+    }, STATUS_ANNOUNCE_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [statusText, overviewStatus.token]);
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader description="Look up an account, or choose an option from the menu." />
@@ -355,11 +426,19 @@ export default function DashboardPage(): JSX.Element {
         </CardContent>
       </Card>
 
+      {/* Always rendered, across lookups and outside every busy element, so
+          assistive technology tracks the region from the start and announces
+          its changes politely. */}
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
+
       {lookup === null ? null : (
         <AccountOverview
           key={lookup.count}
           accountId={lookup.accountId}
           form={form}
+          onStatus={setOverviewStatus}
         />
       )}
 
@@ -370,37 +449,10 @@ export default function DashboardPage(): JSX.Element {
         <h2 id={menuHeadingId} className="text-lg font-semibold">
           {MENU_TITLE}
         </h2>
-        <ul className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {userMenu.map((entry) => {
-            const Icon = entry.icon;
-            return (
-              <li key={entry.id}>
-                <Card className="relative h-full">
-                  <CardContent className="flex items-center gap-3">
-                    {/* Outside the link, so the link's accessible name is the
-                        option text alone and the link variant's padding for
-                        an svg child does not apply. */}
-                    <Icon
-                      aria-hidden="true"
-                      className="size-5 shrink-0 text-muted-foreground"
-                    />
-                    {/* The link fills the whole card through its ::after box,
-                        so the card is the click target rather than the text
-                        line alone; wrapping keeps the longest option text
-                        inside its column. */}
-                    <Button
-                      variant="link"
-                      asChild
-                      className="h-auto justify-start p-0 text-left whitespace-normal after:absolute after:inset-0"
-                    >
-                      <Link to={entry.route}>{entry.label}</Link>
-                    </Button>
-                  </CardContent>
-                </Card>
-              </li>
-            );
-          })}
-        </ul>
+        <MenuOptionList
+          section="user"
+          className="md:grid-cols-2 lg:grid-cols-3"
+        />
       </nav>
     </div>
   );

@@ -692,7 +692,36 @@ pnpm --dir web exec playwright install --with-deps chromium
 
 Success: Playwright reports Chromium downloaded.
 
-The tests need the whole host-mode stack: the Compose services (section 4), a migrated and seeded database (sections 5.1 and 5.2), the API (section 6.1) and Vite (section 7.2). The test fixtures change rows through `docker compose exec postgres psql`, run from the repository root in the Compose project that `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE` name when set, so the API under test must use that Compose PostgreSQL. Every fixture restores the rows it changed.
+The tests need the whole host-mode stack: the Compose services (section 4), a migrated and seeded database with the fixture day posted (sections 5.1, 5.2 and 5.3), the API (section 6.1) and Vite (section 7.2). The test fixtures change rows through `docker compose exec postgres psql`, run from the repository root in the Compose project that `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE` name when set, so the API under test must use that Compose PostgreSQL. Every fixture restores the rows it changed.
+
+The posted fixture day is required. The first seed leaves the live transaction master empty, while the specs list and page existing transactions and add transactions and bill payments, which "Add transaction" and "Bill payment" refuse on an empty master (section 9.2). Count the transactions in the live master, through the same `psql` route the fixtures use:
+
+```bash
+docker compose exec postgres psql -U carddemo -d carddemo -tA -c 'select count(*) from transaction_master'
+```
+
+Success: one number. `0` means the master is empty, as after a fresh seed: post the fixture day once.
+
+```bash
+cargo run --bin batch -- posttran
+echo $?
+```
+
+Success: exit status **4**, the correct result: 38 of the 300 records are rejected and 262 are posted (section 5.3). Do not chain the command with `&&`, because 4 is not a failure. A count above `0` means the prerequisite is already met: do not run `posttran` again, because on a master that holds transactions it abends with exit 16 and changes nothing.
+
+To return a database that earlier runs or manual changes have altered to the seeded and posted state, refresh the seed, empty the live master and post the fixture day again, one command at a time:
+
+```bash
+cargo run --bin batch -- seed
+cargo run --bin batch -- tranbkp
+cargo run --bin batch -- posttran
+```
+
+Success: exit statuses 0, then 0 (or 12 when the master was already empty), then 4, and the count above prints `262`.
+
+The specs take the processing clock to be `CARDDEMO_CLOCK_OVERRIDE` when it is set, and the database clock when it is not: they predict the reward accrual of each transaction they add at that instant, and start each rule they create and then soft-delete on its UTC day, because the API stamps accruals and soft deletes with its own processing clock. Export the same value in the shell that starts the API and in the shell that runs Playwright, or leave it unset in both, its default; the reward tests fail with a message that names `CARDDEMO_CLOCK_OVERRIDE` when the API stamped an accrual at another clock. A pinned instant must lie inside a seed reward rule's window: the retail rule is active from 2022-01-01T00:00:00Z, so `2022-07-01T12:00:00Z` serves. Post the fixture day under the same pin, as in section 9.5, because the reward history lists the latest accrual time first, and accruals posted under a later clock would sort above the ones the specs add.
+
+Run the specs:
 
 ```bash
 pnpm --dir web e2e
@@ -743,6 +772,7 @@ Record each check, the command that ran it and its result in `docs/parity/signof
 - **Admin transaction-type edits and reports.** Edits on the admin screens and by `mnttrdb2` change only the Db2 masters; reports show them only after `seed --only tranextr`.
 - **Stale batch lock files.** A batch job killed with SIGKILL leaves `.<DATASET>.lock` or `.STATEMNT.lock` behind, and later jobs exit 16 until it is removed, which is safe only while no batch job runs (section 9.6).
 - **`mq` on the host does not reconnect.** After a broker restart it exits with status 1; start it again. In Compose mode it is restarted automatically.
+- **CP00 and RabbitMQ direct reply-to.** CP00 answers no requester whose `reply_to` is `amq.rabbitmq.reply-to`: RabbitMQ returns a mandatory publish to that pseudo-queue as unroutable while still delivering it, so `mq` logs a warning and the `M004` record, rejects the request without requeue and writes no authorization. Name a reply queue of your own, for example a server-named exclusive queue.
 - **End-to-end tests against another database.** The fixtures write through `docker compose exec postgres psql`, so an API pointed at any other PostgreSQL fails the specs.
 - **Changing `RUSTFLAGS` rebuilds everything.** Keep it identical across `build`, `test`, `clippy` and `llvm-cov`, for example exported once as in section 11.2.
 - **Lockfiles.** Never run `cargo update` or a `pnpm install` without `--frozen-lockfile`; the gates build with `--locked` against the committed `Cargo.lock` and `web/pnpm-lock.yaml`.

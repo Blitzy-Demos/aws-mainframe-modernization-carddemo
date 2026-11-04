@@ -81,13 +81,12 @@ pub use transactions::LoadOutcome;
 
 use std::collections::BTreeMap;
 
-use carddemo_domain::clock::is_whole_microsecond;
 use carddemo_domain::numeric::{
     AccountGroupId, AccountId, Alnum, AuthCount, CardNumber, CustSsn, CustomerId, Cvv, FicoScore,
     InterestRate, MerchantId, Money, NumericCode, NumericError, RewardPoints, RewardRate,
     TranCategoryCode, TranId, TranTypeCode, UserId,
 };
-use carddemo_domain::ports::{PortError, PortResult};
+use carddemo_domain::ports::{PortError, PortResult, is_whole_microsecond};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
@@ -340,7 +339,7 @@ pub(crate) fn account_group_id(
 /// `PostgreSQL` keeps a timestamp to the whole microsecond and has no leap
 /// second, and the sqlx encoder drops anything finer without a word. An
 /// instant that is not
-/// [`is_whole_microsecond`](carddemo_domain::clock::is_whole_microsecond) is
+/// [`is_whole_microsecond`](carddemo_domain::ports::is_whole_microsecond) is
 /// therefore [`PersistenceError::InexactInstant`] naming the table and column,
 /// never the value, and is never truncated or rounded. Writers call this
 /// before their statement, so a refused instant writes nothing.

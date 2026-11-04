@@ -101,15 +101,17 @@ export function useCard(cardNumber: string, accountId: string) {
  * `useCard` returned, sent unchanged; without `version` the server answers its
  * no-message 400 (E-24).
  *
- * A success refreshes every card query, because a new status or name shows on
- * the list as well as the detail. A 409 ('Record changed by some one else.
- * Please review', COCRDUPC 9300-CHECK-CHANGE-IN-REC) refreshes this card's
- * detail whatever account number it was read with, so the page holds the
- * current record and its new `version`. Both refreshes are returned, so the mutation settles only
- * once the active card queries have reloaded: the 409 then reaches the page
- * with the current record already in place, as COCRDUPC redisplays the
- * changed record with its message, and a form reset on the reloaded record
- * cannot clear the field error the page sets afterwards.
+ * A success refreshes the card lists, where a new status shows, and this
+ * card's detail whatever account number it was read with; other cards'
+ * details are left alone, since the rewrite changed only this record. A 409
+ * ('Record changed by some one else. Please review', COCRDUPC
+ * 9300-CHECK-CHANGE-IN-REC) refreshes the same detail, so the page holds the
+ * current record and its new `version`. Both refreshes are returned, so the
+ * mutation settles only once the active queries they reach have reloaded:
+ * the 409 then reaches the page with the current record already in place, as
+ * COCRDUPC redisplays the changed record with its message, and a form reset
+ * on the reloaded record cannot clear the field error the page sets
+ * afterwards.
  */
 export function useCardUpdateMutation(cardNumber: string) {
   const queryClient = useQueryClient();
@@ -121,7 +123,13 @@ export function useCardUpdateMutation(cardNumber: string) {
           body,
         }),
       ),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: cardKeys.all }),
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: cardKeys.lists() }),
+        queryClient.invalidateQueries({
+          queryKey: [...cardKeys.details(), cardNumber],
+        }),
+      ]),
     onError: (error) => {
       if (error instanceof ApiError && error.status === 409) {
         return queryClient.invalidateQueries({

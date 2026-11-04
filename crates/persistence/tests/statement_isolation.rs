@@ -73,6 +73,7 @@ enum Read {
     TcatbalsAfter,
     SummariesAfter,
     Summary,
+    SummaryForUpdate,
     DetailsForAccount,
     Detail,
     User,
@@ -96,7 +97,7 @@ struct Case {
 }
 
 /// Every case, one read each.
-const CASES: [Case; 24] = [
+const CASES: [Case; 25] = [
     Case {
         read: Read::Account,
         hide: "ALTER TABLE accounts RENAME TO accounts_hidden",
@@ -154,6 +155,11 @@ const CASES: [Case; 24] = [
     },
     Case {
         read: Read::Summary,
+        hide: "ALTER TABLE pending_auth_summaries RENAME TO summaries_hidden",
+        restore: "ALTER TABLE summaries_hidden RENAME TO pending_auth_summaries",
+    },
+    Case {
+        read: Read::SummaryForUpdate,
         hide: "ALTER TABLE pending_auth_summaries RENAME TO summaries_hidden",
         restore: "ALTER TABLE summaries_hidden RENAME TO pending_auth_summaries",
     },
@@ -270,6 +276,7 @@ async fn run_read(uow: &mut UnitOfWork, read: Read) -> PortResult<()> {
         Read::TcatbalsAfter => store.tcatbals_after(None, 10).await.map(|_| ()),
         Read::SummariesAfter => store.summaries_after(None, 10).await.map(|_| ()),
         Read::Summary => store.read_summary(account(1)).await.map(|_| ()),
+        Read::SummaryForUpdate => store.read_summary_for_update(account(1)).await.map(|_| ()),
         Read::DetailsForAccount => store
             .details_for_account(account(1), first_page())
             .await

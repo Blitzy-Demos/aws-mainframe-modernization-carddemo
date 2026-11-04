@@ -102,13 +102,26 @@ export function useUser(userId: string) {
  * CU01: adds a user. The server answers 201 with the user and
  * `User <id> has been added ...`, which the page shows. The password goes out
  * exactly as entered, case kept (E-20).
+ *
+ * A success refreshes the user lists, which now hold the new row, and the
+ * added user's own detail, which an earlier read of that ID may have cached
+ * as not found. Other users' details are left alone. The refresh is
+ * returned, so the mutation settles once the active queries it reaches have
+ * reloaded.
  */
 export function useUserAddMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (body: UserAddBody): Promise<UserMessage> =>
       unwrap(await api.POST("/admin/users", { body })),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: userKeys.all }),
+    onSuccess: (data) =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: userKeys.lists() }),
+        queryClient.invalidateQueries({
+          queryKey: userKeys.detail(data.user.user_id),
+          exact: true,
+        }),
+      ]),
   });
 }
 
@@ -121,6 +134,11 @@ export function useUserAddMutation() {
  * When no field differs the server writes nothing and still answers 200 with
  * `Please modify to update ...`; that answer resolves as data, like
  * `User <id> has been updated ...`, and the page shows its `message`.
+ *
+ * A success refreshes the user lists, which show the names and type, and this
+ * user's detail, whose new read refills the edit form; other users' details
+ * are left alone. The refresh is returned, so the mutation settles once the
+ * active queries it reaches have reloaded.
  */
 export function useUserUpdateMutation(userId: string) {
   const queryClient = useQueryClient();
@@ -132,7 +150,14 @@ export function useUserUpdateMutation(userId: string) {
           body,
         }),
       ),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: userKeys.all }),
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: userKeys.lists() }),
+        queryClient.invalidateQueries({
+          queryKey: userKeys.detail(userId),
+          exact: true,
+        }),
+      ]),
   });
 }
 
@@ -140,8 +165,10 @@ export function useUserUpdateMutation(userId: string) {
  * CU03 PF5, the Confirm of the delete dialog: deletes the user given to
  * `mutate`. The answer carries the user as read before the delete and
  * `User <id> has been deleted ...`. The deleted user's cached detail is
- * dropped before the rest is invalidated, so no mounted view re-reads a user
- * that no longer exists.
+ * dropped, so no mounted view re-reads a user that no longer exists, and the
+ * user lists are refreshed, so the row leaves the page it was on. Other
+ * users' details are left alone. The refresh is returned, so the mutation
+ * settles once the active lists have reloaded.
  */
 export function useUserDeleteMutation() {
   const queryClient = useQueryClient();
@@ -154,7 +181,7 @@ export function useUserDeleteMutation() {
       ),
     onSuccess: (_data, userId) => {
       queryClient.removeQueries({ queryKey: userKeys.detail(userId) });
-      return queryClient.invalidateQueries({ queryKey: userKeys.all });
+      return queryClient.invalidateQueries({ queryKey: userKeys.lists() });
     },
   });
 }

@@ -66,7 +66,7 @@ use carddemo_domain::numeric::{
     AccountId, AccrualId, RewardPoints, RuleId, TranCategoryCode, TranTypeCode,
 };
 use carddemo_domain::ports::{PortError, PortResult};
-use carddemo_domain::rewards::RewardStore;
+use carddemo_domain::rewards::ports::RewardStore;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{Postgres, Transaction};

@@ -1,10 +1,11 @@
 // CC00 sign-on and logout (COSGN00C, map COSGN00): the mutations behind the
 // sign-on page and the logout item of the user menu.
 //
-// - The user ID and password go to the server exactly as typed. COSGN00C
-//   upper-cases both before it reads the user [app/cbl/COSGN00C.cbl:L132-136],
-//   so a value stored in lower or mixed case fails sign-on as in the COBOL
-//   (E-20); changing the case here would sign such a user on.
+// - The user ID and password go to the server exactly as typed, and the
+//   server normalizes them: like COSGN00C [app/cbl/COSGN00C.cbl:L132-136], it
+//   upper-cases and pads both before it reads the user and verifies the
+//   password. A user ID or password an admin stored in lower or mixed case
+//   therefore never signs on, whatever case is typed, as in the COBOL (E-20).
 // - A failed sign-on is a 401 carrying the COSGN00C message ('Wrong Password.
 //   Try again ...', 'User not found. Try again ...'). It reaches the caller as
 //   the ApiError unwrap raises, which the page shows on its fields; nothing

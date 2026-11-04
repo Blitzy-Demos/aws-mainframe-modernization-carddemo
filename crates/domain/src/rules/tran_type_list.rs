@@ -48,7 +48,6 @@
 
 use std::iter::repeat_n;
 
-use crate::entities::TranTypeMaster;
 use crate::error::{DomainError, ErrorKind};
 use crate::messages::{
     C_TR_TYPE_BACKWARD_CLOSE, C_TR_TYPE_BACKWARD_OPEN, C_TR_TYPE_FORWARD_CLOSE,
@@ -71,6 +70,10 @@ use crate::ports::{
 };
 
 use super::ReturnMsg;
+
+/// The transaction type row [`list`] pages through, re-exported from
+/// [`crate::entities`] for the API adapter, which maps it to its response.
+pub use crate::entities::TranTypeMaster;
 
 /// The rows of one list page: `WS-MAX-SCREEN-LINES PIC S9(4) COMP VALUE 7`
 /// [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L60] (P-COTRTLIC-003).

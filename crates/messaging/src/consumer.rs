@@ -36,7 +36,9 @@
 //! - **Reject without requeue on failure.** When there is no confirmed reply,
 //!   the request is rejected with `requeue = false`:
 //!   - after its error record is published to `CARD.DEMO.ERROR` and confirmed,
-//!     as `9000-ERROR` puts `MQ-ERR-DISPLAY` before the task returns;
+//!     as `9000-ERROR` puts `MQ-ERR-DISPLAY` before the task returns, and
+//!     logged as an `ERROR` event that carries the record's `MQ-ERR-DISPLAY`
+//!     group;
 //!   - after the record is logged as the `DISPLAY MQ-ERR-DISPLAY` line when
 //!     that publish fails too [app/app-vsam-mq/cbl/CODATE01.cbl:L433-439]
 //!     [app/app-vsam-mq/cbl/COACCT01.cbl:L529-535];
@@ -68,9 +70,19 @@
 //!   records it before its acknowledgement, and CP00's [`Flow::after_ack`]
 //!   then replaces it through [`record_location`] as it logs each
 //!   post-acknowledgement failure: `I003`, `I004` or `8000-WRITE-AUTH-TO-DB`.
+//! - A request rejected with an error record is an `ERROR` event in the span,
+//!   whichever way the record went: `request rejected: MQ-ERR-DISPLAY
+//!   published to the error queue` with the `MQ-ERR-DISPLAY` group published
+//!   (`mq_err_display`), or `MQ-ERR-DISPLAY` with the text logged in its
+//!   place. Neither carries the request body.
 //! - An acknowledgement or rejection that fails is an `ERROR` event in the
 //!   span: the request stays unsettled, and the broker redelivers it once the
 //!   channel closes.
+//! - The span is `info`, so a filter such as `RUST_LOG=warn` drops it. Every
+//!   warning and error this module logs for a delivery therefore names the
+//!   request itself by its `message_id` and `correlation_id`, empty when it
+//!   has none: a redelivery, an unconfirmed reply, a rejection with an error
+//!   record and a failed settlement.
 //!
 //! The binary's or test's subscriber from `carddemo_runtime::telemetry` writes
 //! the span and the events as JSON lines.
@@ -571,7 +583,12 @@ impl<F: Flow> Session<F> {
             if redelivered {
                 // Single delivery is the parity assumption; a redelivery follows
                 // a lost channel and may repeat CP00's post-acknowledgement writes.
-                tracing::warn!(flow = F::NAME, "request redelivered after a lost channel");
+                tracing::warn!(
+                    flow = F::NAME,
+                    message_id = req.message_id.as_deref().unwrap_or(""),
+                    correlation_id = req.correlation_id.as_deref().unwrap_or(""),
+                    "request redelivered after a lost channel"
+                );
             }
             self.dispatch(&acker, &req, &span).await
         }
@@ -601,6 +618,8 @@ impl<F: Flow> Session<F> {
                     Err(failure) => {
                         tracing::warn!(
                             flow = F::NAME,
+                            message_id = req.message_id.as_deref().unwrap_or(""),
+                            correlation_id = req.correlation_id.as_deref().unwrap_or(""),
                             queue = %reply.queue,
                             failure = %failure,
                             "reply not confirmed"
@@ -610,7 +629,7 @@ impl<F: Flow> Session<F> {
                                 self.reject_with_record(acker, req, &record, span).await
                             }
                             FailureAction::Logged { location } => {
-                                reject_logged(acker, F::NAME, location, span).await
+                                reject_logged(acker, F::NAME, req, location, span).await
                             }
                         }
                     }
@@ -619,7 +638,9 @@ impl<F: Flow> Session<F> {
             Disposition::ErrorRecord { record } => {
                 self.reject_with_record(acker, req, &record, span).await
             }
-            Disposition::Reject { location } => reject_logged(acker, F::NAME, location, span).await,
+            Disposition::Reject { location } => {
+                reject_logged(acker, F::NAME, req, location, span).await
+            }
         }
     }
 
@@ -643,7 +664,7 @@ impl<F: Flow> Session<F> {
         span.record("error_record", "none");
         span.record("location", NO_LOCATION);
         if let Err(error) = acker.ack(BasicAckOptions::default()).await {
-            return Err(unsettled(F::NAME, "acknowledged", error));
+            return Err(unsettled(F::NAME, req, "acknowledged", error));
         }
         self.flow.after_ack(req, work).await;
         Ok(())
@@ -654,11 +675,14 @@ impl<F: Flow> Session<F> {
     ///
     /// Publishes `record` to `CARD.DEMO.ERROR` with the request's IDs, which
     /// the COBOL's put keeps because it reuses the request's message
-    /// descriptor. When that publish is not confirmed, logs the
+    /// descriptor. When that publish is confirmed, logs at `error` the
+    /// rejection with the request's IDs, the error queue and the
+    /// `MQ-ERR-DISPLAY` group of `record`, so the reason stays in the log as
+    /// well as on the queue. When it is not confirmed, logs the
     /// `DISPLAY MQ-ERR-DISPLAY` text [app/app-vsam-mq/cbl/CODATE01.cbl:L433-439]
-    /// [app/app-vsam-mq/cbl/COACCT01.cbl:L529-535]. Then rejects the request
-    /// without requeue: the COBOL ends the task with a normal `RETURN`, which
-    /// commits the get.
+    /// [app/app-vsam-mq/cbl/COACCT01.cbl:L529-535]. Neither event carries the
+    /// request body. Then rejects the request without requeue: the COBOL ends
+    /// the task with a normal `RETURN`, which commits the get.
     async fn reject_with_record(
         &self,
         acker: &Acker,
@@ -676,12 +700,22 @@ impl<F: Flow> Session<F> {
         .await;
         match published {
             Ok(()) => {
+                tracing::error!(
+                    flow = F::NAME,
+                    message_id = req.message_id.as_deref().unwrap_or(""),
+                    correlation_id = req.correlation_id.as_deref().unwrap_or(""),
+                    queue = error_queue::ERROR_QUEUE,
+                    mq_err_display = %error_queue::display_text(record),
+                    "request rejected: MQ-ERR-DISPLAY published to the error queue"
+                );
                 span.record("error_record", "published");
             }
             Err(failure) => {
                 let (condition_code, reason_code) = failure.mq_codes();
                 tracing::error!(
                     flow = F::NAME,
+                    message_id = req.message_id.as_deref().unwrap_or(""),
+                    correlation_id = req.correlation_id.as_deref().unwrap_or(""),
                     failure = %failure,
                     mq_err_display = %error_queue::error_put_failure_display(
                         record,
@@ -695,46 +729,55 @@ impl<F: Flow> Session<F> {
         }
         span.record("outcome", "rejected");
         span.record("location", NO_LOCATION);
-        reject(acker, F::NAME).await
+        reject(acker, F::NAME, req).await
     }
 }
 
-/// Rejects a request of `flow` whose failure the flow has already logged,
-/// recording the flow's `location` in the message span first.
+/// Rejects the request `req` of `flow` whose failure the flow has already
+/// logged, recording the flow's `location` in the message span first.
 async fn reject_logged(
     acker: &Acker,
     flow: &'static str,
+    req: &Request,
     location: &'static str,
     span: &Span,
 ) -> Result<(), MessagingError> {
     span.record("outcome", "rejected");
     span.record("error_record", "none");
     span.record("location", location);
-    reject(acker, flow).await
+    reject(acker, flow, req).await
 }
 
-/// Removes a request of `flow` from its queue without a reply: `basic.reject`
-/// with `requeue = false`, the only way this module settles a failed request.
+/// Removes the request `req` of `flow` from its queue without a reply:
+/// `basic.reject` with `requeue = false`, the only way this module settles a
+/// failed request.
 ///
 /// # Errors
 ///
 /// Returns [`MessagingError::Amqp`] when the rejection fails, after logging
 /// that the request stays unsettled.
-async fn reject(acker: &Acker, flow: &'static str) -> Result<(), MessagingError> {
+async fn reject(acker: &Acker, flow: &'static str, req: &Request) -> Result<(), MessagingError> {
     acker
         .reject(BasicRejectOptions { requeue: false })
         .await
-        .map_err(|error| unsettled(flow, "rejected", error))
+        .map_err(|error| unsettled(flow, req, "rejected", error))
 }
 
-/// Logs, as an `ERROR` event in the message span, that the request of `flow`
-/// was not `settlement` (`acknowledged` or `rejected`) because `basic.ack` or
-/// `basic.reject` failed with `error`. The request stays unsettled, and the
-/// broker redelivers it once the channel closes. Returns the error the
-/// consumer stops with.
-fn unsettled(flow: &'static str, settlement: &'static str, error: lapin::Error) -> MessagingError {
+/// Logs, as an `ERROR` event in the message span that names `req` by its
+/// IDs, that the request of `flow` was not `settlement` (`acknowledged` or
+/// `rejected`) because `basic.ack` or `basic.reject` failed with `error`. The
+/// request stays unsettled, and the broker redelivers it once the channel
+/// closes. Returns the error the consumer stops with.
+fn unsettled(
+    flow: &'static str,
+    req: &Request,
+    settlement: &'static str,
+    error: lapin::Error,
+) -> MessagingError {
     tracing::error!(
         flow,
+        message_id = req.message_id.as_deref().unwrap_or(""),
+        correlation_id = req.correlation_id.as_deref().unwrap_or(""),
         error = %error,
         "request not {settlement}: it stays unsettled, and the broker redelivers it once the channel closes"
     );
@@ -1020,6 +1063,11 @@ mod tests {
     #[test]
     fn a_failed_settlement_is_one_error_event_and_the_amqp_error() {
         // A request whose ack or reject fails is never reported as settled.
+        // Outside any span, the event still names the request by its IDs.
+        let properties = BasicProperties::default()
+            .with_message_id("MSG-9".into())
+            .with_correlation_id("CORR-9".into());
+        let req = Request::from_parts(b"INQA00000000001".to_vec(), &properties);
         for settlement in ["acknowledged", "rejected"] {
             let capture = Capture::default();
             let sink = capture.clone();
@@ -1030,7 +1078,7 @@ mod tests {
                 .expect("valid directives");
             let closed = lapin::Error::InvalidChannelState(ChannelState::Closed);
             let error = tracing::subscriber::with_default(subscriber, || {
-                unsettled("ECHO", settlement, closed)
+                unsettled("ECHO", &req, settlement, closed)
             });
             guard.shutdown().expect("the tracer provider shuts down");
             assert!(
@@ -1048,9 +1096,16 @@ mod tests {
                 "\"message\":\"request not {settlement}: it stays unsettled, and the broker \
                  redelivers it once the channel closes\""
             );
-            for expected in ["\"level\":\"ERROR\"", "\"flow\":\"ECHO\"", &message] {
+            for expected in [
+                "\"level\":\"ERROR\"",
+                "\"flow\":\"ECHO\"",
+                "\"message_id\":\"MSG-9\"",
+                "\"correlation_id\":\"CORR-9\"",
+                &message,
+            ] {
                 assert!(line.contains(expected), "{expected} missing from {line}");
             }
+            assert!(!line.contains("INQA00000000001"), "{line}");
         }
     }
 

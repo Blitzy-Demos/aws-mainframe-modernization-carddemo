@@ -32,7 +32,7 @@
 //! `P-CODATE01-018` (E-22), and the `MQOPEN` failure paths `P-CODATE01-022`
 //! and `P-CODATE01-023` (E-22).
 
-mod common;
+pub mod common;
 
 use std::ops::Range;
 use std::time::Duration;
@@ -585,6 +585,40 @@ fn assert_settled_once(h: &Harness, message_id: &str, outcome: &str) {
     }
 }
 
+/// Waits for the `ERROR` event of the CDRD request `message_id` rejected once
+/// its record was published, and asserts that it holds `display`, the
+/// `MQ-ERR-DISPLAY` group of the published record, with its return message,
+/// and nothing of `body`, the request body.
+async fn assert_rejection_logged(h: &Harness, message_id: &str, display: &[u8], body: &[u8]) {
+    let id = attribute("message_id", message_id);
+    let line = h
+        .wait_for_log(
+            &[
+                r#""level":"ERROR""#,
+                CDRD_FLOW,
+                &id,
+                "request rejected: MQ-ERR-DISPLAY published to the error queue",
+            ],
+            SPAN_WAIT,
+        )
+        .await;
+    let display = attribute("mq_err_display", &String::from_utf8_lossy(display));
+    assert!(
+        line.contains(&display),
+        "the rejection event lacks {display}: {line}"
+    );
+    for text in audit_texts("P-CODATE01-012") {
+        assert!(
+            line.contains(&text),
+            "the rejection event lacks the return message {text}: {line}"
+        );
+    }
+    assert!(
+        !line.contains(&*String::from_utf8_lossy(body)),
+        "the rejection event carries the request body: {line}"
+    );
+}
+
 /// `P-CODATE01-010`, `P-CODATE01-011`, `P-CODATE01-012`, `P-CODATE01-013`,
 /// `P-CODATE01-014`, `P-CODATE01-020`, `P-CODATE01-021`, `P-CODATE01-024`.
 ///
@@ -676,7 +710,8 @@ fn cdrd_reply_uses_pinned_clock() {
 /// with return message `INP MQGET ERR:` and the request queue's name, in its
 /// 1000-byte buffer, goes to the error queue, once. The request is rejected
 /// without requeue, because no path requeues (AAP 0.3.3), so it leaves its
-/// queue and is settled once, with the record published.
+/// queue and is settled once, with the record published. The rejection is an
+/// `ERROR` event that holds the record's `MQ-ERR-DISPLAY`, not the body.
 #[test]
 fn cdrd_oversize_request_gets_get_failure_record_and_no_reply() {
     block_on(async {
@@ -690,6 +725,8 @@ fn cdrd_oversize_request_gets_get_failure_record_and_no_reply() {
         let record = h.next_message(ERROR_QUEUE, REPLY_WAIT).await;
         layout.assert_get_failure(&record.data, request_queue);
         assert_settled(&h, MESSAGE_ID_C, CORRELATION_ID_C, "rejected", "published").await;
+        let display = &record.data[..layout.queue_name.end];
+        assert_rejection_logged(&h, MESSAGE_ID_C, display, &body).await;
         h.assert_no_message(REPLY_QUEUE, ABSENCE_WAIT).await;
         h.assert_no_message(ERROR_QUEUE, ABSENCE_WAIT).await;
         assert_eq!(

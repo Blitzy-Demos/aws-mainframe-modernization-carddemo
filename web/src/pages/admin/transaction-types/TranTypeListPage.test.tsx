@@ -389,3 +389,183 @@ describe("TranTypeListPage delete (F-COTRTLI-008, F-COTRTLI-009)", () => {
     });
   });
 });
+
+describe("TranTypeListPage first page after a delete (F-COTRTLI-009)", () => {
+  // The toasts are counted on screen. A new Toaster shows the ones an earlier
+  // test left open, so those are dismissed first.
+  beforeEach(() => {
+    toast.dismiss();
+  });
+
+  // A type after the seven of the fixture, alone on the second page.
+  const SECOND_PAGE_TYPE = {
+    type_code: "08",
+    description: "Stub type",
+  } satisfies Schemas["TranTypeResponse"];
+
+  // The seven fixture types and one more: seven rows a page, the COTRTLI
+  // screen, so the eighth code starts a second page.
+  const TWO_PAGES: Schemas["TranTypeResponse"][] = [
+    PURCHASE,
+    PAYMENT,
+    { type_code: "03", description: "Credit" },
+    { type_code: "04", description: "Authorization" },
+    { type_code: "05", description: "Refund" },
+    { type_code: "06", description: "Reversal" },
+    { type_code: "07", description: "Adjustment" },
+    SECOND_PAGE_TYPE,
+  ];
+
+  /**
+   * A page's text: its start and the deletes made before it was read, so a
+   * page shown from the cache is told apart from a fresh one.
+   */
+  function pageText(startKey: string | null, deletes: number): string {
+    return `Stub page from ${startKey ?? "the start"} after ${deletes} deletes`;
+  }
+
+  /**
+   * Serves TWO_PAGES less the types deleted, forward from `start_key`. A read
+   * made after a delete answers after a pause, as over a network, so the page
+   * renders the copy it already holds while the read runs. `deleteAnswered`,
+   * when given, holds back the delete until it settles.
+   */
+  function serveTwoPages(deleteAnswered?: Promise<void>): void {
+    let onFile = [...TWO_PAGES];
+    let deletes = 0;
+    respond = async (request) => {
+      const url = new URL(request.url);
+      if (request.method === "DELETE") {
+        await deleteAnswered;
+        const code = decodeURIComponent(
+          url.pathname.slice(API_PATH.length + 1),
+        );
+        onFile = onFile.filter((type) => type.type_code !== code);
+        deletes += 1;
+        return json(DELETE_ANSWER);
+      }
+      if (request.method !== "GET") {
+        return defaultRespond(request);
+      }
+      if (deletes > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const startKey = url.searchParams.get("start_key");
+      const rows = onFile.filter(
+        (type) => startKey === null || type.type_code >= startKey,
+      );
+      return json({
+        items: rows.slice(0, 7),
+        next_key: rows[7]?.type_code ?? null,
+        prev_key: startKey,
+        message: pageText(startKey, deletes),
+      } satisfies Schemas["Page_TranTypeResponse"]);
+    };
+  }
+
+  async function confirmDelete(
+    user: ReturnType<typeof userEvent.setup>,
+    typeCode: string,
+  ): Promise<void> {
+    await user.click(rowButton("Delete", typeCode));
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Delete transaction type",
+    });
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+  }
+
+  /**
+   * The requests sent after the delete of `typeCode`, each as its method and
+   * the names of its query parameters.
+   */
+  function sentAfterDelete(typeCode: string): [string, string[]][] {
+    const sent = fetchMock.mock.calls.map(([request]) => request);
+    const deleteAt = sent.findIndex((request) => request.method === "DELETE");
+    const deleted = sent[deleteAt];
+    if (deleted === undefined) {
+      throw new Error("no delete request was sent");
+    }
+    expect(new URL(deleted.url).pathname).toBe(`${API_PATH}/${typeCode}`);
+    return sent
+      .slice(deleteAt + 1)
+      .map((request) => [
+        request.method,
+        [...new URL(request.url).searchParams.keys()],
+      ]);
+  }
+
+  // COTRTLIC resets its paging after 9300-DELETE-RECORD (P-COTRTLIC-007): the
+  // list answers a delete with its first page, read once, wherever the delete
+  // was made, and with that page's text taken from the fresh answer.
+  it.each([
+    {
+      from: "the second page",
+      typeCode: SECOND_PAGE_TYPE.type_code,
+      paged: true,
+    },
+    { from: "the first page", typeCode: PAYMENT.type_code, paged: false },
+  ])(
+    "reads only the first page again after a delete on $from",
+    async ({ typeCode, paged }) => {
+      const successSpy = vi.spyOn(toast, "success");
+      serveTwoPages();
+      const { user } = await renderLoadedPage();
+      await screen.findByText(pageText(null, 0));
+      if (paged) {
+        await user.click(screen.getByRole("button", { name: "Next" }));
+        await screen.findByText(pageText(typeCode, 0));
+      }
+
+      await confirmDelete(user, typeCode);
+
+      await screen.findByText(pageText(null, 1));
+      expect(successSpy).toHaveBeenCalledWith(DELETE_ANSWER.message);
+      // One read follows the delete: the first page, with no cursor.
+      expect(sentAfterDelete(typeCode)).toEqual([["GET", []]]);
+      // The first page's text shows once for the fresh page, and the cached
+      // copy of the first page read before the delete is not shown again.
+      expect(screen.getAllByText(pageText(null, 1))).toHaveLength(1);
+      expect(screen.getAllByText(pageText(null, 0))).toHaveLength(1);
+      // The fresh first page: the deleted type is gone, and seven types are
+      // left, so no page follows.
+      expect(
+        screen.queryByRole("button", { name: "Delete", description: typeCode }),
+      ).toBeNull();
+      expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(7);
+      expect(
+        screen
+          .getByRole("button", { name: "Next" })
+          .getAttribute("aria-disabled"),
+      ).toBe("true");
+    },
+  );
+
+  // The confirm dialog closes on Confirm, so the list can move on while the
+  // delete runs. Its answer returns to the first page from the request then
+  // on screen, and the page left behind is not read again.
+  it("returns to the first page from the page shown when the delete answers", async () => {
+    let answerDelete = (): void => undefined;
+    serveTwoPages(
+      new Promise<void>((resolve) => {
+        answerDelete = resolve;
+      }),
+    );
+    const { user } = await renderLoadedPage();
+
+    await confirmDelete(user, PAYMENT.type_code);
+    await waitFor(() => {
+      expect(requests("DELETE")).toHaveLength(1);
+    });
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    await screen.findByText(SECOND_PAGE_TYPE.description);
+    answerDelete();
+
+    await screen.findByText(pageText(null, 1));
+    expect(sentAfterDelete(PAYMENT.type_code)).toEqual([
+      ["GET", ["start_key", "direction"]],
+      ["GET", []],
+    ]);
+    expect(screen.queryByText(PAYMENT.description)).toBeNull();
+    expect(screen.getByText(PURCHASE.description)).not.toBeNull();
+  });
+});

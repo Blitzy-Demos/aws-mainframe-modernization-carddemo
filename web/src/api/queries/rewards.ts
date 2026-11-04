@@ -39,11 +39,11 @@ export type RewardBalance = components["schemas"]["RewardBalanceResponse"];
 export type RewardAccrual = components["schemas"]["RewardAccrualResponse"];
 
 // The first element of every reward key. It differs from the reward-rule
-// caches' "admin-reward-rules", so invalidating `rewardKeys.all` after a CT02
-// add, whose accrual commits with the transaction, refreshes balances and
-// histories only. Declared on its own because the factory's members cannot
-// name `rewardKeys` inside its own initializer without making its type
-// circular.
+// caches' "admin-reward-rules", so invalidating `rewardKeys.all` after a
+// card-only CT02 add, whose accrual commits with the transaction, refreshes
+// balances and histories only. Declared on its own because the factory's
+// members cannot name `rewardKeys` inside its own initializer without making
+// its type circular.
 const ROOT = ["rewards"] as const;
 
 /**

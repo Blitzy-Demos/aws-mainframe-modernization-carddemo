@@ -10,20 +10,31 @@
 //! [app/app-transaction-type-db2/jcl/TRANEXTR.jcl:L62-122], so only then do the reports show
 //! the masters' texts.
 //!
-//! The test posts the fixture day, edits type `01`, reports, copies the masters and reports
-//! again. The CTTU edit runs through `common::cttu_upsert`, the COTRTUPC rules and adapters
-//! the API handler drives, because `carddemo-batch` cannot depend on `carddemo-api`;
-//! `crates/api/tests/cttu_tran_type_upsert.rs` covers the HTTP framing.
+//! The test posts the fixture day, edits type `01` through `PUT /admin/transaction-types/01`,
+//! reports, copies the masters and reports again. The edit goes through the real API: the
+//! test has Cargo build the `api` binary of `carddemo-api`, which `carddemo-batch` may not
+//! depend on, runs it against the test database on a loopback port the system picks, signs
+//! on as `ADMIN001` and sends the PUT without `origin`, so the COTRTUPC path of the handler
+//! runs (P-COTRTUPC-007). HTTP/1.1 and JSON are spoken with the standard library alone, and
+//! the server is killed once the edit is answered and its handler span is written.
 
 pub mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use carddemo_audit::Document;
+use carddemo_runtime::config::keys;
+use carddemo_testkit::fixtures;
 use common::{
-    Harness, TRANREPT_CLOCK, block_on, cttu_upsert, expected_span, expected_value, parity,
-    split_records,
+    Harness, TRANREPT_CLOCK, block_on, expected_span, expected_value, parity, split_records,
 };
 
 /// The audit rows this test exercises.
@@ -97,6 +108,51 @@ const MASTER_CATEGORIES_SQL: &str = "SELECT trc_type_code, trc_type_category, tr
 /// Rows in their `PostgreSQL` text form.
 type Rows = Vec<Vec<Option<String>>>;
 
+/// The administrator the seed loads from the DUSRSECJ rows, and the password it hashes for
+/// that user; only an administrator may call `/admin/**`.
+const ADMIN_USER: &str = "ADMIN001";
+const ADMIN_PASSWORD: &str = "PASSWORD";
+
+/// The package and binary the test builds and runs as the API server.
+const API_PACKAGE: &str = "carddemo-api";
+const API_BIN: &str = "api";
+
+/// The listen address the server is given: loopback, on a port the system picks, which its
+/// `api listening` event then names.
+const API_LISTEN: &str = "127.0.0.1:0";
+
+/// The `api listening` event of the server's start-up, and the CICS transaction its
+/// `PUT /admin/transaction-types/{id}` handler records without `origin`.
+const API_LISTENING: &str = "api listening";
+const CTTU: &str = "CTTU";
+
+/// The bound on the `cargo build` of the `api` binary: 900 seconds. A build whose units are
+/// fresh ends in a second, and one that compiles the package and the dependencies the
+/// batch tests do not share takes about a minute. The margin is for a shared host running
+/// many builds at once, or a Cargo that waits for another build's lock on the target
+/// directory.
+const API_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// The bound from the start of the server to its `api listening` event: 120 seconds, a wide
+/// margin over the connect to the test database and the bind.
+const API_START_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The bound on the connect, each write and each read of one HTTP exchange: 120 seconds.
+/// The sign-on verifies an argon2 hash in an unoptimised build, which takes seconds.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the server may take, after its answer, to write the span line of the handler
+/// that served the PUT: 30 seconds. The span ends as the handler returns, so it is usually
+/// written before the answer.
+const SPAN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a child is checked for an exit.
+const POLL: Duration = Duration::from_millis(20);
+
+/// How long the output of a child that has ended is waited for: 10 seconds. Its pipes close
+/// as it exits, so the wait is long only when a process that inherited them holds them.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
 #[test]
 fn master_edit_reaches_report_only_after_tranextr() {
     let doc = parity();
@@ -114,23 +170,24 @@ fn master_edit_reaches_report_only_after_tranextr() {
     let categories_before = rows(&h, PROCESSING_CATEGORIES_SQL);
     let old_desc = description_of(&types_before, TYPE_CODE);
     assert_eq!(old_desc, audited(&doc, "P-CVTRA03Y-005", "tran_type_desc"));
+    let masters_before = rows(&h, MASTER_TYPES_SQL);
     assert_eq!(
-        description_of(&rows(&h, MASTER_TYPES_SQL), TYPE_CODE),
+        description_of(&masters_before, TYPE_CODE),
         audited(&doc, "P-TRNTYPE-004", "tr_description"),
     );
 
-    // CTTU updates the existing type in the master, and only there.
-    let saved = cttu_upsert(&h.db(), TYPE_CODE, NEW_DESC);
-    assert!(
-        !saved.inserted,
-        "CTTU inserted type {TYPE_CODE}, which the Db2 load holds, instead of updating it"
-    );
-    assert_eq!(saved.master.tr_type.to_string(), TYPE_CODE);
-    assert_eq!(saved.master.tr_description, NEW_DESC);
-    assert_eq!(saved.message, audited(&doc, "P-COTRTUPC-007", "info"));
+    // CTTU, through the API, updates the existing type in the master, and only there.
+    let saved = cttu_put(&h, TYPE_CODE, NEW_DESC);
     assert_eq!(
-        description_of(&rows(&h, MASTER_TYPES_SQL), TYPE_CODE),
-        NEW_DESC
+        (saved.type_code.as_str(), saved.description.as_str()),
+        (TYPE_CODE, NEW_DESC)
+    );
+    assert_eq!(saved.message, audited(&doc, "P-COTRTUPC-007", "info"));
+    assert_eq!(saved.info, None, "the COTRTLIC path answered the PUT");
+    assert_eq!(
+        rows(&h, MASTER_TYPES_SQL),
+        redescribed(&masters_before, TYPE_CODE, NEW_DESC),
+        "CTTU inserted or removed a master type, or changed more than the description of {TYPE_CODE}"
     );
     assert_eq!(
         rows(&h, PROCESSING_TYPES_SQL),
@@ -310,6 +367,21 @@ fn description_of(rows: &Rows, key: &str) -> String {
         .unwrap_or_else(|| panic!("no reference row has the key {key:?}"))
 }
 
+/// The type rows `rows`, code and description, with the description of type `code` set to
+/// `description`: the table as an update of that one type in place leaves it.
+fn redescribed(rows: &Rows, code: &str, description: &str) -> Rows {
+    let mut edited = rows.clone();
+    let row = edited
+        .iter_mut()
+        .find(|row| row.first().and_then(Option::as_deref) == Some(code))
+        .unwrap_or_else(|| panic!("no type row has the code {code:?}"));
+    let cell = row
+        .last_mut()
+        .unwrap_or_else(|| panic!("type row {code:?} has no columns"));
+    *cell = Some(description.to_owned());
+    edited
+}
+
 /// The text of the quoted code span of `key=` in row `id`, without its quotes: the audited
 /// value as the database stores it, before any padding to the span's width.
 fn audited(doc: &Document, id: &str, key: &str) -> String {
@@ -319,4 +391,904 @@ fn audited(doc: &Document, id: &str, key: &str) -> String {
         .and_then(|text| text.strip_suffix('"'))
         .unwrap_or_else(|| panic!("parity audit row {id}: {key}= holds no quoted text"))
         .to_owned()
+}
+
+/// What `PUT /admin/transaction-types/{id}` answered with 200: the type as stored, the
+/// program's `message`, and `info`, which only the COTRTLIC path (`origin=list`) sends.
+struct TypeSaved {
+    type_code: String,
+    description: String,
+    message: String,
+    info: Option<String>,
+}
+
+/// CTTU through the API: starts the `api` server on the test database of `h`, signs on as
+/// [`ADMIN_USER`], sends `PUT /admin/transaction-types/{code}` with `description` and no
+/// `origin`, and returns the 200 answer. The server is stopped on return.
+///
+/// Before that, the server must write the span line of the handler that served the PUT,
+/// with the transaction `CTTU`, the type `code` and the outcome `ok`. The line is printed,
+/// so the output of a `--nocapture` run shows the request reached the COTRTUPC handler.
+///
+/// # Panics
+///
+/// Panics as [`ApiServer`] does: when the server cannot be built, started or reached, when
+/// an answer is not 200 or not the documented JSON, or when the handler span is missing or
+/// records another outcome. The message shows the server's stderr and stdout.
+fn cttu_put(h: &Harness, code: &str, description: &str) -> TypeSaved {
+    let mut api = ApiServer::start(h.stack().database_url());
+    let token = api.sign_on(ADMIN_USER, ADMIN_PASSWORD);
+    let saved = api.update_type(&token, code, description);
+    let span = api.handler_span(CTTU, code);
+    println!("handler span the api wrote for the CTTU PUT: {span}");
+    saved
+}
+
+/// The `api` binary of [`API_PACKAGE`], serving one test database on a loopback port the
+/// system picks. Dropping it kills and reaps the process, also when the test panics.
+struct ApiServer {
+    process: Process,
+    addr: SocketAddr,
+}
+
+impl ApiServer {
+    /// Builds the binary ([`api_binary`]), starts it on `database_url`, and waits up to
+    /// [`API_START_TIMEOUT`] for its `api listening` event, which names the bound address.
+    ///
+    /// Every setting the binary reads, [`keys::ALL`], is removed from its environment, so a
+    /// value the shell exports, such as a `CARDDEMO_HTTP_ADDR` of a running stack, cannot
+    /// point it elsewhere. It gets `CARDDEMO_DATABASE_URL`, `CARDDEMO_HTTP_ADDR`
+    /// [`API_LISTEN`] and `RUST_LOG` `info`, at which the handler spans are written, and the
+    /// defaults otherwise, the system clock included.
+    fn start(database_url: &str) -> Self {
+        let mut command = Command::new(api_binary());
+        command.current_dir(fixtures::repo_root());
+        for key in keys::ALL {
+            command.env_remove(key);
+        }
+        command
+            .env(keys::DATABASE_URL, database_url)
+            .env(keys::HTTP_ADDR, API_LISTEN)
+            .env(keys::RUST_LOG, "info");
+        let mut process = Process::spawn("api server", &mut command);
+        let addr = process.wait_for(
+            &format!("{API_LISTENING:?} event"),
+            API_START_TIMEOUT,
+            listening_addr,
+        );
+        Self { process, addr }
+    }
+
+    /// `POST /auth/login` as `user` with `password`: the bearer token of the 200 answer.
+    fn sign_on(&mut self, user: &str, password: &str) -> String {
+        let body = format!(
+            "{{\"user_id\":{},\"password\":{}}}",
+            json_string(user),
+            json_string(password)
+        );
+        let (answer, _) = self.call("POST", "/auth/login", None, &body);
+        match answer.member("token").and_then(Json::text) {
+            Some(token) => token.to_owned(),
+            None => self
+                .process
+                .fail("answered POST /auth/login with 200 but no token"),
+        }
+    }
+
+    /// `PUT /admin/transaction-types/{code}` with `description`, the bearer `token` and no
+    /// `origin`: the COTRTUPC update. Returns the 200 answer.
+    fn update_type(&mut self, token: &str, code: &str, description: &str) -> TypeSaved {
+        assert!(
+            code.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "type code {code:?} would need percent-encoding in the path"
+        );
+        let path = format!("/admin/transaction-types/{code}");
+        let body = format!("{{\"description\":{}}}", json_string(description));
+        let (answer, text) = self.call("PUT", &path, Some(token), &body);
+        let string = |value: Option<&Json>| value.and_then(Json::text).map(str::to_owned);
+        let stored = answer.member("transaction_type");
+        let info = match answer.member("info") {
+            None => Ok(None),
+            Some(Json::Text(info)) => Ok(Some(info.clone())),
+            Some(_) => Err(()),
+        };
+        let fields = (
+            string(stored.and_then(|stored| stored.member("type_code"))),
+            string(stored.and_then(|stored| stored.member("description"))),
+            string(answer.member("message")),
+            info,
+        );
+        let (Some(type_code), Some(description), Some(message), Ok(info)) = fields else {
+            self.process.fail(&format!(
+                "answered PUT {path} with 200 but not a type, a message and an optional \
+                 info text: {text}"
+            ))
+        };
+        TypeSaved {
+            type_code,
+            description,
+            message,
+            info,
+        }
+    }
+
+    /// Waits up to [`SPAN_TIMEOUT`] for the span line of the handler that served
+    /// `transaction` for the type `code`, and returns it once it records the outcome `ok`.
+    fn handler_span(&mut self, transaction: &str, code: &str) -> String {
+        let what = format!("{transaction} handler span for type {code}");
+        let (line, outcome) = self.process.wait_for(&what, SPAN_TIMEOUT, |line| {
+            let span = Json::parse(line).ok()?;
+            let attributes = span.member("attributes")?;
+            let served = span.member("type")?.text()? == "span"
+                && span.member("name")?.text()? == "handler"
+                && attributes.member("transaction")?.text()? == transaction
+                && attributes.member("type_code")?.text()? == code;
+            let outcome = attributes.member("outcome").and_then(Json::text);
+            served.then(|| (line.to_owned(), outcome.map(str::to_owned)))
+        });
+        if outcome.as_deref() != Some("ok") {
+            self.process.fail(&format!(
+                "recorded the outcome {outcome:?} on the {what}: {line}"
+            ));
+        }
+        line
+    }
+
+    /// One HTTP/1.1 exchange on a connection of its own, which `Connection: close` ends
+    /// after the answer: `method` `path` with the JSON `body`, and `Authorization: Bearer`
+    /// `token` when one is given. Returns the parsed JSON of a 200 answer and its text.
+    ///
+    /// A failed exchange, a status other than 200 or a body that is not JSON fails the test
+    /// through [`Process::fail`]. The message never shows the request, which carries the
+    /// password or the token.
+    fn call(
+        &mut self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: &str,
+    ) -> (Json, String) {
+        let authorization = token.map_or_else(String::new, |token| {
+            format!("Authorization: Bearer {token}\r\n")
+        });
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{authorization}Accept: \
+             application/json\r\nContent-Type: application/json\r\nContent-Length: \
+             {length}\r\nConnection: close\r\n\r\n{body}",
+            addr = self.addr,
+            length = body.len(),
+        );
+        let answer = exchange(self.addr, request.as_bytes())
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| response(&bytes));
+        let (status, text) = match answer {
+            Ok(answer) => answer,
+            Err(problem) => self
+                .process
+                .fail(&format!("did not answer {method} {path}: {problem}")),
+        };
+        if status != 200 {
+            self.process
+                .fail(&format!("answered {method} {path} with {status}: {text}"));
+        }
+        match Json::parse(&text) {
+            Ok(json) => (json, text),
+            Err(problem) => self.process.fail(&format!(
+                "answered {method} {path} with a body that is not JSON ({problem}): {text}"
+            )),
+        }
+    }
+}
+
+/// The address the `api listening` event line `line` names in its `addr` field; `None` for
+/// any other line.
+fn listening_addr(line: &str) -> Option<SocketAddr> {
+    let event = Json::parse(line).ok()?;
+    let fields = event.member("fields")?;
+    if fields.member("message")?.text()? != API_LISTENING {
+        return None;
+    }
+    fields.member("addr")?.text()?.parse().ok()
+}
+
+/// The `api` binary of [`API_PACKAGE`], built for this test by the Cargo that runs it.
+///
+/// `carddemo-batch` may not depend on `carddemo-api`, so `cargo test -p carddemo-batch`
+/// builds no `api`. The test runs `cargo build --locked -p carddemo-api --bin api` on the
+/// workspace manifest, into the target directory of this test, the parent of
+/// `CARGO_TARGET_TMPDIR`, and with the test's environment, so the compiler flags, the
+/// offline query data and the instrumentation of a coverage run are those of the test's own
+/// build, and units already built are reused. Cargo releases its lock on the target
+/// directory before it runs tests, so the nested build does not wait for the outer one. It
+/// must end within [`API_BUILD_TIMEOUT`].
+///
+/// The executable is the one the build's `compiler-artifact` message names for the `api`
+/// bin target.
+fn api_binary() -> PathBuf {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let target_dir = tmp
+        .parent()
+        .unwrap_or_else(|| panic!("CARGO_TARGET_TMPDIR {} has no parent", tmp.display()));
+    let root = fixtures::repo_root();
+    let mut command = Command::new(env!("CARGO"));
+    command
+        .args([
+            "build",
+            "--locked",
+            "--package",
+            API_PACKAGE,
+            "--bin",
+            API_BIN,
+        ])
+        .arg("--message-format=json-render-diagnostics")
+        .arg("--manifest-path")
+        .arg(root.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(target_dir)
+        .current_dir(&root);
+    let mut build = Process::spawn("cargo build of the api binary", &mut command);
+    let status = build.wait_exit(API_BUILD_TIMEOUT);
+    if !status.success() {
+        build.fail(&format!("exited with {status}"));
+    }
+    let executables: Vec<PathBuf> = build
+        .stdout
+        .iter()
+        .filter_map(|line| artifact_executable(line))
+        .collect();
+    match executables.as_slice() {
+        [executable] => executable.clone(),
+        _ => build.fail(&format!(
+            "named {} executables of the {API_BIN} bin target instead of one",
+            executables.len()
+        )),
+    }
+}
+
+/// The executable a Cargo `compiler-artifact` message line names for the [`API_BIN`] bin
+/// target; `None` for any other line.
+fn artifact_executable(line: &str) -> Option<PathBuf> {
+    let message = Json::parse(line).ok()?;
+    let target = message.member("target")?;
+    let api_bin = message.member("reason")?.text()? == "compiler-artifact"
+        && target.member("name")?.text()? == API_BIN
+        && target
+            .member("kind")?
+            .items()?
+            .iter()
+            .any(|kind| kind.text() == Some("bin"));
+    if !api_bin {
+        return None;
+    }
+    message.member("executable")?.text().map(PathBuf::from)
+}
+
+/// Sends `request` to `addr` on a new connection, bounded by [`HTTP_TIMEOUT`] for the
+/// connect, each write and each read, and reads the answer until the server closes it.
+fn exchange(addr: SocketAddr, request: &[u8]) -> io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect_timeout(&addr, HTTP_TIMEOUT)?;
+    stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
+    stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+    stream.write_all(request)?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The status code and the body text of the HTTP/1.1 response `bytes`, read to the close of
+/// its connection.
+///
+/// The body is what follows the header section, and must be exactly `Content-Length` bytes
+/// when that header is sent. A response with a `Transfer-Encoding`, chunked or another, is
+/// refused rather than decoded: the API sends its JSON answers with their length.
+fn response(bytes: &[u8]) -> Result<(u16, String), String> {
+    let split = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| format!("{} bytes hold no end of a header section", bytes.len()))?;
+    let (head, body) = (&bytes[..split], &bytes[split + 4..]);
+    let head = std::str::from_utf8(head)
+        .map_err(|error| format!("the header section is not UTF-8: {error}"))?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let status = status_line
+        .strip_prefix("HTTP/1.1 ")
+        .and_then(|rest| rest.split(' ').next())
+        .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("{status_line:?} is not an HTTP/1.1 status line"))?;
+    let mut length = None;
+    for line in lines {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| format!("{line:?} is not a header field"))?;
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(format!(
+                "the body is sent with Transfer-Encoding {value:?}, which this client does \
+                 not decode"
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|error| format!("Content-Length {value:?}: {error}"))?;
+            length = Some(parsed);
+        }
+    }
+    if let Some(length) = length.filter(|&length| length != body.len()) {
+        return Err(format!(
+            "the body holds {} bytes, but Content-Length is {length}",
+            body.len()
+        ));
+    }
+    let text = String::from_utf8(body.to_vec())
+        .map_err(|error| format!("the body is not UTF-8: {error}"))?;
+    Ok((status, text))
+}
+
+/// A child process of the test, its stdout read line by line and its stderr to the end,
+/// each on a thread of its own, so the child never blocks on a full pipe. The stdout lines
+/// received so far are kept for checks and failure messages. Dropping it kills and reaps a
+/// child that is still running.
+struct Process {
+    /// What the child is, in messages.
+    label: &'static str,
+    child: Child,
+    /// When the child was started.
+    started: Instant,
+    /// The stdout lines from the reader thread, then the error that ended it, if any.
+    lines: Receiver<io::Result<String>>,
+    /// The stdout lines received so far, without their line endings.
+    stdout: Vec<String>,
+    /// The whole of stderr, or the error that ended its reading.
+    stderr: Receiver<io::Result<Vec<u8>>>,
+}
+
+impl Process {
+    /// Starts `command`, named `label` in messages, with an empty stdin and both outputs
+    /// piped to their reader threads.
+    fn spawn(label: &'static str, command: &mut Command) -> Self {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let mut child = command.spawn().unwrap_or_else(|error| {
+            panic!(
+                "cannot start the {label} {}: {error}",
+                Path::new(command.get_program()).display()
+            )
+        });
+        let readers = match (child.stdout.take(), child.stderr.take()) {
+            (Some(stdout), Some(stderr)) => lines_on_thread(stdout, label)
+                .and_then(|lines| Ok((lines, bytes_on_thread(stderr, label)?))),
+            _ => Err(io::Error::other("the child has no stdout or stderr pipe")),
+        };
+        match readers {
+            Ok((lines, stderr)) => Self {
+                label,
+                child,
+                started,
+                lines,
+                stdout: Vec::new(),
+                stderr,
+            },
+            Err(error) => {
+                let pid = child.id();
+                let (Ok(ended) | Err(ended)) = kill_and_reap(&mut child);
+                panic!("cannot read the output of the {label} (pid {pid}): {error}; {ended}")
+            }
+        }
+    }
+
+    /// The first value `found` takes from a stdout line received within `bound` of now;
+    /// `what` names the awaited line in a failure. Every line received is kept.
+    fn wait_for<T>(
+        &mut self,
+        what: &str,
+        bound: Duration,
+        mut found: impl FnMut(&str) -> Option<T>,
+    ) -> T {
+        let until = Instant::now() + bound;
+        loop {
+            match self
+                .lines
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                Ok(Ok(line)) => {
+                    let value = found(&line);
+                    self.stdout.push(line);
+                    if let Some(value) = value {
+                        return value;
+                    }
+                }
+                Ok(Err(error)) => self.fail(&format!(
+                    "could not be read while the test waited for the {what}: {error}"
+                )),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.fail(&format!("wrote no {what} within {bound:?}"));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.fail(&format!("closed its stdout without writing the {what}"));
+                }
+            }
+        }
+    }
+
+    /// Waits for the child to exit within `bound` of its start, checking every [`POLL`],
+    /// then for the end of its stdout, and returns its exit status.
+    fn wait_exit(&mut self, bound: Duration) -> ExitStatus {
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if self.started.elapsed() >= bound => {
+                    self.fail(&format!("did not exit within {bound:?}"));
+                }
+                Ok(None) => thread::sleep(POLL),
+                Err(error) => self.fail(&format!("could not be checked for an exit: {error}")),
+            }
+        };
+        let until = Instant::now() + DRAIN_GRACE;
+        loop {
+            match self
+                .lines
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                Ok(Ok(line)) => self.stdout.push(line),
+                Ok(Err(error)) => self.fail(&format!(
+                    "exited with {status}, but its stdout could not be read: {error}"
+                )),
+                Err(RecvTimeoutError::Timeout) => self.fail(&format!(
+                    "exited with {status}, but its stdout was still open {DRAIN_GRACE:?} later"
+                )),
+                Err(RecvTimeoutError::Disconnected) => return status,
+            }
+        }
+    }
+
+    /// Stops the child, collects what it wrote within [`DRAIN_GRACE`], and panics with
+    /// `problem`, the pid, how the child ended, its stderr and its stdout.
+    fn fail(&mut self, problem: &str) -> ! {
+        let (Ok(ended) | Err(ended)) = self.stop();
+        let until = Instant::now() + DRAIN_GRACE;
+        while let Ok(Ok(line)) = self
+            .lines
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+        {
+            self.stdout.push(line);
+        }
+        let stderr = match self
+            .stderr
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+        {
+            Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+            Ok(Err(error)) => format!("<stderr could not be read: {error}>"),
+            Err(RecvTimeoutError::Timeout) => {
+                format!("<stderr was still open {DRAIN_GRACE:?} after the stop>")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                "<the stderr reader ended without a result>".to_owned()
+            }
+        };
+        panic!(
+            "the {} (pid {}) {problem}; {ended}\n--- stderr ---\n{stderr}\n--- stdout ---\n{}",
+            self.label,
+            self.child.id(),
+            self.stdout.join("\n"),
+        )
+    }
+
+    /// Kills and reaps the child unless it has already exited, and says how it ended: `Err`
+    /// when the kill or the reap failed.
+    fn stop(&mut self) -> Result<String, String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Ok(format!("it had exited with {status}")),
+            Ok(None) | Err(_) => kill_and_reap(&mut self.child),
+        }
+    }
+}
+
+impl Drop for Process {
+    /// Kills and reaps a child that is still running, so no process outlives the test,
+    /// whether it passed or panicked. A failed kill or reap is reported on stderr; it
+    /// changes no outcome.
+    fn drop(&mut self) {
+        if let Err(problem) = self.stop() {
+            eprintln!(
+                "cannot stop the {} (pid {}): {problem}",
+                self.label,
+                self.child.id()
+            );
+        }
+    }
+}
+
+/// Kills `child` with `SIGKILL` and waits for it, so it leaves no zombie. `Ok` describes the
+/// reaped status; `Err` names the step that failed.
+fn kill_and_reap(child: &mut Child) -> Result<String, String> {
+    let killed = child.kill();
+    match (killed, child.wait()) {
+        (Ok(()), Ok(status)) => Ok(format!("it was killed and reaped with {status}")),
+        (killed, reaped) => Err(format!("kill returned {killed:?}, reap {reaped:?}")),
+    }
+}
+
+/// Reads `pipe`, the stdout of the child `label`, line by line on a new thread, which sends
+/// each line without its line ending, then the read error that ends it, if any.
+///
+/// # Errors
+///
+/// The thread cannot be started.
+fn lines_on_thread<R: Read + Send + 'static>(
+    pipe: R,
+    label: &str,
+) -> io::Result<Receiver<io::Result<String>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name(format!("{label} stdout"))
+        .spawn(move || {
+            let mut reader = BufReader::new(pipe);
+            loop {
+                let mut line = Vec::new();
+                let read = match reader.read_until(b'\n', &mut line) {
+                    Ok(0) => return,
+                    Ok(_) => {
+                        let text = line.strip_suffix(b"\n").unwrap_or(&line);
+                        let text = text.strip_suffix(b"\r").unwrap_or(text);
+                        Ok(String::from_utf8_lossy(text).into_owned())
+                    }
+                    Err(error) => Err(error),
+                };
+                let failed = read.is_err();
+                // The receiver is gone only when the test has already failed and stopped
+                // reading; the error, if any, is the last thing sent.
+                if sender.send(read).is_err() || failed {
+                    return;
+                }
+            }
+        })?;
+    Ok(receiver)
+}
+
+/// Reads `pipe`, the stderr of the child `label`, to its end on a new thread, which sends the
+/// bytes or the read error.
+///
+/// # Errors
+///
+/// The thread cannot be started.
+fn bytes_on_thread<R: Read + Send + 'static>(
+    mut pipe: R,
+    label: &str,
+) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name(format!("{label} stderr"))
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let read = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            // The receiver is gone only when the test has already failed and stopped waiting.
+            let _ = sender.send(read);
+        })?;
+    Ok(receiver)
+}
+
+/// `text` as a JSON string literal: quoted, with `"`, `\` and every control character
+/// escaped.
+fn json_string(text: &str) -> String {
+    let mut literal = String::with_capacity(text.len() + 2);
+    literal.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            control if control < ' ' => {
+                let code = u32::from(control);
+                literal.push_str("\\u00");
+                // Both nibbles are below 16, so each is one hexadecimal digit.
+                for nibble in [code >> 4, code & 0xF] {
+                    literal.extend(char::from_digit(nibble, 16));
+                }
+            }
+            other => literal.push(other),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+/// A JSON value (RFC 8259), as [`Json::parse`] reads the API's answers, the server's event
+/// and span lines and Cargo's messages.
+#[derive(Debug)]
+enum Json {
+    /// `true`, `false`, `null` or a number, whose value no check reads.
+    Scalar,
+    Text(String),
+    List(Vec<Json>),
+    /// The members in their order; [`Json::member`] finds the first of a name.
+    Object(Vec<(String, Json)>),
+}
+
+impl Json {
+    /// Parses `text`, which must hold exactly one JSON value, with whitespace around it.
+    fn parse(text: &str) -> Result<Self, String> {
+        let mut reader = JsonReader { text, at: 0 };
+        let value = reader.value()?;
+        reader.skip_whitespace();
+        if reader.at == text.len() {
+            Ok(value)
+        } else {
+            Err(reader.unexpected("the end of the text"))
+        }
+    }
+
+    /// The value of the first member `key` of an object; `None` for any other value.
+    fn member(&self, key: &str) -> Option<&Self> {
+        match self {
+            Self::Object(members) => members
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
+            Self::Scalar | Self::Text(_) | Self::List(_) => None,
+        }
+    }
+
+    /// The text of a string; `None` for any other value.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Scalar | Self::List(_) | Self::Object(_) => None,
+        }
+    }
+
+    /// The items of an array; `None` for any other value.
+    fn items(&self) -> Option<&[Self]> {
+        match self {
+            Self::List(items) => Some(items),
+            Self::Scalar | Self::Text(_) | Self::Object(_) => None,
+        }
+    }
+}
+
+/// The cursor of [`Json::parse`]: the text and the byte offset reached, always at a
+/// character boundary, as the reader steps over ASCII bytes and whole runs of string text.
+struct JsonReader<'t> {
+    text: &'t str,
+    at: usize,
+}
+
+impl JsonReader<'_> {
+    /// The byte at the cursor.
+    fn peek(&self) -> Option<u8> {
+        self.text.as_bytes().get(self.at).copied()
+    }
+
+    /// Steps over the JSON whitespace: space, tab, line feed and carriage return.
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.at += 1;
+        }
+    }
+
+    /// Steps over `byte`, which must be at the cursor.
+    fn eat(&mut self, byte: u8) -> Result<(), String> {
+        if self.peek() == Some(byte) {
+            self.at += 1;
+            Ok(())
+        } else {
+            Err(self.unexpected(&format!("{:?}", char::from(byte))))
+        }
+    }
+
+    /// The error of a text that holds something else than `wanted` at the cursor.
+    fn unexpected(&self, wanted: &str) -> String {
+        match self.peek() {
+            Some(byte) => format!(
+                "{wanted} expected at byte {}, found {:?}",
+                self.at,
+                char::from(byte)
+            ),
+            None => format!("{wanted} expected at the end of the text"),
+        }
+    }
+
+    /// The value at the cursor, after whitespace.
+    fn value(&mut self) -> Result<Json, String> {
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b'{') => self.object(),
+            Some(b'[') => self.list(),
+            Some(b'"') => self.string().map(Json::Text),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(b't' | b'f' | b'n') => self.literal(),
+            _ => Err(self.unexpected("a JSON value")),
+        }
+    }
+
+    /// An object: members `"name": value` between braces, separated by commas.
+    fn object(&mut self) -> Result<Json, String> {
+        self.eat(b'{')?;
+        let mut members = Vec::new();
+        self.skip_whitespace();
+        if self.peek() == Some(b'}') {
+            self.at += 1;
+            return Ok(Json::Object(members));
+        }
+        loop {
+            self.skip_whitespace();
+            let name = self.string()?;
+            self.skip_whitespace();
+            self.eat(b':')?;
+            members.push((name, self.value()?));
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => self.at += 1,
+                Some(b'}') => {
+                    self.at += 1;
+                    return Ok(Json::Object(members));
+                }
+                _ => return Err(self.unexpected("',' or '}'")),
+            }
+        }
+    }
+
+    /// An array: values between brackets, separated by commas.
+    fn list(&mut self) -> Result<Json, String> {
+        self.eat(b'[')?;
+        let mut items = Vec::new();
+        self.skip_whitespace();
+        if self.peek() == Some(b']') {
+            self.at += 1;
+            return Ok(Json::List(items));
+        }
+        loop {
+            items.push(self.value()?);
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => self.at += 1,
+                Some(b']') => {
+                    self.at += 1;
+                    return Ok(Json::List(items));
+                }
+                _ => return Err(self.unexpected("',' or ']'")),
+            }
+        }
+    }
+
+    /// `true`, `false` or `null`.
+    fn literal(&mut self) -> Result<Json, String> {
+        let rest = self.text.get(self.at..).unwrap_or_default();
+        for word in ["true", "false", "null"] {
+            if rest.starts_with(word) {
+                self.at += word.len();
+                return Ok(Json::Scalar);
+            }
+        }
+        Err(self.unexpected("true, false or null"))
+    }
+
+    /// A number: an optional `-`, an integer part without a leading zero, an optional
+    /// fraction and an optional exponent.
+    fn number(&mut self) -> Result<Json, String> {
+        if self.peek() == Some(b'-') {
+            self.at += 1;
+        }
+        match self.peek() {
+            Some(b'0') => self.at += 1,
+            Some(b'1'..=b'9') => self.digits()?,
+            _ => return Err(self.unexpected("a digit")),
+        }
+        if self.peek() == Some(b'.') {
+            self.at += 1;
+            self.digits()?;
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.at += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.at += 1;
+            }
+            self.digits()?;
+        }
+        Ok(Json::Scalar)
+    }
+
+    /// Steps over one or more decimal digits.
+    fn digits(&mut self) -> Result<(), String> {
+        let start = self.at;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.at += 1;
+        }
+        if self.at == start {
+            Err(self.unexpected("a digit"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A string, its escapes decoded. A control character must be escaped.
+    fn string(&mut self) -> Result<String, String> {
+        self.eat(b'"')?;
+        let text = self.text;
+        let mut decoded = String::new();
+        loop {
+            let start = self.at;
+            while matches!(self.peek(), Some(byte) if byte != b'"' && byte != b'\\' && byte >= 0x20)
+            {
+                self.at += 1;
+            }
+            // The run ends at an ASCII byte or at the end, so both its ends are character
+            // boundaries.
+            let run = text
+                .get(start..self.at)
+                .ok_or_else(|| format!("bytes {start} to {} split a character", self.at))?;
+            decoded.push_str(run);
+            match self.peek() {
+                Some(b'"') => {
+                    self.at += 1;
+                    return Ok(decoded);
+                }
+                Some(b'\\') => {
+                    self.at += 1;
+                    decoded.push(self.escape()?);
+                }
+                Some(_) => return Err(self.unexpected("an escaped control character")),
+                None => return Err(self.unexpected("'\"'")),
+            }
+        }
+    }
+
+    /// The character of the escape after a `\`: one of `"\/bfnrt`, or `u` and four
+    /// hexadecimal digits, a high surrogate taking the `\u` low surrogate that must follow.
+    fn escape(&mut self) -> Result<char, String> {
+        let decoded = match self.peek() {
+            Some(b'"') => '"',
+            Some(b'\\') => '\\',
+            Some(b'/') => '/',
+            Some(b'b') => '\u{8}',
+            Some(b'f') => '\u{c}',
+            Some(b'n') => '\n',
+            Some(b'r') => '\r',
+            Some(b't') => '\t',
+            Some(b'u') => {
+                self.at += 1;
+                return self.unicode_escape();
+            }
+            _ => return Err(self.unexpected("an escape character")),
+        };
+        self.at += 1;
+        Ok(decoded)
+    }
+
+    /// The character of `\uXXXX` after its `u`, with the low surrogate `\uXXXX` that a high
+    /// one takes.
+    fn unicode_escape(&mut self) -> Result<char, String> {
+        let unit = self.hex4()?;
+        let scalar = if (0xD800..0xDC00).contains(&unit) {
+            self.eat(b'\\')?;
+            self.eat(b'u')?;
+            let low = self.hex4()?;
+            if !(0xDC00..0xE000).contains(&low) {
+                return Err(format!("\\u{unit:04X} is not followed by a low surrogate"));
+            }
+            0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+        } else {
+            unit
+        };
+        char::from_u32(scalar).ok_or_else(|| format!("\\u{unit:04X} is a lone surrogate"))
+    }
+
+    /// Four hexadecimal digits at the cursor, as a number.
+    fn hex4(&mut self) -> Result<u32, String> {
+        let text = self.text;
+        let digits = text
+            .get(self.at..self.at + 4)
+            .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| self.unexpected("four hexadecimal digits"))?;
+        let unit = u32::from_str_radix(digits, 16).map_err(|error| error.to_string())?;
+        self.at += 4;
+        Ok(unit)
+    }
 }

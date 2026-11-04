@@ -11,7 +11,10 @@
 //!
 //! - The sign-on answer holds exactly the token, its RFC 3339 expiry
 //!   (`CARDDEMO_JWT_TTL_SECS` after issue), the user ID, the user type and the
-//!   landing route, and the token's claims repeat the user ID and type.
+//!   landing route, and the token's claims repeat the user ID and type. The
+//!   user ID, stored password and type expected of the seeded regular user
+//!   are those its reviewed parity row records, read through
+//!   `carddemo_audit`.
 //! - A request without a valid token is 401 `Authentication required`: no
 //!   `Authorization` header, another scheme, a value that is no JWT, a
 //!   tampered signature, an algorithm other than `HS256`, another secret, or
@@ -39,15 +42,19 @@ use carddemo_domain::messages;
 use carddemo_runtime::config::Settings;
 use carddemo_testkit::block_on;
 use chrono::DateTime;
-use common::{Resp, TestApp, assert_error, send};
+use common::{Resp, SeededUser, TestApp, assert_error, send};
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use reqwest::StatusCode;
 use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
 
-/// The seeded regular user, type `U` [app/jcl/DUSRSECJ.jcl:L40].
+/// The user ID typed to sign the seeded regular user on.
 const REGULAR_USER: &str = "USER0001";
+
+/// The seeded regular user: the user ID, stored password and type the
+/// sign-on answer and the token's claims must carry [app/jcl/DUSRSECJ.jcl:L40].
+const REGULAR_USER_ROW: &str = "P-CSUSR01Y-009";
 
 /// The seeded admin, type `A` [app/jcl/DUSRSECJ.jcl:L35].
 const ADMIN_USER: &str = "ADMIN001";
@@ -90,11 +97,12 @@ const STORED_ADD_SQL: &str = "SELECT user_id FROM users WHERE user_id = 'QAACTR0
 /// container.
 #[test]
 fn bearer_tokens_are_issued_verified_and_name_the_only_actor() {
+    let regular = common::seeded_user(&common::parity_audit(), REGULAR_USER_ROW);
     let app = TestApp::start();
     let settings = Settings::default();
     let keys = JwtKeys::new(&settings.jwt_secret, settings.jwt_ttl_secs);
     block_on(async {
-        let user = login_answer_carries_the_token(&app, &keys).await;
+        let user = login_answer_carries_the_token(&app, &keys, &regular).await;
         invalid_tokens_are_401(&app, &keys, &settings.jwt_secret, &user).await;
         the_token_alone_names_the_actor(&app, &user).await;
     });
@@ -103,8 +111,22 @@ fn bearer_tokens_are_issued_verified_and_name_the_only_actor() {
 /// Signs `USER0001` on and checks the answer: exactly the [`LOGIN_KEYS`], an
 /// expiry [`JwtKeys::ttl_secs`] after the moment of issue, and a compact
 /// three-segment token whose claims, verified with the API's own keys, repeat
-/// the answer's user ID, type and expiry. Returns the token.
-async fn login_answer_carries_the_token(app: &TestApp, keys: &JwtKeys) -> String {
+/// the answer's user ID, type and expiry. The typed credentials are the
+/// `seeded` user's ID and stored password, and the answer and the claims
+/// carry its user ID and type. Returns the token.
+async fn login_answer_carries_the_token(
+    app: &TestApp,
+    keys: &JwtKeys,
+    seeded: &SeededUser,
+) -> String {
+    assert_eq!(
+        REGULAR_USER, seeded.user_id,
+        "{REGULAR_USER_ROW}: the typed user ID is the seeded one"
+    );
+    assert_eq!(
+        SEED_PASSWORD, seeded.password,
+        "{REGULAR_USER_ROW}: the typed password is the stored one"
+    );
     let ttl = keys.ttl_secs();
     let body = json!({ "user_id": REGULAR_USER, "password": SEED_PASSWORD });
     let before = now_secs();
@@ -148,13 +170,24 @@ async fn login_answer_carries_the_token(app: &TestApp, keys: &JwtKeys) -> String
     let claims = keys
         .verify(token)
         .unwrap_or_else(|error| panic!("the API's keys reject the issued token: {error}"));
-    assert_eq!(claims.sub, REGULAR_USER, "the `sub` claim");
-    assert_eq!(claims.sub, string_at(&answer, "user_id", &raw), "{raw}");
-    assert_eq!(claims.usr_type, UserType::User, "the `usr_type` claim");
+    assert_eq!(
+        claims.sub, seeded.user_id,
+        "the `sub` claim is the user ID of {REGULAR_USER_ROW}"
+    );
+    assert_eq!(
+        string_at(&answer, "user_id", &raw),
+        seeded.user_id,
+        "the answer's user ID is that of {REGULAR_USER_ROW}: {raw}"
+    );
     assert_eq!(
         claims.usr_type.as_code(),
+        seeded.usr_type,
+        "the `usr_type` claim is the type of {REGULAR_USER_ROW}"
+    );
+    assert_eq!(
         string_at(&answer, "usr_type", &raw),
-        "{raw}"
+        seeded.usr_type,
+        "the answer's user type is that of {REGULAR_USER_ROW}: {raw}"
     );
     assert_eq!(claims.exp, exp, "the `exp` claim is `expires_at`");
     assert_eq!(claims.exp.checked_sub(claims.iat), Some(ttl), "{claims:?}");

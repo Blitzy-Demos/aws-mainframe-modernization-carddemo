@@ -53,7 +53,7 @@ use std::process::ExitCode;
 
 use carddemo_domain::clock::AnyClock;
 use carddemo_messaging::{MessagingError, STATEMENT_TIMEOUT, run};
-use carddemo_persistence::connect_with_statement_timeout;
+use carddemo_persistence::tx::connect_with_statement_timeout;
 use carddemo_runtime::config::Settings;
 use carddemo_runtime::telemetry;
 

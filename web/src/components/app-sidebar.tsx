@@ -2,6 +2,8 @@
 // COMEN02Y) and the CA00 admin menu (COADM01C, options from COADM02Y) as
 // navigation links, the web replacement for typing an option number and
 // pressing ENTER [app/cbl/COMEN01C.cbl:L94-95] [app/cbl/COADM01C.cbl:L98-99].
+// The file also supplies MenuOptionList, the same options as the list of
+// option cards the dashboard and /admin landing pages show.
 //
 // Every label, route and icon comes from nav/menu.ts, so the link names and
 // destinations are the function-map rows' `control=link "<name>"` and
@@ -27,8 +29,10 @@ import {
   type RefObject,
 } from "react";
 import { WalletCards } from "lucide-react";
-import { NavLink, useLocation, useResolvedPath } from "react-router";
+import { Link, NavLink, useLocation, useResolvedPath } from "react-router";
 
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import {
   Sidebar,
   SidebarContent,
@@ -42,11 +46,13 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { isAdmin, useSession } from "@/lib/session";
+import { cn } from "@/lib/utils";
 import {
   MENU_SECTION_LABELS,
   adminMenu,
   userMenu,
   type MenuEntry,
+  type MenuSection,
 } from "@/nav/menu";
 
 // NavLink's own `end` test, so the highlight (`isActive`) and NavLink's
@@ -175,5 +181,63 @@ export function AppSidebar(): JSX.Element {
         )}
       </SidebarContent>
     </Sidebar>
+  );
+}
+
+/** The nav/menu.ts entries of each menu section, in COBOL option order. */
+const MENU_OPTIONS: Readonly<Record<MenuSection, readonly MenuEntry[]>> = {
+  user: userMenu,
+  admin: adminMenu,
+};
+
+/**
+ * The CM00 or CA00 option list the menu landing pages show: section "user"
+ * on the dashboard, "admin" on /admin. Each option's label, route and icon
+ * comes from nav/menu.ts, and choosing its link replaces typing the option
+ * number and pressing ENTER [app/cbl/COMEN01C.cbl:L94-95]
+ * [app/cbl/COADM01C.cbl:L98-99]. The page supplies the navigation landmark
+ * and the column classes; this renders only the list.
+ */
+export function MenuOptionList({
+  section,
+  className,
+}: {
+  section: MenuSection;
+  className?: string;
+}): JSX.Element {
+  // BLITZY [A11Y]: the links keep the generated Button focus ring, the
+  // built-in `ring-ring/50` token of index.css, about 1.5:1 against the card
+  // background, below the WCAG AA 3:1 non-text minimum. Kept as the shadcn
+  // token set defines it; flagged for designer review.
+  return (
+    <ul className={cn("grid gap-4", className)}>
+      {MENU_OPTIONS[section].map((entry) => (
+        <li key={entry.id}>
+          <Card className="relative h-full">
+            <CardContent className="flex items-center gap-3">
+              {/* Outside the link, so the link's accessible name is the
+                  option text alone and the link variant's padding for an svg
+                  child does not apply. */}
+              <entry.icon
+                aria-hidden="true"
+                className="size-5 shrink-0 text-muted-foreground"
+              />
+              {/* The link fills the whole card through its ::after box, so
+                  the card is the click target rather than the text line
+                  alone. The padding and height reset align the text with the
+                  icon, and wrapping keeps the longest option text inside its
+                  column, a lg column beside the expanded sidebar included. */}
+              <Button
+                variant="link"
+                asChild
+                className="h-auto justify-start p-0 text-left whitespace-normal after:absolute after:inset-0"
+              >
+                <Link to={entry.route}>{entry.label}</Link>
+              </Button>
+            </CardContent>
+          </Card>
+        </li>
+      ))}
+    </ul>
   );
 }

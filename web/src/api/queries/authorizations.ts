@@ -17,6 +17,7 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type Query,
   type UseMutationResult,
   type UseQueryResult,
 } from "@tanstack/react-query";
@@ -60,6 +61,22 @@ export const authorizationKeys = {
   details: () => [...all, "detail"] as const,
   detail: (authId: string) => [...all, "detail", authId] as const,
 } as const;
+
+/**
+ * Whether `query`, under `authorizationKeys.summaries()`, holds a summary page
+ * of `accountId`: its key's params name that account. Both sides are the 11
+ * zero-padded digits, the only form the summary query is sent with and the one
+ * a detail's `account_id` takes.
+ */
+function isSummaryOf(query: Query, accountId: string): boolean {
+  const params = query.queryKey[2];
+  return (
+    typeof params === "object" &&
+    params !== null &&
+    "account_id" in params &&
+    params.account_id === accountId
+  );
+}
 
 /**
  * COPAUS0C ENTER, PF7 and PF8: the summary of `params.account_id` and one page
@@ -114,10 +131,12 @@ export function useAuthorizationDetail(
  * `authId`. The request has no body, because PF5 acts on the record shown.
  * The result carries `message`, the success text the page shows.
  *
- * On success the shown detail becomes the replaced one, and every summary is
- * marked stale, so CPVS reads the account again after the write, as PF3 back
- * to COPAUS0C does. On failure the server has rolled both writes back
- * (ROLL-BACK), so the cache is left alone and the ApiError reaches the page.
+ * On success the shown detail becomes the replaced one, and the summary pages
+ * of the authorization's account are marked stale, so CPVS reads that account
+ * again after the write, as PF3 back to COPAUS0C does. Other accounts'
+ * summaries are left alone, since the write touched only this account's
+ * records. On failure the server has rolled both writes back (ROLL-BACK), so
+ * the cache is left alone and the ApiError reaches the page.
  */
 export function useFraudToggleMutation(
   authId: string,
@@ -139,6 +158,7 @@ export function useFraudToggleMutation(
       const shown = queryClient.getQueryData<AuthDetail>(detailKey);
       const summaries = queryClient.invalidateQueries({
         queryKey: authorizationKeys.summaries(),
+        predicate: (query) => isSummaryOf(query, data.detail.account_id),
       });
       if (shown === undefined) {
         // No detail to keep a PF8 neighbour from: read it afresh.

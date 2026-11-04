@@ -12,6 +12,12 @@
 //! `docs/parity/parity-oracle-audit.md`. Every case names the audit rows it
 //! proves in a string literal, which the coverage gates read.
 //!
+//! A seeded balance or card is never copied into a case: it is decoded from
+//! `acctdata.txt` and `cardxref.txt` at the reviewed section A offsets
+//! ([`fixture_records`]), and the amount and balance a payment of it gives
+//! follow from the audited `MOVE` and `COMPUTE` (P-COBIL00C-021,
+//! P-COBIL00C-022). Balances a setup statement gives an account stay literal.
+//!
 //! Failures no request can provoke are injected with SQL through the stack:
 //! triggers that fail or skip one of the two writes (E-19), and renames that
 //! make one of the three reads fail. Each fault is removed before the next
@@ -32,7 +38,7 @@ use reqwest::StatusCode;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
 
-use common::{Resp, TestApp, assert_error};
+use common::{Resp, TestApp, assert_error, fixture_records};
 
 /// The processing clock, the source of the payment timestamps.
 const CLOCK: &str = "2022-07-01T12:00:00Z";
@@ -343,6 +349,26 @@ const REFUSALS: [Refusal; 19] = [
     },
 ];
 
+/// The `ACCT-CURR-BAL` an account holds when a case reads it.
+#[derive(Debug, Clone, Copy)]
+enum Balance {
+    /// The balance of its `acctdata.txt` record, as seeded.
+    Seeded,
+    /// The decimal string a setup statement gives it.
+    Set(&'static str),
+}
+
+impl Balance {
+    /// The balance of the account `account_id` as the response's decimal
+    /// string, a [`Balance::Seeded`] one decoded through `parity`.
+    fn of(self, parity: &Document, account_id: &str) -> String {
+        match self {
+            Self::Seeded => seeded_balance(parity, account_id),
+            Self::Set(balance) => balance.to_owned(),
+        }
+    }
+}
+
 /// A blank confirmation on an account with a positive balance: 200 with the
 /// balance and `Confirm to make a bill payment...`, no TRAN-ID, no write.
 struct Prompt {
@@ -352,41 +378,42 @@ struct Prompt {
     account_id: &'static str,
     /// `confirm` of the body; `None` leaves the field out.
     confirm: Option<&'static str>,
-    /// `ACCT-CURR-BAL` as the response's decimal string.
-    balance: &'static str,
+    /// `ACCT-CURR-BAL`, which the response carries as its decimal string.
+    balance: Balance,
 }
 
-/// The prompts, after [`REFUSAL_SETUP`]; balances from `acctdata.txt`.
+/// The prompts, after [`REFUSAL_SETUP`], which sets account 7's balance and
+/// leaves the seeded balances of accounts 1 and 6.
 const PROMPTS: [Prompt; 5] = [
     Prompt {
         rows: "V-COBIL00C-008, P-COBIL00C-007",
         account_id: "00000000001",
         confirm: Some(""),
-        balance: "194.00",
+        balance: Balance::Seeded,
     },
     Prompt {
         rows: "V-COBIL00C-008, P-COBIL00C-007: a missing confirmation is blank",
         account_id: "00000000001",
         confirm: None,
-        balance: "194.00",
+        balance: Balance::Seeded,
     },
     Prompt {
         rows: "V-COBIL00C-008, P-COBIL00C-007: LOW-VALUES are blank",
         account_id: "00000000001",
         confirm: Some("\u{0}"),
-        balance: "194.00",
+        balance: Balance::Seeded,
     },
     Prompt {
         rows: "V-COBIL00C-008, P-COBIL00C-020: one cent is more than zero",
         account_id: "00000000007",
         confirm: Some(" "),
-        balance: "0.01",
+        balance: Balance::Set("0.01"),
     },
     Prompt {
         rows: "V-COBIL00C-008, P-COBIL00C-011: only a confirmed payment reads the cross-reference",
         account_id: "00000000006",
         confirm: Some(""),
-        balance: "218.00",
+        balance: Balance::Seeded,
     },
 ];
 
@@ -407,16 +434,37 @@ struct WriteFault {
     /// The audited message, the last one the program set.
     message: &'static str,
     /// `acct_curr_bal` afterwards.
-    balance: &'static str,
-    /// The payment row that persists, as TRAN-ID, amount and card number;
-    /// `None` when the transaction write failed.
-    persisted: Option<(&'static str, &'static str, &'static str)>,
+    balance: After,
+    /// The TRAN-ID of the payment row that persists, which holds the
+    /// account's [`Payment::record`]; `None` when the transaction write
+    /// failed.
+    persisted: Option<&'static str>,
 }
 
-/// The E-19 cases in run order, after [`LIVE_ROW`]. A failed `WRITE` still
-/// reduces and rewrites the balance; a failed `REWRITE` keeps the written
-/// transaction; both files are `RECOVERY(NONE)` [app/csd/CARDDEMO.CSD:L1-96].
-/// A TRAN-ID whose insert failed is allocated again by the next case.
+/// The `acct_curr_bal` of a paid account after its payment's writes.
+#[derive(Debug, Clone, Copy)]
+enum After {
+    /// The `REWRITE` succeeded: [`Payment::after`].
+    Paid,
+    /// The `REWRITE` failed: [`Payment::balance`], as seeded.
+    Unchanged,
+}
+
+impl After {
+    /// The balance `payment` leaves.
+    fn of(self, payment: &Payment) -> &str {
+        match self {
+            Self::Paid => &payment.after,
+            Self::Unchanged => &payment.balance,
+        }
+    }
+}
+
+/// The E-19 cases in run order, after [`LIVE_ROW`], each paying a seeded
+/// balance ([`Payment::of`]). A failed `WRITE` still reduces and rewrites the
+/// balance; a failed `REWRITE` keeps the written transaction; both files are
+/// `RECOVERY(NONE)` [app/csd/CARDDEMO.CSD:L1-96]. A TRAN-ID whose insert
+/// failed is allocated again by the next case.
 const WRITE_FAULTS: [WriteFault; 5] = [
     WriteFault {
         rows: "V-COBIL00C-014, P-COBIL00C-017, P-COBIL00C-018, P-COBIL00C-024",
@@ -426,7 +474,7 @@ const WRITE_FAULTS: [WriteFault; 5] = [
         status: StatusCode::CONFLICT,
         code: ErrorKind::Duplicate.code(),
         message: messages::TRAN_ID_ALREADY_EXIST,
-        balance: "0.00",
+        balance: After::Paid,
         persisted: None,
     },
     WriteFault {
@@ -437,7 +485,7 @@ const WRITE_FAULTS: [WriteFault; 5] = [
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: ErrorKind::Unexpected.code(),
         message: messages::UNABLE_TO_ADD_BILL_PAY_TRANSACTION,
-        balance: "0.00",
+        balance: After::Paid,
         persisted: None,
     },
     WriteFault {
@@ -448,8 +496,8 @@ const WRITE_FAULTS: [WriteFault; 5] = [
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: ErrorKind::Unexpected.code(),
         message: messages::UNABLE_TO_UPDATE_ACCOUNT,
-        balance: "605.00",
-        persisted: Some(("0000000000000301", "605.00", "8931369351894783")),
+        balance: After::Unchanged,
+        persisted: Some("0000000000000301"),
     },
     WriteFault {
         rows: "V-COBIL00C-016, P-COBIL00C-016, P-COBIL00C-019, P-COBIL00C-024",
@@ -459,8 +507,8 @@ const WRITE_FAULTS: [WriteFault; 5] = [
         status: StatusCode::NOT_FOUND,
         code: ErrorKind::NotFound.code(),
         message: messages::ACCOUNT_ID_NOT_FOUND,
-        balance: "560.00",
-        persisted: Some(("0000000000000302", "560.00", "9501733721429893")),
+        balance: After::Unchanged,
+        persisted: Some("0000000000000302"),
     },
     // `SEND-BILLPAY-SCREEN` does not end the task, so the rewrite's message
     // replaces the write's, and neither write persists.
@@ -472,7 +520,7 @@ const WRITE_FAULTS: [WriteFault; 5] = [
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: ErrorKind::Unexpected.code(),
         message: messages::UNABLE_TO_UPDATE_ACCOUNT,
-        balance: "159.00",
+        balance: After::Unchanged,
         persisted: None,
     },
 ];
@@ -581,13 +629,13 @@ fn assert_refused(
 }
 
 /// Asserts that `resp` is the 200 confirmation prompt `expected`: exactly the
-/// account, its balance and `Confirm to make a bill payment...`, with no
-/// TRAN-ID.
-fn assert_prompt(resp: &Resp, expected: &Prompt) {
+/// account, its balance, a seeded one decoded through `parity`, and
+/// `Confirm to make a bill payment...`, with no TRAN-ID.
+fn assert_prompt(resp: &Resp, expected: &Prompt, parity: &Document) {
     let (status, body, raw) = resp;
     let prompt = json!({
         "account_id": expected.account_id,
-        "current_balance": expected.balance,
+        "current_balance": expected.balance.of(parity, expected.account_id),
         "message": messages::CONFIRM_TO_MAKE_A_BILL_PAYMENT,
     });
     assert_eq!(
@@ -656,10 +704,103 @@ fn set_balance(balances: &mut [Vec<Option<String>>], account_id: &str, balance: 
     row[1] = Some(balance.to_owned());
 }
 
+/// The reviewed section D row of account 1's seeded state.
+const ACCOUNT_ONE_SEED: &str = "P-CVACT01Y-015";
+
+/// The magnitude from which `MOVE ACCT-CURR-BAL TO TRAN-AMT` drops high-order
+/// digits: 1,000,000,000.00, the first balance whose integer part exceeds the
+/// nine digits of `TRAN-AMT S9(09)V99` (P-COBIL00C-021).
+const TRAN_AMT_OVERFLOW: i64 = 1_000_000_000;
+
+/// `ACCT-CURR-BAL` of the account `account_id` as seeded: the `acct_curr_bal`
+/// of its `acctdata.txt` record, decoded at the reviewed `CVACT01Y` offsets.
+fn seeded_balance(parity: &Document, account_id: &str) -> String {
+    fixture_records::account(parity, account_id)
+        .value("acct_curr_bal")
+        .to_owned()
+}
+
+/// `XREF-CARD-NUM` of the account `account_id` as seeded, which
+/// `READ-CXACAIX-FILE` reads by `XREF-ACCT-ID` (P-COBIL00C-011): the card of
+/// its one `cardxref.txt` record, decoded at the reviewed `CVACT03Y` offsets
+/// (P-CVACT03Y-001, P-CVACT03Y-003, P-CVACT03Y-006).
+fn seeded_card(parity: &Document, account_id: &str) -> String {
+    fixture_records::account_xref(parity, account_id)
+        .value("xref_card_num")
+        .to_owned()
+}
+
+/// The confirmed payment of a seeded balance, as the audited rules give it.
+struct Payment {
+    /// `ACCT-CURR-BAL` as seeded ([`seeded_balance`]).
+    balance: String,
+    /// `TRAN-AMT`, the balance moved to `S9(09)V99` (P-COBIL00C-021).
+    amount: String,
+    /// `ACCT-CURR-BAL - TRAN-AMT`, what the `REWRITE` stores (P-COBIL00C-022).
+    after: String,
+    /// The card of the payment record, the account's `XREF-CARD-NUM`
+    /// ([`seeded_card`], P-COBIL00C-015).
+    card: String,
+}
+
+impl Payment {
+    /// The payment of the seeded balance of the account `account_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the seeded balance is no decimal, is not above zero, which
+    /// the guard of P-COBIL00C-020 refuses, or reaches [`TRAN_AMT_OVERFLOW`],
+    /// which the `MOVE` of P-COBIL00C-021 truncates; and as
+    /// [`fixture_records::account`] and [`fixture_records::account_xref`] do.
+    fn of(parity: &Document, account_id: &str) -> Self {
+        let balance = seeded_balance(parity, account_id);
+        let seeded = Decimal::from_str(&balance).unwrap_or_else(|error| {
+            panic!("account {account_id}: the seeded balance {balance:?} is no decimal: {error}")
+        });
+        assert!(
+            seeded > Decimal::ZERO,
+            "P-COBIL00C-020: account {account_id} has its seeded {balance} to pay"
+        );
+        assert!(
+            seeded < Decimal::from(TRAN_AMT_OVERFLOW),
+            "P-COBIL00C-021: the seeded {balance} of account {account_id} fits TRAN-AMT whole"
+        );
+        // Below the overflow, the `MOVE` keeps every digit of the balance.
+        let amount = seeded;
+        Self {
+            amount: amount.to_string(),
+            after: (seeded - amount).to_string(),
+            card: seeded_card(parity, account_id),
+            balance,
+        }
+    }
+
+    /// The payment record under `tran_id`, as [`ADDED_ROWS`] reads it.
+    fn record(&self, tran_id: &str) -> Vec<Option<String>> {
+        payment_row(tran_id, &self.amount, &self.card)
+    }
+}
+
+/// Asserts that the reviewed section D row of account 1's seeded state
+/// (P-CVACT01Y-015) records the account `account_id` with `balance`, the
+/// balance decoded from its fixture record: the payment derived from the
+/// fixture is the payment of the reviewed state.
+fn assert_reviewed_seed(parity: &Document, account_id: &str, balance: &str) {
+    assert_eq!(
+        (
+            fixture_records::section_d_value(parity, ACCOUNT_ONE_SEED, "value"),
+            fixture_records::section_d_value(parity, ACCOUNT_ONE_SEED, "acct_curr_bal"),
+        ),
+        (account_id.to_owned(), balance.to_owned()),
+        "P-CVACT01Y-015: the reviewed seeded state of account {account_id}"
+    );
+}
+
 /// `PROCESS-ENTER-KEY` up to the TRAN-ID allocation: every entry edit, read
 /// refusal and confirmation prompt answers as audited, and none writes.
 #[test]
 fn entry_edits_refusals_and_prompts_write_nothing() {
+    let parity = common::parity_audit();
     let app = TestApp::start_with_clock(CLOCK);
     carddemo_testkit::block_on(async {
         app.stack().exec_sql(REFUSAL_SETUP).await;
@@ -680,7 +821,7 @@ fn entry_edits_refusals_and_prompts_write_nothing() {
         for prompt in &PROMPTS {
             let body = request(Some(prompt.account_id), prompt.confirm);
             let resp = app.post(PAYMENTS, Some(&token), &body).await;
-            assert_prompt(&resp, prompt);
+            assert_prompt(&resp, prompt, &parity);
         }
         assert_eq!(
             written(&app).await,
@@ -692,9 +833,15 @@ fn entry_edits_refusals_and_prompts_write_nothing() {
 
 /// A confirmed payment writes the bill-payment transaction for the whole
 /// balance, moved to `TRAN-AMT` with high-order truncation, and rewrites the
-/// balance reduced by it; the paid account then has nothing to pay.
+/// balance reduced by it; the paid account then has nothing to pay. Account
+/// 1 pays its seeded balance, the one P-CVACT01Y-015 records; account 3 pays
+/// the oversized balance [`OVERSIZED_BALANCE`] sets, on its seeded card.
 #[test]
 fn a_confirmed_payment_pays_the_whole_balance() {
+    let parity = common::parity_audit();
+    let payment = Payment::of(&parity, "00000000001");
+    assert_reviewed_seed(&parity, "00000000001", &payment.balance);
+    let oversized_card = seeded_card(&parity, "00000000003");
     let app = TestApp::start_with_clock(CLOCK);
     carddemo_testkit::block_on(async {
         let stack = app.stack();
@@ -706,9 +853,16 @@ fn a_confirmed_payment_pays_the_whole_balance() {
 
         let body = request(Some("00000000001"), Some("Y"));
         let paid = app.post(PAYMENTS, Some(&token), &body).await;
-        let rows = "P-COBIL00C-012, P-COBIL00C-016, P-COBIL00C-022: highest key + 1, 194.00 paid";
-        assert_paid(&paid, rows, "00000000001", "0.00", "0000000000000301");
-        let first = payment_row("0000000000000301", "194.00", "9680294154603697");
+        let rows =
+            "P-COBIL00C-012, P-COBIL00C-016, P-COBIL00C-022: highest key + 1, whole balance paid";
+        assert_paid(
+            &paid,
+            rows,
+            "00000000001",
+            &payment.after,
+            "0000000000000301",
+        );
+        let first = payment.record("0000000000000301");
         assert_eq!(
             stack.fetch_text_rows(ADDED_ROWS).await,
             [first.clone()],
@@ -738,14 +892,14 @@ fn a_confirmed_payment_pays_the_whole_balance() {
             "1000000000.00",
             "0000000000000302",
         );
-        let second = payment_row("0000000000000302", "234567890.12", "3999169246375885");
+        let second = payment_row("0000000000000302", "234567890.12", &oversized_card);
         assert_eq!(
             stack.fetch_text_rows(ADDED_ROWS).await,
             [first, second],
             "P-COBIL00C-015, P-COBIL00C-021: the payment records"
         );
 
-        set_balance(&mut balances, "00000000001", "0.00");
+        set_balance(&mut balances, "00000000001", &payment.after);
         set_balance(&mut balances, "00000000003", "1000000000.00");
         assert_eq!(
             stack.fetch_text_rows(BALANCES).await,
@@ -774,6 +928,7 @@ fn a_confirmed_payment_pays_the_whole_balance() {
 /// fails, and the answer is the last message the program set.
 #[test]
 fn a_failed_write_keeps_the_other_write() {
+    let parity = common::parity_audit();
     let app = TestApp::start_with_clock(CLOCK);
     carddemo_testkit::block_on(async {
         let stack = app.stack();
@@ -783,6 +938,7 @@ fn a_failed_write_keeps_the_other_write() {
         let mut persisted = Vec::new();
         let token = app.user_token().await;
         for case in &WRITE_FAULTS {
+            let payment = Payment::of(&parity, case.account_id);
             for fault in case.faults {
                 stack.exec_sql(fault).await;
             }
@@ -799,15 +955,15 @@ fn a_failed_write_keeps_the_other_write() {
                 case.message,
                 ACTIDIN,
             );
-            set_balance(&mut balances, case.account_id, case.balance);
+            set_balance(&mut balances, case.account_id, case.balance.of(&payment));
             assert_eq!(
                 stack.fetch_text_rows(BALANCES).await,
                 balances,
                 "{}: the balances",
                 case.rows
             );
-            if let Some((tran_id, amount, card)) = case.persisted {
-                persisted.push(payment_row(tran_id, amount, card));
+            if let Some(tran_id) = case.persisted {
+                persisted.push(payment.record(tran_id));
             }
             assert_eq!(
                 stack.fetch_text_rows(ADDED_ROWS).await,
@@ -831,6 +987,7 @@ fn a_failed_write_keeps_the_other_write() {
 /// same payment goes through.
 #[test]
 fn a_failed_read_writes_nothing() {
+    let payment = Payment::of(&common::parity_audit(), "00000000001");
     let app = TestApp::start_with_clock(CLOCK);
     carddemo_testkit::block_on(async {
         let stack = app.stack();
@@ -859,7 +1016,13 @@ fn a_failed_read_writes_nothing() {
         let body = request(Some("00000000001"), Some("Y"));
         let paid = app.post(PAYMENTS, Some(&token), &body).await;
         let rows = "P-COBIL00C-012, P-COBIL00C-016: the restored relations serve the payment";
-        assert_paid(&paid, rows, "00000000001", "0.00", "0000000000000301");
+        assert_paid(
+            &paid,
+            rows,
+            "00000000001",
+            &payment.after,
+            "0000000000000301",
+        );
     });
 }
 
@@ -1051,7 +1214,7 @@ fn cb00_screen_mechanics_answer_through_the_one_post() {
         stack.exec_sql(MECHANICS_SETUP).await;
         let token = app.user_token().await;
         let before = written(&app).await;
-        preselected_account(&app, &token, &examples).await;
+        preselected_account(&app, &token, &doc, &examples).await;
         received_map_and_keys(&app, &token).await;
         without_a_session(&app).await;
         assert_eq!(
@@ -1059,7 +1222,7 @@ fn cb00_screen_mechanics_answer_through_the_one_post() {
             before,
             "P-COBIL00C-001, P-COBIL00C-002, P-COBIL00C-027, P-COBIL00C-028: nothing written"
         );
-        initialized_form(&app, &token).await;
+        initialized_form(&app, &token, &doc).await;
     });
 }
 
@@ -1067,10 +1230,20 @@ fn cb00_screen_mechanics_answer_through_the_one_post() {
 /// `ACTIDINI` and runs `PROCESS-ENTER-KEY` with `CONFIRMI` still
 /// `LOW-VALUES`, so the body holding the account alone answers the prompt,
 /// with the balance the `GET /accounts/{id}` preview shows, or the
-/// nothing-to-pay refusal. P-COBIL00C-023: the prompt carries `ACCT-CURR-BAL`
-/// exactly, and `WS-CURR-BAL` edits it to the audited screen text.
-async fn preselected_account(app: &TestApp, token: &str, examples: &[(Decimal, String)]) {
-    for (account_id, balance) in [("00000000001", "194.00"), ("00000000003", "1940.00")] {
+/// nothing-to-pay refusal: account 1 at its seeded balance, decoded through
+/// `parity`, and account 3 at the balance [`MECHANICS_SETUP`] sets.
+/// P-COBIL00C-023: the prompt carries `ACCT-CURR-BAL` exactly, and
+/// `WS-CURR-BAL` edits it to the audited screen text.
+async fn preselected_account(
+    app: &TestApp,
+    token: &str,
+    parity: &Document,
+    examples: &[(Decimal, String)],
+) {
+    for (account_id, balance) in [
+        ("00000000001", Balance::Seeded),
+        ("00000000003", Balance::Set("1940.00")),
+    ] {
         let resp = app
             .post(PAYMENTS, Some(token), &request(Some(account_id), None))
             .await;
@@ -1080,7 +1253,7 @@ async fn preselected_account(app: &TestApp, token: &str, examples: &[(Decimal, S
             confirm: None,
             balance,
         };
-        assert_prompt(&resp, &prompt);
+        assert_prompt(&resp, &prompt, parity);
         let view = app
             .get(&format!("/accounts/{account_id}"), Some(token))
             .await;
@@ -1177,9 +1350,10 @@ async fn without_a_session(app: &TestApp) {
 /// on `ACTIDIN`. On `N` (`CLEAR-CURRENT-SCREEN`) the answer sets no message
 /// and reads no account; after the payment's write it runs before the success
 /// text is built, so the 201 message holds that text alone, not the prompt the
-/// same account answered before. P-COBIL00C-029: the payment carries no
-/// header field.
-async fn initialized_form(app: &TestApp, token: &str) {
+/// same account answered before; it pays account 1's seeded balance, decoded
+/// through `parity`. P-COBIL00C-029: the payment carries no header field.
+async fn initialized_form(app: &TestApp, token: &str, parity: &Document) {
+    let payment = Payment::of(parity, "00000000001");
     for account_id in ["00000000001", "99999999999"] {
         let resp = app
             .post(PAYMENTS, Some(token), &request(Some(account_id), Some("N")))
@@ -1207,7 +1381,7 @@ async fn initialized_form(app: &TestApp, token: &str) {
         &paid,
         "P-COBIL00C-031: the success text alone",
         "00000000001",
-        "0.00",
+        &payment.after,
         "0000000000000301",
     );
     assert_eq!(

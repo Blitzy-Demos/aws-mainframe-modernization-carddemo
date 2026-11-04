@@ -14,7 +14,7 @@
 // shadcn/ui has no heading component, so the title is a semantic h1 styled with
 // Tailwind type-scale utilities. Pages render no other h1.
 import { Fragment, type JSX, type ReactNode } from "react";
-import { Link, useMatches } from "react-router";
+import { Link, useMatches, type UIMatch } from "react-router";
 
 import {
   Breadcrumb,
@@ -77,18 +77,35 @@ function rendersContent(node: ReactNode): boolean {
   return node !== undefined && node !== null && typeof node !== "boolean";
 }
 
+// The breadcrumb trail of the matched routes: every match whose handle is a
+// RouteHandle, outermost first, so the last crumb is the page itself.
+function routeCrumbs(matches: readonly UIMatch[]): Crumb[] {
+  return matches.flatMap((match): Crumb[] =>
+    isRouteHandle(match.handle)
+      ? [{ id: match.id, pathname: match.pathname, handle: match.handle }]
+      : [],
+  );
+}
+
+/**
+ * The heading the matched routes give the current page: the last RouteHandle's
+ * `title`, else its `crumb`; undefined when no matched route has a handle.
+ * PageHeader renders it as the h1 unless its `title` prop overrides it, and
+ * the app shell announces it on every route change.
+ */
+export function usePageTitle(): string | undefined {
+  const leaf = routeCrumbs(useMatches()).at(-1)?.handle;
+  return leaf?.title ?? leaf?.crumb;
+}
+
 export function PageHeader({
   title,
   description,
   actions,
 }: PageHeaderProps): JSX.Element {
-  const crumbs = useMatches().flatMap((match): Crumb[] =>
-    isRouteHandle(match.handle)
-      ? [{ id: match.id, pathname: match.pathname, handle: match.handle }]
-      : [],
-  );
-  const leaf = crumbs.at(-1)?.handle;
-  const heading = title ?? leaf?.title ?? leaf?.crumb;
+  const crumbs = routeCrumbs(useMatches());
+  const pageTitle = usePageTitle();
+  const heading = title ?? pageTitle;
   const hasHeading = heading !== undefined && heading !== "";
   const hasDescription = description !== undefined && description !== "";
   const hasActions = rendersContent(actions);

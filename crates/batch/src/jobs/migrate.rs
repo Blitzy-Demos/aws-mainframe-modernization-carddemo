@@ -12,7 +12,8 @@
 //! The job is idempotent: on a migrated database every version is already recorded, nothing
 //! changes, and the job ends with exit 0 again.
 
-use carddemo_persistence::{Db, migrate};
+use carddemo_persistence::migrate;
+use carddemo_persistence::tx::Db;
 
 use super::{JobContext, setup_failure};
 use crate::exit::ExitStatus;

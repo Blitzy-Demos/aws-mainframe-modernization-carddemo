@@ -4,7 +4,9 @@
 // 2210-EDIT-ACCOUNT refuses without sending a request (V-COACTVWC-001,
 // V-COACTVWC-002); and a server rejection is shown as a toast, as the ACCTSID
 // field error and with the cursor on ACCTSID, as 1300-SETUP-SCREEN-ATTRS
-// places it [app/cbl/COACTVWC.cbl:L545-552].
+// places it [app/cbl/COACTVWC.cbl:L545-552]. The page's status region
+// announces each read, a repeated lookup included, by its account number and
+// never by a detail value, and is empty after a failed read.
 //
 // The API is the stubbed global the client calls for every request, so each
 // test sees the exact Request the page sent.
@@ -81,6 +83,10 @@ const XREF_NOT_FOUND =
 /** V-COACTVWC-002 as the server answers a key that reached it through the URL. */
 const ZERO_KEY = ACCOUNT_KEY_MESSAGES.accountFilterMustBeNonZero11Digit;
 
+/** The status region's texts while the account is read and once it is. */
+const ACCOUNT_LOADING = "Loading account";
+const ACCOUNT_LOADED = `Account ${account.account_id} loaded`;
+
 /** The global the API client sends each Request through. */
 type FetchFn = (input: Request, init?: RequestInit) => Promise<Response>;
 
@@ -145,6 +151,52 @@ function renderedDetails(): Record<string, string | null | undefined> {
   );
 }
 
+/** A promise and its resolver, so a test decides when an answer arrives. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+/** Holds the next answer back until the returned function sends it. */
+function holdNextAnswer(): (
+  status: number,
+  body: AccountResponse | ErrorBody,
+) => void {
+  const answer = deferred<Response>();
+  fetchMock.mockImplementationOnce(async () => answer.promise);
+  return (status, body) => {
+    answer.resolve(jsonResponse(status, body));
+  };
+}
+
+/** The page's status region, the one on the page. */
+function lookupStatus(): HTMLElement {
+  return screen.getByRole("status");
+}
+
+// The observers recordTexts started, disconnected after each test.
+const observers: MutationObserver[] = [];
+
+// Every text `region` takes from now on, in order, so the cleared state
+// between two announcements is seen although it lasts only the announcement
+// delay.
+function recordTexts(region: HTMLElement): string[] {
+  const texts: string[] = [];
+  const observer = new MutationObserver(() => {
+    texts.push(region.textContent ?? "");
+  });
+  observer.observe(region, {
+    childList: true,
+    characterData: true,
+    subtree: true,
+  });
+  observers.push(observer);
+  return texts;
+}
+
 beforeEach(() => {
   fetchMock = vi.fn<FetchFn>();
   respondWith(200, account);
@@ -152,6 +204,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  observers.splice(0).forEach((observer) => {
+    observer.disconnect();
+  });
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -310,4 +365,85 @@ describe("AccountViewPage", () => {
       expect(document.querySelector("dl")).toBeNull();
     },
   );
+
+  it("announces each read by its account, a repeated lookup included", async () => {
+    const user = userEvent.setup();
+    renderPage("/accounts");
+
+    // Present and empty before any lookup, so assistive technology tracks the
+    // region before it first changes.
+    const region = lookupStatus();
+    expect(region.textContent).toBe("");
+
+    await user.type(accountInput(), `${account.account_id}{Enter}`);
+
+    await waitFor(() => {
+      expect(region.textContent).toBe(ACCOUNT_LOADED);
+    });
+    // The same element throughout, naming the account and never a detail
+    // value such as the SSN, a balance or the card number.
+    expect(lookupStatus()).toBe(region);
+    for (const detail of [
+      account.cust_ssn,
+      "020-97-3888",
+      account.acct_curr_bal,
+      account.card_number,
+      account.cust_last_name,
+    ]) {
+      expect(region.textContent).not.toContain(detail);
+    }
+
+    // ENTER on the key on screen reads it again; its answer is held so that
+    // the progress is seen.
+    const release = holdNextAnswer();
+    const texts = recordTexts(region);
+    await user.click(screen.getByRole("button", { name: "Look up account" }));
+
+    await waitFor(() => {
+      expect(region.textContent).toBe(ACCOUNT_LOADING);
+    });
+    release(200, account);
+    await waitFor(() => {
+      expect(region.textContent).toBe(ACCOUNT_LOADED);
+    });
+    // Cleared before each text, so the unchanged result is announced again.
+    expect(texts).toEqual(["", ACCOUNT_LOADING, "", ACCOUNT_LOADED]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("empties the status region when a lookup after a found account fails, and its toast and field error report it", async () => {
+    const toastError = vi.spyOn(toast, "error");
+    const user = userEvent.setup();
+    const { router } = renderPage(`/accounts/${account.account_id}`);
+    const region = lookupStatus();
+    await waitFor(() => {
+      expect(region.textContent).toBe(ACCOUNT_LOADED);
+    });
+
+    // The rejection is held so that the lookup's progress is seen.
+    const release = holdNextAnswer();
+    const texts = recordTexts(region);
+    await user.clear(accountInput());
+    await user.type(accountInput(), "99999999999{Enter}");
+
+    await waitFor(() => {
+      expect(region.textContent).toBe(ACCOUNT_LOADING);
+    });
+    release(404, {
+      code: "NOT_FOUND",
+      message: XREF_NOT_FOUND,
+      fields: [{ field: "ACCTSID", message: XREF_NOT_FOUND }],
+    });
+
+    const fieldError = await screen.findByRole("alert");
+    expect(fieldError.textContent).toBe(XREF_NOT_FOUND);
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(toastError).toHaveBeenCalledWith(XREF_NOT_FOUND);
+    await waitFor(() => {
+      expect(region.textContent).toBe("");
+    });
+    expect(texts).toEqual(["", ACCOUNT_LOADING, ""]);
+    expect(router.state.location.pathname).toBe("/accounts/99999999999");
+    expect(document.querySelector("dl")).toBeNull();
+  });
 });

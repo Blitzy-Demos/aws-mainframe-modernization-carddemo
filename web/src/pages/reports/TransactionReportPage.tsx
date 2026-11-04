@@ -11,7 +11,15 @@
 // and answers with the audited text; the form schema only mirrors the edits
 // it can decide, so input it rejects is never sent. Accessible names are the
 // F-CORPT00 rows of docs/parity/function-map.md.
-import { useId, useState, type JSX, type ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type JSX,
+  type ReactNode,
+} from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import {
   Controller,
@@ -46,7 +54,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Skeleton } from "@/components/ui/skeleton";
-import { applyApiError, showSuccess } from "@/lib/api-errors";
+import { applyApiError, showApiError, showSuccess } from "@/lib/api-errors";
 import {
   reportRequestBmsFieldMap,
   reportRequestSchema,
@@ -149,6 +157,25 @@ export default function TransactionReportPage(): JSX.Element {
   // The last report produced. It stays shown after the form is cleared and
   // while a later request fails, and is replaced by the next report.
   const [report, setReport] = useState<TransactionReport | null>(null);
+  // The records as one text, joined once per report rather than on every
+  // render of the form above it: a report has no line cap.
+  const reportText = useMemo(() => report?.lines.join("\n") ?? "", [report]);
+
+  // Counts the user's edits of the entry: each radio choice and each change
+  // of a date text. The reset after a report fires no change event and is
+  // not counted. runReport compares it to tell whether the form still holds
+  // the entry it sent, since the inputs stay editable while a report runs.
+  const entryRevision = useRef(0);
+  useEffect(() => {
+    const subscription = form.watch((_values, { type }) => {
+      if (type === "change") {
+        entryRevision.current += 1;
+      }
+    });
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [form]);
 
   const askForConfirmation = (values: ReportRequestFormValues): void => {
     if (mutation.isPending) {
@@ -162,6 +189,11 @@ export default function TransactionReportPage(): JSX.Element {
     if (request === null) {
       return;
     }
+    // An answer that arrives after the entry was edited belongs to the entry
+    // sent, not to the one on the form: its report and message are still
+    // shown, but the newer entry is neither cleared, marked nor focused.
+    const sentRevision = entryRevision.current;
+    const ownsEntry = (): boolean => entryRevision.current === sentRevision;
     mutation.mutate(
       { ...request, confirm: CONFIRM_YES },
       {
@@ -171,13 +203,20 @@ export default function TransactionReportPage(): JSX.Element {
           // in green after INITIALIZE-ALL-FIELDS, the cursor on MONTHLY
           // [app/cbl/CORPT00C.cbl:L445-454].
           showSuccess(data.message);
+          if (!ownsEntry()) {
+            return;
+          }
           // keepFieldsRef keeps the registered elements, so setFocus finds
           // the MONTHLY item now rather than after the fields re-register.
           form.reset(DEFAULT_VALUES, { keepFieldsRef: true });
           form.setFocus("report_type");
         },
         onError: (error) => {
-          applyApiError(error, form, reportRequestBmsFieldMap);
+          if (ownsEntry()) {
+            applyApiError(error, form, reportRequestBmsFieldMap);
+          } else {
+            showApiError(error);
+          }
         },
       },
     );
@@ -324,7 +363,7 @@ export default function TransactionReportPage(): JSX.Element {
                 tabIndex={0}
                 className="overflow-x-auto font-mono text-sm whitespace-pre"
               >
-                {report.lines.join("\n")}
+                {reportText}
               </pre>
             </CardContent>
           </Card>

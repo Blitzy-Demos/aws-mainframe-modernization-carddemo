@@ -15,8 +15,8 @@
 //! [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L767-779].
 //!
 //! Each test starts its own stack and breaks it for good: a deleted reply
-//! queue, a dropped `accounts` table, a reply queue that never existed. What
-//! the tests observe:
+//! queue, a dropped `accounts` table, a reply queue that never existed, a
+//! requester on `RabbitMQ` direct reply-to. What the tests observe:
 //!
 //! - **Error record**: the body on `CARD.DEMO.ERROR`, compared field by field
 //!   with the record laid out from the audit's section A rows of
@@ -31,26 +31,31 @@
 //!   lose its channel instead.
 //! - **Never redelivered**: after a settle wait, no second error record has
 //!   arrived and exactly one message span exists per request.
+//! - **Logged**: each request rejected with an error record is one `ERROR`
+//!   event whose own fields name the request and hold the published
+//!   `MQ-ERR-DISPLAY` group, never the request body.
 //!
 //! Every expected text comes from `docs/parity/parity-oracle-audit.md`
 //! through [`audit_texts`] and [`audit_row`], never from the code under test.
 //! AMQP produces no MQ or CICS codes; the codes the records carry are the
 //! proposal of escalation E-39 in `docs/parity/escalations.md`.
 
-mod common;
+pub mod common;
 
 use std::ops::Range;
 use std::time::Duration;
 
-use carddemo_audit::Citation;
 use carddemo_domain::numeric::ids::AccountId;
 use carddemo_domain::numeric::{Alnum, NumericCode, NumericError};
 use carddemo_domain::ports::{AuthorizationStore, Browse, Direction, PortError};
 use carddemo_messaging::error_queue::ERROR_QUEUE;
 use carddemo_messaging::flows::{cdra, cdrd};
 use carddemo_testkit::{block_on, fixtures};
+use common::audit_tables::{Citation, citations};
 use common::{Harness, audit_row, audit_texts};
-use lapin::options::QueueDeleteOptions;
+use futures_util::{FutureExt, StreamExt};
+use lapin::options::{BasicConsumeOptions, QueueDeleteOptions};
+use lapin::types::FieldTable;
 
 /// How long an error record, a reply or a log line may take to appear.
 const ARRIVAL: Duration = Duration::from_secs(30);
@@ -146,6 +151,12 @@ const CCPAUERY: &str = "app/app-authorization-ims-db2-mq/cpy/CCPAUERY.cpy";
 /// names it, since touching a missing queue closes the channel.
 const MISSING_REPLY_QUEUE: &str = "CARD.DEMO.NO.SUCH.REPLY";
 
+/// The `RabbitMQ` direct reply-to pseudo-queue: a requester consumes it with
+/// `no_ack` and names it as the `reply_to` of a request published on the
+/// same channel, and the broker rewrites that `reply_to` to
+/// `amq.rabbitmq.reply-to.<token>`.
+const DIRECT_REPLY_TO: &str = "amq.rabbitmq.reply-to";
+
 /// Account `00000000001` and its fixture card
 /// [app/data/ASCII/cardxref.txt:L49].
 const ACCOUNT_1: &str = "00000000001";
@@ -170,6 +181,10 @@ const REJECTED_WITH_RECORD: [&str; 3] = [
     "\"location\":\"none\"",
 ];
 
+/// The message of the `ERROR` event of a request rejected once its error
+/// record was published and confirmed.
+const REJECTED_EVENT: &str = "request rejected: MQ-ERR-DISPLAY published to the error queue";
+
 /// The requests of the tests, each with its own `message_id`.
 const CDRD_RETURNED: &str = "ACK-CDRD-RETURNED-1";
 const CDRD_AFTER: &str = "ACK-CDRD-RETURNED-2";
@@ -178,6 +193,17 @@ const CDRA_READ_ERROR_AGAIN: &str = "ACK-CDRA-READ-ERROR-2";
 const CDRA_RETURNED: &str = "ACK-CDRA-RETURNED-3";
 const CP00_RETURNED: &str = "ACK-CP00-M004-1";
 const CP00_ANSWERED: &str = "ACK-CP00-ANSWERED-2";
+const CP00_DIRECT_REPLY_TO: &str = "ACK-CP00-DIRECT-REPLY-TO-3";
+
+/// The message span of a CP00 request rejected after its logged `M004`.
+/// `error_record` names the fate of an MQ-ERR-DISPLAY record, which only CDRD
+/// and CDRA put; CP00 has no error queue, so its span records `none`, and the
+/// logged CCPAUERY record shows as its `location`.
+const CP00_REJECTED_M004: [&str; 3] = [
+    "\"outcome\":\"rejected\"",
+    "\"error_record\":\"none\"",
+    "\"location\":\"M004\"",
+];
 
 /// Asserts that each audit row `ids` names is a data row of the audit, so the
 /// IDs the tests cite stay in step with it.
@@ -300,7 +326,7 @@ fn layout_field(id: &'static str) -> ErrDisplayField {
 /// The COBOL line the Paragraph cell of the section A row `id` cites as
 /// `[<path>:L<n>]`.
 fn cited_line(id: &str, paragraph: &str) -> String {
-    let cited = carddemo_audit::citations(paragraph);
+    let cited = citations(paragraph);
     let [Citation { path, start, end }] = cited.as_slice() else {
         panic!("audit row {id} cites {cited:?}, not one COBOL line");
     };
@@ -538,6 +564,98 @@ fn assert_never_replied(h: &Harness, flow: &str) {
     assert!(replied.is_empty(), "{flow} replied: {replied:#?}");
 }
 
+/// The `fields` object of the JSON log event `line`: the event's own fields,
+/// without those of the spans it was logged in, which the formatter writes
+/// after it, from `target` on.
+fn event_fields(line: &str) -> &str {
+    line.split_once("\"fields\":{")
+        .and_then(|(_, rest)| rest.split_once("},\"target\":"))
+        .map_or_else(
+            || panic!("not a JSON log event: {line}"),
+            |(fields, _)| fields,
+        )
+}
+
+/// Asserts that `flow` logged one `ERROR` event for the request `message_id`
+/// rejected once its record was published, whose own fields name the
+/// request's IDs and the error queue and hold the `MQ-ERR-DISPLAY` group of
+/// `expected`, and that `body`, the request body, appears nowhere in its line
+/// but inside that group.
+async fn assert_rejection_logged(
+    h: &Harness,
+    flow: &str,
+    expected: &ExpectedRecord,
+    message_id: &str,
+    correlation_id: &str,
+    body: &str,
+) {
+    let id_field = format!("\"message_id\":\"{message_id}\"");
+    let line = h
+        .wait_for_log(&["\"level\":\"ERROR\"", REJECTED_EVENT, &id_field], ARRIVAL)
+        .await;
+    let display = format!(
+        "\"mq_err_display\":\"{}\"",
+        String::from_utf8_lossy(&expected.bytes[..ERR_DISPLAY_LEN])
+    );
+    let fields = event_fields(&line);
+    for field in [
+        format!("\"flow\":\"{flow}\""),
+        id_field.clone(),
+        format!("\"correlation_id\":\"{correlation_id}\""),
+        format!("\"queue\":\"{ERROR_QUEUE}\""),
+        display.clone(),
+    ] {
+        assert!(
+            fields.contains(&field),
+            "the rejection event of {message_id} lacks {field}: {line}"
+        );
+    }
+    assert!(
+        !line.replace(&display, "").contains(body),
+        "the rejection event of {message_id} carries its body: {line}"
+    );
+    let events = h
+        .logs()
+        .into_iter()
+        .filter(|line| line.contains(REJECTED_EVENT) && line.contains(&id_field))
+        .count();
+    assert_eq!(events, 1, "rejection events of {message_id}");
+}
+
+/// Asserts that `flow` logged the `reply not confirmed` warning of the
+/// request `message_id`, whose reply was returned, and that the warning's own
+/// fields name the request by its IDs.
+async fn assert_reply_not_confirmed(
+    h: &Harness,
+    flow: &str,
+    message_id: &str,
+    correlation_id: &str,
+) {
+    let id_field = format!("\"message_id\":\"{message_id}\"");
+    let line = h
+        .wait_for_log(
+            &[
+                "\"level\":\"WARN\"",
+                "\"message\":\"reply not confirmed\"",
+                &id_field,
+            ],
+            ARRIVAL,
+        )
+        .await;
+    let fields = event_fields(&line);
+    for field in [
+        format!("\"flow\":\"{flow}\""),
+        id_field.clone(),
+        format!("\"correlation_id\":\"{correlation_id}\""),
+        "\"failure\":\"returned unroutable\"".to_owned(),
+    ] {
+        assert!(
+            fields.contains(&field),
+            "the reply-not-confirmed warning of {message_id} lacks {field}: {line}"
+        );
+    }
+}
+
 /// The request queue the settings name for `queue`, which must be the local
 /// default `expected`.
 fn request_queue(queue: &str, expected: &str) -> String {
@@ -649,6 +767,14 @@ fn cdrd_returned_reply_publishes_error_record_and_rejects() {
         for message_id in [CDRD_RETURNED, CDRD_AFTER] {
             assert_single_span(&h, "CDRD", message_id, &REJECTED_WITH_RECORD).await;
         }
+        for (message_id, correlation_id) in [
+            (CDRD_RETURNED, "ACK-CDRD-CORREL-1"),
+            (CDRD_AFTER, "ACK-CDRD-CORREL-2"),
+        ] {
+            assert_reply_not_confirmed(&h, "CDRD", message_id, correlation_id).await;
+            assert_rejection_logged(&h, "CDRD", &expected, message_id, correlation_id, "DATE")
+                .await;
+        }
         assert_never_replied(&h, "CDRD");
         h.shutdown().await;
     });
@@ -754,6 +880,12 @@ async fn cdra_read_errors(h: &Harness, queue: &str) {
     for message_id in [CDRA_READ_ERROR, CDRA_READ_ERROR_AGAIN] {
         assert_single_span(h, "CDRA", message_id, &REJECTED_WITH_RECORD).await;
     }
+    for (message_id, correlation_id) in [
+        (CDRA_READ_ERROR, "ACK-CDRA-CORREL-1"),
+        (CDRA_READ_ERROR_AGAIN, "ACK-CDRA-CORREL-2"),
+    ] {
+        assert_rejection_logged(h, "CDRA", &expected, message_id, correlation_id, &inquiry).await;
+    }
 }
 
 /// A request that reads no account, here an unknown function, reaches
@@ -780,6 +912,16 @@ async fn cdra_returned_reply(h: &Harness, queue: &str) {
         "{CDRA_RETURNED} left on {queue}"
     );
     assert_single_span(h, "CDRA", CDRA_RETURNED, &REJECTED_WITH_RECORD).await;
+    assert_reply_not_confirmed(h, "CDRA", CDRA_RETURNED, "ACK-CDRA-CORREL-3").await;
+    assert_rejection_logged(
+        h,
+        "CDRA",
+        &expected,
+        CDRA_RETURNED,
+        "ACK-CDRA-CORREL-3",
+        &request,
+    )
+    .await;
 }
 
 /// CDRA: an account read that fails with anything but `NOTFND` gets no reply.
@@ -856,10 +998,12 @@ fn account_1_request(approved: &str) -> String {
 }
 
 /// COPAUA0C 7100-SEND-RESPONSE: waits for the `M004` record of the request
-/// [`CP00_RETURNED`] and asserts its `CCPAUERY` fields: critical, MQ
-/// subsystem, the `FAILED TO PUT ON REPLY MQ` message, application `CP00`,
-/// program `COPAUA0C` [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L767-777].
-async fn assert_m004_logged(h: &Harness) {
+/// `message_id` and asserts its `CCPAUERY` fields: critical, MQ subsystem,
+/// the `FAILED TO PUT ON REPLY MQ` message, application `CP00`, program
+/// `COPAUA0C` [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L767-777].
+/// The record's own fields name the request by `message_id` and
+/// `correlation_id`, outside its message span.
+async fn assert_m004_logged(h: &Harness, message_id: &str, correlation_id: &str) {
     assert!(
         audit_row("P-COPAUA0C-012").contains("M004 critical"),
         "P-COPAUA0C-012 no longer records the critical M004 record"
@@ -870,7 +1014,7 @@ async fn assert_m004_logged(h: &Harness) {
     );
     let [message] = texts::<1>("P-COPAUA0C-012");
     let message_field = format!("\"err_message\":\"{message}\"");
-    let id_field = format!("\"message_id\":\"{CP00_RETURNED}\"");
+    let id_field = format!("\"message_id\":\"{message_id}\"");
     let location = "\"err_location\":\"M004\"";
     let line = h
         .wait_for_log(&[location, &message_field, &id_field], ARRIVAL)
@@ -886,6 +1030,13 @@ async fn assert_m004_logged(h: &Harness) {
         assert!(
             line.contains(&field),
             "the M004 record lacks {field}: {line}"
+        );
+    }
+    let fields = event_fields(&line);
+    for field in [id_field, format!("\"correlation_id\":\"{correlation_id}\"")] {
+        assert!(
+            fields.contains(&field),
+            "the M004 record does not itself name {field}: {line}"
         );
     }
 }
@@ -977,7 +1128,8 @@ fn cp00_failed_reply_logs_m004_and_writes_nothing() {
             reply_to,
         )
         .await;
-        assert_m004_logged(&h).await;
+        assert_reply_not_confirmed(&h, "CP00", CP00_RETURNED, correlation).await;
+        assert_m004_logged(&h, CP00_RETURNED, correlation).await;
         assert_eq!(
             h.queue_depth(&queue).await,
             0,
@@ -1003,15 +1155,7 @@ fn cp00_failed_reply_logs_m004_and_writes_nothing() {
             "a CP00 request redelivered to {queue}"
         );
 
-        // `error_record` names the fate of an MQ-ERR-DISPLAY record, which
-        // only CDRD and CDRA put; CP00 has no error queue, so its span records
-        // `none`, and the logged CCPAUERY record shows as its `location`.
-        let rejected = [
-            "\"outcome\":\"rejected\"",
-            "\"error_record\":\"none\"",
-            "\"location\":\"M004\"",
-        ];
-        assert_single_span(&h, "CP00", CP00_RETURNED, &rejected).await;
+        assert_single_span(&h, "CP00", CP00_RETURNED, &CP00_REJECTED_M004).await;
         let replied = [REPLIED, "\"location\":\"none\""];
         assert_single_span(&h, "CP00", CP00_ANSWERED, &replied).await;
         assert_no_pending_authorization(&h).await;
@@ -1028,6 +1172,92 @@ fn cp00_failed_reply_logs_m004_and_writes_nothing() {
             write_failures.is_empty(),
             "write failures logged: {write_failures:#?}"
         );
+        h.shutdown().await;
+    });
+}
+
+/// CP00: a requester on `RabbitMQ` direct reply-to gets no reply. The broker
+/// would deliver a mandatory reply to that pseudo-queue and still return it
+/// as unroutable, so the reply would reach the requester while the request
+/// went unwritten. CP00 publishes nothing to it: a warning names the
+/// pseudo-queue, the critical `M004` record is logged, the request is
+/// rejected without requeue, never redelivered, and nothing is written.
+///
+/// The requester consumes [`DIRECT_REPLY_TO`] with `no_ack` on the test's
+/// channel and publishes the request on that channel, as the broker requires,
+/// so the request reaches CP00 with the `reply_to` the broker rewrote.
+///
+/// Proves `P-COPAUA0C-002` (the request consumed at get time),
+/// `P-COPAUA0C-012` (`7100-SEND-RESPONSE`: `M004` critical, no reply, no
+/// database write), `P-COPAUA0C-015` (the `CCPAUERY` record logged as JSON)
+/// and `P-COPAUA0C-035` (no write without a confirmed reply).
+#[test]
+fn cp00_direct_reply_to_logs_m004_without_a_reply_or_a_write() {
+    block_on(async {
+        assert_cited(&[
+            "P-COPAUA0C-002",
+            "P-COPAUA0C-012",
+            "P-COPAUA0C-015",
+            "P-COPAUA0C-021",
+            "P-COPAUA0C-035",
+        ]);
+        let approvable = account_1_request(&audited_request("P-COPAUA0C-021"));
+
+        let h = Harness::start(None).await;
+        let queue = request_queue(&h.settings.queue_pauth_request, PAUTH_REQUEST_QUEUE);
+        let mut replies = h
+            .channel
+            .basic_consume(
+                DIRECT_REPLY_TO,
+                "ack-cp00-direct-reply-to",
+                BasicConsumeOptions {
+                    no_ack: true,
+                    ..BasicConsumeOptions::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("cannot consume {DIRECT_REPLY_TO}: {error}"));
+        h.publish(
+            &queue,
+            approvable.as_bytes(),
+            CP00_DIRECT_REPLY_TO,
+            "ACK-CP00-CORREL-3",
+            Some(DIRECT_REPLY_TO),
+        )
+        .await;
+
+        let id_field = format!("\"message_id\":\"{CP00_DIRECT_REPLY_TO}\"");
+        let rewritten = format!("\"reply_to\":\"{DIRECT_REPLY_TO}.");
+        let warning = h
+            .wait_for_log(&["\"level\":\"WARN\"", &id_field, &rewritten], ARRIVAL)
+            .await;
+        assert!(
+            warning.contains("RabbitMQ direct reply-to is not supported"),
+            "the direct reply-to warning: {warning}"
+        );
+        assert!(
+            !warning.contains(ACCOUNT_1_CARD),
+            "the direct reply-to warning carries the card: {warning}"
+        );
+        assert_m004_logged(&h, CP00_DIRECT_REPLY_TO, "ACK-CP00-CORREL-3").await;
+
+        // CP00 has no error queue, and nothing reaches it; the wait also gives
+        // a reply time to reach the requester.
+        h.assert_no_message(ERROR_QUEUE, SETTLE).await;
+        let reply = replies.next().now_or_never();
+        assert!(
+            reply.is_none(),
+            "the direct reply-to requester got a reply: {reply:?}"
+        );
+        assert_eq!(
+            h.queue_depth(&queue).await,
+            0,
+            "{CP00_DIRECT_REPLY_TO} left on or redelivered to {queue}"
+        );
+        assert_single_span(&h, "CP00", CP00_DIRECT_REPLY_TO, &CP00_REJECTED_M004).await;
+        assert_no_pending_authorization(&h).await;
+        assert_never_replied(&h, "CP00");
         h.shutdown().await;
     });
 }

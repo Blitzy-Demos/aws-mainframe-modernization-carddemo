@@ -24,6 +24,9 @@
 //!   without a valid token, or whose token names no stored user, is therefore
 //!   401 on `/admin/**` routes too, and only a valid token whose `usr_type` is
 //!   not `A` is 403 ([`ApiError::forbidden`]).
+//! - [`BearerUser`] serves the public `POST /auth/logout`: the user of a
+//!   bearer token that verifies, if one is sent, for its span only. It reads
+//!   no store, logs nothing and never refuses a request.
 //!
 //! The COBOL keeps users out of admin functions only through menu routing:
 //! COSGN00C transfers an `A` user to COADM01C and every other user to
@@ -51,8 +54,9 @@
 //! request asks for, `outcome` `rejected`, and for a 403 the verified
 //! `user_id`. Each event therefore carries them in its span context. A 500 of
 //! the `USRSEC` read, or of its unit of work, is recorded the same way
-//! through `crate::record_failure`, with `outcome` `failed` and no user,
-//! before its detail is logged.
+//! through `crate::record_failure`, with `outcome` `failed` and the verified
+//! token's `sub` as `user_id`, before its detail is logged. The 401 of a
+//! `sub` that names no stored user records no user.
 //!
 //! A verified user is also kept in the request's extensions, where
 //! `verified_user` finds it. Every handler takes its [`AuthUser`] or
@@ -62,15 +66,18 @@
 //! user, and a request to the public `POST /auth/login`, keep no user, so
 //! their refusals record none.
 
+use std::convert::Infallible;
 use std::ops::Deref;
+use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRef, FromRequestParts};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap};
 use carddemo_domain::numeric::UserId;
-use carddemo_domain::ports::{PortError, UserStore};
-use carddemo_persistence::PersistenceError;
+use carddemo_domain::rules::PortError;
+use carddemo_domain::rules::signon::UserStore;
+use carddemo_persistence::tx::PersistenceError;
 
 use crate::auth::jwt::{Claims, JwtKeys, UserType};
 use crate::error::ApiError;
@@ -194,6 +201,44 @@ pub(crate) fn authenticate(parts: &mut Parts, keys: &JwtKeys) -> Result<AuthUser
     Ok(user)
 }
 
+/// The user the request's bearer token names, when `keys` verify the token:
+/// [`bearer_token`] and [`JwtKeys::verify`] as [`authenticate`] runs them,
+/// without its refusal.
+///
+/// `None` when the request has no single bearer token or its token does not
+/// verify. No store is read, nothing is kept in the extensions, recorded or
+/// logged, and the token's text goes nowhere.
+pub(crate) fn bearer_user(headers: &HeaderMap, keys: &JwtKeys) -> Option<AuthUser> {
+    let token = bearer_token(headers)?;
+    keys.verify(token).ok().map(AuthUser::from_claims)
+}
+
+/// The user a request's bearer token names when the token verifies, or
+/// `None`: [`bearer_user`] as an extractor that never refuses a request.
+///
+/// For the public `POST /auth/logout`, which requires no token and names the
+/// user of one that verifies in its span only. Unlike [`AuthUser`], it reads
+/// no store, keeps nothing in the request's extensions, records nothing on
+/// the request span and logs nothing. The keys are the state's
+/// `Arc<JwtKeys>`, so a handler that takes only this extractor reaches no
+/// other part of the state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BearerUser(pub Option<AuthUser>);
+
+impl<S> FromRequestParts<S> for BearerUser
+where
+    Arc<JwtKeys>: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    /// Verifies the request's bearer token, if any, with the state's keys.
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let keys = Arc::<JwtKeys>::from_ref(state);
+        Ok(Self(bearer_user(&parts.headers, &keys)))
+    }
+}
+
 /// The user [`authenticate`] verified for the request whose `extensions`
 /// these are, or `None` when no extractor has authenticated it yet, when its
 /// token did not verify or names no stored user, or when its route is public.
@@ -214,7 +259,7 @@ pub(crate) fn verified_user(extensions: &Extensions) -> Option<&AuthUser> {
 /// `transaction` is the code of the operation the request asks for
 /// (`crate::transaction_of`). A refusal is recorded on the request span with
 /// it before it is logged: `crate::record_refusal` for the 401, with no user,
-/// and `crate::record_failure` for a failed read.
+/// and `crate::record_failure` for a failed read, with the token's `sub`.
 ///
 /// # Errors
 ///
@@ -237,7 +282,7 @@ pub(crate) async fn require_signed_on_user<S: UserStore>(
         Ok(_) => Ok(user),
         Err(PortError::NotFound) => Err(unknown_subject(transaction)),
         Err(err) => {
-            crate::record_failure(transaction);
+            crate::record_failure(transaction, &user.user_id);
             Err(ApiError::from(err))
         }
     }
@@ -284,15 +329,18 @@ pub(crate) fn require_admin(parts: &Parts, user: AuthUser) -> Result<AdminUser, 
 /// # Errors
 ///
 /// The subject check's error, or 500 when the unit of work cannot be opened
-/// or rolled back. Each 500 is recorded on the request span
-/// (`crate::record_failure`) before its detail is logged.
+/// or rolled back. Each 500 is recorded on the request span with the token's
+/// `sub` (`crate::record_failure`) before its detail is logged.
 async fn signed_on_user(
     state: &AppState,
     user: AuthUser,
     transaction: Option<&'static str>,
 ) -> Result<AuthUser, ApiError> {
+    // The check takes the user by value, and a rollback that fails after it
+    // still names the token's `sub`.
+    let user_id = user.user_id.clone();
     let failed = |err: PersistenceError| {
-        crate::record_failure(transaction);
+        crate::record_failure(transaction, &user_id);
         ApiError::from(err)
     };
     let mut uow = state.db().begin().await.map_err(failed)?;
@@ -1184,22 +1232,25 @@ mod tests {
 
     #[test]
     fn a_subject_check_refusal_is_on_the_request_span_before_its_event() {
-        // (case, store, the request span's `outcome`, the event's level)
+        // (case, store, the request span's `outcome`, the event's level, the
+        // `user_id` recorded)
         let cases = [
             (
                 "unknown subject",
                 OneUserStore::default(),
                 "rejected",
                 "WARN",
+                None,
             ),
             (
                 "failed read",
                 OneUserStore::failing(PortError::Unavailable(READ_DETAIL.to_owned())),
                 "failed",
                 "ERROR",
+                Some("ADMIN001"),
             ),
         ];
-        for (case, mut store, outcome, level) in cases {
+        for (case, mut store, outcome, level, user_id) in cases {
             let (result, lines) =
                 checked_in_request_span(&mut store, token_user("ADMIN001", UserType::Admin));
             assert!(result.is_err(), "{case}");
@@ -1207,21 +1258,25 @@ mod tests {
                 panic!("{case}: one event and one span line expected, got {lines:?}");
             };
             assert_eq!(event["level"], level, "{case}");
-            // The event carries the refusal in its span context, and the
-            // unconfirmed user is recorded nowhere.
-            assert_eq!(
-                event["span"],
-                json!({"name": "request", "transaction": "CAVW", "outcome": outcome}),
-                "{case}"
-            );
+            // The event carries the refusal in its span context: a 500 names
+            // the verified token's `sub`, and the 401 of a `sub` that names
+            // no stored user records it nowhere.
+            let mut context = json!({"name": "request", "transaction": "CAVW", "outcome": outcome});
+            if let Some(user_id) = user_id {
+                context["user_id"] = json!(user_id);
+            }
+            assert_eq!(event["span"], context, "{case}");
             assert_eq!(span["type"], "span", "{case}");
             assert_eq!(span["attributes"]["transaction"], "CAVW", "{case}");
             assert_eq!(span["attributes"]["outcome"], outcome, "{case}");
-            assert!(
-                span["attributes"].get("user_id").is_none(),
+            assert_eq!(
+                span["attributes"].get("user_id").and_then(Value::as_str),
+                user_id,
                 "{case}: {span}"
             );
-            assert!(!event.to_string().contains("ADMIN001"), "{case}: {event}");
+            if user_id.is_none() {
+                assert!(!event.to_string().contains("ADMIN001"), "{case}: {event}");
+            }
         }
     }
 }

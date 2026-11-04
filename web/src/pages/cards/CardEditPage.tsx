@@ -2,10 +2,12 @@
 // [app/bms/COCRDUP.bms:L75-78], at /cards/:cardNumber/edit?account_id=<acct>.
 //
 // - The account and card numbers are the keys the screen was entered with
-//   (E-55) and are shown read-only: ACCTSID is PROT and the route fixes the
+//   (E-55) and are read-only inputs: ACCTSID is PROT and the route fixes the
 //   card. Both come from the URL, not from the card read, because COCRDUPC
 //   shows CC-ACCT-ID and CC-CARD-NUM, the keys entered
-//   [app/cbl/COCRDUPC.cbl:L1088-1096]; they travel in the PUT as entered.
+//   [app/cbl/COCRDUPC.cbl:L1088-1096]; they travel in the PUT as entered. A
+//   key error the API reports receives focus, as COCRDUPC's
+//   `MOVE -1 TO ACCTSIDL` places the cursor on the key.
 // - Name on card, Card Active Y/N, Expiry Month and Expiry Year are the
 //   unprotected fields; EXPDAY is dark and protected, so it has no control and
 //   the server keeps the stored day.
@@ -17,7 +19,12 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { ArrowLeft } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type JSX } from "react";
-import { Controller, useForm, type Control } from "react-hook-form";
+import {
+  Controller,
+  useForm,
+  type Control,
+  type ControllerRenderProps,
+} from "react-hook-form";
 import { Link, useParams, useSearchParams } from "react-router";
 
 import { useCard, useCardUpdateMutation } from "@/api/queries/cards";
@@ -71,7 +78,7 @@ type EditableField = Exclude<
  * the keys as entered, the fetched name and status, and the month and year
  * cut from the stored `YYYY-MM-DD` expiry, `CARD-EXPIRY-YEAR` (1:4) and
  * `CARD-EXPIRY-MONTH` (6:2) [app/cbl/COCRDUPC.cbl:L115-121]. `version` is the
- * token the PUT echoes; no control renders it or the keys.
+ * token the PUT echoes; no control renders it.
  */
 function toFormValues(
   card: CardResponse,
@@ -112,39 +119,102 @@ function checkKeys(keys: CardKeys): { valid: boolean; errors: KeyErrors } {
   return { valid: false, errors };
 }
 
-type KeyItemProps = { label: string; value: string; error?: string };
+/** ACCTSID and CARDSID with their COCRDUP captions, in map order. */
+const KEY_FIELDS = [
+  { name: "account_id", label: "Account Number" },
+  { name: "card_number", label: "Card Number" },
+] as const satisfies readonly { name: keyof CardKeys; label: string }[];
 
-function KeyItem({ label, value, error }: KeyItemProps): JSX.Element {
+type KeyFieldProps = {
+  name: keyof CardKeys;
+  label: string;
+  /** The key as entered in the URL. */
+  value: string;
+  invalid: boolean;
+  /** The text of the key's error, from the key edits or the API. */
+  message?: string;
+  /** The form's binding of the key, while the form holds the card. */
+  field?: ControllerRenderProps<CardUpdateFormValues, keyof CardKeys>;
+};
+
+/**
+ * One key, a read-only input showing the value entered. Bound through
+ * `field`, its `ref` is the key's, so a key error the API reports moves focus
+ * here, as COCRDUPC 3300-SETUP-SCREEN-ATTRS places the cursor with
+ * `MOVE -1 TO ACCTSIDL` or `CARDSIDL` [app/cbl/COCRDUPC.cbl:L1217-1234].
+ */
+function KeyField({
+  name,
+  label,
+  value,
+  invalid,
+  message,
+  field,
+}: KeyFieldProps): JSX.Element {
+  const id = `card-edit-${name}`;
+  const errorId = `${id}-error`;
   return (
-    <div className="flex flex-col gap-1">
-      <dt className="text-sm text-muted-foreground">{label}</dt>
-      <dd className="flex flex-col gap-1">
-        <span className="font-medium break-all">{value}</span>
-        {error !== undefined ? <FieldError>{error}</FieldError> : null}
-      </dd>
-    </div>
+    <Field data-invalid={invalid}>
+      <FieldLabel htmlFor={id}>{label}</FieldLabel>
+      <Input
+        {...field}
+        id={id}
+        value={value}
+        readOnly
+        autoComplete="off"
+        spellCheck={false}
+        aria-invalid={invalid}
+        aria-describedby={invalid ? errorId : undefined}
+        className="bg-muted"
+      />
+      <FieldError id={errorId}>{message}</FieldError>
+    </Field>
   );
 }
 
-type KeyDetailsProps = { keys: CardKeys; errors: KeyErrors };
+type KeyDetailsProps = {
+  keys: CardKeys;
+  /** The key edits' texts, shown while no form binds the keys. */
+  errors: KeyErrors;
+  /** The form holding the card: it binds both keys and holds their errors. */
+  control?: Control<CardUpdateFormValues>;
+};
 
 /** ACCTSID and CARDSID, read-only, with any error the edits or the API report. */
-function KeyDetails({ keys, errors }: KeyDetailsProps): JSX.Element {
+function KeyDetails({ keys, errors, control }: KeyDetailsProps): JSX.Element {
   return (
     <Card>
       <CardContent>
-        <dl className="grid gap-6 lg:grid-cols-2">
-          <KeyItem
-            label="Account Number"
-            value={keys.account_id}
-            error={errors.account_id}
-          />
-          <KeyItem
-            label="Card Number"
-            value={keys.card_number}
-            error={errors.card_number}
-          />
-        </dl>
+        <FieldGroup className="grid gap-6 lg:grid-cols-2">
+          {KEY_FIELDS.map(({ name, label }) =>
+            control === undefined ? (
+              <KeyField
+                key={name}
+                name={name}
+                label={label}
+                value={keys[name]}
+                invalid={errors[name] !== undefined}
+                message={errors[name]}
+              />
+            ) : (
+              <Controller
+                key={name}
+                control={control}
+                name={name}
+                render={({ field, fieldState }) => (
+                  <KeyField
+                    name={name}
+                    label={label}
+                    value={keys[name]}
+                    invalid={fieldState.invalid}
+                    message={fieldState.error?.message}
+                    field={field}
+                  />
+                )}
+              />
+            ),
+          )}
+        </FieldGroup>
       </CardContent>
     </Card>
   );
@@ -221,7 +291,13 @@ export default function CardEditPage(): JSX.Element {
   );
   const keyCheck = useMemo(() => checkKeys(keys), [keys]);
 
-  const cardQuery = useCard(cardNumber, accountId);
+  // Keys the edits reject reach the hook as blanks, which it never sends:
+  // COCRDUPC performs 9000-READ-DATA only when both key edits pass
+  // [app/cbl/COCRDUPC.cbl:L959-962].
+  const cardQuery = useCard(
+    keyCheck.valid ? cardNumber : "",
+    keyCheck.valid ? accountId : "",
+  );
   const mutation = useCardUpdateMutation(cardNumber);
   const card = cardQuery.data;
 
@@ -272,8 +348,20 @@ export default function CardEditPage(): JSX.Element {
     }
   }, [loadError]);
 
+  // One request at a time, a save or Cancel's re-read: a re-read answered with
+  // the card as it stood before a save could otherwise land after it and
+  // bring back the old entries and token. The ref closes the gap before the
+  // busy state re-renders, so a second Enter or click sends nothing.
+  const inFlight = useRef(false);
+  const [reading, setReading] = useState(false);
+
   function saveCard(values: CardUpdateFormValues): void {
-    mutation.mutate(toCardUpdateRequest(values), {
+    if (inFlight.current) {
+      return;
+    }
+    const body = toCardUpdateRequest(values);
+    inFlight.current = true;
+    mutation.mutate(body, {
       onSuccess: (result) => {
         // An entry equal to the fetched card writes nothing and answers 'No
         // change detected with respect to values fetched.' (V-COCRDUPC-009),
@@ -288,6 +376,12 @@ export default function CardEditPage(): JSX.Element {
       onError: (error) => {
         setFailure({ error });
       },
+      // Runs after either outcome, once the hook's re-reads have settled.
+      // Per-call callbacks run only while the page is on screen; a page that
+      // has left has no guard to release.
+      onSettled: () => {
+        inFlight.current = false;
+      },
     });
   }
 
@@ -295,12 +389,28 @@ export default function CardEditPage(): JSX.Element {
   // dropped. An unchanged card keeps its object, so the form is reset here
   // rather than by the read effect.
   async function cancelEdits(): Promise<void> {
-    const reread = await cardQuery.refetch();
-    if (reread.isSuccess) {
-      form.reset(toFormValues(reread.data, keys));
-      setFormCard(reread.data);
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
+    setReading(true);
+    try {
+      const reread = await cardQuery.refetch();
+      if (reread.isSuccess) {
+        form.reset(toFormValues(reread.data, keys));
+        setFormCard(reread.data);
+      }
+    } finally {
+      inFlight.current = false;
+      setReading(false);
     }
   }
+
+  // aria-disabled rather than disabled: a focused button that becomes
+  // disabled loses focus to the document, which would strand a keyboard user
+  // after Save or Cancel; the guard above keeps the inert buttons from acting.
+  const busy = mutation.isPending || reading;
+  const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
 
   const backTo = {
     pathname: `/cards/${encodeURIComponent(cardNumber)}`,
@@ -310,18 +420,24 @@ export default function CardEditPage(): JSX.Element {
         : `?${new URLSearchParams({ account_id: accountId }).toString()}`,
   };
 
-  const { errors } = form.formState;
-  const keyErrors: KeyErrors = keyCheck.valid
-    ? {
-        account_id: errors.account_id?.message,
-        card_number: errors.card_number?.message,
-      }
-    : keyCheck.errors;
+  // Once the form holds the card it binds the keys, and they sit inside it, so
+  // Enter on a focused key submits as on every other field.
+  const holdsCard =
+    keyCheck.valid && card !== undefined && formCard !== undefined;
 
   let editor: JSX.Element | null = null;
-  if (keyCheck.valid && card !== undefined && formCard !== undefined) {
+  if (holdsCard) {
     editor = (
-      <form noValidate onSubmit={form.handleSubmit(saveCard)}>
+      <form
+        noValidate
+        onSubmit={form.handleSubmit(saveCard)}
+        className="flex flex-col gap-6"
+      >
+        <KeyDetails
+          keys={keys}
+          errors={keyCheck.errors}
+          control={form.control}
+        />
         <Card>
           <CardContent>
             <FieldGroup className="grid gap-6 lg:grid-cols-2">
@@ -359,13 +475,14 @@ export default function CardEditPage(): JSX.Element {
             </FieldGroup>
           </CardContent>
           <CardFooter className="flex-wrap gap-2">
-            <Button type="submit" disabled={mutation.isPending}>
+            <Button type="submit" aria-disabled={busy} className={busyClass}>
               Save
             </Button>
             <Button
               type="button"
               variant="outline"
-              disabled={mutation.isPending}
+              aria-disabled={busy}
+              className={busyClass}
               onClick={() => {
                 void cancelEdits();
               }}
@@ -395,7 +512,7 @@ export default function CardEditPage(): JSX.Element {
           </Button>
         }
       />
-      <KeyDetails keys={keys} errors={keyErrors} />
+      {holdsCard ? null : <KeyDetails keys={keys} errors={keyCheck.errors} />}
       {editor}
     </div>
   );

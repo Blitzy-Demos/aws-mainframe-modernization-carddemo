@@ -36,12 +36,13 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use carddemo_domain::error::{DomainError, ErrorKind};
+use carddemo_domain::error::DomainError;
 use carddemo_domain::messages::UNABLE_TO_LOOKUP_TRANSACTION;
+use carddemo_domain::rules::ErrorKind;
 use carddemo_domain::rules::bill_payment::{
     self, BillPaymentInput, BillPaymentStep, EntryEdit, FIELD_ACTIDIN, PaymentDraft,
 };
-use carddemo_persistence::UnitOfWork;
+use carddemo_persistence::tx::UnitOfWork;
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span};
 

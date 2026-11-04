@@ -60,11 +60,13 @@
 
 use axum::Json;
 use axum::extract::State;
-use carddemo_domain::error::{DomainError, ErrorKind};
+use carddemo_domain::error::DomainError;
 use carddemo_domain::messages;
 use carddemo_domain::numeric::{AccountId, CardNumber};
-use carddemo_domain::rules::{ReturnMsg, VersionToken, card_list, card_update, card_view};
-use carddemo_persistence::UnitOfWork;
+use carddemo_domain::rules::{
+    ErrorKind, ReturnMsg, VersionToken, card_list, card_update, card_view,
+};
+use carddemo_persistence::tx::UnitOfWork;
 use tracing::Span;
 use tracing::field::Empty;
 

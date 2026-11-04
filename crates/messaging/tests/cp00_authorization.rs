@@ -37,6 +37,15 @@
 //!   `PA-ACCOUNT-STATUS`, which no statement sets (E-25), are excluded from
 //!   comparison.
 //!
+//! A second test, on a harness of its own, sends the `P-COPAUA0C-021` request
+//! while a purge unit of work holds the account's summary: it has swept it
+//! with its locking `GN` and deleted it, uncommitted. IMS program isolation
+//! orders `COPAUA0C` after that purge, so CP00 waits on the summary's row
+//! lock, as `pg_stat_activity` shows, and once the purge commits it answers
+//! and writes what the seeded state gives after the purge: the row's audited
+//! approval, a new summary of one approval and exactly the new detail
+//! (`P-COPAUA0C-008`, `P-COPAUA0C-013`, `P-CBPAUP0C-006`).
+//!
 //! Not proved here: the per-task queue open, get loop, task end, PSB
 //! schedule, terminate and close (`P-COPAUA0C-001`, `P-COPAUA0C-003`,
 //! `P-COPAUA0C-032`, `P-COPAUA0C-033`, `P-COPAUA0C-036`, `P-COPAUA0C-037`),
@@ -45,15 +54,21 @@
 //! no row; and the failed reply put of `P-COPAUA0C-012` (`M004`), which
 //! `ack_after_confirm.rs` proves.
 
-mod common;
+pub mod common;
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use carddemo_domain::entities::pending_auth_detail::{FraudFlag, MatchStatus, PendingAuthDetail};
-use carddemo_domain::entities::pending_auth_summary::PendingAuthSummary;
+use carddemo_domain::entities::pending_auth_detail::{
+    FraudFlag, MatchStatus, NewPendingAuthDetail, PendingAuthDetail,
+};
+use carddemo_domain::entities::pending_auth_summary::{
+    PA_ACCOUNT_STATUS_OCCURS, PendingAuthSummary,
+};
 use carddemo_domain::numeric::ids::{AccountId, CustomerId};
+use carddemo_domain::numeric::{Alnum, AuthCount, CardNumber, Money, NumericCode};
 use carddemo_domain::ports::{AuthorizationStore, Browse, Direction, PortError};
+use carddemo_persistence::UnitOfWork;
 use carddemo_testkit::block_on;
 use common::{Harness, audit_row, audit_texts};
 use lapin::message::Delivery;
@@ -137,6 +152,24 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The most summaries or details one port read returns here: far more than
 /// the run writes.
 const ROW_LIMIT: u16 = 100;
+
+/// The sessions of the test database whose locking summary read waits on a
+/// lock: CP00's `5500-READ-AUTH-SUMMRY`, `SELECT … FOR UPDATE` of
+/// `pending_auth_summaries`, behind the row lock of a purge sweep. The
+/// session asking is left out, since its own statement names the same words.
+const SUMMARY_LOCK_WAITS: &str = "SELECT count(*) FROM pg_stat_activity \
+     WHERE datname = current_database() AND pid <> pg_backend_pid() \
+       AND wait_event_type = 'Lock' \
+       AND query LIKE '%FROM pending_auth_summaries%FOR UPDATE%'";
+
+/// How long CP00 may take to reach its wait on the sweep's lock: less than
+/// the 30-second database deadline of its read, so the read still waits when
+/// the sweep commits.
+const LOCK_WAIT: Duration = Duration::from_secs(20);
+
+/// `PA-AUTH-DATE-9C` of the approval the purged summary holds: 30 days
+/// before [`PINNED`], a key the new detail does not repeat.
+const PURGED_DATE_9C: i32 = DATE_9C + 30;
 
 /// The placeholder of bytes the COBOL never sets, `{UNDEF:n}`.
 const UNDEF_OPEN: &str = "{UNDEF:";
@@ -1007,6 +1040,186 @@ fn section_d_requests_get_their_audited_replies_and_writes() {
         unknown_card(&h, "P-COPAUA0C-026", &escalation).await;
         assert_final_state(&h).await;
         assert_no_write_failures(&h);
+        h.shutdown().await;
+    });
+}
+
+/// An amount of the fixture account as `Money`, from its audit text.
+fn money<const D: u8>(amount: &str) -> Money<D> {
+    Money::from_cents(cents_of(amount)).expect("an amount within the field")
+}
+
+/// The summary a purge sweep holds when the request of
+/// [`a_request_during_a_purge_waits_for_it_and_writes_on_what_it_left`]
+/// arrives: the fixture account with three approvals and 69.00 of its credit
+/// limit left, so a decision on it would decline the row's 100.00
+/// (`P-COPAUA0C-017`).
+fn purged_summary() -> PendingAuthSummary {
+    PendingAuthSummary {
+        pa_acct_id: fixture_account(),
+        pa_cust_id: fixture_customer(),
+        pa_auth_status: Alnum::spaces(),
+        pa_account_status: [Alnum::spaces(); PA_ACCOUNT_STATUS_OCCURS],
+        pa_credit_limit: money(CREDIT_LIMIT),
+        pa_cash_limit: money(CASH_LIMIT),
+        pa_credit_balance: money("6100.00"),
+        pa_cash_balance: Money::ZERO,
+        pa_approved_auth_cnt: AuthCount::new(3).expect("a count of at most four digits"),
+        pa_declined_auth_cnt: AuthCount::ZERO,
+        pa_approved_auth_amt: money("6100.00"),
+        pa_declined_auth_amt: Money::ZERO,
+    }
+}
+
+/// An approval under [`purged_summary`], dated [`PURGED_DATE_9C`].
+fn purged_detail() -> NewPendingAuthDetail {
+    NewPendingAuthDetail {
+        pa_acct_id: fixture_account(),
+        pa_auth_date_9c: PURGED_DATE_9C,
+        pa_auth_time_9c: TIME_9C,
+        pa_auth_orig_date: Alnum::move_from("220601"),
+        pa_auth_orig_time: Alnum::move_from("120000"),
+        pa_card_num: CardNumber::move_from("0500024453765740"),
+        pa_auth_type: Alnum::move_from("0100"),
+        pa_card_expiry_date: Alnum::move_from("1225"),
+        pa_message_type: Alnum::move_from("0100"),
+        pa_message_source: Alnum::move_from("POS"),
+        pa_auth_id_code: Alnum::move_from("120000"),
+        pa_auth_resp_code: Alnum::move_from("00"),
+        pa_auth_resp_reason: Alnum::move_from("0000"),
+        pa_processing_code: NumericCode::new(0).expect("a six-digit code"),
+        pa_transaction_amt: money("6100.00"),
+        pa_approved_amt: money("6100.00"),
+        pa_merchant_catagory_code: Alnum::move_from("5411"),
+        pa_acqr_country_code: Alnum::move_from("840"),
+        pa_pos_entry_mode: NumericCode::new(1).expect("a two-digit code"),
+        pa_merchant_id: Alnum::move_from("M00000000000001"),
+        pa_merchant_name: Alnum::move_from("FIXTURE MERCHANT"),
+        pa_merchant_city: Alnum::move_from("SEATTLE"),
+        pa_merchant_state: Alnum::move_from("WA"),
+        pa_merchant_zip: Alnum::move_from("98101"),
+        pa_transaction_id: Alnum::move_from("TXNPURGED000001"),
+        pa_match_status: MatchStatus::Pending,
+        pa_auth_fraud: FraudFlag::Blank,
+        pa_fraud_rpt_date: Alnum::spaces(),
+    }
+}
+
+/// Commits [`purged_summary`] and [`purged_detail`] through the port.
+async fn commit_purged_state(h: &Harness) {
+    let mut uow = h.db.begin().await.expect("open the setup unit of work");
+    uow.store()
+        .insert_summary(purged_summary())
+        .await
+        .expect("insert the summary the purge holds");
+    uow.store()
+        .insert_detail(purged_detail())
+        .await
+        .expect("insert the detail under it");
+    uow.commit().await.expect("commit the setup");
+}
+
+/// `CBPAUP0C` as the request meets it (`P-CBPAUP0C-002`, `P-CBPAUP0C-006`,
+/// `P-CBPAUP0C-007`): a purge unit of work that has taken the purge
+/// exclusion, swept the summaries with its locking `GN` and deleted the
+/// fixture account's summary, its detail with it, without committing. It
+/// holds the deleted summary's row lock.
+async fn holding_sweep(h: &Harness) -> UnitOfWork {
+    let mut uow = h.db.begin().await.expect("open the purge unit of work");
+    uow.store()
+        .exclude_other_purges()
+        .await
+        .expect("the purge excludes other purges");
+    let swept = uow
+        .store()
+        .summaries_after(None, ROW_LIMIT)
+        .await
+        .expect("the sweep reads the summaries");
+    let accounts: Vec<AccountId> = swept.iter().map(|summary| summary.pa_acct_id).collect();
+    assert_eq!(
+        accounts,
+        [fixture_account()],
+        "the summaries the sweep holds"
+    );
+    uow.store()
+        .delete_summary(fixture_account())
+        .await
+        .expect("the purge deletes the summary");
+    uow
+}
+
+/// Whether a session of the test database waits in a locking summary read
+/// ([`SUMMARY_LOCK_WAITS`]) within [`LOCK_WAIT`].
+async fn summary_lock_wait_seen(h: &Harness) -> bool {
+    let until = Instant::now() + LOCK_WAIT;
+    loop {
+        let rows = h.stack.fetch_text_rows(SUMMARY_LOCK_WAITS).await;
+        let waiting = rows.first().and_then(|row| row.first()).cloned().flatten();
+        if waiting.is_some_and(|sessions| sessions != "0") {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        pause(POLL_INTERVAL).await;
+    }
+}
+
+/// `P-COPAUA0C-008`, `P-COPAUA0C-013`, `P-COPAUA0C-021`, `P-CBPAUP0C-006`: a
+/// request that arrives while a purge holds its account's summary.
+///
+/// `COPAUA0C` and the `CBPAUP0C` BMP both run under the PSB `PSBPAUTB` with
+/// `PROCOPT=AP` [app/app-authorization-ims-db2-mq/ims/PSBPAUTB.psb:L17], and
+/// IMS program isolation orders them one after the other. The purge here has
+/// deleted the summary, which would decline the row's 100.00, and has not
+/// committed. CP00's summary read waits on the purge's row lock, as
+/// `pg_stat_activity` shows, so no reply exists while the purge holds it.
+/// Once the purge commits, CP00 decides on what it left, no summary, so the
+/// fixture account's available amount approves the row (`P-COPAUA0C-018`)
+/// with the reply the audit records, and the write inserts a new summary of
+/// one approval with exactly the new detail: the result of the purge followed
+/// by the request.
+#[test]
+fn a_request_during_a_purge_waits_for_it_and_writes_on_what_it_left() {
+    block_on(async {
+        let h = Harness::start(Some(PINNED)).await;
+        commit_purged_state(&h).await;
+        let holder = holding_sweep(&h).await;
+        let case = Case::new("P-COPAUA0C-021");
+        let reply_queue = send(&h, &case).await;
+        let waited = summary_lock_wait_seen(&h).await;
+        // The purge ends before any assertion, so a failed one never leaves the
+        // consumer waiting on a lock the test still holds.
+        holder.commit().await.expect("the purge commits");
+        assert!(
+            waited,
+            "CP00's summary read never waited on the purge's row lock within {LOCK_WAIT:?}"
+        );
+
+        let reply = h.next_message(&reply_queue, REPLY_WAIT).await;
+        assert_reply(&reply, &case, &mut HashSet::new());
+        let span = message_span(&h, &case).await;
+        assert_span(&span, &case, "replied", NO_LOCATION);
+        assert_request_consumed(&h, &case).await;
+
+        let (summary, details) = settled(&h, fixture_account(), |summary, details| {
+            summary.is_some() && !details.is_empty()
+        })
+        .await;
+        let summary =
+            summary.unwrap_or_else(|| panic!("{}: no summary within {DATA_WAIT:?}", case.id));
+        assert_approved_summary(&summary, &case);
+        assert_eq!(
+            details.len(),
+            1,
+            "{}: details under the new summary",
+            case.id
+        );
+        assert_detail(&details[0], &case);
+        let records = records_of(&h, &case);
+        assert!(records.is_empty(), "{}: error records {records:?}", case.id);
+        assert_no_write_failures(&h);
+        h.assert_no_message(&reply_queue, SETTLE).await;
         h.shutdown().await;
     });
 }

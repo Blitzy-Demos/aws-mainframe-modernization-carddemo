@@ -63,12 +63,12 @@ pub mod transactions;
 
 use std::collections::BTreeSet;
 
-use carddemo_domain::error::ErrorKind;
 use carddemo_domain::numeric::{
     AccountGroupId, AccountId, AccrualId, Alnum, AuthId, CardNumber, CustSsn, CustomerId,
     FicoScore, MerchantId, Money, NumericCode, RuleId, TranCategoryCode, TranId, TranTypeCode,
     TransactionRowId, UserId,
 };
+use carddemo_domain::rules::ErrorKind;
 use rust_decimal::Decimal;
 use validator::{ValidationError, ValidationErrors};
 

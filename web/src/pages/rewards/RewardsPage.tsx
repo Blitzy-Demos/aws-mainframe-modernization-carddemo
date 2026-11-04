@@ -62,6 +62,11 @@ const ACCOUNT_ERROR_ID = "rewards-account-id-error";
 // never sent.
 const FIRST_PAGE_KEY = "first";
 
+// How long the balance status stays empty before it announces. The region is
+// cleared and then refilled, so the identical result of a repeated lookup is
+// still announced as a change; the delay is the one DataTable uses.
+const STATUS_ANNOUNCE_DELAY_MS = 150;
+
 // Every cell renders the API string as sent: the default accessor cell shows
 // the value itself, with no date parsing or locale formatting.
 const columns: DataTableProps<RewardAccrual>["columns"] = [
@@ -84,6 +89,9 @@ export default function RewardsPage(): JSX.Element {
   const [startKey, setStartKey] = useState<string | undefined>(undefined);
   // The start keys of the pages before the shown one, oldest visit first.
   const [visited, setVisited] = useState<Array<string | undefined>>([]);
+  // Whether the history page shown is the newest page a lookup selected:
+  // true from each lookup until Next or Previous moves the table.
+  const [lookupPage, setLookupPage] = useState(false);
 
   const balance = useRewardBalance(accountId ?? NO_ACCOUNT);
   // The history is read only once the balance has answered for the account,
@@ -113,6 +121,7 @@ export default function RewardsPage(): JSX.Element {
     const onFirstPage = startKey === undefined;
     setStartKey(undefined);
     setVisited([]);
+    setLookupPage(true);
     if (values.account_id !== accountId) {
       setAccountId(values.account_id);
       return;
@@ -137,6 +146,7 @@ export default function RewardsPage(): JSX.Element {
     }
     setVisited([...visited, startKey]);
     setStartKey(nextKey);
+    setLookupPage(false);
   };
 
   const onPrevious = (): void => {
@@ -145,10 +155,51 @@ export default function RewardsPage(): JSX.Element {
     }
     setStartKey(previousKey);
     setVisited(visited.slice(0, -1));
+    setLookupPage(false);
   };
 
   const showResult =
     accountId !== null && (balance.isLoading || balance.isSuccess);
+
+  // The history table loads while its page is first read, while a new page
+  // is read over the previous one (placeholder data), and, for the page a
+  // lookup selected, while that lookup's balance or history read runs. A
+  // repeated lookup reads the same keys again over the rows they hold, so
+  // without the last case those rows would be shown as its result before
+  // its answer arrives. A page that Next or Previous returns to from the
+  // cache keeps its rows on screen while it is read again.
+  const historyLoading =
+    balance.isLoading ||
+    history.isLoading ||
+    history.isPlaceholderData ||
+    (lookupPage && (balance.isFetching || history.isFetching));
+
+  // The balance read as one polite status line: its progress, then the
+  // account it answered for. It never reads a points value, and it is empty
+  // before a lookup and after a failed read, whose toast reports it.
+  let statusText = "";
+  if (accountId !== null && balance.isFetching) {
+    statusText = "Loading reward balance";
+  } else if (balance.isSuccess && !balance.isFetching) {
+    statusText = `Reward balance of account ${balance.data.account_id} loaded`;
+  }
+
+  // Each change of the text, and each new answer of a repeated lookup even
+  // when its text is unchanged, clears the region and fills it after the
+  // delay.
+  const [announcement, setAnnouncement] = useState("");
+  useEffect(() => {
+    setAnnouncement("");
+    if (statusText === "") {
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      setAnnouncement(statusText);
+    }, STATUS_ANNOUNCE_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [statusText, balance.dataUpdatedAt]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -195,6 +246,13 @@ export default function RewardsPage(): JSX.Element {
           </form>
         </CardContent>
       </Card>
+
+      {/* Always rendered, and outside the busy balance section, so assistive
+          technology tracks the region from the start and announces its
+          changes politely. */}
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
 
       {showResult ? (
         <>
@@ -245,11 +303,7 @@ export default function RewardsPage(): JSX.Element {
               onNext={onNext}
               emptyMessage="No reward points have been earned on this account."
               caption="Reward history"
-              loading={
-                balance.isLoading ||
-                history.isLoading ||
-                history.isPlaceholderData
-              }
+              loading={historyLoading}
             />
           )}
         </>

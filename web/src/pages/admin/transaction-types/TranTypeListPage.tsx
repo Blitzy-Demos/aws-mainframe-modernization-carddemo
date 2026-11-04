@@ -353,6 +353,13 @@ export default function TranTypeListPage(): JSX.Element {
   // The applied filters and cursor. Blank filters are omitted, which
   // COTRTLIC reads as no filter.
   const [params, setParams] = useState<TranTypeListParams>({});
+  // The request on screen, for an answer that arrives after the page moved
+  // on: the confirm dialog closes on Confirm, so Search, Previous and Next
+  // stay usable while a delete runs.
+  const currentParams = useRef(params);
+  useEffect(() => {
+    currentParams.current = params;
+  }, [params]);
   const [editingCode, setEditingCode] = useState<string | null>(null);
   // The row the dialog names stays set while the dialog closes, so its text
   // does not change during the closing animation.
@@ -398,12 +405,15 @@ export default function TranTypeListPage(): JSX.Element {
   // The page-boundary text answers the key that asked for the page, F7 or F8
   // (COTRTLIC 2500-SETUP-MESSAGE, 8000-READ-FORWARD), so it is shown once per
   // list request: not again when a write or a refocus reads the same page
-  // again. An empty page shows it in the table instead.
+  // again. It comes from the page the request read: a cached copy shown while
+  // that read runs, such as the first page after a delete, waits for the
+  // answer. An empty page shows it in the table instead.
   const shownFor = useRef<TranTypeListParams | null>(null);
   useEffect(() => {
     if (
       page === undefined ||
       list.isPlaceholderData ||
+      list.isFetching ||
       shownFor.current === params
     ) {
       return;
@@ -412,7 +422,7 @@ export default function TranTypeListPage(): JSX.Element {
     if (page.items.length > 0) {
       showMessage(page.message);
     }
-  }, [page, params, list.isPlaceholderData]);
+  }, [page, params, list.isPlaceholderData, list.isFetching]);
 
   // ENTER: the filters, read from the first page, since the Search request
   // carries no start key (F-COTRTLI-001). Unchanged filters on the first
@@ -457,6 +467,10 @@ export default function TranTypeListPage(): JSX.Element {
 
   // F10 on a pending `D`. A deleted type returns the list to its first page
   // under the same filters, as COTRTLIC resets its paging after the delete.
+  // The delete marks the cached pages stale without reading any, so that
+  // first page is read once: by the change of request, or by rereadList when
+  // the first page is already the request on screen. The new request identity
+  // shows the first page's text once its fresh answer is in.
   const onConfirmDelete = (): void => {
     if (deleteTarget === null) {
       return;
@@ -466,7 +480,12 @@ export default function TranTypeListPage(): JSX.Element {
       {
         onSuccess: (answer) => {
           showSuccess(answer.message);
-          setParams((current) => filterOf(current));
+          const shown = currentParams.current;
+          const first = filterOf(shown);
+          if (sameRequest(first, shown)) {
+            void rereadList();
+          }
+          setParams(first);
         },
         onError: (error) => {
           showApiError(error);
