@@ -7,9 +7,13 @@
 // The session lives in memory and is mirrored to sessionStorage, the
 // session-scoped store, so a reload in the same tab keeps the user signed on
 // and a new browser session starts signed out. Nothing is written to any store
-// that outlives the browser session. A page restored from the back/forward
-// cache, or told of a change to the store, checks the store again, so a
-// sign-off in a later page of the tab ends its session too.
+// that outlives the browser session. Each change this module makes to the
+// stored record is announced on a BroadcastChannel, and Chrome evicts a page
+// held in its back/forward cache whose channel receives a message, so Back
+// after a sign-off loads that page afresh instead of showing the signed-on
+// view it was frozen with. A page restored from the cache all the same, or
+// told of a change to the store, checks the store again, so a sign-off in a
+// later page of the tab ends its session too.
 //
 // Consumers: api/client.ts reads the token for the Authorization header and
 // clears the session on a 401 to a request that session sent, naming that
@@ -50,6 +54,34 @@ let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 // What readStoredSession returns when the browser refuses the read, which
 // tells nothing about whether the tab holds a session.
 const UNREADABLE = Symbol("sessionStorage unreadable");
+
+// The channel on which every change to the stored record is announced (see
+// resyncWithStore). It is opened before the rehydration below, which removes
+// an expired or malformed record and so announces it. Where the browser has no
+// BroadcastChannel, or refuses one as some refuse storage, nothing is
+// announced and the resync alone applies.
+const SESSION_CHANNEL_NAME = "carddemo.session";
+
+function openSessionChannel(): BroadcastChannel | null {
+  if (typeof BroadcastChannel !== "function") {
+    return null;
+  }
+  try {
+    return new BroadcastChannel(SESSION_CHANNEL_NAME);
+  } catch (error) {
+    console.warn(
+      `BroadcastChannel ${SESSION_CHANNEL_NAME} could not be opened; Back may briefly show a page signed on with an earlier session.`,
+      error,
+    );
+    return null;
+  }
+}
+
+const sessionChannel = openSessionChannel();
+
+// The one message the channel carries. It names no session, so neither the
+// token nor the user ever leaves this page through the channel.
+const RECORD_CHANGED = "record-changed";
 
 // Rehydrated when the module loads, so the first render after a reload
 // already sees the session the tab signed on with. A store the browser blocks
@@ -147,7 +179,6 @@ function readStoredSession(): Session | null | typeof UNREADABLE {
 function writeStoredSession(session: Session): boolean {
   try {
     window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
-    return true;
   } catch (error) {
     console.warn(
       `The session applies to this page only: sessionStorage rejected ${SESSION_STORAGE_KEY}.`,
@@ -156,14 +187,45 @@ function writeStoredSession(session: Session): boolean {
     removeStoredSession();
     return false;
   }
+  announceRecordChange();
+  return true;
 }
 
+// Announces the removal only when a record was there to remove: clearSession
+// calls this with nothing stored as well, and an announcement then would
+// evict cached pages that nothing has changed for.
 function removeStoredSession(): void {
+  let held: boolean;
   try {
+    held = window.sessionStorage.getItem(SESSION_STORAGE_KEY) !== null;
     window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
   } catch (error) {
     console.warn(
       `sessionStorage rejected removing ${SESSION_STORAGE_KEY}; a reload may restore the cleared session until it expires.`,
+      error,
+    );
+    return;
+  }
+  if (held) {
+    announceRecordChange();
+  }
+}
+
+// Tells the origin's other pages that the stored record changed. The message
+// matters only for the eviction described at resyncWithStore, so no page
+// listens for it: the other pages of this tab, which share the record, are the
+// cached ones it evicts, and other tabs keep their own record in their own
+// sessionStorage, so a cached page of theirs that it evicts merely loads
+// afresh on Back. A refused post leaves the cached pages to the resync.
+function announceRecordChange(): void {
+  if (sessionChannel === null) {
+    return;
+  }
+  try {
+    sessionChannel.postMessage(RECORD_CHANGED);
+  } catch (error) {
+    console.warn(
+      `BroadcastChannel ${SESSION_CHANNEL_NAME} rejected the notice that ${SESSION_STORAGE_KEY} changed; Back may briefly show a page signed on with an earlier session.`,
       error,
     );
   }
@@ -225,6 +287,18 @@ function endSessionInMemory(): void {
 // and one told that another document changed the record, therefore checks the
 // record and ends its in-memory session unless the record still holds the
 // same token.
+//
+// This check cannot keep the signed-on view off the screen. Chrome first
+// presents a restored document's last painted frame and runs its script,
+// pageshow included, only afterwards, so the view it was frozen with shows for
+// a frame before this check sends it to sign on. Changes are therefore also
+// announced on sessionChannel: Chrome evicts a cached document whose open
+// BroadcastChannel receives a message, reporting the not-restored reason
+// "broadcastchannel-message", and Back then loads that page afresh. A channel
+// that receives nothing leaves the cache working as before. This check stays
+// for browsers that restore such a document anyway, for a refused post, and
+// for a document frozen before a change that no live document announced, such
+// as its session expiring while the tab showed another site.
 //
 // The session stays when the record cannot be read, which proves nothing, and
 // when it never reached the record (writeStoredSession's rejection), since

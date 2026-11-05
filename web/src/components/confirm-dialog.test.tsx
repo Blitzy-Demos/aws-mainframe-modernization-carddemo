@@ -10,7 +10,8 @@
 // nearest focusable ancestor the opener had (the data table), whether the
 // deleted row leaves before the dialog has closed or after focus has returned
 // to its Delete, with or without a move handed over, and never to another
-// record's control.
+// record's control; and the focus the dialog returns or restores is scrolled
+// into view only when the user cannot see it.
 //
 // jsdom runs no CSS animation, so Radix removes the content as soon as the
 // dialog closes, and its close autofocus follows on the next task. The
@@ -622,6 +623,156 @@ describe("ConfirmDialog with an opener that leaves the document", () => {
         setTimeout(resolve, 20);
       });
       expect(document.activeElement).toBe(userIdField);
+    },
+  );
+});
+
+// Boxes in a 768×1024 viewport, as a tablet rotated while the dialog was shown
+// leaves them: the page behind a shown dialog does not scroll.
+const VIEWPORT = { width: 768, height: 1024 };
+const BUTTON_BELOW = DOMRect.fromRect({ x: 24, y: 1286, width: 160, height: 36 });
+const BUTTON_SHOWN = DOMRect.fromRect({ x: 24, y: 640, width: 160, height: 36 });
+const BUTTON_ABOVE = DOMRect.fromRect({ x: 24, y: -40, width: 160, height: 36 });
+const TABLE_BELOW = DOMRect.fromRect({ x: 24, y: 1100, width: 686, height: 400 });
+const TABLE_ACROSS_EDGE = DOMRect.fromRect({ x: 24, y: 900, width: 686, height: 400 });
+
+const CENTRED: ScrollIntoViewOptions = { block: "center", inline: "nearest" };
+const NEAREST: ScrollIntoViewOptions = { block: "nearest" };
+
+// A shown dialog, and the element its focus handling is to place focus on.
+type Shown = { user: User; dialog: HTMLElement; focused: HTMLElement };
+
+// The form page's dialog, opened from its button, which takes focus back.
+async function showFromForm(props: PageProps = {}): Promise<Shown> {
+  const user = renderPage(props);
+  const button = opener();
+  const dialog = await openDialog(user);
+  return { user, dialog, focused: button };
+}
+
+// A row's Delete in the data table, whose row the confirmed request deletes,
+// so focus goes to the table.
+async function showFromTableRow(): Promise<Shown> {
+  const user = userEvent.setup();
+  render(
+    <DeleteList
+      answer="before close"
+      container="table"
+      deleted={null}
+      handsMove={false}
+    />,
+  );
+  const table = screen.getByRole("table");
+  screen.getByRole("button", { name: "Delete SECOND" }).focus();
+  await user.keyboard("{Enter}");
+  const dialog = await screen.findByRole("alertdialog");
+  return { user, dialog, focused: table };
+}
+
+async function pressEscape(user: User): Promise<void> {
+  await user.keyboard("{Escape}");
+}
+
+async function pressConfirm(user: User, dialog: HTMLElement): Promise<void> {
+  await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+}
+
+async function pressOverlay(user: User): Promise<void> {
+  const overlay = document.querySelector<HTMLElement>(
+    '[data-slot="alert-dialog-overlay"]',
+  );
+  if (overlay === null) {
+    throw new Error("the dialog renders no overlay");
+  }
+  await user.click(overlay);
+  await nextTask();
+}
+
+describe("ConfirmDialog revealing the focus it places", () => {
+  it.each<{
+    name: string;
+    show: () => Promise<Shown>;
+    box: DOMRect;
+    answer: (user: User, dialog: HTMLElement) => Promise<void>;
+    scroll: ScrollIntoViewOptions | null;
+  }>([
+    {
+      name: "the opener below the viewport, on Escape",
+      show: () => showFromForm(),
+      box: BUTTON_BELOW,
+      answer: pressEscape,
+      scroll: CENTRED,
+    },
+    {
+      name: "the opener inside the viewport, on Escape",
+      show: () => showFromForm(),
+      box: BUTTON_SHOWN,
+      answer: pressEscape,
+      scroll: null,
+    },
+    {
+      name: "the opener below the viewport, after a move that places no focus",
+      show: () => showFromForm({ onConfirm: (afterClose) => afterClose(() => undefined) }),
+      box: BUTTON_BELOW,
+      answer: pressConfirm,
+      scroll: CENTRED,
+    },
+    {
+      name: "the table below the viewport, once the opener's row has gone",
+      show: showFromTableRow,
+      box: TABLE_BELOW,
+      answer: pressConfirm,
+      scroll: NEAREST,
+    },
+    {
+      name: "the table across the viewport's edge, once the opener's row has gone",
+      show: showFromTableRow,
+      box: TABLE_ACROSS_EDGE,
+      answer: pressConfirm,
+      scroll: null,
+    },
+    {
+      name: "Cancel above the viewport, after a press of the overlay",
+      show: async () => {
+        const shown = await showFromForm();
+        return {
+          ...shown,
+          focused: within(shown.dialog).getByRole("button", { name: "Cancel" }),
+        };
+      },
+      box: BUTTON_ABOVE,
+      answer: pressOverlay,
+      scroll: CENTRED,
+    },
+  ])(
+    "scrolls $name into view only when the user cannot see it",
+    async ({ show, box, answer, scroll }) => {
+      const { user, dialog, focused } = await show();
+      vi.spyOn(focused, "getBoundingClientRect").mockReturnValue(box);
+      vi.spyOn(document.documentElement, "clientWidth", "get").mockReturnValue(
+        VIEWPORT.width,
+      );
+      vi.spyOn(document.documentElement, "clientHeight", "get").mockReturnValue(
+        VIEWPORT.height,
+      );
+      const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+
+      await answer(user, dialog);
+
+      await waitFor(() => {
+        expect(document.activeElement).toBe(focused);
+      });
+      // Still there, and scrolled no further, once every focus task has run.
+      await nextTask();
+      await nextTask();
+      expect(document.activeElement).toBe(focused);
+      if (scroll === null) {
+        expect(scrollIntoView).not.toHaveBeenCalled();
+      } else {
+        expect(scrollIntoView).toHaveBeenCalledTimes(1);
+        expect(scrollIntoView).toHaveBeenCalledWith(scroll);
+        expect(scrollIntoView.mock.contexts[0]).toBe(focused);
+      }
     },
   );
 });

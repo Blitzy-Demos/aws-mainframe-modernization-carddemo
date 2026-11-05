@@ -4,6 +4,9 @@
 // - the balance cards and the history table show the API's decimal integer
 //   strings exactly as sent, 9007199254740993 included, which a JavaScript
 //   number would read as 9007199254740992 (o8);
+// - the history's Created at column shows each RFC 3339 UTC instant as its
+//   UTC date and time of day to the second, and text of any other shape as
+//   sent, inside a time element whose dateTime keeps the full instant;
 // - an unknown account is reported by one toast and leaves the form usable;
 // - an account that has earned no points shows the zero balance and the
 //   empty-history text over both page controls, disabled, and a failed
@@ -79,6 +82,11 @@ const balanceBody: RewardBalance = {
   available_points: BEYOND_DOUBLE,
 };
 
+// The instant every stubbed accrual was created at, and that instant as the
+// history's Created at column shows it: its UTC date and time of day.
+const CREATED_AT = "2022-07-01T12:00:00Z";
+const CREATED_AT_SHOWN = "2022-07-01 12:00:00 UTC";
+
 function accrual(
   accrual_id: string,
   transaction_id: string,
@@ -91,7 +99,7 @@ function accrual(
     transaction_id,
     rule_id: "1",
     points_earned,
-    created_at: "2022-07-01T12:00:00Z",
+    created_at: CREATED_AT,
   };
 }
 
@@ -348,14 +356,15 @@ function historyRows(): string[][] {
   );
 }
 
-// A page's rows as the table shows them, in the page's column order.
+// A page's rows as the table shows them, in the page's column order. Every
+// stubbed accrual was created at CREATED_AT.
 function rowsOf(page: RewardHistoryPage): string[][] {
   return page.items.map((item) => [
     item.accrual_id,
     item.transaction_id,
     item.rule_id,
     item.points_earned,
-    item.created_at,
+    CREATED_AT_SHOWN,
   ]);
 }
 
@@ -560,6 +569,70 @@ describe("RewardsPage", () => {
       "Created at",
     ]);
   });
+
+  it.each([
+    {
+      shape: "no fraction",
+      created_at: "2022-07-01T12:00:00Z",
+      shown: "2022-07-01 12:00:00 UTC",
+    },
+    {
+      shape: "milliseconds",
+      created_at: "2026-11-05T20:34:41.417Z",
+      shown: "2026-11-05 20:34:41 UTC",
+    },
+    {
+      shape: "microseconds",
+      created_at: "2026-11-05T18:36:02.182788Z",
+      shown: "2026-11-05 18:36:02 UTC",
+    },
+    {
+      shape: "nanoseconds just before midnight",
+      created_at: "2026-11-05T23:59:59.999999999Z",
+      shown: "2026-11-05 23:59:59 UTC",
+    },
+    {
+      shape: "lower-case separators",
+      created_at: "2026-11-05t20:34:41.417264z",
+      shown: "2026-11-05 20:34:41 UTC",
+    },
+    {
+      shape: "a UTC offset",
+      created_at: "2026-11-05T22:34:41.417264+02:00",
+      shown: "2026-11-05T22:34:41.417264+02:00",
+    },
+    {
+      shape: "unexpected text",
+      created_at: "not an instant",
+      shown: "not an instant",
+    },
+  ])(
+    "shows a created_at with $shape as $shown, keeping the full instant as its dateTime",
+    async ({ created_at, shown }) => {
+      balances.set(ACCOUNT, { status: 200, body: balanceBody });
+      histories.set(historyKey(ACCOUNT), {
+        status: 200,
+        body: {
+          items: [{ ...accrual("43", "250", "100"), created_at }],
+          next_key: null,
+          prev_key: null,
+        },
+      });
+      const user = renderPage();
+
+      await lookUp(user, ACCOUNT);
+
+      await waitFor(() => {
+        expect(historyRows()).toEqual([["43", "250", "1", "100", shown]]);
+      });
+      const table = screen.getByRole("table", { name: "Reward history" });
+      const dateTimes = Array.from(
+        table.querySelectorAll("tbody tr:not([aria-hidden='true']) td time"),
+        (time) => time.getAttribute("datetime"),
+      );
+      expect(dateTimes).toEqual([created_at]);
+    },
+  );
 
   it.each([
     { entry: "", why: "nothing entered" },

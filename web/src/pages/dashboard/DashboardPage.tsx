@@ -142,15 +142,41 @@ const transactionColumns: DataTableProps<TransactionResponse>["columns"] = [
   {
     accessorKey: "tran_desc",
     header: "Description",
-    meta: { placeholder: "Purchase at Merchant, Inc and Company" },
+    // BLITZY [LAYOUT]: the description may break anywhere (overrode the
+    // cell's whitespace-nowrap), so a TRAN-DESC X(100) without spaces no
+    // longer sets the column's minimum width: the column takes the width the
+    // other columns leave, and Amount stays inside the card. It is clamped to
+    // one line, so a row stays as tall as the skeleton and filler rows, and
+    // the title gives the full text the clamp hides.
+    cell: ({ row }) => (
+      <span
+        title={row.original.tran_desc}
+        className="line-clamp-1 whitespace-normal wrap-anywhere"
+      >
+        {row.original.tran_desc}
+      </span>
+    ),
+    meta: {
+      placeholder: (
+        <span className="line-clamp-1 whitespace-normal wrap-anywhere">
+          Purchase at Merchant, Inc and Company
+        </span>
+      ),
+    },
   },
   {
     accessorKey: "tran_amt",
-    header: "Amount",
+    header: () => <span className="block text-end">Amount</span>,
     cell: ({ row }) => (
-      <span className="tabular-nums">{row.original.tran_amt}</span>
+      <span className="block text-end tabular-nums">
+        {row.original.tran_amt}
+      </span>
     ),
-    meta: { placeholder: <span className="tabular-nums">-999.99</span> },
+    meta: {
+      placeholder: (
+        <span className="block text-end tabular-nums">-999.99</span>
+      ),
+    },
   },
 ];
 

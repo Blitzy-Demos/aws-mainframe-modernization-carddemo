@@ -11,7 +11,10 @@
 // Every points value and identifier is the API's decimal integer string,
 // rendered exactly as received and never converted to a number or reformatted:
 // a balance such as 9007199254740993 lies beyond what a JavaScript number holds
-// exactly. Every message comes from the server and is shown by lib/api-errors.
+// exactly. An accrual's RFC 3339 `created_at` is shown as its UTC date and time
+// of day, cut from the text and never parsed, inside a time element whose
+// dateTime keeps the full instant. Every message comes from the server and is
+// shown by lib/api-errors.
 import { useEffect, useState, type JSX } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -66,11 +69,30 @@ const FIRST_PAGE_KEY = "first";
 // still announced as a change; the delay is the one DataTable uses.
 const STATUS_ANNOUNCE_DELAY_MS = 150;
 
-// Every cell renders the API string as sent: the default accessor cell shows
-// the value itself, with no date parsing or locale formatting. Each
-// placeholder is a value as wide as the column's on a seeded history page:
-// identifiers and points of the seeded accruals' digit counts, and the RFC
-// 3339 `created_at` with its microseconds.
+// An RFC 3339 UTC instant as the API writes it: its date, its time of day to
+// the second, an optional fraction of a second and the `Z` designator.
+const UTC_INSTANT = /^(\d{4}-\d{2}-\d{2})[Tt](\d{2}:\d{2}:\d{2})(?:\.\d+)?[Zz]$/;
+
+// An accrual's `created_at` as the history shows it: its UTC date in the
+// `YYYY-MM-DD` form the reward-rule list shows, its UTC time of day to the
+// second (the fraction dropped) and "UTC", since nothing is converted to the
+// browser's zone. Both are cut from the text, never parsed. Text of any other
+// shape is shown exactly as sent. Either way the time element's dateTime keeps
+// the full instant.
+function createdAtCell(instant: string): JSX.Element {
+  const match = UTC_INSTANT.exec(instant);
+  const date = match?.[1];
+  const time = match?.[2];
+  const shown =
+    date === undefined || time === undefined ? instant : `${date} ${time} UTC`;
+  return <time dateTime={instant}>{shown}</time>;
+}
+
+// Every cell but Created at renders the API string as sent: the default
+// accessor cell shows the value itself. Created at shows its instant through
+// `createdAtCell`. Each placeholder is its cell's markup around a value as wide
+// as the column's on a seeded history page: identifiers and points of the
+// seeded accruals' digit counts, and an instant shown as its UTC date and time.
 //
 // `transaction_id` is the accrued transaction's row identity, not its 16-digit
 // TRAN-ID, which the transaction screens label "Transaction ID"; its column is
@@ -95,7 +117,8 @@ const columns: DataTableProps<RewardAccrual>["columns"] = [
   {
     accessorKey: "created_at",
     header: "Created at",
-    meta: { placeholder: "0000-00-00T00:00:00.000000Z" },
+    cell: ({ row }) => createdAtCell(row.original.created_at),
+    meta: { placeholder: createdAtCell("0000-00-00T00:00:00Z") },
   },
 ];
 

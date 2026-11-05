@@ -40,6 +40,7 @@ import {
   resolveRoute,
   REWARD_SCREENS,
   routeScope,
+  rowInput,
   seedPendingAuthorization,
   sidebar,
   sidebarLink,
@@ -48,6 +49,7 @@ import {
   tabTo,
   tableByCaption,
   test,
+  typeInto,
   UNMAPPED_LABELS,
   urlPath,
   USERS,
@@ -552,6 +554,68 @@ test.describe("app shell", () => {
     await expect
       .poll(() => main.evaluate((element) => element === document.activeElement || element.contains(document.activeElement)))
       .toBe(true);
+  });
+
+  // Sonner's toasts paint above every menu, so a theme menu that opened under
+  // the top-centre toast column would hide its items while a toast shows. The
+  // open menu's box is compared with every toast's box rather than hit-tested:
+  // while the Radix menu is open the body has pointer-events none, so
+  // elementFromPoint answers with the menu item even where a toast covers it.
+  test("the theme menu opens clear of a visible toast", async ({ page }) => {
+    await gotoApp(page, "/");
+    await expectScreen(page);
+    await typeInto(page, mapInput(content(page), rowInput("F-COACTVW-001", 0)), FIXTURE_KEYS.missingAccount);
+    await page.keyboard.press("Enter");
+    await expect(page.locator('[data-sonner-toast][data-type="error"]'), "the lookup failure is toasted").toBeVisible();
+    await page.getByRole("button", { name: "Toggle theme", exact: true }).click();
+    const menu = page.getByRole("menu");
+    await expect(menu.getByRole("menuitem", { name: "Light", exact: true })).toBeVisible();
+    await expect(menu.getByRole("menuitem", { name: "Dark", exact: true })).toBeVisible();
+    // The boxes are read once the menu's open animation and the toast's enter
+    // transition have come to rest. Only the toaster's and the menu's own
+    // finite animations are awaited; one cancelled meanwhile has stopped too.
+    await page.evaluate(() =>
+      Promise.all(
+        document
+          .getAnimations()
+          .filter((animation) => {
+            const effect = animation.effect;
+            return (
+              effect instanceof KeyframeEffect &&
+              effect.target !== null &&
+              effect.target.closest('[data-sonner-toaster], [role="menu"]') !== null &&
+              effect.getTiming().iterations !== Infinity
+            );
+          })
+          .map((animation) => animation.finished.catch(() => animation)),
+      ).then(() => undefined),
+    );
+    const boxes = await page.evaluate(() => {
+      const box = (element: Element): { left: number; top: number; right: number; bottom: number } => {
+        const { left, top, right, bottom } = element.getBoundingClientRect();
+        return { left, top, right, bottom };
+      };
+      const open = document.querySelector('[role="menu"]');
+      return {
+        menu: open === null ? null : box(open),
+        toasts: [...document.querySelectorAll("[data-sonner-toast]")].map(box),
+      };
+    });
+    const menuBox = boxes.menu;
+    if (menuBox === null) {
+      throw new Error("the theme menu is not rendered");
+    }
+    expect(boxes.toasts.length, "a toast is shown while the menu is open").toBeGreaterThan(0);
+    const covering = boxes.toasts.filter(
+      (toast) =>
+        toast.left < menuBox.right &&
+        menuBox.left < toast.right &&
+        toast.top < menuBox.bottom &&
+        menuBox.top < toast.bottom,
+    );
+    expect(covering, `toasts over the theme menu at ${JSON.stringify(menuBox)}`).toEqual([]);
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
   });
 });
 

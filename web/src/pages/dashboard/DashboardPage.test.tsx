@@ -432,6 +432,91 @@ describe("DashboardPage", () => {
     ]);
   });
 
+  // A TRAN-DESC X(100) at its full length without a space breaks anywhere and
+  // is clamped to one line, so it cannot widen the table past its card; the
+  // title and the text keep it whole.
+  it("clamps a 100-character description to one line with the full text as its title", async () => {
+    const longDescription = "ABCDEFGHIJ".repeat(10);
+    const longPage: TransactionPage = {
+      ...transactionPage,
+      items: [{ ...transaction, tran_desc: longDescription }],
+    };
+    stubApi({ ...SUCCESS, transactions: [200, longPage] });
+    const toastError = vi.spyOn(toast, "error");
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(accountInput(), `${ACCOUNT_ID}{Enter}`);
+    const table = await screen.findByRole("table", {
+      name: "Recent transactions",
+    });
+    const description = await within(table).findByText(longDescription);
+    const [headerRow, firstRow] = within(table).getAllByRole("row");
+    expect(within(headerRow).getAllByRole("columnheader")[2].textContent).toBe(
+      "Description",
+    );
+    expect(within(firstRow).getAllByRole("cell")[2].contains(description)).toBe(
+      true,
+    );
+    expect(longDescription).toHaveLength(100);
+    expect(description.getAttribute("title")).toBe(longDescription);
+    expect(description.textContent).toBe(longDescription);
+    expect([...description.classList]).toEqual(
+      expect.arrayContaining(["line-clamp-1", "whitespace-normal", "wrap-anywhere"]),
+    );
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  // The money column aligns to the end, as on the Transaction List page: its
+  // header, each skeleton row's placeholder and each amount.
+  it("aligns the Amount header, placeholders and amounts to the end", async () => {
+    stubApi(SUCCESS);
+    const releaseTransactions = holdReply("/api/transactions");
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(accountInput(), `${ACCOUNT_ID}{Enter}`);
+    // The account found, its transactions are read under the table's header.
+    const table = await screen.findByRole("table", {
+      name: "Recent transactions",
+    });
+    await waitFor(() => {
+      expect(table.getAttribute("aria-busy")).toBe("true");
+    });
+    const header = within(table).getAllByRole("columnheader")[3];
+    const headerText = within(header).getByText("Amount");
+    expect(headerText.tagName).toBe("SPAN");
+    expect([...headerText.classList]).toEqual(
+      expect.arrayContaining(["block", "text-end"]),
+    );
+    const skeletonRows = table.querySelectorAll("tbody tr");
+    expect(skeletonRows).toHaveLength(5);
+    skeletonRows.forEach((row) => {
+      const placeholder = row.querySelectorAll("td")[3].querySelector("span");
+      expect(placeholder?.textContent).toBe("-999.99");
+      expect([...(placeholder?.classList ?? [])]).toEqual(
+        expect.arrayContaining(["block", "text-end", "tabular-nums"]),
+      );
+    });
+
+    releaseTransactions([200, fullPage]);
+    await waitFor(() => {
+      expect(table.hasAttribute("aria-busy")).toBe(false);
+    });
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows).toHaveLength(fullPage.items.length);
+    rows.forEach((row, index) => {
+      const amount = within(row).getAllByRole("cell")[3].firstElementChild;
+      expect(amount?.tagName).toBe("SPAN");
+      expect(amount?.textContent).toBe(
+        fullPage.items[fullPage.items.length - 1 - index].tran_amt,
+      );
+      expect([...(amount?.classList ?? [])]).toEqual(
+        expect.arrayContaining(["block", "text-end", "tabular-nums"]),
+      );
+    });
+  });
+
   it("holds the summary's place with its loading shells while the account and then its reward balance are read", async () => {
     stubApi(SUCCESS);
     const releaseAccount = holdReply(`/api/accounts/${ACCOUNT_ID}`);

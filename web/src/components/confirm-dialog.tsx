@@ -34,8 +34,11 @@
 // Escape closes (pending included, since the caller owns `open`) and an
 // outside click is ignored. Focus placement is adjusted only where Radix would
 // leave it on the body, as described in the component: on an open while
-// pending, on close, and on a press of the overlay. The content also carries
-// aria-modal, the alertdialog semantics the Radix content does not set.
+// pending, on close, and on a press of the overlay. The focus the dialog
+// returns or restores is scrolled into view only when the user cannot see it,
+// as after a viewport change while the dialog held the page still; a target
+// the user sees never moves. The content also carries aria-modal, the
+// alertdialog semantics the Radix content does not set.
 //
 // Every visible word comes from the caller, so the buttons' accessible names
 // are exactly the labels docs/parity/function-map.md lists for the
@@ -117,6 +120,46 @@ function returnTarget(
   return opener?.isConnected
     ? opener
     : ancestors.find((ancestor) => ancestor.isConnected);
+}
+
+// The dialog focuses without the scroll focus() would make, then scrolls the
+// element it focused into view only when that element holds focus and the
+// user cannot see it, so a target the user sees never moves. The page stays
+// still while the dialog is shown, so a viewport change meanwhile (a tablet
+// rotated, a window resized) can leave the opener off-screen. A control
+// (`whole`), the opener or one inside the dialog, counts as shown only when
+// all of it lies inside the viewport, and is otherwise centred, so its whole
+// focus ring shows. A focusable ancestor (`part`), the data table or the main
+// region, which may be taller than the viewport, counts as shown when any
+// part of it does, and is otherwise brought to the nearest edge. The viewport
+// is the document's client area, which excludes its scrollbars.
+function revealFocusIfHidden(
+  element: HTMLElement,
+  shown: "whole" | "part",
+): void {
+  if (document.activeElement !== element) {
+    return;
+  }
+  const rect = element.getBoundingClientRect();
+  const { clientWidth, clientHeight } = document.documentElement;
+  const visible =
+    shown === "whole"
+      ? rect.top >= 0 &&
+        rect.left >= 0 &&
+        rect.bottom <= clientHeight &&
+        rect.right <= clientWidth
+      : rect.bottom > 0 &&
+        rect.right > 0 &&
+        rect.top < clientHeight &&
+        rect.left < clientWidth;
+  if (visible) {
+    return;
+  }
+  element.scrollIntoView(
+    shown === "whole"
+      ? { block: "center", inline: "nearest" }
+      : { block: "nearest" },
+  );
 }
 
 export function ConfirmDialog({
@@ -201,7 +244,10 @@ export function ConfirmDialog({
           // on its own timer), so whether one placed focus is read on the
           // task after theirs: with focus still on the body, where the
           // removed dialog left it, the opener takes it or, once its row has
-          // gone, its nearest focusable ancestor still in the document.
+          // gone, its nearest focusable ancestor still in the document. Only
+          // focus the dialog returns this way is scrolled into view, and only
+          // when the user cannot see it; focus a move placed stands where it
+          // is.
           const moves = queuedMovesRef.current.splice(0);
           if (moves.length > 0) {
             event.preventDefault();
@@ -218,6 +264,10 @@ export function ConfirmDialog({
                   returned !== undefined
                 ) {
                   returned.focus({ preventScroll: true });
+                  revealFocusIfHidden(
+                    returned,
+                    returned === opener ? "whole" : "part",
+                  );
                 }
               }, 0);
             }
@@ -227,7 +277,7 @@ export function ConfirmDialog({
           // its own controls stands. Focus on the body was still in the
           // removed dialog, and only then is the opener refocused or, once
           // its row has gone, its nearest focusable ancestor still in the
-          // document.
+          // document, and scrolled into view when the user cannot see it.
           const active = document.activeElement;
           if (
             active instanceof HTMLElement &&
@@ -241,6 +291,7 @@ export function ConfirmDialog({
           if (target !== undefined) {
             event.preventDefault();
             target.focus({ preventScroll: true });
+            revealFocusIfHidden(target, target === opener ? "whole" : "part");
           }
         }}
         onBlur={(event) => {
@@ -249,9 +300,9 @@ export function ConfirmDialog({
           // trap ignores a blur with no element receiving focus. Once the
           // press has settled, on the next task, the element that lost focus
           // takes it back, or the content when that element can no longer
-          // hold it. A switch to another window keeps focus on its element,
-          // and a closing dialog hands focus on in onCloseAutoFocus, so
-          // neither is touched.
+          // hold it, scrolled into view when the user cannot see it. A switch
+          // to another window keeps focus on its element, and a closing
+          // dialog hands focus on in onCloseAutoFocus, so neither is touched.
           if (event.relatedTarget !== null || !openRef.current) {
             return;
           }
@@ -274,6 +325,7 @@ export function ConfirmDialog({
                 ? lost
                 : content;
             target.focus({ preventScroll: true });
+            revealFocusIfHidden(target, "whole");
           }, 0);
         }}
       >

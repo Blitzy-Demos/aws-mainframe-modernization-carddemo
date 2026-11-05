@@ -1,10 +1,15 @@
 // Tests of the signed-on session store (lib/session.ts): the sessionStorage
 // mirror, rehydration on module load, expiry through getSession and through
-// the expiry timer, change notification, and the useSession binding.
+// the expiry timer, change notification, the announcements on its
+// BroadcastChannel, and the useSession binding.
 //
 // The module rehydrates when it loads, so every test loads a fresh instance
 // after arranging storage. Fake timers are installed first, so both the clock
 // the module reads and the timers it schedules are under the test's control.
+// The module opens a BroadcastChannel when it loads, so a FakeChannel is
+// installed first as well: it records what the module opens and posts, and
+// unlike Node's own channel it leaves nothing open to keep the test process
+// alive.
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -45,14 +50,45 @@ function storedValue(): unknown {
   return text === null ? null : JSON.parse(text);
 }
 
+// The BroadcastChannel every load opens. Each test starts with no channel
+// opened, so `opened` holds the channels of that test's loads only.
+class FakeChannel {
+  static readonly opened: FakeChannel[] = [];
+
+  readonly name: string;
+
+  readonly posted: unknown[] = [];
+
+  constructor(name: string) {
+    this.name = name;
+    FakeChannel.opened.push(this);
+  }
+
+  postMessage(message: unknown): void {
+    this.posted.push(message);
+  }
+}
+
+// The channel of the instance the test loaded last.
+function lastChannel(): FakeChannel {
+  const channel = FakeChannel.opened.at(-1);
+  if (channel === undefined) {
+    throw new Error("the module opened no BroadcastChannel");
+  }
+  return channel;
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
+  FakeChannel.opened.length = 0;
+  vi.stubGlobal("BroadcastChannel", FakeChannel);
 });
 
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("SESSION_STORAGE_KEY", () => {
@@ -494,6 +530,212 @@ describe("resync with sessionStorage", () => {
     expect(getSession()).toEqual(USER);
     expect(listener).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(1);
+  });
+});
+
+// A message on the channel makes Chrome evict the pages of the tab held in its
+// back/forward cache, so a post must follow every change to the stored record
+// and nothing else: a post with no change would evict pages for nothing.
+describe("announcements on the session channel", () => {
+  const USER = sessionExpiringIn(60_000, {
+    token: "user.session.token",
+    user_id: "USER0001",
+    usr_type: "U",
+    landing: "/",
+  });
+
+  function rejectWrites(): void {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("quota exceeded", "QuotaExceededError");
+    });
+  }
+
+  // A BroadcastChannel the browser refuses to open.
+  class RefusedChannel {
+    constructor() {
+      throw new DOMException("storage is blocked", "SecurityError");
+    }
+  }
+
+  it("opens one channel named carddemo.session when the module loads", async () => {
+    await loadSession();
+
+    expect(FakeChannel.opened.map((channel) => channel.name)).toEqual([
+      "carddemo.session",
+    ]);
+    expect(lastChannel().posted).toEqual([]);
+  });
+
+  it.each<{
+    change: string;
+    stored: string | null;
+    run: (module: SessionModule) => void;
+    posts: "once" | "nothing";
+  }>([
+    {
+      change: "a sign-on",
+      stored: null,
+      run: ({ setSession }) => {
+        setSession(USER);
+      },
+      posts: "once",
+    },
+    {
+      change: "a sign-off with a stored record",
+      stored: JSON.stringify(USER),
+      run: ({ clearSession }) => {
+        clearSession();
+      },
+      posts: "once",
+    },
+    {
+      change: "a sign-off with no stored record",
+      stored: null,
+      run: ({ clearSession }) => {
+        clearSession();
+      },
+      posts: "nothing",
+    },
+    {
+      change: "the expiry timer ending a stored session",
+      stored: JSON.stringify(USER),
+      run: () => {
+        vi.advanceTimersByTime(60_000);
+      },
+      posts: "once",
+    },
+    {
+      change: "rehydration removing an expired record",
+      stored: JSON.stringify(sessionExpiringIn(0)),
+      run: () => undefined,
+      posts: "once",
+    },
+    {
+      change: "rehydration removing a malformed record",
+      stored: "{not json",
+      run: () => undefined,
+      posts: "once",
+    },
+    {
+      change: "rehydration restoring a live record",
+      stored: JSON.stringify(USER),
+      run: () => undefined,
+      posts: "nothing",
+    },
+    {
+      change: "a rejected write removing the stored record it replaces",
+      stored: JSON.stringify(USER),
+      run: ({ setSession }) => {
+        rejectWrites();
+        setSession(sessionExpiringIn(120_000));
+      },
+      posts: "once",
+    },
+    {
+      change: "a rejected write with no stored record",
+      stored: null,
+      run: ({ setSession }) => {
+        rejectWrites();
+        setSession(USER);
+      },
+      posts: "nothing",
+    },
+  ])("$change posts $posts", async ({ stored, run, posts }) => {
+    if (stored !== null) {
+      sessionStorage.setItem(KEY, stored);
+    }
+    const session = await loadSession();
+
+    run(session);
+
+    expect(lastChannel().posted).toHaveLength(posts === "once" ? 1 : 0);
+  });
+
+  it("posts one constant message that names neither the token nor the user", async () => {
+    const expired = sessionExpiringIn(0, { token: "expired.session.token" });
+    sessionStorage.setItem(KEY, JSON.stringify(expired));
+    const { clearSession, setSession } = await loadSession();
+
+    setSession(USER);
+    clearSession();
+
+    const { posted } = lastChannel();
+    expect(posted).toHaveLength(3);
+    expect(new Set(posted).size).toBe(1);
+    const text = JSON.stringify(posted);
+    for (const named of [
+      expired.token,
+      expired.user_id,
+      USER.token,
+      USER.user_id,
+    ]) {
+      expect(text).not.toContain(named);
+    }
+  });
+
+  it.each<{ browser: string; install: () => void; warnings: number }>([
+    {
+      browser: "has no BroadcastChannel",
+      install: () => {
+        vi.stubGlobal("BroadcastChannel", undefined);
+      },
+      warnings: 0,
+    },
+    {
+      browser: "refuses to open the channel",
+      install: () => {
+        vi.stubGlobal("BroadcastChannel", RefusedChannel);
+      },
+      warnings: 1,
+    },
+  ])(
+    "loads, signs on and signs off where the browser $browser",
+    async ({ install, warnings }) => {
+      install();
+      const warn = vi
+        .spyOn(console, "warn")
+        .mockImplementation(() => undefined);
+      sessionStorage.setItem(KEY, "{not json");
+      const { clearSession, getSession, setSession } = await loadSession();
+      expect(sessionStorage.getItem(KEY)).toBeNull();
+
+      setSession(USER);
+
+      expect(getSession()).toEqual(USER);
+      expect(storedValue()).toEqual(USER);
+
+      clearSession();
+
+      expect(getSession()).toBeNull();
+      expect(sessionStorage.getItem(KEY)).toBeNull();
+      expect(warn).toHaveBeenCalledTimes(warnings);
+      expect(FakeChannel.opened).toEqual([]);
+    },
+  );
+
+  it("signs on and off, warning each time, when the browser refuses a post", async () => {
+    vi.spyOn(FakeChannel.prototype, "postMessage").mockImplementation(() => {
+      throw new DOMException("the channel is closed", "InvalidStateError");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { clearSession, getSession, setSession } = await loadSession();
+
+    setSession(USER);
+
+    expect(getSession()).toEqual(USER);
+    expect(storedValue()).toEqual(USER);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenLastCalledWith(
+      expect.stringContaining("BroadcastChannel carddemo.session"),
+      expect.any(DOMException),
+    );
+
+    clearSession();
+
+    expect(getSession()).toBeNull();
+    expect(sessionStorage.getItem(KEY)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 });
 
