@@ -325,6 +325,13 @@ fn receive_description(entered: &str) -> String {
 /// - backward without a start key, the F7 on the first page from the start
 ///   of the table.
 ///
+/// The forward read of F7 on the first page answers
+/// [`NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC`] even when it fails, with the
+/// rows it fetched: after a failed `CLOSE` the page read whole, after a
+/// failed look-ahead `FETCH` the page with its last code as the next key,
+/// and with no next key the rows before a failed `FETCH` of a page row, or
+/// none after a failed `OPEN` (E-86).
+///
 /// # Errors
 ///
 /// - [`ErrorKind::NotFound`] with
@@ -346,7 +353,8 @@ fn receive_description(entered: &str) -> String {
 ///   ([`ERROR_ON_FETCH_CURSOR_C_TR_TYPE_BACKWARD`], V-COTRTLIC-010) or its
 ///   `CLOSE` ([`C_TR_TYPE_BACKWARD_CLOSE`], V-COTRTLIC-027). Each is
 ///   [`UNEXPECTED_ERROR`] for a failure without a Db2 code. A backward read
-///   failure that reaches the first page gives way to
+///   failure that reaches the first page, and any failure of the forward
+///   read of F7 on the first page, give way to
 ///   [`NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC`] (V-COTRTLIC-009).
 pub async fn list<S: TranTypeMasterStore>(
     store: &mut S,
@@ -463,28 +471,60 @@ async fn read_forward<S: TranTypeMasterStore>(
 }
 
 /// COTRTLIC 0000-MAIN F7 with CA-FIRST-PAGE, 8000-READ-FORWARD,
-/// 9450-CLOSE-FORWARD-CURSOR, 2500-SETUP-MESSAGE — P-COTRTLIC-004,
-/// P-COTRTLIC-028, P-COTRTLIC-038, V-COTRTLIC-009, V-COTRTLIC-025
+/// 9400-OPEN-FORWARD-CURSOR, 9450-CLOSE-FORWARD-CURSOR, 2500-SETUP-MESSAGE —
+/// P-COTRTLIC-004, P-COTRTLIC-028, P-COTRTLIC-031, P-COTRTLIC-032,
+/// P-COTRTLIC-037, P-COTRTLIC-038, V-COTRTLIC-006, V-COTRTLIC-007,
+/// V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-025
 ///
 /// The page is read forward from `start_key`, the first code shown, and
 /// [`NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC`] is moved over whatever the read
-/// set, because `WS-DB2-ERROR` is not tested after it (E-73). A read whose
-/// `CLOSE` fails has fetched the page and its look-ahead row, which stay
-/// shown as after a whole read (P-COTRTLIC-038); any other failed read
-/// leaves the page empty.
+/// set, because `WS-DB2-ERROR` is not tested after it (E-73). The map is
+/// sent with the rows the read moved before any step failed:
+///
+/// - a failed `CLOSE` comes after the page and its look-ahead row, which
+///   stay shown as after a whole read (P-COTRTLIC-038, V-COTRTLIC-025);
+/// - a failed look-ahead `FETCH` comes after the page, whose rows stay
+///   shown. The program moved the page's last code to `WS-CA-LAST-TR-CODE`
+///   before that `FETCH` and keeps `CA-NEXT-PAGE-EXISTS`, and F8 reads from
+///   that code inclusive, so it is the next key (P-COTRTLIC-031,
+///   V-COTRTLIC-006);
+/// - a failed `FETCH` of a row of the page keeps the rows fetched before it,
+///   in order (P-COTRTLIC-032, V-COTRTLIC-007), and a failed `OPEN` leaves
+///   the page empty (P-COTRTLIC-037, V-COTRTLIC-024). Neither moves
+///   `WS-CA-LAST-TR-CODE`, so the code F8 starts from is the COMMAREA's from
+///   earlier screens, and after the `OPEN`, which leaves before
+///   `CA-NEXT-PAGE-EXISTS` is set, so is whether F8 is offered; the stateless
+///   request carries neither (E-54). That result cannot be proven, so no
+///   next key is guessed: the page offers none, the proposal of the halt
+///   E-86.
 async fn reread_first_page<S: TranTypeMasterStore>(
     store: &mut S,
     filter: TranTypeFilter,
     start_key: Option<TranTypeCode>,
     page_size: u16,
 ) -> TranTypePage {
+    let shown = usize::from(page_size);
     let read = browse(store, filter, start_key, Direction::Forward, page_size).await;
     let mut page = match read {
         Ok(rows) => forward_page(rows, page_size),
-        Err(failure) if failure.phase == CursorPhase::Close => {
-            forward_page(failure.fetched, page_size)
-        }
-        Err(_) => TranTypePage::default(),
+        Err(failure) => match failure.phase {
+            CursorPhase::Close => forward_page(failure.fetched, page_size),
+            CursorPhase::Fetch if failure.fetched.len() >= shown => {
+                let mut rows = failure.fetched;
+                rows.truncate(shown);
+                let next_key = rows.last().map(|row| row.tr_type);
+                TranTypePage {
+                    items: rows,
+                    next_key,
+                    ..TranTypePage::default()
+                }
+            }
+            CursorPhase::Fetch => TranTypePage {
+                items: failure.fetched,
+                ..TranTypePage::default()
+            },
+            CursorPhase::Open => TranTypePage::default(),
+        },
     };
     page.message = Some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC);
     page
@@ -1304,8 +1344,8 @@ mod tests {
         let expected = DomainError::unexpected(UNEXPECTED_ERROR).with_field(FIELD_TYPE_FILTER);
         assert_eq!(outcome, Err(expected));
 
-        // F7 on the first page: the re-read's failure gives way to the
-        // first-page text, and the page is empty.
+        // F7 on the first page: the re-read's failed OPEN gives way to the
+        // first-page text, and the page is empty (P-COTRTLIC-037).
         for error in [PortError::Contention, unavailable] {
             let mut store = numbered(9);
             store.fail_next("browse_tran_types", error.clone());
@@ -1394,22 +1434,37 @@ mod tests {
             assert_eq!(outcome, Err(expected), "{case}");
 
             // F7 on the first page re-reads it forward, and the first-page
-            // text replaces whichever text the failed step gave. A failed
-            // CLOSE comes after the page and its look-ahead row, which stay
-            // shown (P-COTRTLIC-038); any earlier failure leaves no row.
+            // text replaces whichever text the failed step gave; the rows
+            // fetched stay shown. A failed CLOSE comes after the page and its
+            // look-ahead row 08, the next key (P-COTRTLIC-038); a failed
+            // look-ahead FETCH after the page, whose last code 07 is the next
+            // key (P-COTRTLIC-031); a failed FETCH of a page row keeps the
+            // rows before it and a failed OPEN none, with no next key
+            // (P-COTRTLIC-032, P-COTRTLIC-037, E-86).
             let mut store = numbered(count);
             store.fail_tran_type_cursor(fetched, PortError::Contention);
             let page = block_on(list(&mut store, browse("", BACKWARD)))
                 .expect("the first-page text is not an error");
-            let expected = if fetched > usize::from(SCREEN_ROWS) {
-                let mut whole = block_on(list(&mut numbered(count), browse("", FORWARD)))
-                    .expect("the first page of a whole read");
-                whole.message = Some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC);
-                whole
-            } else {
-                empty_page(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC)
+            let page_rows = usize::from(SCREEN_ROWS);
+            let next = match fetched {
+                rows if rows > page_rows => "08",
+                rows if rows == page_rows => "07",
+                _ => "",
+            };
+            let items = (1..=fetched.min(page_rows))
+                .map(|number| {
+                    let type_code = format!("{number:02}");
+                    master(&type_code, &format!("TYPE {type_code}"))
+                })
+                .collect();
+            let expected = TranTypePage {
+                items,
+                next_key: key(next),
+                prev_key: None,
+                message: Some(NO_PREVIOUS_PAGES_TO_DISPLAY_COTRTLIC),
             };
             assert_eq!(page, expected, "{case}");
+            assert_eq!(store.calls, ["browse_tran_types"], "{case}");
         }
     }
 

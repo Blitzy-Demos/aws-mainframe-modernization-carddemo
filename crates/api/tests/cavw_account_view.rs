@@ -61,7 +61,7 @@ use common::audit_text::{Operand, Template};
 use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, SET_COOKIE};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The program whose validation rows the first test exercises.
 const PROGRAM: &str = "COACTVWC";
@@ -967,6 +967,10 @@ const JSON_MEDIA_TYPE: &str = "application/json";
 /// identity the handler is called with directly.
 const SIGNED_ON_USER: &str = "USER0001";
 
+/// The `code` of the 401 for a request without a bearer token, answered with
+/// [`messages::AUTHENTICATION_REQUIRED`] and no `fields`.
+const UNAUTHENTICATED: &str = "UNAUTHENTICATED";
+
 /// One HTTP answer of the dialogue, with the headers its rows read.
 struct Answer {
     /// The request, as failure messages show it.
@@ -1376,13 +1380,17 @@ fn assert_no_conversation_state(parity: &Document, dialogue: &Dialogue) {
             answer.request
         );
     }
-    let refused = ApiError::unauthenticated();
+    let refused = json!({
+        "code": UNAUTHENTICATED,
+        "message": messages::AUTHENTICATION_REQUIRED,
+    });
     let unauthenticated = &dialogue.unauthenticated;
     assert_eq!(
         (unauthenticated.status, &unauthenticated.body),
-        (refused.status(), &error_body(&refused)),
-        "{id} ({replacement}): {}",
-        unauthenticated.request
+        (StatusCode::UNAUTHORIZED, &refused),
+        "{id} ({replacement}): {}: {}",
+        unauthenticated.request,
+        unauthenticated.raw
     );
 }
 

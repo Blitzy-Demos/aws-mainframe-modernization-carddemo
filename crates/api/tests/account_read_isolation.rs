@@ -15,17 +15,19 @@
 //! customer table stays readable, and both routes must answer with the
 //! `ACCTDAT` text the audit rows give.
 //!
-//! The expected texts are built by `carddemo_domain::messages` from the audit
-//! rows' `ERROR-FILE` literal, with the `READ` operation name of the COBOL
-//! `WHEN OTHER` branch and the RESP and RESP2 values E-44 sets for a database
-//! failure.
+//! Each expected text is the reviewed template of its audit row, expanded by
+//! `common::audit_text` into the 75 bytes of `WS-RETURN-MSG`, never composed
+//! by `carddemo_domain::messages`: the row's `ERROR-FILE` literal, the `READ`
+//! operation name of the COBOL `WHEN OTHER` branch and the RESP and RESP2
+//! values E-44 sets for a database failure, each moved into its COBOL
+//! picture.
 
 pub mod common;
 
 use carddemo_audit::Document;
 use carddemo_domain::error::ErrorKind;
-use carddemo_domain::messages;
 use carddemo_testkit::block_on;
+use common::audit_text::{Operand, Template};
 use common::{TestApp, assert_error, validation_audit};
 use reqwest::StatusCode;
 use serde_json::{Map, Value};
@@ -45,11 +47,32 @@ const RESTORE_ACCOUNTS: &str = "ALTER TABLE accounts_offline RENAME TO accounts"
 /// [app/cbl/COACTUPC.cbl:L3739].
 const ERROR_OPNAME_READ: &str = "READ";
 
+/// `WS-RETURN-MSG PIC X(75)`, the receiver of the file-error text in both
+/// programs [app/cbl/COACTVWC.cbl:L117] [app/cbl/COACTUPC.cbl:L479].
+const RETURN_MSG_LEN: usize = 75;
+
+/// `ERROR-OPNAME PIC X(8)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COACTVWC.cbl:L89] [app/cbl/COACTUPC.cbl:L392].
+const ERROR_OPNAME_LEN: usize = 8;
+
+/// `ERROR-FILE PIC X(9)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COACTVWC.cbl:L93] [app/cbl/COACTUPC.cbl:L396].
+const ERROR_FILE_LEN: usize = 9;
+
+/// The digits of `WS-RESP-CD` and `WS-REAS-CD`, both `PIC S9(09) COMP`
+/// [app/cbl/COACTVWC.cbl:L40-42] [app/cbl/COACTUPC.cbl:L40-42], which `MOVE`
+/// sends to `ERROR-RESP` and `ERROR-RESP2` as their 9-digit display.
+const RESP_DIGITS: usize = 9;
+
+/// `ERROR-RESP PIC X(10)` and `ERROR-RESP2 PIC X(10)`
+/// [app/cbl/COACTVWC.cbl:L98-103] [app/cbl/COACTUPC.cbl:L401-406].
+const ERROR_RESP_LEN: usize = 10;
+
 /// The `RESP` E-44 sets for a database failure: `IOERR`.
-const RESP_IOERR: u32 = 17;
+const RESP_IOERR: u64 = 17;
 
 /// The `RESP2` E-44 sets alongside [`RESP_IOERR`].
-const RESP2_IOERR: u32 = 0;
+const RESP2_IOERR: u64 = 0;
 
 /// The account group the update body changes, `AADDGRP X(10)`, a field no
 /// edit checks.
@@ -114,7 +137,9 @@ struct Expected {
     field: String,
 }
 
-/// The status, the file-error text and the BMS field of the audit row `id`.
+/// The status, the file-error text and the BMS field of the audit row `id`:
+/// its reviewed template expanded with [`file_error`] into the 75 bytes of
+/// `WS-RETURN-MSG`.
 fn expected(doc: &Document, id: &str) -> Expected {
     let (table, row) = doc
         .find_row(id)
@@ -130,16 +155,28 @@ fn expected(doc: &Document, id: &str) -> Expected {
         .ok()
         .and_then(|code| StatusCode::from_u16(code).ok())
         .unwrap_or_else(|| panic!("{id} has no HTTP status: {}", cell("Status")));
+    let bindings = file_error(error_file(cell("Message text")));
     Expected {
         status,
-        message: messages::file_error_message(
-            ERROR_OPNAME_READ,
-            error_file(cell("Message text")),
-            RESP_IOERR,
-            RESP2_IOERR,
-        ),
+        message: Template::load(doc, id).expand(&bindings, RETURN_MSG_LEN),
         field: cell("BMS field").to_owned(),
     }
+}
+
+/// The bindings of the `WS-FILE-ERROR-MESSAGE` template for a failed read of
+/// `file`: `ERROR-OPNAME` holding `READ`, `ERROR-FILE` holding `file`, and
+/// `ERROR-RESP` and `ERROR-RESP2` holding the 9-digit display of the `IOERR`
+/// codes E-44 sets, each in its `PIC X` field.
+fn file_error(file: &str) -> [Operand; 4] {
+    let resp = |name: &str, code: u64| {
+        Operand::unsigned_to_alphanumeric(name, code, RESP_DIGITS, ERROR_RESP_LEN)
+    };
+    [
+        Operand::alphanumeric("ERROR-OPNAME", ERROR_OPNAME_READ, ERROR_OPNAME_LEN),
+        Operand::alphanumeric("ERROR-FILE", file, ERROR_FILE_LEN),
+        resp("ERROR-RESP", RESP_IOERR),
+        resp("ERROR-RESP2", RESP2_IOERR),
+    ]
 }
 
 /// The `ERROR-FILE` literal a message cell names: the quoted text after its

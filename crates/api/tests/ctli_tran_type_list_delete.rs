@@ -12,8 +12,11 @@
 //! Every error answer takes its status and its `code` from its reviewed
 //! `V-COTRTLIC` row of `docs/parity/validation-audit.md`, read at run time
 //! (the `Status` column and the `kind=` of the trigger cell), and its text
-//! from `carddemo_domain::messages`. Each `P-` row cited is checked to have
-//! passed its review in `docs/parity/parity-oracle-audit.md`.
+//! from `carddemo_domain::messages`, except a Db2 text, which is the row's
+//! audited `Message text` filled with the `PIC ----9` edit of the injected
+//! `SQLCODE` and the empty `DSNTIAC` text, then checked to equal the text
+//! `messages` composes. Each `P-` row cited is checked to have passed its
+//! review in `docs/parity/parity-oracle-audit.md`.
 //!
 //! The seeded master is the Db2 initial load, decoded at run time from the
 //! `DB2LTTYP.ctl` lines P-TRNTYPE-003 cites, and checked against the table
@@ -38,7 +41,9 @@
 //! A cursor `CLOSE` fails only after the read has returned every row it asked
 //! for, and the cursor is one statement that no test SQL fails after its last
 //! row, so the `CLOSE` check drives the list rule over an in-memory store
-//! that reports that failure, and needs no container either.
+//! that reports that failure, and needs no container either. The same store
+//! fails the forward re-read of F7 on the first page at its `OPEN` and at a
+//! `FETCH`, with no container.
 
 pub mod common;
 
@@ -1276,9 +1281,12 @@ async fn inline_updates(app: &TestApp, token: &str, audits: &Audits) {
 
     // The type is gone since it was listed: the UPDATE finds no row, and the
     // action text is formatted with its `SQLCODE` like every Db2 text.
-    let not_found = db2_text(
+    let not_found = mapped_db2_text(
+        audits,
+        "V-COTRTLIC-016",
         messages::RECORD_NOT_FOUND_DELETED_BY_OTHERS,
         SQLCODE_NOT_FOUND,
+        EDITED_NOT_FOUND,
     );
     assert!(
         not_found.starts_with(messages::RECORD_NOT_FOUND_DELETED_BY_OTHERS),
@@ -1415,7 +1423,13 @@ async fn failed_reads(app: &TestApp, token: &str, audits: &Audits) {
     ]);
     app.stack().exec_sql(FAIL_READS_WITH_LOCK_TIMEOUT).await;
 
-    let forward = db2_text(messages::C_TR_TYPE_FORWARD_OPEN, SQLCODE_CONTENTION);
+    let forward = mapped_db2_text(
+        audits,
+        "V-COTRTLIC-024",
+        messages::C_TR_TYPE_FORWARD_OPEN,
+        SQLCODE_CONTENTION,
+        EDITED_CONTENTION,
+    );
     let resp = list_error(app, token, "").await;
     assert_row_error(
         audits,
@@ -1430,7 +1444,13 @@ async fn failed_reads(app: &TestApp, token: &str, audits: &Audits) {
     // the backward cursor that ends every backward read keeps the text of
     // the failed open.
     audits.reviewed(&["P-COTRTLIC-035"]);
-    let backward = db2_text(messages::C_TR_TYPE_BACKWARD_OPEN, SQLCODE_CONTENTION);
+    let backward = mapped_db2_text(
+        audits,
+        "V-COTRTLIC-026",
+        messages::C_TR_TYPE_BACKWARD_OPEN,
+        SQLCODE_CONTENTION,
+        EDITED_CONTENTION,
+    );
     let resp = list_error(app, token, "?start_key=09&direction=backward").await;
     assert_row_error(
         audits,
@@ -1464,9 +1484,13 @@ async fn failed_reads(app: &TestApp, token: &str, audits: &Audits) {
 /// such a page-back a backward cursor that fails before its first row its
 /// `OPEN`, whose text the `FETCH` and `CLOSE` of the unopened cursor keep. On
 /// a page-back that reaches the first page both give way to the first-page
-/// text, with the rows read. The look-behind row past the backward page,
-/// which the program never fetches, fails nothing the program reads: the
-/// page is answered as read. Once the master reads again, so does the list.
+/// text, with the rows read. So does a failed forward `FETCH` on F7 from the
+/// first page, which re-reads it forward: the rows before a failed `FETCH`
+/// of a page row with no next key (E-86), the page before a failed
+/// look-ahead `FETCH` with its last code as the next key. The look-behind
+/// row past the backward page, which the program never fetches, fails
+/// nothing the program reads: the page is answered as read. Once the master
+/// reads again, so does the list.
 async fn failed_fetches(app: &TestApp, token: &str, audits: &Audits) {
     let master = rows(app, MASTER_ROWS).await;
     let codes: Vec<String> = master.iter().map(|(code, _)| code.clone()).collect();
@@ -1486,12 +1510,43 @@ async fn failed_fetches(app: &TestApp, token: &str, audits: &Audits) {
         assert_cursor_error(app, token, audits, query, "V-COTRTLIC-007", page_fetch).await;
     }
 
+    // F7 on the first page re-reads it forward, from the start of the table
+    // and from its first code, before which no type stands: the first-page
+    // text replaces the cursor's, and the rows 01 to 04 fetched before the
+    // failed FETCH of 05 stay shown, with no next key (E-86).
+    audits.reviewed(&["P-COTRTLIC-004"]);
+    audits.ok_row("V-COTRTLIC-009");
+    let first_page = audited_message(audits, "V-COTRTLIC-009");
+    let first_page_back = [
+        "?direction=backward".to_owned(),
+        format!("?start_key={}&direction=backward", master[0].0),
+    ];
+    let before_05: Vec<(String, String)> = master
+        .iter()
+        .take_while(|(code, _)| code.as_str() < "05")
+        .cloned()
+        .collect();
+    let kept = page(&before_05, None, None, Some(&first_page));
+    for query in &first_page_back {
+        assert_page(app, token, query, &kept).await;
+    }
+
     // The seven rows of the first page are fetched, and the look-ahead
     // FETCH of 09 fails.
     audits.reviewed(&["P-COTRTLIC-031"]);
     app.stack().exec_sql(UNREADABLE_09).await;
     let look_ahead = messages::C_TR_TYPE_FORWARD_FETCH;
     assert_cursor_error(app, token, audits, "", "V-COTRTLIC-006", look_ahead).await;
+
+    // F7 on the first page: the seven rows fetched stay shown, and the
+    // seventh code, which the program moves to WS-CA-LAST-TR-CODE before the
+    // look-ahead FETCH, is the next key.
+    let shown = &master[..SCREEN_ROWS];
+    let last_shown = shown.last().map(|(code, _)| code.as_str());
+    let kept = page(shown, last_shown, None, Some(&first_page));
+    for query in &first_page_back {
+        assert_page(app, token, query, &kept).await;
+    }
 
     // Backward from 11, 10 is fetched and the FETCH of 09 fails: more than a
     // page of types precede 11, so the page reached is not the first.
@@ -2138,7 +2193,8 @@ const DB2_TEXT_SEPARATOR: &str = " ";
 const DESCRIPTION_OF_ELEVEN: &str = "E";
 
 /// The type master at the rule boundary, for the cursor `CLOSE` failures of
-/// P-COTRTLIC-038 and P-COTRTLIC-040.
+/// P-COTRTLIC-038 and P-COTRTLIC-040, and for each failed step of the
+/// first-page re-read (E-86).
 ///
 /// The adapter reads a cursor as one statement whose rows all arrive before
 /// it completes, and no test SQL fails that statement only after its last
@@ -2501,6 +2557,70 @@ fn first_page_close_failures(audits: &Audits) {
         let last = store.reads.last().copied();
         let reread = Some((Direction::Forward, start_key(start)));
         assert_eq!(last, reread, "F7 from {start:?} re-reads forward");
+    }
+}
+
+/// COTRTLIC 0000-MAIN F7 with CA-FIRST-PAGE, 8000-READ-FORWARD,
+/// 9400-OPEN-FORWARD-CURSOR, 2500-SETUP-MESSAGE — P-COTRTLIC-004,
+/// P-COTRTLIC-031, P-COTRTLIC-032, P-COTRTLIC-037, V-COTRTLIC-009: F7 on the
+/// first page over a [`CursorStore`] whose forward re-read fails before its
+/// `CLOSE`, answered as the router answers the rule's outcome. The text of
+/// V-COTRTLIC-009 replaces the cursor's, 200, and the rows fetched before
+/// the failure stay shown, the rows of the Db2 load ([`db2_load`]) in order:
+///
+/// - the look-ahead `FETCH` fails after the page: the page, with its last
+///   code as the next key, the code F8 reads from (P-COTRTLIC-031);
+/// - a `FETCH` of a page row fails: the rows before it, with no next key, as
+///   the halt E-86 proposes (P-COTRTLIC-032);
+/// - the `OPEN` fails: no row and no next key (P-COTRTLIC-037, E-86).
+///
+/// The re-read runs from the start of the table and from the first code of
+/// the Db2 load, before which no type stands. The `OPEN` case runs from the
+/// start of the table only: from the first code, the backward read, which
+/// returns no row, would take a failure queued after none. Needs no Docker.
+#[test]
+fn a_failed_first_page_reread_keeps_the_rows_fetched() {
+    let audits = Audits::load();
+    audits.reviewed(&[
+        "P-COTRTLIC-004",
+        "P-COTRTLIC-031",
+        "P-COTRTLIC-032",
+        "P-COTRTLIC-037",
+    ]);
+    audits.ok_row("V-COTRTLIC-009");
+    let first_page = audited_message(&audits, "V-COTRTLIC-009");
+    let types = &audits.db2_types;
+    assert!(
+        types.len() >= SCREEN_ROWS,
+        "the Db2 load fills a page: {types:?}"
+    );
+    let first_code = types[0].0.as_str();
+    let cases = [
+        ("", SCREEN_ROWS, CursorPhase::Fetch),
+        (first_code, SCREEN_ROWS, CursorPhase::Fetch),
+        ("", 4, CursorPhase::Fetch),
+        (first_code, 4, CursorPhase::Fetch),
+        ("", 1, CursorPhase::Fetch),
+        ("", 0, CursorPhase::Open),
+    ];
+    for (start, fetched, phase) in cases {
+        let case = format!("F7 from {start:?} failing after {fetched} rows");
+        let next_key = (fetched == SCREEN_ROWS).then(|| types[SCREEN_ROWS - 1].0.as_str());
+        let expected = page(&types[..fetched], next_key, None, Some(&first_page));
+        for error in [PortError::Contention, unavailable()] {
+            let mut store = CursorStore::new(types, Some((fetched, error)));
+            let resp = listed(&mut store, read_from(start, Direction::Backward));
+            assert_eq!(
+                (resp.0, &resp.1),
+                (StatusCode::OK, &expected),
+                "{case}: {}",
+                resp.2
+            );
+            assert_eq!(store.failed, [phase], "{case}");
+            let last = store.reads.last().copied();
+            let reread = Some((Direction::Forward, start_key(start)));
+            assert_eq!(last, reread, "{case} re-reads forward");
+        }
     }
 }
 
