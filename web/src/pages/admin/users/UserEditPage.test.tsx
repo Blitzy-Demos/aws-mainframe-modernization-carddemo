@@ -216,6 +216,20 @@ function fieldErrorOf(input: HTMLElement): string | null {
   return alert?.textContent ?? null;
 }
 
+// The FieldDescription of an input: the field-description element its
+// aria-describedby names.
+function fieldDescriptionOf(input: HTMLElement): string | null {
+  const ids = (input.getAttribute("aria-describedby") ?? "")
+    .split(" ")
+    .filter((id) => id !== "");
+  const description = ids
+    .map((id) => document.getElementById(id))
+    .find(
+      (element) => element?.getAttribute("data-slot") === "field-description",
+    );
+  return description?.textContent ?? null;
+}
+
 // The Sonner toast showing `message`, once it has appeared.
 async function toastShowing(message: string): Promise<HTMLElement> {
   return waitFor(() => {
@@ -296,8 +310,19 @@ describe("UserEditPage (CU02, COUSR02C)", () => {
       ).toBeTruthy();
       expect(textbox("User ID").value).toBe("USER0001");
       expect(textbox("User ID").readOnly).toBe(true);
+      // jsdom computes no Tailwind, so the read-only cue is held to its class
+      // tokens: bg-muted in both themes, the Input's dark:bg-input/30 replaced.
+      const userIdClasses = Array.from(textbox("User ID").classList);
+      expect(userIdClasses).toEqual(
+        expect.arrayContaining(["bg-muted", "dark:bg-muted"]),
+      );
+      expect(userIdClasses).not.toContain("dark:bg-input/30");
       expect(textbox("Last Name").value).toBe("THOMAS");
       expect(textbox("User Type").value).toBe("U");
+      // The COUSR02 hint beside USRTYPE [app/bms/COUSR02.bms:L150-154].
+      expect(fieldDescriptionOf(textbox("User Type"))).toBe(
+        "(A=Admin, U=User)",
+      );
       // E-21: the current password is never shown.
       expect(passwordInput().value).toBe("");
       expect(passwordInput().disabled).toBe(true);

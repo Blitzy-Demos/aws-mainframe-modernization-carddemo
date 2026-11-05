@@ -5,22 +5,32 @@
 // - /admin/transaction-types/new is the key entry. "Look up" applies the
 //   COTRTUPC key edits and reads the code: a type on file opens its edit route,
 //   as COTRTUPC shows a found type for update; a code not on file enables the
-//   description and "Add" (POST), as F5 on a key not found does. The legend's
-//   F6=Add is that same Add (E-23). "Cancel" abandons the add and returns to
-//   the empty key entry (F12, E-64).
-// - /admin/transaction-types/:code/edit shows the type for update. "Save" is
-//   ENTER's validation and the F5 write in one submit (PUT without `origin`,
-//   so the server applies the COTRTUPC edits and texts; E-56). "Delete" opens
-//   the confirm dialog of F4; its "Confirm" is the confirming F4 (DELETE with
-//   `origin=form`, E-23) and its "Cancel" closes it. "Cancel" leaves for the
-//   empty key entry (F12, E-64).
+//   description and "Add" (POST), as F5 on a key not found does, with the
+//   read's not-found text on the key (V-COTRTUPC-004). The legend's F6=Add is
+//   that same Add (E-23). "Cancel" abandons the add and returns to the empty
+//   key entry (F12, E-64).
+// - /admin/transaction-types/:code/edit shows the type for update. A code its
+//   read finds no type for is handed to the key entry, which opens that same
+//   add in place of the edit route. "Save" is ENTER's validation and the F5
+//   write in one submit (PUT without `origin`, so the server applies the
+//   COTRTUPC edits and texts; E-56). "Delete" opens the confirm dialog of F4;
+//   its "Confirm" is the confirming F4 (DELETE with `origin=form`, E-23) and
+//   its "Cancel" closes it. "Cancel" leaves for the empty key entry (F12,
+//   E-64).
 // - "Back" (F3) links to the list on both routes.
 //
 // Every COBOL text comes from the server or from the schema module; this page
 // writes none. Writes reach the Db2 master alone, so reports show them only
 // after `batch seed --only tranextr`. The route is admin-only, and the server's
 // 403 is authoritative: the page checks no role.
-import { useEffect, useId, useRef, useState, type JSX } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type JSX,
+} from "react";
 import {
   Controller,
   useForm,
@@ -30,8 +40,7 @@ import {
   type UseFormReturn,
 } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeft } from "lucide-react";
-import { Link, useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate, useParams } from "react-router";
 
 import { ApiError, api, unwrap } from "@/api/client";
 import {
@@ -41,8 +50,8 @@ import {
   useTranTypeUpdateMutation,
   type TranType,
 } from "@/api/queries/transaction-types";
-import { ConfirmDialog } from "@/components/confirm-dialog";
-import { PageHeader } from "@/components/page-header";
+import { ConfirmDialog, type AfterClose } from "@/components/confirm-dialog";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -57,13 +66,13 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   applyApiError,
-  noUsableAnswer,
   showApiError,
   showMessage,
   showSuccess,
 } from "@/lib/api-errors";
 import { decodeKeySegment, keyPathSegment } from "@/lib/key-segment";
 import {
+  TRAN_TYPE_UPSERT_MESSAGES,
   toTranTypeUpdateRequest,
   tranTypeCreateSchema,
   tranTypeEditFormSchema,
@@ -144,16 +153,43 @@ function readKeyOf(entry: string): string | undefined {
   return integer.padStart(TYPE_CODE_LENGTH, "0");
 }
 
-/** F3: back to the list, on both routes (F-COTRTUP-005). */
-function BackLink(): JSX.Element {
-  return (
-    <Button asChild variant="outline">
-      <Link to={LIST_ROUTE}>
-        <ArrowLeft aria-hidden="true" />
-        Back
-      </Link>
-    </Button>
-  );
+/**
+ * The location state with which the edit route hands the key entry a code
+ * its read found no type for.
+ */
+type KeyNotFoundState = { notFoundTypeCode: string };
+
+function keyNotFoundState(typeCode: string): KeyNotFoundState {
+  return { notFoundTypeCode: typeCode };
+}
+
+/**
+ * The code of the key entry's location state when it is a key-not-found
+ * hand-over: a code the Look up would read as it stands, so one the COTRTUPC
+ * key edits pass and that readKeyOf leaves unchanged. Any other state (none,
+ * another shape, a key the edits refuse such as `00`, or one the read would
+ * change such as `1`) hands nothing over, and the key entry opens empty.
+ */
+function keyNotFoundOf(state: unknown): string | undefined {
+  if (
+    typeof state !== "object" ||
+    state === null ||
+    !("notFoundTypeCode" in state)
+  ) {
+    return undefined;
+  }
+  const typeCode = state.notFoundTypeCode;
+  if (typeof typeCode !== "string" || readKeyOf(typeCode) !== typeCode) {
+    return undefined;
+  }
+  const edited = tranTypeCreateSchema.safeParse({
+    type_code: typeCode,
+    description: "",
+  });
+  const keyRefused =
+    !edited.success &&
+    edited.error.issues.some((issue) => issue.path[0] === "type_code");
+  return keyRefused ? undefined : typeCode;
 }
 
 type TranTypeFieldsProps = {
@@ -191,6 +227,11 @@ function TranTypeFields({
               inputMode="numeric"
               autoComplete="off"
               readOnly={typeCodeReadOnly}
+              // User Update's read-only cue; dark:bg-muted outranks the
+              // Input's own dark:bg-input/30 in the dark theme.
+              className={
+                typeCodeReadOnly ? "bg-muted dark:bg-muted" : undefined
+              }
               autoFocus={autoFocus === "type_code"}
               aria-invalid={fieldState.invalid}
               aria-describedby={
@@ -208,7 +249,10 @@ function TranTypeFields({
         control={form.control}
         name="description"
         render={({ field, fieldState }) => (
-          <Field data-invalid={fieldState.invalid}>
+          <Field
+            data-invalid={fieldState.invalid}
+            data-disabled={descriptionDisabled}
+          >
             <FieldLabel htmlFor={descriptionId}>Description</FieldLabel>
             <Input
               {...field}
@@ -250,12 +294,21 @@ type AddPhase = "entry" | "add";
 /** /admin/transaction-types/new: key entry and add. */
 function TranTypeAddForm(): JSX.Element {
   const navigate = useNavigate();
+  const location = useLocation();
+  // The code an edit route found no type for, read once on arrival: the page
+  // then opens on its add.
+  const [handedOver] = useState(() => keyNotFoundOf(location.state));
   const createMutation = useTranTypeCreateMutation();
-  const [phase, setPhase] = useState<AddPhase>("entry");
+  const [phase, setPhase] = useState<AddPhase>(
+    handedOver === undefined ? "entry" : "add",
+  );
   const titleId = useId();
   const form = useForm<TranTypeFormValues>({
     resolver: phase === "entry" ? keyEntryResolver : createResolver,
-    defaultValues: EMPTY_VALUES,
+    defaultValues:
+      handedOver === undefined
+        ? EMPTY_VALUES
+        : { type_code: handedOver, description: "" },
   });
 
   // The cursor follows the phase: the key on entry, the description on the
@@ -273,10 +326,35 @@ function TranTypeAddForm(): JSX.Element {
   }
 
   /**
+   * COTRTUPC TTUP-DETAILS-NOT-FOUND, for the Look up and the edit route
+   * alike: the add of the key, the F5 the screen then offers, with the read's
+   * text on the key (V-COTRTUPC-004). The Add's edits replace that text, and
+   * Cancel clears it with the entry.
+   */
+  const toAddOfKeyNotFound = useCallback((): void => {
+    setPhase("add");
+    form.setError("type_code", {
+      type: "notFound",
+      message: TRAN_TYPE_UPSERT_MESSAGES.recordNotFound,
+    });
+  }, [form]);
+
+  // The hand-over is taken off the history entry once applied, so a reload
+  // or a return through the history opens the empty key entry rather than
+  // the add of a code that may have been added since.
+  useEffect(() => {
+    if (handedOver === undefined) {
+      return;
+    }
+    toAddOfKeyNotFound();
+    navigate(KEY_ENTRY_ROUTE, { replace: true });
+  }, [handedOver, navigate, toAddOfKeyNotFound]);
+
+  /**
    * Reads the edited key through the list's type code filter: a type on file
    * opens its edit route; none (the list's 404, or a page without that code)
-   * opens the add. The list's own text for an empty result is COTRTLIC's, not
-   * COTRTUPC's, so it is not shown; any other failure is.
+   * opens the add of a key not found. The list's own text for an empty result
+   * is COTRTLIC's, not COTRTUPC's, so it is not shown; any other failure is.
    */
   async function lookUp(entry: string): Promise<void> {
     const key = readKeyOf(entry);
@@ -298,7 +376,11 @@ function TranTypeAddForm(): JSX.Element {
           return;
         }
       }
+      toAddOfKeyNotFound();
+      return;
     }
+    // The midpoint key is not read (readKeyOf), so the add opens without a
+    // not-found text, and the server's answer to the Add stands.
     setPhase("add");
   }
 
@@ -355,7 +437,7 @@ function TranTypeAddForm(): JSX.Element {
   const adding = phase === "add";
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader actions={<BackLink />} />
+      <PageHeader actions={<BackLink to={LIST_ROUTE} />} />
       <Card>
         <form
           className="flex flex-col gap-6"
@@ -375,11 +457,12 @@ function TranTypeAddForm(): JSX.Element {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {/* The Add posts the key the Look up found absent, so the key is
-                fixed until Cancel. COTRTUPC leaves it editable on a key not
-                found, but never reads a key typed over it there and can write
-                a type it never showed (E-70); with the key fixed, an existing
-                code is added only by a race, which POST answers 409 (E-51). */}
+            {/* The Add posts the key the Look up or the edit route found
+                absent, so the key is fixed until Cancel. COTRTUPC leaves it
+                editable on a key not found, but never reads a key typed over
+                it there and can write a type it never showed (E-70); with the
+                key fixed, an existing code is added only by a race, which
+                POST answers 409 (E-51). */}
             <TranTypeFields
               form={form}
               typeCodeReadOnly={adding}
@@ -456,33 +539,43 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
         : { type_code: record.type_code, description: record.description },
   });
 
+  // A read that finds no type for the code (the list's 404, or a page without
+  // that code) is COTRTUPC's key not found. The list's text for it is
+  // COTRTLIC's, so it is not shown: the code is handed to the key entry,
+  // which opens its add with COTRTUPC's text, and replaces this route in the
+  // history so that Back does not return to it.
+  const notFound =
+    (query.error instanceof ApiError && query.error.status === 404) ||
+    (query.isSuccess && !query.isPlaceholderData && record === undefined);
+
   // A delete's success marks this read stale without repeating it, and the
-  // page then leaves for the key entry. A read of the type that still fails
-  // while the delete runs or after it succeeded finds the type gone: that
-  // answer is the delete's outcome, not an error of this page, so it is not
-  // shown. A delete that got no usable answer may have been applied as well,
-  // and the read it repeats then answers 404: that is the delete's outcome
-  // too, which the delete's own toast already says may have happened, so it
-  // is taken as shown. Each other failure of the read is shown once.
+  // page then leaves for the empty key entry. A read of the type that still
+  // fails while the delete runs or after it succeeded finds the type gone:
+  // that answer is the delete's outcome, not an error of this page, so it is
+  // neither shown nor handed over. A delete that got no usable answer may
+  // have been applied as well, and the read it repeats then answers 404: its
+  // own toast already says the type may have been deleted, so the 404 is not
+  // toasted either, and the key entry's add of a key not found shows that the
+  // type is gone. Each other failure of the read is shown once.
   const deleting = deleteMutation.isPending || deleteMutation.isSuccess;
-  const deleteOutcomeUnknown =
-    deleteMutation.isError && noUsableAnswer(deleteMutation.error);
   const shownError = useRef<unknown>(null);
   useEffect(() => {
-    if (
-      query.error === null ||
-      query.error === shownError.current ||
-      deleting
-    ) {
+    if (deleting) {
+      return;
+    }
+    if (notFound) {
+      navigate(KEY_ENTRY_ROUTE, {
+        replace: true,
+        state: keyNotFoundState(code),
+      });
+      return;
+    }
+    if (query.error === null || query.error === shownError.current) {
       return;
     }
     shownError.current = query.error;
-    const typeGone =
-      query.error instanceof ApiError && query.error.status === 404;
-    if (!(deleteOutcomeUnknown && typeGone)) {
-      showApiError(query.error);
-    }
-  }, [deleting, deleteOutcomeUnknown, query.error]);
+    showApiError(query.error);
+  }, [code, deleting, navigate, notFound, query.error]);
 
   // One write at a time: a second click or Enter before the busy state
   // re-renders would send the PUT again, and Enter in the description would
@@ -529,7 +622,7 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
     );
   });
 
-  function confirmDelete(): void {
+  function confirmDelete(afterClose: AfterClose): void {
     if (record === undefined) {
       return;
     }
@@ -540,9 +633,13 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
           showSuccess(response.message);
           navigate(KEY_ENTRY_ROUTE);
         },
+        // A refused delete marks and focuses the type code, which waits for
+        // the dialog to leave the page.
         onError: (error) => {
-          applyApiError(error, form, tranTypeUpsertBmsFieldMap, {
-            unknownOutcome: DELETE_OUTCOME_UNKNOWN,
+          afterClose(() => {
+            applyApiError(error, form, tranTypeUpsertBmsFieldMap, {
+              unknownOutcome: DELETE_OUTCOME_UNKNOWN,
+            });
           });
         },
       },
@@ -561,7 +658,7 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
   // for designer review.
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader actions={<BackLink />} />
+      <PageHeader actions={<BackLink to={LIST_ROUTE} />} />
       <Card>
         <form
           className="flex flex-col gap-6"

@@ -20,12 +20,11 @@
 // exactly as typed, case kept and never trimmed or padded: COUSR01C stores the user ID
 // and the password as entered (E-20).
 import { useEffect, useRef, type JSX } from "react";
-import { Link } from "react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm, type Control } from "react-hook-form";
 
 import { useUserAddMutation } from "@/api/queries/admin-users";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import {
@@ -247,9 +246,7 @@ export default function UserAddPage(): JSX.Element {
             >
               Reset
             </Button>
-            <Button variant="ghost" asChild>
-              <Link to="/admin/users">Back</Link>
-            </Button>
+            <BackLink to="/admin/users" />
           </CardFooter>
         </Card>
       </form>

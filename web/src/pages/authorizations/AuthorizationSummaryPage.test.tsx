@@ -232,6 +232,23 @@ describe("CPVS ENTER with an account ID that passes the edits", () => {
     expect(screen.queryByRole("alert")).toBeNull();
     expect(toastError).not.toHaveBeenCalled();
   });
+
+  // The controls CT00 shares look the same here: the search in a card with a
+  // plain "Search" beside the field, and a visible Actions column header.
+  it("shows the search and the list with CT00's controls", async () => {
+    stubApi(200, summaryOk);
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(accountField().closest('[data-slot="card"]')).not.toBeNull();
+    expect(searchButton().parentElement).toBe(accountField().parentElement);
+    expect(searchButton().querySelector("svg")).toBeNull();
+
+    await user.type(accountField(), `${ACCOUNT_1}{Enter}`);
+
+    const actions = await screen.findByRole("columnheader", { name: "Actions" });
+    expect(actions.querySelector(".sr-only")).toBeNull();
+  });
 });
 
 describe("CPVS ENTER with an account ID the edits reject", () => {

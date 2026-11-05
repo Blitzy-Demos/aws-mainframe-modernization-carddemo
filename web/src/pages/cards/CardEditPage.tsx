@@ -17,7 +17,7 @@
 //   (F-COCRDUP-004).
 // - Every message is the server's, shown through lib/api-errors.ts.
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeft, LoaderCircle } from "lucide-react";
+import { LoaderCircle } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import {
   Controller,
@@ -25,11 +25,11 @@ import {
   type Control,
   type ControllerRenderProps,
 } from "react-hook-form";
-import { Link, useParams, useSearchParams } from "react-router";
+import { useParams, useSearchParams } from "react-router";
 
 import { useCard, useCardUpdateMutation } from "@/api/queries/cards";
 import type { components } from "@/api/schema";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import {
@@ -185,7 +185,7 @@ function KeyDetails({ keys, errors, control }: KeyDetailsProps): JSX.Element {
   return (
     <Card>
       <CardContent>
-        <FieldGroup className="grid gap-6 lg:grid-cols-2">
+        <FieldGroup className="grid gap-4 lg:grid-cols-2">
           {KEY_FIELDS.map(({ name, label }) =>
             control === undefined ? (
               <KeyField
@@ -271,7 +271,7 @@ function EditorSkeleton(): JSX.Element {
   return (
     <Card role="status" aria-busy="true">
       <span className="sr-only">Loading</span>
-      <CardContent className="grid gap-6 lg:grid-cols-2">
+      <CardContent className="grid gap-4 lg:grid-cols-2">
         <Skeleton className="h-16 w-full" />
         <Skeleton className="h-16 w-full" />
         <Skeleton className="h-16 w-full" />
@@ -443,7 +443,7 @@ export default function CardEditPage(): JSX.Element {
         />
         <Card>
           <CardContent>
-            <FieldGroup className="grid gap-6 lg:grid-cols-2">
+            <FieldGroup className="grid gap-4 lg:grid-cols-2">
               <CardTextField
                 control={form.control}
                 name="embossed_name"
@@ -458,7 +458,7 @@ export default function CardEditPage(): JSX.Element {
               />
               <FieldSet className="lg:col-span-2">
                 <FieldLegend variant="label">Expiry Date</FieldLegend>
-                <div className="grid gap-6 lg:grid-cols-2">
+                <div className="grid gap-4 lg:grid-cols-2">
                   <CardTextField
                     control={form.control}
                     name="expiry_month"
@@ -518,14 +518,7 @@ export default function CardEditPage(): JSX.Element {
     <div className="flex flex-col gap-6">
       <PageHeader
         title={TITLE}
-        actions={
-          <Button variant="ghost" asChild>
-            <Link to={backTo}>
-              <ArrowLeft aria-hidden="true" />
-              Back
-            </Link>
-          </Button>
-        }
+        actions={<BackLink to={backTo} />}
       />
       {holdsCard ? null : <KeyDetails keys={keys} errors={keyCheck.errors} />}
       {editor}

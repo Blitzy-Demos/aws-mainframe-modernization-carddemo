@@ -5,7 +5,9 @@
 //! live master, keeps the records whose processing date lies in the range and
 //! sorts them by card number (`STEP05R`, P-TRANREPT-002), then runs `CBTRN03C`
 //! over that file with the same dates in `DATEPARM` (P-TRANREPT-003, E-34).
-//! [`select_for_report`] is the `STEP05R` selection and sort; [`ReportRun`] is
+//! [`select_for_report`] is the `STEP05R` selection and sort, and
+//! [`report_sort_key`] its rule for one record, which `batch tranrept` applies
+//! as it streams the backup into its external sort; [`ReportRun`] is
 //! the program: the caller feeds it the selected records in order through
 //! [`ReportRun::process`] and ends it with [`ReportRun::finish`], writing every
 //! returned line as one 133-byte `TRANREPT` record. Both callers share both
@@ -155,6 +157,60 @@ fn in_date_range(start: &Alnum<10>, end: &Alnum<10>, tran: &Transaction) -> bool
     proc_date >= *start && proc_date <= *end
 }
 
+/// The place of a selected record in the `STEP05R` sort output: TRANREPT
+/// `SORT FIELDS=(TRAN-CARD-NUM,A)` [app/jcl/TRANREPT.jcl:L37-55] —
+/// P-TRANREPT-002, TRAN-ID ascending within a card (E-38).
+///
+/// The derived order compares the card number first, then the TRAN-ID, so
+/// sorting the selected records by their keys, stably, gives the order of
+/// [`select_for_report`]. [`report_sort_key`] gives a record its key.
+///
+/// `Debug` masks the card number to its last four digits, as [`CardNumber`]
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReportSortKey {
+    /// `TRAN-CARD-NUM`, the `SORT FIELDS` key (`TRAN-CARD-NUM,263,16,ZD`),
+    /// whose 16 digits sort in byte order.
+    pub card_number: CardNumber,
+    /// `TRAN-ID`, the order within a card: the order of the backup the sort
+    /// reads, as escalation E-38 proposes and the audit's report lines assume
+    /// (P-CBTRN03C-015).
+    pub tran_id: TranId,
+}
+
+/// TRANREPT `STEP05R` [app/jcl/TRANREPT.jcl:L37-55] — P-TRANREPT-002, for one
+/// `SORTIN` record: `Some` key when `INCLUDE COND` keeps `tran` (its
+/// processing date lies from `start` to `end`), `None` when it leaves `tran`
+/// out.
+///
+/// [`select_for_report`] applies it to every record and sorts by the keys;
+/// `batch tranrept` applies it record by record as it streams the backup into
+/// its external sort, so both selections share this one rule.
+///
+/// # Errors
+///
+/// [`UnpinnedSortKey`] naming `tran` when `INCLUDE COND` keeps it and its card
+/// number holds a byte other than `0` to `9`, whose zoned-decimal place no
+/// audit row pins. A record outside the range never stops the sort.
+pub fn report_sort_key(
+    start: &Alnum<10>,
+    end: &Alnum<10>,
+    tran: &Transaction,
+) -> Result<Option<ReportSortKey>, UnpinnedSortKey> {
+    if !in_date_range(start, end, tran) {
+        return Ok(None);
+    }
+    if !tran.tran_card_num.as_alnum().is_numeric() {
+        return Err(UnpinnedSortKey {
+            tran_id: tran.tran_id,
+        });
+    }
+    Ok(Some(ReportSortKey {
+        card_number: tran.tran_card_num,
+        tran_id: tran.tran_id,
+    }))
+}
+
 /// TRANREPT `STEP05R` [app/jcl/TRANREPT.jcl:L37-55] — P-TRANREPT-002: the
 /// records of `records` whose processing date lies from `start` to `end`,
 /// sorted ascending by card number, TRAN-ID ascending within a card.
@@ -163,31 +219,27 @@ fn in_date_range(start: &Alnum<10>, end: &Alnum<10>, tran: &Transaction) -> bool
 /// undefined; the order within a card is TRAN-ID order, the order of the
 /// backup the sort reads, as escalation E-38 proposes and the audit's report
 /// lines assume (P-CBTRN03C-015). Sorting on the TRAN-ID too makes the result
-/// independent of the order the caller passes the records in.
+/// independent of the order the caller passes the records in. Each record's
+/// place comes from [`report_sort_key`]; records with equal keys keep their
+/// input order.
 ///
 /// # Errors
 ///
 /// [`UnpinnedSortKey`] when a selected record's card number holds a byte other
-/// than `0` to `9`.
+/// than `0` to `9`: the first such record in input order.
 pub fn select_for_report(
     start: &Alnum<10>,
     end: &Alnum<10>,
     records: impl IntoIterator<Item = Transaction>,
 ) -> Result<Vec<Transaction>, UnpinnedSortKey> {
-    let mut selected: Vec<Transaction> = records
-        .into_iter()
-        .filter(|tran| in_date_range(start, end, tran))
-        .collect();
-    if let Some(unpinned) = selected
-        .iter()
-        .find(|tran| !tran.tran_card_num.as_alnum().is_numeric())
-    {
-        return Err(UnpinnedSortKey {
-            tran_id: unpinned.tran_id,
-        });
+    let mut selected = Vec::new();
+    for tran in records {
+        if let Some(key) = report_sort_key(start, end, &tran)? {
+            selected.push((key, tran));
+        }
     }
-    selected.sort_by_key(|tran| (tran.tran_card_num, tran.tran_id));
-    Ok(selected)
+    selected.sort_by_key(|&(key, _)| key);
+    Ok(selected.into_iter().map(|(_, tran)| tran).collect())
 }
 
 /// TRANREPT `STEP05R` [app/jcl/TRANREPT.jcl:L37-55] — P-TRANREPT-002, read as
@@ -739,7 +791,10 @@ async fn lookup_tran_category<S: TranTypeFileReader>(
 
 #[cfg(test)]
 mod tests {
-    use super::{LookupKey, PAGE_SIZE, ReportAbend, ReportRun, UnpinnedSortKey, select_for_report};
+    use super::{
+        LookupKey, PAGE_SIZE, ReportAbend, ReportRun, ReportSortKey, UnpinnedSortKey,
+        report_sort_key, select_for_report,
+    };
     use crate::entities::{CardXref, TranCategoryRecord, TranTypeRecord, Transaction};
     use crate::entities::{TranCategoryMaster, TranTypeMaster};
     use crate::format::{self, REPORT_RECORD_LEN, ReportDetail};
@@ -1449,6 +1504,39 @@ mod tests {
                 tran_id: TranId::move_from("0000000000000002"),
             })
         );
+    }
+
+    #[test]
+    fn the_sort_key_of_one_record_keeps_the_range_and_stops_only_inside_it() {
+        // P-TRANREPT-002: `INCLUDE COND` on the 10-byte `CH` date with both
+        // ends inclusive, and a zoned-decimal key pinned only for digits.
+        let id = "0000000000000007";
+        let unpinned = "41110000000000AB";
+        let key = |card: &str| {
+            Ok(Some(ReportSortKey {
+                card_number: CardNumber::move_from(card),
+                tran_id: TranId::move_from(id),
+            }))
+        };
+        let stop = Err(UnpinnedSortKey {
+            tran_id: TranId::move_from(id),
+        });
+        let cases = [
+            (START, CARD_A, key(CARD_A)),
+            (END, CARD_B, key(CARD_B)),
+            ("2021-12-31", CARD_A, Ok(None)),
+            ("2022-07-07", CARD_A, Ok(None)),
+            (IN_RANGE, unpinned, stop),
+            ("2022-07-07", unpinned, Ok(None)),
+        ];
+        for (proc_date, card, expected) in cases {
+            let tran = tran_on(id, card, 100, proc_date);
+            assert_eq!(
+                report_sort_key(&date(START), &date(END), &tran),
+                expected,
+                "{proc_date} {card}"
+            );
+        }
     }
 
     use super::ReportSelection;

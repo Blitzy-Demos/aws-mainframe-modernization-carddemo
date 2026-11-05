@@ -1,6 +1,8 @@
 // FN tests of the CCLI card list (CardListPage; COCRDLIC, map COCRDLI). ENTER
 // ("Search", F-COCRDLI-001) sends the account filter as entered; a filter the
-// client schema rejects sends no request (V-COCRDLIC-001); and a 400 the server
+// client schema rejects sends no request (V-COCRDLIC-001, V-COCRDLIC-002),
+// whichever key was pressed, and takes the listed cards and paging keys off
+// the screen, its text standing in their place; and a 400 the server
 // answers at ACCTSID reaches the user as a toast, as the filter's field error
 // and as the cursor on the filter, the COBOL `MOVE -1 TO ACCTSIDL`.
 //
@@ -41,6 +43,9 @@ const UNKNOWN_ACCOUNT = "99999999999";
 const ACCOUNT_NOT_NUMERIC =
   "ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER";
 
+/** COCRDLIC 2220-EDIT-CARD's text (V-COCRDLIC-002), byte for byte. */
+const CARD_NOT_NUMERIC = "CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER";
+
 const PAGE: CardPage = {
   items: [
     {
@@ -52,6 +57,10 @@ const PAGE: CardPage = {
   next_key: null,
   prev_key: null,
 };
+
+// The same first page with a page after it, which starts at the next card of
+// carddata.txt in card-number order, so Next is enabled.
+const PAGE_WITH_NEXT: CardPage = { ...PAGE, next_key: "0683586198171516" };
 
 const ACCOUNT_FILTER_ERROR: ErrorBody = {
   code: "INVALID",
@@ -91,6 +100,14 @@ function cardListRequests(): Request[] {
 
 function queryOf(request: Request): URLSearchParams {
   return new URL(request.url).searchParams;
+}
+
+/** The cell texts of the card table's body rows, top to bottom. */
+function cardRows(): string[][] {
+  const table = screen.getByRole("table", { name: "Credit cards" });
+  return Array.from(table.querySelectorAll("tbody tr"), (row) =>
+    Array.from(row.querySelectorAll("td"), (cell) => cell.textContent ?? ""),
+  );
 }
 
 /**
@@ -210,6 +227,73 @@ describe("CardListPage (CCLI, COCRDLI)", () => {
     expect(cardListRequests()).toHaveLength(1);
   });
 
+  it.each([
+    {
+      why: "SQL text in the account filter",
+      key: "Search",
+      label: "Account number",
+      entry: "' OR 1=1 --",
+      message: ACCOUNT_NOT_NUMERIC,
+      listed: PAGE,
+    },
+    {
+      why: "an account filter of fewer than 11 digits",
+      key: "Search",
+      label: "Account number",
+      entry: "123",
+      message: ACCOUNT_NOT_NUMERIC,
+      listed: PAGE,
+    },
+    {
+      why: "a card filter that is not 16 digits",
+      key: "Next",
+      label: "Card number",
+      entry: "050002445376574X",
+      message: CARD_NOT_NUMERIC,
+      listed: PAGE_WITH_NEXT,
+    },
+  ] as const)(
+    "takes the listed cards off the screen when $key is pressed with $why, and lists them again on a valid Search",
+    async ({ key, label, entry, message, listed }) => {
+      fetchMock.mockImplementation(async () => jsonResponse(listed));
+      const { user } = await renderPage();
+      const input = screen.getByLabelText<HTMLInputElement>(label);
+      expect(cardRows().map((cells) => cells[1])).toEqual([FIRST_CARD]);
+      expect(screen.getByRole("button", { name: "Next" })).toBeDefined();
+
+      await user.type(input, entry);
+      await user.click(screen.getByRole("button", { name: key }));
+
+      const error = await waitFor(() => fieldError(input));
+      expect(error.textContent).toBe(message);
+      // The filter's text stands in place of the rows, and no paging key is
+      // offered under it.
+      await waitFor(() => {
+        expect(cardRows()).toEqual([[message]]);
+      });
+      expect(screen.queryByText(FIRST_CARD)).toBeNull();
+      expect(screen.queryByRole("link", { name: "View" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+      expect(cardListRequests()).toHaveLength(1);
+
+      await user.clear(input);
+      await user.click(screen.getByRole("button", { name: "Search" }));
+
+      await waitFor(() => {
+        expect(cardRows().map((cells) => cells[1])).toEqual([FIRST_CARD]);
+      });
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+      const sent = cardListRequests();
+      expect(sent).toHaveLength(2);
+      // Search reads forward from the first card shown, which the page's
+      // null prev_key leaves unset, with no filter.
+      expect([...queryOf(sent[1]).entries()]).toEqual([
+        ["direction", "forward"],
+      ]);
+    },
+  );
+
   it("shows a 400 at ACCTSID as a toast, a field error and the cursor on the filter", async () => {
     const errorSpy = vi.spyOn(toast, "error");
     // The filtered answer waits until the test has seen the cursor leave the
@@ -248,4 +332,30 @@ describe("CardListPage (CCLI, COCRDLI)", () => {
       expect(document.activeElement).toBe(accountInput);
     });
   });
+
+  // The Active column's flag as a badge carrying its letter: N, the inactive
+  // state, is destructive.
+  it.each([
+    { flag: "Y", variant: "secondary" },
+    { flag: "N", variant: "destructive" },
+  ])(
+    "shows the Active flag $flag as a $variant badge",
+    async ({ flag, variant }) => {
+      fetchMock.mockImplementation(async () =>
+        jsonResponse({
+          ...PAGE,
+          items: PAGE.items.map((card) => ({
+            ...card,
+            card_active_status: flag,
+          })),
+        }),
+      );
+      await renderPage();
+
+      const row = screen.getByText(FIRST_CARD).closest("tr");
+      const badge = row?.querySelector('[data-slot="badge"]');
+      expect(badge?.textContent).toBe(flag);
+      expect(badge?.getAttribute("data-variant")).toBe(variant);
+    },
+  );
 });

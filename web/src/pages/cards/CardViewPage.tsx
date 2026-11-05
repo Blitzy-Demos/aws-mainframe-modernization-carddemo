@@ -17,15 +17,17 @@ import {
   useRef,
   useState,
   type JSX,
-  type ReactNode,
 } from "react";
-import { ArrowLeft } from "lucide-react";
-import { Link, useParams, useSearchParams } from "react-router";
+import { useParams, useSearchParams } from "react-router";
 
 import { useCard, type CardViewResult } from "@/api/queries/cards";
-import { PageHeader } from "@/components/page-header";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import {
+  DetailItem,
+  DetailList,
+  DetailValueSkeleton,
+  FlagBadge,
+} from "@/components/detail-list";
+import { BackLink, PageHeader } from "@/components/page-header";
 import {
   Card,
   CardContent,
@@ -33,7 +35,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { FieldError } from "@/components/ui/field";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { showApiError } from "@/lib/api-errors";
@@ -80,33 +81,6 @@ function expiryOf(date: string): string {
   return `${date.slice(5, 7)}/${date.slice(0, 4)}`;
 }
 
-type DetailItemProps = {
-  label: string;
-  children?: ReactNode;
-  /** The key edit texts shown under the value. */
-  errors?: { message: string }[];
-};
-
-/** One caption and its value. */
-function DetailItem({ label, children, errors }: DetailItemProps): JSX.Element {
-  return (
-    <div className="flex flex-col gap-1">
-      <dt className="text-sm text-muted-foreground">{label}</dt>
-      <dd className="flex flex-col gap-1 font-medium wrap-anywhere">
-        {children}
-        {errors !== undefined && errors.length > 0 ? (
-          <FieldError errors={errors} />
-        ) : null}
-      </dd>
-    </div>
-  );
-}
-
-/** A value placeholder while the card is read. */
-function ValueSkeleton({ className }: { className: string }): JSX.Element {
-  return <Skeleton aria-hidden="true" className={className} />;
-}
-
 type CardFieldsProps = {
   /** The card as read, or `undefined` while it is being read. */
   card: CardViewResult | undefined;
@@ -115,31 +89,31 @@ type CardFieldsProps = {
 /** CRDNAME, CRDSTCD and EXPMON/EXPYEAR [app/bms/COCRDSL.bms:L103-138]. */
 function CardFields({ card }: CardFieldsProps): JSX.Element {
   return (
-    <dl className="grid gap-x-6 gap-y-4 lg:grid-cols-2">
+    <DetailList>
       <DetailItem label="Name on card">
         {card === undefined ? (
-          <ValueSkeleton className="h-5 w-48" />
+          <DetailValueSkeleton className="w-48" />
         ) : (
           card.card_embossed_name
         )}
       </DetailItem>
       <DetailItem label="Card Active Y/N">
         {card === undefined ? (
-          <ValueSkeleton className="h-5 w-8" />
-        ) : card.card_active_status !== "" ? (
-          <Badge variant="secondary">{card.card_active_status}</Badge>
-        ) : null}
+          <DetailValueSkeleton className="w-8" />
+        ) : (
+          <FlagBadge value={card.card_active_status} />
+        )}
       </DetailItem>
       <DetailItem label="Expiry Date">
         {card === undefined ? (
-          <ValueSkeleton className="h-5 w-20" />
+          <DetailValueSkeleton className="w-20" />
         ) : (
           <span className="tabular-nums">
             {expiryOf(card.card_expiraion_date)}
           </span>
         )}
       </DetailItem>
-    </dl>
+    </DetailList>
   );
 }
 
@@ -193,14 +167,7 @@ export default function CardViewPage(): JSX.Element {
     <div className="flex flex-col gap-6">
       <PageHeader
         title={TITLE}
-        actions={
-          <Button variant="outline" asChild>
-            <Link to={BACK_TARGET}>
-              <ArrowLeft aria-hidden="true" />
-              Back
-            </Link>
-          </Button>
-        }
+        actions={<BackLink to={BACK_TARGET} />}
       />
       <Card role="region" aria-labelledby={titleId} aria-busy={reading}>
         <CardHeader>
@@ -214,13 +181,19 @@ export default function CardViewPage(): JSX.Element {
           ) : card !== undefined ? (
             // INFOMSG of a found card, '   Displaying requested details'.
             <CardDescription>{card.message}</CardDescription>
+          ) : reading ? (
+            // The message line's place while the card is read: one text-sm
+            // line (h-5), so the details do not move down when it arrives.
+            <CardDescription aria-hidden="true">
+              <Skeleton className="h-5 w-48" />
+            </CardDescription>
           ) : null}
         </CardHeader>
         <CardContent className="flex flex-col gap-6">
           {/* ACCTSIDO and CARDSIDO show the keys as entered, CC-ACCT-ID and
               CC-CARD-NUM, not the card record's own account, which the read
               does not compare (E-55, P-COCRDSLC-010). */}
-          <dl className="grid gap-x-6 gap-y-4 lg:grid-cols-2">
+          <DetailList>
             <DetailItem
               label="Account Number"
               errors={keyIssues?.account_id}
@@ -230,7 +203,7 @@ export default function CardViewPage(): JSX.Element {
             <DetailItem label="Card Number" errors={keyIssues?.card_number}>
               <span className="tabular-nums">{cardNumber}</span>
             </DetailItem>
-          </dl>
+          </DetailList>
           {showFields ? (
             <>
               <Separator />

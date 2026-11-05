@@ -2,7 +2,10 @@
 // row F-COSGN00-001 of docs/parity/function-map.md.
 //
 // - ENTER becomes the form's submit: Enter in either field, or the "Sign on"
-//   button, sends POST /auth/login once loginSchema accepts the values.
+//   button, sends POST /auth/login once loginSchema accepts the values. One
+//   sign-on is out at a time: a second Enter or click before the answer sends
+//   nothing, and the form stays busy until the landing route replaces the
+//   page or the server rejects the sign-on.
 // - The user ID and password are sent exactly as typed, and the server
 //   normalizes them: like COSGN00C [app/cbl/COSGN00C.cbl:L132-136], it
 //   upper-cases and pads both before it reads the user and verifies the
@@ -19,7 +22,13 @@
 // - The map's F3=Exit has no control on this screen. The sign-on screen holds
 //   no session to end, so F-COSGN00-002 places the sign-off on the "Log out"
 //   menu item of the signed-on shell, and other AID keys have none (E-56).
-import { useId, type HTMLInputTypeAttribute, type JSX } from "react";
+import {
+  useId,
+  useRef,
+  useState,
+  type HTMLInputTypeAttribute,
+  type JSX,
+} from "react";
 import { Controller, useForm } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -100,15 +109,32 @@ export default function LoginPage(): JSX.Element {
   const baseId = useId();
   const titleId = `${baseId}-title`;
 
+  // One sign-on at a time. The ref closes the gap before the busy state
+  // re-renders, so a second Enter or click sends nothing. `signingOn` keeps
+  // the form busy after the mutation settles: on a success the page stays on
+  // screen while the router loads the landing route, so neither is cleared
+  // and the page leaves the screen still busy. A failure clears both, so the
+  // corrected values can be sent.
+  const inFlight = useRef(false);
+  const [signingOn, setSigningOn] = useState(false);
+  const busy = signingOn || login.isPending;
+
   // handleSubmit calls this only for values loginSchema accepts, so input
   // the server would reject on its blank or length edits is never sent.
   // useLoginMutation has stored the session before onSuccess runs.
   const onSubmit = (values: LoginFormValues): void => {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
+    setSigningOn(true);
     login.mutate(values, {
       onSuccess: (response) => {
         void navigate(response.landing, { replace: true });
       },
       onError: (error) => {
+        inFlight.current = false;
+        setSigningOn(false);
         applyApiError(error, form, loginBmsFieldMap);
       },
     });
@@ -135,7 +161,7 @@ export default function LoginPage(): JSX.Element {
           <CardContent>
             <form
               aria-labelledby={titleId}
-              aria-busy={login.isPending}
+              aria-busy={busy}
               noValidate
               onSubmit={form.handleSubmit(onSubmit)}
             >
@@ -189,9 +215,9 @@ export default function LoginPage(): JSX.Element {
                 <Button
                   type="submit"
                   className="w-full"
-                  disabled={login.isPending}
+                  disabled={busy}
                 >
-                  {login.isPending ? (
+                  {busy ? (
                     <LoaderCircle
                       aria-hidden="true"
                       className="motion-safe:animate-spin"

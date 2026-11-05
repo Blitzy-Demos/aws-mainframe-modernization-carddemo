@@ -21,7 +21,7 @@ import type { components } from "@/api/schema";
 import { useRewardBalance, useRewardHistory } from "@/api/queries/rewards";
 import { DataTable, type DataTableProps } from "@/components/data-table";
 import { PageHeader } from "@/components/page-header";
-import { SummaryCard } from "@/components/summary-card";
+import { SummaryCard, SummaryCardSkeleton } from "@/components/summary-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -31,7 +31,6 @@ import {
   FieldLabel,
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { Skeleton } from "@/components/ui/skeleton";
 import { applyApiError, showApiError } from "@/lib/api-errors";
 import {
   rewardsAccountBmsFieldMap,
@@ -69,9 +68,13 @@ const STATUS_ANNOUNCE_DELAY_MS = 150;
 
 // Every cell renders the API string as sent: the default accessor cell shows
 // the value itself, with no date parsing or locale formatting.
+//
+// `transaction_id` is the accrued transaction's row identity, not its 16-digit
+// TRAN-ID, which the transaction screens label "Transaction ID"; its column is
+// headed "Transaction row" so that the two are not read as one key.
 const columns: DataTableProps<RewardAccrual>["columns"] = [
   { accessorKey: "accrual_id", header: "Accrual ID" },
-  { accessorKey: "transaction_id", header: "Transaction ID" },
+  { accessorKey: "transaction_id", header: "Transaction row" },
   { accessorKey: "rule_id", header: "Rule ID" },
   { accessorKey: "points_earned", header: "Points earned" },
   { accessorKey: "created_at", header: "Created at" },
@@ -129,12 +132,30 @@ export default function RewardsPage(): JSX.Element {
     // A repeated lookup of the same account reads it again, so its result
     // (or its error) is reported again. The newest history page is reread
     // only once the balance has answered, as on a first lookup; from a later
-    // page, resetting the start key already selects the newest page.
+    // page, resetting the start key already selects the newest page. It is
+    // reread only when the history is already keyed to the account, that is
+    // when the balance had answered before this lookup: a lookup repeated
+    // while the first balance read still runs (a double click) finds the
+    // history holding no account, whose reread would request the history of
+    // an empty account number, and the key change that follows the balance's
+    // answer reads the newest page by itself.
+    const historyKeyed = balance.isSuccess;
     void reloadBalance().then((result) => {
-      if (result.isSuccess && onFirstPage) {
+      if (result.isSuccess && onFirstPage && historyKeyed) {
         void reloadHistory();
       }
     });
+  };
+
+  // An entry the schema rejects shows no account, as the account view's
+  // lookup of the same key does: its field error does not stand beside the
+  // previous account's balance and history. A later lookup of that account
+  // then reads it as a new one.
+  const onInvalid = (): void => {
+    setAccountId(null);
+    setStartKey(undefined);
+    setVisited([]);
+    setLookupPage(false);
   };
 
   const nextKey = history.data?.next_key ?? null;
@@ -160,6 +181,15 @@ export default function RewardsPage(): JSX.Element {
 
   const showResult =
     accountId !== null && (balance.isLoading || balance.isSuccess);
+
+  // The balance cards load while the balance is first read and, for the page
+  // a lookup selected, while that lookup's balance read runs. The cache can
+  // already hold a balance of the account (another lookup, or the
+  // dashboard's reward card, read it earlier), and without the last case
+  // that older figure would be shown as the lookup's result until its answer
+  // replaces it.
+  const balanceLoading =
+    balance.isLoading || (lookupPage && balance.isFetching);
 
   // The history table loads while its page is first read, while a new page
   // is read over the previous one (placeholder data), and, for the page a
@@ -207,7 +237,7 @@ export default function RewardsPage(): JSX.Element {
 
       <Card>
         <CardContent>
-          <form noValidate onSubmit={form.handleSubmit(onSubmit)}>
+          <form noValidate onSubmit={form.handleSubmit(onSubmit, onInvalid)}>
             <Controller
               name="account_id"
               control={form.control}
@@ -258,10 +288,10 @@ export default function RewardsPage(): JSX.Element {
         <>
           <section
             aria-label="Reward balance"
-            aria-busy={balance.isLoading ? true : undefined}
+            aria-busy={balanceLoading ? true : undefined}
             className="grid gap-4 lg:grid-cols-3"
           >
-            {balance.isSuccess ? (
+            {balance.isSuccess && !balanceLoading ? (
               <>
                 <SummaryCard
                   title="Points earned"
@@ -284,9 +314,9 @@ export default function RewardsPage(): JSX.Element {
               </>
             ) : (
               <>
-                <Skeleton aria-hidden="true" className="h-24 rounded-xl" />
-                <Skeleton aria-hidden="true" className="h-24 rounded-xl" />
-                <Skeleton aria-hidden="true" className="h-24 rounded-xl" />
+                <SummaryCardSkeleton description />
+                <SummaryCardSkeleton description />
+                <SummaryCardSkeleton description />
               </>
             )}
           </section>

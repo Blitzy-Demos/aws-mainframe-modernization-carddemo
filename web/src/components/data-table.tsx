@@ -9,7 +9,8 @@
 // caller requests the adjacent page with the `prev_key` or `next_key` it
 // already holds, closing over the matching key and direction, so no page
 // number is ever computed and no key is ever converted. Rows render in the
-// order the API returns them, which is the COBOL key order, so the table has no
+// order the caller passes them: the order the API returns them, which is the
+// COBOL key order, or a screen's reversal of one page. The table has no
 // client-side sorting, filtering or pagination row models.
 //
 // While the caller's page request is pending (`loading`), skeleton rows stand
@@ -22,6 +23,7 @@
 // TanStack Table 9 and does not apply.
 import {
   useEffect,
+  useMemo,
   useState,
   type JSX,
   type KeyboardEvent,
@@ -33,6 +35,7 @@ import {
   getCoreRowModel,
   useReactTable,
   type ColumnDef,
+  type ColumnPinningPosition,
 } from "@tanstack/react-table";
 
 import { Card, CardFooter } from "@/components/ui/card";
@@ -53,6 +56,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { cn } from "@/lib/utils";
 
 /**
  * Props of {@link DataTable}.
@@ -60,13 +64,14 @@ import {
  * - `columns`: TanStack column definitions (`accessorKey`/`header`/`cell`). A
  *   row-action column supplies its own `cell` rendering `Button variant="link"`,
  *   the replacement of the 3270 `S`/`U` selectors.
- * - `data`: the page's `items`, in the order the API returned them. Keep one
- *   non-empty array per result across renders (the query's `items` as
- *   returned): TanStack Table re-derives its rows for every new array, and the
- *   status region announces every new non-empty array as a new result. Every
- *   empty array is the same result, so an inline fallback such as
- *   `page?.items ?? []` is announced again only when the empty-page text
- *   changes or `loading` ends.
+ * - `data`: the page's `items`, in the order the API returned them or, where
+ *   a screen shows a page in reverse, a reversed copy. Keep one non-empty
+ *   array per result across renders (the query's `items` as returned, or a
+ *   copy memoized on them): TanStack Table re-derives its rows for every new
+ *   array, and the status region announces every new non-empty array as a
+ *   new result. Every empty array is the same result, so an inline fallback
+ *   such as `page?.items ?? []` is announced again only when the empty-page
+ *   text changes or `loading` ends.
  * - `prevKey`, `nextKey`: the page's `prev_key` and `next_key`. A non-empty
  *   string enables Previous (PF7) or Next (PF8); `null` or absent disables it.
  * - `onPrevious`, `onNext`: called when the enabled control is activated. The
@@ -80,6 +85,10 @@ import {
  *   rows still held, so the table keeps its height) and for the empty
  *   message, the table is busy, and Previous and Next are disabled. Defaults
  *   to false.
+ * - `pinnedEndColumn`: the `id` of one column, such as the row actions, held
+ *   at the inline end of the card while the other columns scroll under it, so
+ *   its controls are never clipped and never hidden when focused, however
+ *   wide the table. The column renders last. Omitted, no column is pinned.
  */
 export type DataTableProps<TData> = {
   columns: ColumnDef<TData>[];
@@ -91,6 +100,7 @@ export type DataTableProps<TData> = {
   emptyMessage?: string | null;
   caption?: string;
   loading?: boolean;
+  pinnedEndColumn?: string;
 };
 
 // Shown in the single row of an empty page when the API sent no message.
@@ -103,6 +113,37 @@ const DEFAULT_SKELETON_ROWS = 5;
 // cleared region is committed first, so a screen reader hears a result whose
 // text equals the previous one (two full pages of the same size) as a change.
 const STATUS_ANNOUNCE_DELAY_MS = 150;
+
+// No column pinned on a side: one array, so the pinning state keeps its
+// identity across renders.
+const NO_COLUMNS: string[] = [];
+
+// Each row of a table with a pinned column is a named group, which the pinned
+// cell's tint follows.
+const PINNED_ROW_CLASS = "group/row";
+
+// The card of a table with a pinned column clips its content to its rounded
+// corners.
+const PINNED_CARD_CLASS = "overflow-clip";
+
+// The pinned column's header and body cells stick to the inline end of the
+// generated table's scroll container, stacked above the cells that scroll
+// under them and opaque in the card's colour. The table collapses its borders,
+// and a collapsed cell border is painted by the table beneath the cell's
+// opaque background, so the start border (the cue that the table continues
+// under the column) is drawn on a ::before layer that moves with the cell. That
+// layer, under the cell's content within its stacking context, also repeats
+// the row's hover and expanded tints (TableRow's bg-muted/50), so a pinned
+// cell reads as part of its row.
+const PINNED_CELL_CLASS =
+  "sticky end-0 z-10 bg-card before:absolute before:inset-0 before:-z-10 before:border-s before:border-border before:transition-colors group-hover/row:before:bg-muted/50 group-has-aria-expanded/row:before:bg-muted/50";
+
+// The class of a header or body cell whose column is pinned at `position`:
+// the pinned column's cells stick to the inline end, and every other cell
+// keeps the generated styling.
+function pinnedCellClass(position: ColumnPinningPosition): string | undefined {
+  return position === false ? undefined : PINNED_CELL_CLASS;
+}
 
 // A cursor key enables its control only when it is a non-empty string.
 function hasKey(key: string | null | undefined): key is string {
@@ -218,9 +259,10 @@ function pageControl(
  * card's `min-w-0` and inline-size containment make a wide table scroll inside
  * the card at `md` instead of widening the page. The card therefore takes its
  * width from its container (block flow, a stretched flex column or a grid
- * track) and has no content-based width of its own. The paging controls stay
- * shown while a page loads and are otherwise hidden only for an empty page
- * that has neither key.
+ * track) and has no content-based width of its own. A `pinnedEndColumn` stays
+ * in view at the card's inline end while the other columns scroll. The paging
+ * controls stay shown while a page loads and are otherwise hidden only for an
+ * empty page that has neither key.
  */
 export function DataTable<TData>({
   columns,
@@ -232,12 +274,24 @@ export function DataTable<TData>({
   emptyMessage,
   caption,
   loading = false,
+  pinnedEndColumn,
 }: DataTableProps<TData>): JSX.Element {
+  // TanStack's column pinning (its `right` side is the inline end of this
+  // left-to-right table) places the pinned column last in the header groups
+  // and in every row's cells.
+  const columnPinning = useMemo(
+    () => ({
+      left: NO_COLUMNS,
+      right: pinnedEndColumn === undefined ? NO_COLUMNS : [pinnedEndColumn],
+    }),
+    [pinnedEndColumn],
+  );
   const table = useReactTable({
     data,
     columns,
     getCoreRowModel: getCoreRowModel(),
     manualPagination: true,
+    state: { columnPinning },
   });
 
   // The status region is empty while a page loads (the table's aria-busy
@@ -265,10 +319,17 @@ export function DataTable<TData>({
 
   const isEmpty = data.length === 0;
   const showPaging = loading || !isEmpty || hasKey(prevKey) || hasKey(nextKey);
-  // The leaf count equals columns.length for flat definitions and stays
+  // The leaf columns in the order the header shows them, the pinned column
+  // last. The leaf count equals columns.length for flat definitions and stays
   // correct when the caller groups columns under a shared header.
-  const leafColumns = table.getVisibleLeafColumns();
+  const leafColumns = [
+    ...table.getLeftVisibleLeafColumns(),
+    ...table.getCenterVisibleLeafColumns(),
+    ...table.getRightVisibleLeafColumns(),
+  ];
   const columnCount = leafColumns.length;
+  const pinned = leafColumns.some((column) => column.getIsPinned() !== false);
+  const rowClass = pinned ? PINNED_ROW_CLASS : undefined;
 
   let body: ReactNode;
   if (loading) {
@@ -279,9 +340,16 @@ export function DataTable<TData>({
     // table's height.
     const skeletonRows = isEmpty ? DEFAULT_SKELETON_ROWS : data.length;
     body = Array.from({ length: skeletonRows }, (_, index) => (
-      <TableRow key={`skeleton-${index}`} aria-hidden="true">
+      <TableRow
+        key={`skeleton-${index}`}
+        aria-hidden="true"
+        className={rowClass}
+      >
         {leafColumns.map((column) => (
-          <TableCell key={column.id}>
+          <TableCell
+            key={column.id}
+            className={pinnedCellClass(column.getIsPinned())}
+          >
             <Skeleton className="h-5 w-full" />
           </TableCell>
         ))}
@@ -300,9 +368,12 @@ export function DataTable<TData>({
     );
   } else {
     body = table.getRowModel().rows.map((row) => (
-      <TableRow key={row.id}>
+      <TableRow key={row.id} className={rowClass}>
         {row.getVisibleCells().map((cell) => (
-          <TableCell key={cell.id}>
+          <TableCell
+            key={cell.id}
+            className={pinnedCellClass(cell.column.getIsPinned())}
+          >
             {flexRender(cell.column.columnDef.cell, cell.getContext())}
           </TableCell>
         ))}
@@ -314,9 +385,17 @@ export function DataTable<TData>({
   // also keeps the table's width out of the card's intrinsic width, so no
   // ancestor (such as a flex item without min-w-0) is widened past the
   // viewport by a wide table: the card takes its container's width and the
-  // table scrolls inside it.
+  // table scrolls inside it. A table with a pinned column also clips to the
+  // card's rounded corners, which its opaque pinned header cell would
+  // otherwise square off; overflow-clip makes no scroll container, so the
+  // pinned cells still stick within the table's own.
   return (
-    <Card className="min-w-0 gap-0 py-0 contain-inline-size">
+    <Card
+      className={cn(
+        "min-w-0 gap-0 py-0 contain-inline-size",
+        pinned && PINNED_CARD_CLASS,
+      )}
+    >
       <Table aria-busy={loading ? true : undefined}>
         {/* BLITZY [LAYOUT]: caption aligned to the start (overrode the
             centred default), so a table wider than its card shows the
@@ -328,12 +407,13 @@ export function DataTable<TData>({
         ) : null}
         <TableHeader>
           {table.getHeaderGroups().map((headerGroup) => (
-            <TableRow key={headerGroup.id}>
+            <TableRow key={headerGroup.id} className={rowClass}>
               {headerGroup.headers.map((header) => (
                 <TableHead
                   key={header.id}
                   colSpan={header.colSpan}
                   scope={header.colSpan > 1 ? "colgroup" : "col"}
+                  className={pinnedCellClass(header.column.getIsPinned())}
                 >
                   {header.isPlaceholder
                     ? null

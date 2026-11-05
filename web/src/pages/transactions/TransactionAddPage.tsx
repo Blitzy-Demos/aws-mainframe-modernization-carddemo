@@ -31,9 +31,9 @@ import {
   type JSX,
   type ReactNode,
 } from "react";
-import { Link } from "react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm, type Control } from "react-hook-form";
+import { LoaderCircle } from "lucide-react";
 
 import { ApiError } from "@/api/client";
 import {
@@ -41,8 +41,8 @@ import {
   useTransactionAddMutation,
 } from "@/api/queries/transactions";
 import type { components } from "@/api/schema";
-import { ConfirmDialog } from "@/components/confirm-dialog";
-import { PageHeader } from "@/components/page-header";
+import { ConfirmDialog, type AfterClose } from "@/components/confirm-dialog";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import {
@@ -347,7 +347,9 @@ export default function TransactionAddPage(): JSX.Element {
   //   opens the confirm dialog;
   // - the submit is disabled during PF5 only. During the add, the closed
   //   dialog gives the focus back to its opener (the submit, or the input
-  //   ENTER was pressed in), and a disabled submit would leave it on the body;
+  //   ENTER was pressed in), and a disabled submit would leave it on the body,
+  //   so the submit is aria-disabled and busy instead, with a spinner, and
+  //   keeps the focus it holds;
   // - "Copy last transaction" stays enabled, since it holds the focus during
   //   PF5, and ignores presses instead.
   // `copyingRef` changes with `copying`, so a second press before the next
@@ -387,13 +389,14 @@ export default function TransactionAddPage(): JSX.Element {
     setConfirming(true);
   }
 
-  function addTransaction(): void {
+  function addTransaction(afterClose: AfterClose): void {
     const values = confirmation;
     if (values === null) {
       return;
     }
     // The inputs stay read-only while the add runs, so its answer clears or
-    // marks the entry confirmed, never a newer one.
+    // marks the entry confirmed, never a newer one. The clear and the marking
+    // move the cursor, so they wait for the dialog to leave the page.
     add.mutate(
       { ...values, confirm: CONFIRM_YES },
       {
@@ -403,14 +406,16 @@ export default function TransactionAddPage(): JSX.Element {
             // 'Transaction added successfully.  Your Tran ID is <id>.' in
             // green [app/cbl/COTRN02C.cbl:L723-734].
             showSuccess(data.message);
-            clearForm();
+            afterClose(clearForm);
           } else {
             showMessage(data.message);
           }
         },
         onError: (error) => {
-          applyApiError(error, form, transactionAddBmsFieldMap, {
-            unknownOutcome: ADD_OUTCOME_UNKNOWN,
+          afterClose(() => {
+            applyApiError(error, form, transactionAddBmsFieldMap, {
+              unknownOutcome: ADD_OUTCOME_UNKNOWN,
+            });
           });
         },
       },
@@ -509,11 +514,7 @@ export default function TransactionAddPage(): JSX.Element {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        actions={
-          <Button variant="outline" asChild>
-            <Link to="/transactions">Back</Link>
-          </Button>
-        }
+        actions={<BackLink to="/transactions" />}
       />
       <form
         noValidate
@@ -564,7 +565,17 @@ export default function TransactionAddPage(): JSX.Element {
           </CardContent>
           {/* The map's key line order: ENTER, F4, F5. */}
           <CardFooter className="flex-wrap gap-2">
-            <Button ref={submitRef} type="submit" disabled={copying}>
+            <Button
+              ref={submitRef}
+              type="submit"
+              disabled={copying}
+              aria-disabled={add.isPending}
+              aria-busy={add.isPending}
+              className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
+            >
+              {add.isPending ? (
+                <LoaderCircle aria-hidden="true" className="motion-safe:animate-spin" />
+              ) : null}
               Add transaction
             </Button>
             <Button type="button" variant="outline" disabled={busy} onClick={clearForm}>

@@ -383,6 +383,108 @@ describe("RewardRuleListPage status", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Window boundaries
+// ---------------------------------------------------------------------------
+
+describe("RewardRuleListPage window boundaries", () => {
+  // A soft delete under the live clock stamps an instant with microseconds.
+  const SOFT_DELETED = rule(
+    "5",
+    "2022-01-01T00:00:00Z",
+    "2026-11-04T18:53:02.243996Z",
+    "ended",
+  );
+
+  // Each boundary shows its UTC date, the date the edit form shows, and keeps
+  // the stored instant in its time element; an open end shows NONE alone.
+  it.each([
+    {
+      name: "a midnight Active from",
+      target: OPEN_ENDED,
+      column: "Active from",
+      text: "2022-01-01",
+      instants: ["2022-01-01T00:00:00Z"],
+    },
+    {
+      name: "a midnight Active to",
+      target: ENDS_NEXT_DAY,
+      column: "Active to",
+      text: "2022-07-02",
+      instants: ["2022-07-02T00:00:00Z"],
+    },
+    {
+      name: "a soft-delete Active to with microseconds",
+      target: SOFT_DELETED,
+      column: "Active to",
+      text: "2026-11-04",
+      instants: ["2026-11-04T18:53:02.243996Z"],
+    },
+    {
+      name: "an open-ended Active to",
+      target: OPEN_ENDED,
+      column: "Active to",
+      text: "—",
+      instants: [],
+    },
+  ])("shows $name as $text", async ({ target, column, text, instants }) => {
+    renderPage([OPEN_ENDED, ENDS_NEXT_DAY, SOFT_DELETED]);
+    await ruleShown(SOFT_DELETED.rule_id);
+
+    const cell = cellUnder(rowOf(target.rule_id), column);
+    expect(cell.textContent).toBe(text);
+    expect(
+      Array.from(cell.querySelectorAll("time"), (time) =>
+        time.getAttribute("datetime"),
+      ),
+    ).toEqual(instants);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Row actions
+// ---------------------------------------------------------------------------
+
+describe("RewardRuleListPage row actions", () => {
+  // A cell the table holds at its inline end while the others scroll.
+  function isPinned(cell: HTMLElement): boolean {
+    return cell.classList.contains("sticky") && cell.classList.contains("end-0");
+  }
+
+  it("pins only the Actions column, whose Edit and Delete describe their rule", async () => {
+    renderPage(RULES);
+    await ruleShown(ENDED_IN_MARCH.rule_id);
+
+    const headers = within(rulesTable()).getAllByRole("columnheader");
+    expect(headers.map((header) => header.textContent)).toEqual([
+      "Rule ID",
+      "Type",
+      "Category",
+      "Rate",
+      "Min amount",
+      "Max amount",
+      "Active from",
+      "Active to",
+      "Status",
+      "Actions",
+    ]);
+    expect(headers.filter(isPinned)).toEqual(headers.slice(-1));
+    const rows = dataRows();
+    expect(
+      rows.map((row) => within(row).getAllByRole("cell").filter(isPinned)),
+    ).toEqual(rows.map((row) => [cellUnder(row, "Actions")]));
+    expect(
+      rows.map((row) => {
+        const actions = within(cellUnder(row, "Actions"));
+        return [
+          actions.getByRole("link", { name: "Edit" }),
+          actions.getByRole("button", { name: "Delete" }),
+        ].map((action) => action.getAttribute("aria-description"));
+      }),
+    ).toEqual(RULES.map(({ rule_id }) => [`Rule ${rule_id}`, `Rule ${rule_id}`]));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Delete
 // ---------------------------------------------------------------------------
 
@@ -419,7 +521,12 @@ describe("RewardRuleListPage delete", () => {
       await waitFor(() => {
         expect(cellUnder(rowOf("1"), "Status").textContent).toBe("Ended");
       });
-      expect(cellUnder(rowOf("1"), "Active to").textContent).toBe(PINNED_CLOCK);
+      // The soft-delete instant, shown as its UTC date.
+      const activeTo = cellUnder(rowOf("1"), "Active to");
+      expect(activeTo.textContent).toBe("2022-07-01");
+      expect(activeTo.querySelector("time")?.getAttribute("datetime")).toBe(
+        PINNED_CLOCK,
+      );
       expect(toastError).not.toHaveBeenCalled();
     },
   );
@@ -450,6 +557,79 @@ describe("RewardRuleListPage delete", () => {
     expect(toastError).toHaveBeenCalledWith(UNEXPECTED_ERROR);
     expect(toastSuccess).toHaveBeenCalledWith("Reward rule 1 ended");
   });
+});
+
+// A DELETE the server refuses ends nothing: its text is toasted, no "ended"
+// text is shown, the dialog closes, and the row stays listed as it was, with
+// no re-read, since only a delete that succeeded reads the list again. The
+// rule's Delete then asks again, and a confirmed retry ends it.
+describe("RewardRuleListPage failed delete", () => {
+  it.each([
+    {
+      status: 404,
+      body: {
+        code: "NOT_FOUND",
+        message: "Reward rule not found",
+      } satisfies ErrorBody,
+    },
+    {
+      status: 500,
+      body: {
+        code: "UNEXPECTED",
+        message: UNEXPECTED_ERROR,
+      } satisfies ErrorBody,
+    },
+  ])(
+    "a $status DELETE toasts its message and keeps the rule as listed",
+    async ({ status, body }) => {
+      const { user } = renderPage(RULES);
+      await ruleShown(OPEN_ENDED.rule_id);
+      const statusBefore = cellUnder(rowOf("1"), "Status").textContent;
+      const activeToBefore = cellUnder(rowOf("1"), "Active to").textContent;
+      expect(statusBefore).toBe("Active");
+      answer(`DELETE ${LIST_PATH}/1`, status, body);
+
+      const dialog = await openDelete(user, OPEN_ENDED.rule_id);
+      await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+
+      await waitFor(() => {
+        expect(toastError).toHaveBeenCalledWith(body.message);
+      });
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(toastSuccess).not.toHaveBeenCalled();
+      expect(sentTo("DELETE", `${LIST_PATH}/1`)).toHaveLength(1);
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      expect(sentTo("GET", LIST_PATH)).toHaveLength(1);
+      expect(shownRuleIds()).toEqual(RULES.map((shown) => shown.rule_id));
+      expect(cellUnder(rowOf("1"), "Status").textContent).toBe(statusBefore);
+      expect(cellUnder(rowOf("1"), "Active to").textContent).toBe(
+        activeToBefore,
+      );
+
+      // The next delete is accepted: the rule's Delete asks again, and the
+      // confirmed retry ends the rule.
+      const ended = endedNow(OPEN_ENDED);
+      answer(`DELETE ${LIST_PATH}/1`, 200, {
+        ...ended,
+        outcome: "deleted",
+      } satisfies RewardRuleDeletion);
+      answer(`GET ${LIST_PATH}`, 200, [ended, ...RULES.slice(1)]);
+      const again = await openDelete(user, OPEN_ENDED.rule_id);
+      await user.click(within(again).getByRole("button", { name: "Delete" }));
+
+      await waitFor(() => {
+        expect(toastSuccess).toHaveBeenCalledWith("Reward rule 1 ended");
+      });
+      expect(toastSuccess).toHaveBeenCalledTimes(1);
+      expect(sentTo("DELETE", `${LIST_PATH}/1`)).toHaveLength(2);
+      await waitFor(() => {
+        expect(cellUnder(rowOf("1"), "Status").textContent).toBe("Ended");
+      });
+      expect(toastError).toHaveBeenCalledTimes(1);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

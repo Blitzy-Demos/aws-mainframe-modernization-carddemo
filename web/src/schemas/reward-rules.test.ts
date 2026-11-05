@@ -3,8 +3,13 @@
 // `^-?[0-9]+(\.[0-9]+)?$`, then RewardRate's NUMERIC(9,4) scale check, made
 // after trailing fraction zeros are dropped. A rate whose digits beyond the
 // fourth fraction place are all zeros is accepted and submitted as entered; a
-// non-zero digit there, or text that is not a plain decimal, gets zod's regex
-// issue; any leading minus gets the request-written negative-rate message.
+// non-zero digit there, or text that is not a plain decimal, gets a regex issue
+// with the form's own rate text; any leading minus gets the request-written
+// negative-rate message.
+//
+// Every field check reports an explicit text: the request-written texts of
+// REWARD_RULE_MESSAGES, or the client-only texts of REWARD_RULE_FORM_MESSAGES,
+// never a zod default, but for the dates' settled `Invalid date`.
 //
 // The window tests hold the edit schema (rewardRuleEditSchema) to the PUT that
 // replaces a stored rule: a boundary date left unchanged is sent as the stored
@@ -16,6 +21,7 @@ import { z } from "zod";
 import type { components } from "@/api/schema";
 
 import {
+  REWARD_RULE_FORM_MESSAGES,
   REWARD_RULE_MESSAGES,
   type RewardRuleFormInput,
   type RewardRuleFormValues,
@@ -62,8 +68,8 @@ describe("rewardRuleSchema reward_rate", () => {
     },
   );
 
-  it.each(["1.50001", "0.00001", "1.12345", "1.", ".5", "1.5.0", "abc", ""])(
-    "rejects the rate %j with zod's regex issue",
+  it.each(["1.50001", "0.00001", "1.12345", "1.", ".5", "1.5.0", "abc", " 1"])(
+    "rejects the rate %j with a regex issue and the form's rate text",
     (reward_rate) => {
       const issues = issuesOf(ruleWith(reward_rate));
       expect(issues).toHaveLength(1);
@@ -71,6 +77,7 @@ describe("rewardRuleSchema reward_rate", () => {
         path: ["reward_rate"],
         code: z.ZodIssueCode.invalid_string,
         validation: "regex",
+        message: REWARD_RULE_FORM_MESSAGES.rateInvalid,
       });
       expect(REQUEST_WRITTEN).not.toContain(issues[0]?.message);
     },
@@ -90,6 +97,125 @@ describe("rewardRuleSchema reward_rate", () => {
       });
     },
   );
+});
+
+type AmountField = "min_transaction_amount" | "max_transaction_amount";
+
+const AMOUNT_FIELDS: readonly AmountField[] = [
+  "min_transaction_amount",
+  "max_transaction_amount",
+];
+
+/** The text each amount bound's malformed or out-of-range entry gets. */
+const AMOUNT_MESSAGES: Record<AmountField, string> = {
+  min_transaction_amount: REWARD_RULE_FORM_MESSAGES.minAmountInvalid,
+  max_transaction_amount: REWARD_RULE_FORM_MESSAGES.maxAmountInvalid,
+};
+
+/** A rule every client edit accepts but for the amount bound `field`. */
+function ruleWithBound(field: AmountField, value: string): RewardRuleFormInput {
+  return { ...ruleWith("1.5"), [field]: value };
+}
+
+// The S9(09)V99 range of the published pattern
+// `^-?0*[0-9]{1,9}(\.[0-9]{1,2})?$`, the text the server converts: at most 9
+// integer digits after any leading zeros and at most 2 fraction digits.
+describe.each(AMOUNT_FIELDS)("rewardRuleSchema %s", (field) => {
+  it.each([
+    "999999999.99",
+    "-999999999.99",
+    "0000000001.00",
+    "000000000999999999.99",
+    "0",
+    "-0.00",
+    "10.5",
+  ])("accepts the amount %j and submits it unchanged", (value) => {
+    const result = rewardRuleSchema.safeParse(ruleWithBound(field, value));
+    expect(result.success).toBe(true);
+    expect(result.data?.[field]).toBe(value);
+  });
+
+  it.each([
+    "1000000000.00",
+    "-1000000000.00",
+    "1000000000",
+    "01000000000",
+    "1.234",
+    "1.",
+    ".5",
+    "+1",
+    "1e3",
+    "ten",
+  ])("rejects the amount %j on its field with the range text", (value) => {
+    const issues = issuesOf(ruleWithBound(field, value));
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({
+      path: [field],
+      message: AMOUNT_MESSAGES[field],
+    });
+  });
+});
+
+// The form's empty entry, as the new-rule page starts.
+const EMPTY_ENTRY: RewardRuleFormInput = {
+  transaction_type_cd: "",
+  transaction_category_cd: "",
+  reward_rate: "",
+  min_transaction_amount: "",
+  max_transaction_amount: "",
+  active_from: "",
+  active_to: "",
+};
+
+// Each field's issue texts, keyed by the field.
+function messagesByField(
+  values: Partial<RewardRuleFormInput>,
+): Record<string, string[]> {
+  const result = rewardRuleSchema.safeParse(values);
+  const messages: Record<string, string[]> = {};
+  for (const issue of result.success ? [] : result.error.issues) {
+    const field = String(issue.path[0]);
+    messages[field] = [...(messages[field] ?? []), issue.message];
+  }
+  return messages;
+}
+
+describe("rewardRuleSchema field texts", () => {
+  const texts = REWARD_RULE_FORM_MESSAGES;
+
+  // The empty optional fields are omitted from the body; each required field
+  // gets one text, its own, and the start date keeps zod's `Invalid date`.
+  it("reports each empty required field with its required text", () => {
+    expect(messagesByField(EMPTY_ENTRY)).toEqual({
+      transaction_type_cd: [texts.typeRequired],
+      transaction_category_cd: [texts.categoryRequired],
+      reward_rate: [texts.rateRequired],
+      active_from: ["Invalid date"],
+    });
+  });
+
+  // An absent member is the empty field.
+  it("reports each absent required code and the rate with its required text", () => {
+    expect(messagesByField({ active_from: "2022-01-01" })).toEqual({
+      transaction_type_cd: [texts.typeRequired],
+      transaction_category_cd: [texts.categoryRequired],
+      reward_rate: [texts.rateRequired],
+    });
+  });
+
+  it.each<[keyof RewardRuleFormInput, string, string]>([
+    ["transaction_type_cd", "\u20ac", texts.typeInvalid],
+    ["transaction_type_cd", "\u0000", texts.typeInvalid],
+    ["transaction_type_cd", "012", texts.typeTooLong],
+    ["transaction_category_cd", "12345", texts.categoryInvalid],
+    ["transaction_category_cd", "1a", texts.categoryInvalid],
+    ["transaction_category_cd", "-1", texts.categoryInvalid],
+    ["transaction_category_cd", " ", texts.categoryInvalid],
+  ])("rejects %s %j with its text alone", (field, value, message) => {
+    expect(messagesByField({ ...ruleWith("1.5"), [field]: value })).toEqual({
+      [field]: [message],
+    });
+  });
 });
 
 // A stored rule of type `07`, category `0001`, as `GET /admin/reward-rules`

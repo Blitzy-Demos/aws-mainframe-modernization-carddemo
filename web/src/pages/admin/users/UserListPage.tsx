@@ -33,7 +33,6 @@ import {
 import { Link } from "react-router";
 import { Controller, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeftIcon } from "lucide-react";
 
 import {
   useUser,
@@ -44,7 +43,7 @@ import {
 } from "@/api/queries/admin-users";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { DataTable, type DataTableProps } from "@/components/data-table";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -67,6 +66,7 @@ import {
   showSuccess,
 } from "@/lib/api-errors";
 import { keyPathSegment } from "@/lib/key-segment";
+import { clearSession, getSession } from "@/lib/session";
 import {
   userListBmsFieldMap,
   userListFilterSchema,
@@ -213,9 +213,14 @@ export default function UserListPage(): JSX.Element {
   }, [listError, reading, filterForm]);
 
   // The page-boundary text of a page with rows (V-COUSR00C-005,
-  // V-COUSR00C-008) is toasted once per browse, when its answer arrives: a
-  // page kept on screen while the next one loads is not that answer, and a
-  // re-read the user did not ask for shows nothing. An empty page shows its
+  // V-COUSR00C-008) is toasted once per browse, when the answer to the read
+  // that browse started arrives. While a read is out, fetching or paused
+  // offline, the page shown is not that answer: it is the page kept on screen
+  // while the next one loads, or the cache's copy of the requested page, which
+  // a return to the list or a Previous or Next onto a page read before shows
+  // while the page is read again, and whose text an earlier read found. A
+  // re-read the user did not ask for, such as the one after a delete, shows
+  // nothing, and a failed read leaves no page to show. An empty page shows its
   // text in place of the rows, and its status region announces it, so it is
   // not toasted as well. dataUpdatedAt marks every answer, including a
   // repeated search whose page equals the one shown.
@@ -225,6 +230,7 @@ export default function UserListPage(): JSX.Element {
     if (
       page === undefined ||
       isPlaceholderData ||
+      reading ||
       answeredBrowse.current === browseCount.current
     ) {
       return;
@@ -233,7 +239,7 @@ export default function UserListPage(): JSX.Element {
     if (page.items.length > 0) {
       showMessage(page.message);
     }
-  }, [page, dataUpdatedAt, isPlaceholderData]);
+  }, [page, dataUpdatedAt, isPlaceholderData, reading]);
 
   // The table waits for the read that is out: the first one, a page loading
   // behind the one kept on screen, or a re-read of a browse whose last read
@@ -287,15 +293,28 @@ export default function UserListPage(): JSX.Element {
   ]);
 
   // F5=Delete, DELETE-USER-INFO [app/cbl/COUSR03C.cbl:L174-196]. The delete
-  // hook refreshes the list, so the deleted row leaves the page it was on.
+  // hook refreshes the list, so the deleted row leaves the page it was on. It
+  // settles on the delete's answer without waiting for that refresh, so the
+  // outcome is shown before the refresh answers.
+  //
+  // An admin who deletes their own account ends their session with it: the
+  // server answers every later request of that token 401, because its `sub`
+  // names no stored user. The session is therefore ended here, once the text
+  // is shown, and without a cause, so RequireAuth sends the admin to sign on
+  // with no session-end notice and the delete's text is the only toast. The
+  // refresh already out then belongs to an ended session, and api/client.ts
+  // ends no session for its 401; the unmounted page shows nothing for it.
   const onConfirmDelete = (): void => {
     if (dialogUser === null) {
       return;
     }
     setDialogOpen(false);
     deleteMutation.mutate(dialogUser.user_id, {
-      onSuccess: (response) => {
+      onSuccess: (response, deletedId) => {
         showSuccess(response.message);
+        if (getSession()?.user_id === deletedId) {
+          clearSession();
+        }
       },
       onError: (error) => {
         showApiError(error);
@@ -343,8 +362,8 @@ export default function UserListPage(): JSX.Element {
           const user = row.original;
           const describedBy = `${baseId}-user-${row.index}`;
           return (
-            <div className="flex items-center gap-1">
-              <Button variant="link" size="sm" asChild>
+            <div className="flex items-center gap-2">
+              <Button variant="link" asChild>
                 <Link
                   to={`${LIST_ROUTE}/${keyPathSegment(user.user_id)}/edit`}
                   state={{ from: LIST_ROUTE }}
@@ -356,7 +375,6 @@ export default function UserListPage(): JSX.Element {
               <Button
                 type="button"
                 variant="link"
-                size="sm"
                 aria-describedby={describedBy}
                 onClick={() => {
                   setLookupId(user.user_id);
@@ -375,14 +393,7 @@ export default function UserListPage(): JSX.Element {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        actions={
-          <Button variant="outline" asChild>
-            <Link to={ADMIN_ROUTE}>
-              <ArrowLeftIcon aria-hidden="true" />
-              Back
-            </Link>
-          </Button>
-        }
+        actions={<BackLink to={ADMIN_ROUTE} />}
       />
 
       <Card>

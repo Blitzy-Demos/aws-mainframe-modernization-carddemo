@@ -28,11 +28,11 @@ import {
   type JSX,
   type ReactNode,
 } from "react";
-import { ArrowLeft, List } from "lucide-react";
+import { List } from "lucide-react";
 import { Link, useParams } from "react-router";
 
 import { useTransaction, type Transaction } from "@/api/queries/transactions";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -282,12 +282,7 @@ export default function TransactionViewPage(): JSX.Element {
         title={TITLE}
         actions={
           <>
-            <Button variant="outline" asChild>
-              <Link to={LIST_ROUTE}>
-                <ArrowLeft aria-hidden="true" />
-                Back
-              </Link>
-            </Button>
+            <BackLink to={LIST_ROUTE} />
             <Button variant="outline" asChild>
               <Link to={LIST_ROUTE}>
                 <List aria-hidden="true" />

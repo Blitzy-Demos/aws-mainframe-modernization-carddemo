@@ -262,6 +262,71 @@ describe("AccountViewPage", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  // Both Y/N flags of COACTVW are one badge, its letter kept so the state is
+  // not carried by colour alone: N, the inactive state, is destructive.
+  it.each([
+    { flag: "Y", variant: "secondary" },
+    { flag: "N", variant: "destructive" },
+  ])(
+    "shows the Y/N flags $flag as $variant badges",
+    async ({ flag, variant }) => {
+      respondWith(200, {
+        ...account,
+        acct_active_status: flag,
+        cust_pri_card_holder_ind: flag,
+      });
+      renderPage(`/accounts/${account.account_id}`);
+      await screen.findByText(account.cust_last_name);
+
+      for (const label of ["Active Y/N", "Primary Card Holder Y/N"]) {
+        const caption = screen.getByText(label, { selector: "dt" });
+        const badge = caption.nextElementSibling?.querySelector(
+          '[data-slot="badge"]',
+        );
+        expect(badge?.textContent).toBe(flag);
+        expect(badge?.getAttribute("data-variant")).toBe(variant);
+      }
+    },
+  );
+
+  it("holds the details' place with their cards and captions while the account is read", async () => {
+    const release = holdNextAnswer();
+    renderPage(`/accounts/${account.account_id}`);
+
+    // The loaded view's cards and captions, each value a placeholder line
+    // (the Address two), all hidden from assistive technology.
+    const captions = (): Array<string | null> =>
+      Array.from(document.querySelectorAll("dt"), (term) => term.textContent);
+    await waitFor(() => {
+      expect(document.querySelector("dl")).not.toBeNull();
+    });
+    const placeholderCaptions = captions();
+    expect(placeholderCaptions).toHaveLength(28);
+    const terms = Array.from(document.querySelectorAll("dt"));
+    expect(terms[0].closest('[aria-hidden="true"]')).not.toBeNull();
+    for (const term of terms) {
+      const lines = term.nextElementSibling?.querySelectorAll(
+        '[data-slot="skeleton"]',
+      );
+      expect(lines).toHaveLength(term.textContent === "Address" ? 2 : 1);
+    }
+    expect(
+      Array.from(document.querySelectorAll("h2"), (title) => title.textContent),
+    ).toEqual(["Account", "Customer Details", "Card"]);
+    expect(
+      screen.queryByRole("heading", { level: 2, name: "Account" }),
+    ).toBeNull();
+
+    release(200, account);
+    await screen.findByText(account.cust_last_name);
+    expect(captions()).toEqual(placeholderCaptions);
+    expect(document.querySelector('[data-slot="skeleton"]')).toBeNull();
+    expect(document.querySelector('[aria-hidden="true"] dl')).toBeNull();
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Account" }),
+    ).toBeTruthy();
+  });
+
   it.each([
     { entered: "", message: ACCOUNT_KEY_MESSAGES.noInputReceived },
     { entered: "   ", message: ACCOUNT_KEY_MESSAGES.noInputReceived },

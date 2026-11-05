@@ -12,6 +12,16 @@
 //! standard output, in a buffer owned by the harness, so tests running side by
 //! side in one process never see each other's lines.
 //!
+//! The consumers reach the broker through an [`amqp_tap::Tap`], a pass-through
+//! proxy that journals the frames of their one connection: each delivery, each
+//! publish with the broker's return and confirm, and each `basic.ack`,
+//! `basic.reject` or `basic.nack`, with the capture's length when that frame
+//! left the consumer. [`Harness::assert_acked_after_confirm`],
+//! [`Harness::assert_rejected`] and [`Harness::assert_delivered_once`] read a
+//! request's settlement from that journal, and [`Harness::hold_next_confirm`]
+//! keeps the next publisher confirm from the consumers, so what the tests hold
+//! the consumers to is what the broker saw, not what the consumers log.
+//!
 //! The MQ message descriptor maps onto AMQP properties as the consumers read
 //! them: `MSGID` is `message_id`, `CORRELID` is `correlation_id` and `REPLYTOQ`
 //! is `reply_to` [app/app-vsam-mq/cbl/CODATE01.cbl:L313-315]
@@ -25,8 +35,9 @@
 //!
 //! Every broker operation the harness awaits is bounded: by the caller's
 //! deadline where there is one, by `READY_TIMEOUT` while the consumers
-//! subscribe, and by `BROKER_TIMEOUT` otherwise. One that does not complete in
-//! time panics, naming the operation, its queue and the bound. The crate enables
+//! subscribe, and by `BROKER_TIMEOUT` otherwise; [`bounded`] gives a test's own
+//! broker operations the same bound. One that does not complete in time
+//! panics, naming the operation, its queue and the bound. The crate enables
 //! no tokio timer, so the polling helpers sleep on a blocking thread, and each
 //! bound is a blocking thread that waits out the remaining time unless the
 //! operation completes first and wakes it.
@@ -38,6 +49,8 @@
 // that includes this harness.
 #[path = "../../../audit/src/lib.rs"]
 pub mod audit_tables;
+
+pub mod amqp_tap;
 
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
@@ -52,7 +65,7 @@ use carddemo_testkit::{TestStack, fixtures};
 use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicGetOptions, BasicPublishOptions, ConfirmSelectOptions,
-    QueueDeclareOptions,
+    QueueDeclareOptions, QueueDeleteOptions,
 };
 use lapin::protocol::constants::REPLY_SUCCESS;
 use lapin::publisher_confirm::Confirmation;
@@ -60,6 +73,7 @@ use lapin::types::FieldTable;
 use lapin::{BasicProperties, Channel, Connection, Queue};
 use tracing::instrument::WithSubscriber;
 
+use self::amqp_tap::{ConfirmHold, Handling, Journal, Outcome, Settle, Settlement, Tap};
 use self::audit_tables::{
     CodeSpan, Document, PARITY_AUDIT_PATH, PARITY_COMMON_COLUMNS, Repo, Row, Table,
 };
@@ -74,6 +88,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long one broker operation of a helper without a caller deadline may
 /// take; a publish and its confirm count as one.
 const BROKER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a request may take, from its publish, to be settled on the wire.
+const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Service name of the captured span lines.
 const SERVICE_NAME: &str = "mq-test";
@@ -111,6 +128,15 @@ async fn pause(period: Duration) {
     tokio::task::spawn_blocking(move || std::thread::sleep(period))
         .await
         .expect("sleep task");
+}
+
+/// The non-blank lines of captured telemetry `bytes`, in write order.
+fn lines(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|&byte| byte == b'\n')
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .filter(|line| !line.trim().is_empty())
+        .collect()
 }
 
 /// The instant by which broker operations must complete, with the bound it was
@@ -182,6 +208,24 @@ impl Deadline {
     }
 }
 
+/// Starts a test's own broker operation, `operation` on `subject` (usually a
+/// queue), with what `start` returns, and awaits it for at most 30 seconds,
+/// the bound of every harness broker operation without a caller deadline.
+///
+/// # Panics
+///
+/// Panics, naming the operation, its subject and the bound, once the bound
+/// passes before the operation completes.
+pub async fn bounded<F: Future>(
+    operation: &str,
+    subject: &str,
+    start: impl FnOnce() -> F,
+) -> F::Output {
+    Deadline::after(BROKER_TIMEOUT)
+        .run(operation, subject, start)
+        .await
+}
+
 /// A running consumer stack and a client of its broker, owned by one test.
 ///
 /// Build it with [`Harness::start`] and end it with [`Harness::shutdown`],
@@ -191,15 +235,19 @@ pub struct Harness {
     pub stack: TestStack,
     /// The database handle the consumers were started with.
     pub db: Db,
-    /// The settings the consumers were started with: the stack's URLs, the
-    /// default request queue names and the clock override.
+    /// The settings the consumers were started with: the stack's database
+    /// URL, the broker URL of `tap`, the default request queue names and the
+    /// clock override.
     pub settings: Settings,
     /// The test's own channel on the broker, in publisher-confirm mode.
     pub channel: Channel,
-    /// The connection of `channel` and of the helpers' short-lived channels.
+    /// The connection of `channel` and of the helpers' short-lived channels,
+    /// straight to the broker.
     connection: Connection,
     /// The started consumers.
     running: Running,
+    /// The proxy the consumers' connection passes through.
+    tap: Tap,
     /// Every JSON line the consumers' telemetry wrote, in write order.
     buffer: Arc<Mutex<Vec<u8>>>,
     /// Owns the tracer provider of the capture.
@@ -208,28 +256,37 @@ pub struct Harness {
 
 impl Harness {
     /// Starts a seeded stack and the CDRD, CDRA and CP00 consumers on it, with
-    /// their telemetry captured for [`Harness::logs`], and returns once every
+    /// their telemetry captured for [`Harness::logs`] and their broker
+    /// connection passing through an [`amqp_tap::Tap`], and returns once every
     /// request queue reports a consumer.
     ///
     /// `clock_override` is the `CARDDEMO_CLOCK_OVERRIDE` value, an RFC 3339
     /// instant that pins every time-dependent output, or `None` for the system
-    /// clock. Every other setting keeps its default, and the process
-    /// environment is never read or changed, because parallel tests share it.
+    /// clock. The broker URL is the tap's; every other setting keeps its
+    /// default, and the process environment is never read or changed, because
+    /// parallel tests share it.
     ///
     /// # Panics
     ///
-    /// Panics if the containers do not start, the seed fails, the settings,
-    /// the clock or the telemetry cannot be built, the consumers do not start,
-    /// the client connection or channel cannot be opened, opening the test
-    /// channel or putting it in confirm mode takes more than 30 seconds each,
-    /// or a request queue reports no consumer within 30 seconds, which also
-    /// bound the broker operations of its probes. An expiry names the
-    /// operation and its queue or channel.
+    /// Panics if the containers do not start, the seed fails, the tap cannot
+    /// listen, the settings, the clock or the telemetry cannot be built, the
+    /// consumers do not start, the client connection or channel cannot be
+    /// opened, opening the test channel or putting it in confirm mode takes
+    /// more than 30 seconds each, or a request queue reports no consumer
+    /// within 30 seconds, which also bound the broker operations of its
+    /// probes. An expiry names the operation and its queue or channel.
     pub async fn start(clock_override: Option<&str>) -> Self {
         let stack = TestStack::with_rabbitmq().await;
         stack.seed().await.expect("seed the test database");
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let tap = Tap::start(
+            stack
+                .amqp_url()
+                .expect("a stack with RabbitMQ has a broker URL"),
+            Arc::clone(&buffer),
+        );
         let settings = Settings::from_lookup(|key| match key {
-            keys::AMQP_URL => stack.amqp_url().map(str::to_owned),
+            keys::AMQP_URL => Some(tap.url().to_owned()),
             keys::DATABASE_URL => Some(stack.database_url().to_owned()),
             keys::CLOCK_OVERRIDE => clock_override.map(str::to_owned),
             _ => None,
@@ -241,7 +298,6 @@ impl Harness {
             .expect("parse the test clock override");
         let db = Db::from_pool(stack.pool().clone());
 
-        let buffer = Arc::new(Mutex::new(Vec::new()));
         let writer = {
             let buffer = Arc::clone(&buffer);
             move || Capture(Arc::clone(&buffer))
@@ -278,6 +334,7 @@ impl Harness {
             channel,
             connection,
             running,
+            tap,
             buffer,
             guard,
         };
@@ -505,6 +562,22 @@ impl Harness {
             .message_count()
     }
 
+    /// Deletes `queue` on the test's channel and returns the number of
+    /// messages it held.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker refuses the deletion, and, naming the queue and
+    /// the operation, if it does not answer within 30 seconds.
+    pub async fn delete_queue(&self, queue: &str) -> u32 {
+        bounded("queue.delete", queue, || {
+            self.channel
+                .queue_delete(queue, QueueDeleteOptions::default())
+        })
+        .await
+        .unwrap_or_else(|error| panic!("cannot delete {queue}: {error}"))
+    }
+
     /// Every non-blank line the consumers' telemetry has written so far, in
     /// write order: JSON log events and `"type":"span"` lines.
     #[must_use]
@@ -514,11 +587,261 @@ impl Harness {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        bytes
-            .split(|&byte| byte == b'\n')
-            .map(|line| String::from_utf8_lossy(line).into_owned())
-            .filter(|line| !line.trim().is_empty())
-            .collect()
+        lines(&bytes)
+    }
+
+    /// The lines of [`Harness::logs`] the telemetry had written when
+    /// `settlement`'s frame left the consumer, so before the consumer settled
+    /// the request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the capture is shorter than the length the settlement
+    /// recorded, which a capture that only grows never is.
+    #[must_use]
+    pub fn logs_before(&self, settlement: &Settlement) -> Vec<String> {
+        let buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        let written = buffer.get(..settlement.captured).unwrap_or_else(|| {
+            panic!(
+                "the capture holds {} bytes, fewer than the {} of {settlement:?}",
+                buffer.len(),
+                settlement.captured
+            )
+        });
+        lines(written)
+    }
+
+    /// The journal of the consumers' connection so far.
+    #[must_use]
+    pub fn journal(&self) -> Journal {
+        self.tap.journal()
+    }
+
+    /// Arms a hold of the next publisher confirm the broker sends the
+    /// consumers: the tap keeps it, and every frame after it, from them until
+    /// the hold is released or dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another hold is armed.
+    #[must_use]
+    pub fn hold_next_confirm(&self) -> ConfirmHold<'_> {
+        self.tap.hold_next_confirm()
+    }
+
+    /// Waits until the journal shows the `flow` request `message_id`
+    /// settled, and returns its handling with the journal it was read from.
+    ///
+    /// Then asserts what every request must show on the wire: one delivery,
+    /// to the flow's consumer tag `carddemo-<flow>`, not redelivered, and
+    /// one settlement frame.
+    async fn settled(&self, flow: &str, message_id: &str) -> (Handling, Journal) {
+        let deadline = Deadline::after(SETTLEMENT_TIMEOUT);
+        let (handling, journal) = loop {
+            let journal = self.tap.journal();
+            match journal.handling(message_id) {
+                Err(problem) => panic!("{flow} request {message_id}: {problem}\n{journal}"),
+                Ok(Some(handling)) if !handling.settlements.is_empty() => {
+                    break (handling, journal);
+                }
+                Ok(_) => {}
+            }
+            assert!(
+                !deadline.passed(),
+                "{flow} request {message_id} not settled on the wire within \
+                 {SETTLEMENT_TIMEOUT:?}\n{journal}"
+            );
+            pause(POLL_INTERVAL).await;
+        };
+        let tag = format!("carddemo-{}", flow.to_ascii_lowercase());
+        assert_eq!(
+            handling.consumer_tag, tag,
+            "{flow} request {message_id} delivered to another consumer\n{journal}"
+        );
+        assert!(
+            !handling.redelivered,
+            "{flow} request {message_id} delivered as redelivered\n{journal}"
+        );
+        assert_eq!(
+            handling.settlements.len(),
+            1,
+            "{flow} request {message_id} settled by {} frames\n{journal}",
+            handling.settlements.len()
+        );
+        (handling, journal)
+    }
+
+    /// Waits until the `flow` request `message_id` is settled on the wire,
+    /// and asserts that the consumer acknowledged it after its reply's
+    /// confirm, as the broker saw it: delivered once to the flow's consumer,
+    /// not redelivered; exactly one publish between the delivery and the
+    /// settlement, to `reply_queue` through the default exchange, mandatory,
+    /// confirmed with a plain `basic.ack` and never returned (lapin's
+    /// `Ack(None)`), that confirm forwarded to the consumer before it settled;
+    /// and one settlement, a single `basic.ack`, no `basic.reject` or
+    /// `basic.nack`. Returns the settlement.
+    ///
+    /// # Panics
+    ///
+    /// Panics, with the journal, when the request is not settled within 30
+    /// seconds, the journal is broken, or any of the above does not hold.
+    pub async fn assert_acked_after_confirm(
+        &self,
+        flow: &str,
+        message_id: &str,
+        reply_queue: &str,
+    ) -> Settlement {
+        let (handling, journal) = self.settled(flow, message_id).await;
+        let settlement = handling.settlements[0];
+        assert_eq!(
+            settlement.settle,
+            Settle::Ack { multiple: false },
+            "{flow} request {message_id} not settled by one basic.ack\n{journal}"
+        );
+        let [reply] = handling.publishes.as_slice() else {
+            panic!(
+                "{flow} request {message_id}: {} publishes before its acknowledgement, \
+                 not one reply\n{journal}",
+                handling.publishes.len()
+            );
+        };
+        assert_eq!(
+            (reply.exchange.as_str(), reply.routing_key.as_str()),
+            ("", reply_queue),
+            "{flow} request {message_id}: the reply's exchange and routing key\n{journal}"
+        );
+        assert!(
+            reply.mandatory,
+            "{flow} request {message_id}: the reply is not mandatory\n{journal}"
+        );
+        assert_eq!(
+            reply.outcome,
+            Outcome::Confirmed,
+            "{flow} request {message_id}: acknowledged without a confirmed reply\n{journal}"
+        );
+        assert!(
+            reply
+                .confirm
+                .is_some_and(|confirm| confirm < settlement.index),
+            "{flow} request {message_id}: acknowledged before its reply's confirm \
+             reached the consumer\n{journal}"
+        );
+        settlement
+    }
+
+    /// Waits until the `flow` request `message_id` is settled on the wire,
+    /// and asserts that the consumer rejected it without requeue, as the
+    /// broker saw it: delivered once to the flow's consumer, not redelivered;
+    /// the publishes between the delivery and the settlement exactly
+    /// `publishes`, each a routing key through the default exchange with the
+    /// broker's answer, in order, each mandatory and its confirm forwarded to
+    /// the consumer before it settled; and one settlement, a single
+    /// `basic.reject` with `requeue` clear, no `basic.ack` or `basic.nack`.
+    /// Returns the settlement, whose [`Harness::logs_before`] are the lines
+    /// written before the rejection.
+    ///
+    /// # Panics
+    ///
+    /// Panics, with the journal, when the request is not settled within 30
+    /// seconds, the journal is broken, or any of the above does not hold.
+    pub async fn assert_rejected(
+        &self,
+        flow: &str,
+        message_id: &str,
+        publishes: &[(&str, Outcome)],
+    ) -> Settlement {
+        let (handling, journal) = self.settled(flow, message_id).await;
+        let settlement = handling.settlements[0];
+        assert_eq!(
+            settlement.settle,
+            Settle::Reject { requeue: false },
+            "{flow} request {message_id} not settled by one basic.reject without \
+             requeue\n{journal}"
+        );
+        let answered: Vec<(&str, Outcome)> = handling
+            .publishes
+            .iter()
+            .map(|publish| (publish.routing_key.as_str(), publish.outcome))
+            .collect();
+        assert_eq!(
+            answered, publishes,
+            "{flow} request {message_id}: its publishes and the broker's answers\n{journal}"
+        );
+        for publish in &handling.publishes {
+            let queue = &publish.routing_key;
+            assert!(
+                publish.exchange.is_empty() && publish.mandatory,
+                "{flow} request {message_id}: the publish to {queue} is not a mandatory \
+                 default-exchange publish\n{journal}"
+            );
+            assert!(
+                publish
+                    .confirm
+                    .is_some_and(|confirm| confirm < settlement.index),
+                "{flow} request {message_id}: rejected before the confirm of its publish \
+                 to {queue} reached the consumer\n{journal}"
+            );
+        }
+        settlement
+    }
+
+    /// Watches the journal for the whole of `watch` and returns when it held,
+    /// throughout, exactly one delivery of the `flow` request `message_id`
+    /// and at most one settlement frame for it: never redelivered, never
+    /// settled twice.
+    ///
+    /// # Panics
+    ///
+    /// Panics, with the journal, as soon as the journal is broken, the
+    /// request is not delivered, or it is delivered or settled again.
+    pub async fn assert_delivered_once(&self, flow: &str, message_id: &str, watch: Duration) {
+        let until = Instant::now() + watch;
+        loop {
+            let journal = self.tap.journal();
+            let handling = journal
+                .handling(message_id)
+                .unwrap_or_else(|problem| {
+                    panic!("{flow} request {message_id}: {problem}\n{journal}")
+                })
+                .unwrap_or_else(|| panic!("{flow} request {message_id} not delivered\n{journal}"));
+            assert!(
+                handling.settlements.len() <= 1,
+                "{flow} request {message_id} settled again\n{journal}"
+            );
+            if Instant::now() >= until {
+                return;
+            }
+            pause(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Watches the journal for the whole of `window` and returns when the
+    /// delivered `flow` request `message_id` stayed unsettled throughout: no
+    /// `basic.ack`, `basic.reject` or `basic.nack` for it left the consumer.
+    ///
+    /// # Panics
+    ///
+    /// Panics, with the journal, as soon as the journal is broken, the
+    /// request is not delivered, or a frame settles it.
+    pub async fn assert_unsettled_during(&self, flow: &str, message_id: &str, window: Duration) {
+        let until = Instant::now() + window;
+        loop {
+            let journal = self.tap.journal();
+            let handling = journal
+                .handling(message_id)
+                .unwrap_or_else(|problem| {
+                    panic!("{flow} request {message_id}: {problem}\n{journal}")
+                })
+                .unwrap_or_else(|| panic!("{flow} request {message_id} not delivered\n{journal}"));
+            assert!(
+                handling.settlements.is_empty(),
+                "{flow} request {message_id} settled within {window:?}\n{journal}"
+            );
+            if Instant::now() >= until {
+                return;
+            }
+            pause(POLL_INTERVAL).await;
+        }
     }
 
     /// The first captured line holding every one of `needles`, waiting up to
@@ -548,16 +871,17 @@ impl Harness {
         }
     }
 
-    /// Stops the consumers, closes the test's channel and connection, shuts
-    /// the capture down and removes the containers, in that order.
+    /// Stops the consumers, ends the tap, closes the test's channel and
+    /// connection, shuts the capture down and removes the containers, in that
+    /// order.
     ///
     /// # Panics
     ///
     /// Panics if the consumers' connection or the test's connection cannot be
-    /// closed, if the test's channel fails to close for a reason other than
-    /// the broker having closed it already, if closing the test's channel or
-    /// connection takes more than 30 seconds each, or if the capture's tracer
-    /// provider fails to shut down.
+    /// closed, if the tap's threads do not end, if the test's channel fails to
+    /// close for a reason other than the broker having closed it already, if
+    /// closing the test's channel or connection takes more than 30 seconds
+    /// each, or if the capture's tracer provider fails to shut down.
     pub async fn shutdown(self) {
         let Self {
             stack,
@@ -566,10 +890,12 @@ impl Harness {
             channel,
             connection,
             running,
+            tap,
             buffer,
             guard,
         } = self;
         running.shutdown().await.expect("stop the consumers");
+        tap.shutdown().await;
         let closed = Deadline::after(BROKER_TIMEOUT)
             .run("channel.close", "the test channel", || {
                 channel.close(REPLY_SUCCESS, "done")

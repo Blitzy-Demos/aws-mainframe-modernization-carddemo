@@ -860,6 +860,12 @@ describe("TransactionAddPage (CT02, COTRN02)", () => {
       });
       expectLocked(true);
       expect(buttonOf("Add transaction").disabled).toBe(false);
+      // It shows the add running instead: aria-disabled and busy, with a
+      // hidden spinner, its accessible name unchanged.
+      const pendingSubmit = buttonOf("Add transaction");
+      expect(pendingSubmit.getAttribute("aria-disabled")).toBe("true");
+      expect(pendingSubmit.getAttribute("aria-busy")).toBe("true");
+      expect(pendingSubmit.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
       await tryToChangeEntry(user);
       expectUntouched(VALID_ENTRY);
       expect(sent).toHaveLength(1);
@@ -873,6 +879,10 @@ describe("TransactionAddPage (CT02, COTRN02)", () => {
         expect(document.activeElement).toBe(inputOf("ACTIDIN"));
       });
       expectLocked(false);
+      const idleSubmit = buttonOf("Add transaction");
+      expect(idleSubmit.getAttribute("aria-disabled")).not.toBe("true");
+      expect(idleSubmit.getAttribute("aria-busy")).not.toBe("true");
+      expect(idleSubmit.querySelector("svg")).toBeNull();
       expect(await requestsOf("POST")[0]?.clone().json()).toEqual(EXPECTED_ADD_BODY);
       expect(toast.error).not.toHaveBeenCalled();
     },

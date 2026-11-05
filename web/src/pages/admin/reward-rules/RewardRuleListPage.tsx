@@ -10,8 +10,11 @@
 // makes no role check of its own.
 //
 // Every value is shown as the string the API wrote (rule IDs, codes, the
-// NUMERIC(9,4) rate, the S9(09)V99 bounds, RFC 3339 instants): no value passes
-// through a JavaScript number, and none is reformatted.
+// NUMERIC(9,4) rate, the S9(09)V99 bounds) and none is reformatted, except the
+// RFC 3339 instants of the active window: each is shown as its UTC date
+// (`YYYY-MM-DD`, the date the edit form shows), cut from the text by `dateOf`,
+// inside a time element whose dateTime keeps the full stored instant. No value
+// passes through a JavaScript number or Date.
 //
 // The whole list arrives in one answer and soft delete never shrinks it, so
 // the table shows it WINDOW_SIZE rules at a time: Previous and Next move the
@@ -39,6 +42,7 @@ import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { showApiError, showSuccess } from "@/lib/api-errors";
+import { dateOf } from "@/schemas/reward-rules";
 
 type RewardRuleResponse = components["schemas"]["RewardRuleResponse"];
 
@@ -60,6 +64,12 @@ const WINDOW_SIZE = 10;
 // itself, so the keys name no rule.
 const PREVIOUS_WINDOW = "previous-window";
 const NEXT_WINDOW = "next-window";
+
+// The row-action column, which the table pins at its inline end: the other
+// nine columns are wider than the card at md and with the sidebar expanded at
+// lg, so they scroll under it while Edit and Delete stay in view, focused or
+// not.
+const ACTIONS_COLUMN = "actions";
 
 // The list while none is shown (loading, or a failed read): one array, so the
 // window over it keeps its identity across renders.
@@ -95,6 +105,17 @@ function statusBadge(status: RuleStatus): JSX.Element {
 
 function orNone(value: string | null): string {
   return value ?? NONE;
+}
+
+// A window boundary as the list shows it: the instant's UTC date, with the
+// instant itself, time of day and fraction included, as the machine-readable
+// dateTime. A null boundary (an open-ended rule's end) is NONE.
+function instantCell(instant: string | null): JSX.Element | string {
+  return instant === null ? (
+    NONE
+  ) : (
+    <time dateTime={instant}>{dateOf(instant)}</time>
+  );
 }
 
 // The amount columns align to the end, as numeric columns do in the shadcn
@@ -140,12 +161,12 @@ function ruleColumns(
     {
       accessorKey: "active_from",
       header: "Active from",
-      cell: ({ row }) => row.original.active_from,
+      cell: ({ row }) => instantCell(row.original.active_from),
     },
     {
       accessorKey: "active_to",
       header: "Active to",
-      cell: ({ row }) => orNone(row.original.active_to),
+      cell: ({ row }) => instantCell(row.original.active_to),
     },
     {
       id: "status",
@@ -153,7 +174,7 @@ function ruleColumns(
       cell: ({ row }) => statusBadge(row.original.status),
     },
     {
-      id: "actions",
+      id: ACTIONS_COLUMN,
       header: "Actions",
       // BLITZY [A11Y]: the row actions keep the library's default Button
       // size (h-9, 36px), below the 44px touch-target recommendation;
@@ -305,6 +326,7 @@ export default function RewardRuleListPage(): JSX.Element {
         emptyMessage={loadFailed ? LOAD_FAILED : undefined}
         caption="Reward rules"
         loading={loading}
+        pinnedEndColumn={ACTIONS_COLUMN}
       />
     ),
     [

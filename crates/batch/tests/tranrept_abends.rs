@@ -24,11 +24,11 @@
 //!
 //! The other opens and closes have no failure the replacement can meet, so only their status-00
 //! branch, `continue`, is proven, by the runs that end normally: `TRANFILE` is the
-//! `TRANSACT.DALY(+1)` the job has just cataloged, read whole (P-CBTRN03C-468, P-CBTRN03C-478);
-//! `DATEPARM` is the job's `--start-date` and `--end-date`, which no file holds (E-34;
-//! P-CBTRN03C-473, P-CBTRN03C-483); and the three lookup tables are read in one unit of work,
-//! whose end is the database connection rather than a file statement (P-CBTRN03C-480 to
-//! P-CBTRN03C-482).
+//! `TRANSACT.DALY(+1)` the job has just cataloged, read record by record (P-CBTRN03C-468,
+//! P-CBTRN03C-478); `DATEPARM` is the job's `--start-date` and `--end-date`, which no file
+//! holds (E-34; P-CBTRN03C-473, P-CBTRN03C-483); and the three lookup tables are read in one
+//! unit of work, whose end is the database connection rather than a file statement
+//! (P-CBTRN03C-480 to P-CBTRN03C-482).
 //!
 //! Every `DISPLAY` text is read from the code spans of the audit rows.
 

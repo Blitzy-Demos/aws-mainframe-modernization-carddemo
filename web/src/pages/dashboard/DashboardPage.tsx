@@ -6,9 +6,9 @@
 //   number [app/bms/COACTVW.bms:L84-91], edited by the account view's schema
 //   and answered with its texts. A found account is summarised in place: the
 //   COACTVW balance figures, the reward balance and the five most recent
-//   transactions, with links to the full view (F-COACTVW-002) and the update
-//   screen (F-COACTUP-001). The Account View and Account Update options link
-//   here for that key entry (E-61).
+//   transactions, newest first, with links to the full view (F-COACTVW-002)
+//   and the update screen (F-COACTUP-001). The Account View and Account
+//   Update options link here for that key entry (E-61).
 // - The menu: every COMEN02Y option in COBOL order, then Rewards. The shared
 //   MenuOptionList (components/app-sidebar.tsx) renders them, each label,
 //   route and icon from nav/menu.ts (F-COMEN01-001 to F-COMEN01-011).
@@ -29,6 +29,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type JSX,
@@ -45,7 +46,7 @@ import { useRecentTransactions } from "@/api/queries/transactions";
 import { MenuOptionList } from "@/components/app-sidebar";
 import { DataTable, type DataTableProps } from "@/components/data-table";
 import { PageHeader } from "@/components/page-header";
-import { SummaryCard } from "@/components/summary-card";
+import { SummaryCard, SummaryCardSkeleton } from "@/components/summary-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -78,6 +79,9 @@ const NO_ACCOUNT = "";
 // One empty page for every render without transaction rows, so the table
 // sees the same array until the page arrives.
 const NO_TRANSACTIONS: TransactionResponse[] = [];
+
+/** The transactions table's caption, its name, loaded and loading alike. */
+const TRANSACTIONS_CAPTION = "Recent transactions";
 
 /** The map title [app/bms/COMEN01.bms:L79], heading and naming the menu. */
 const MENU_TITLE = "Main Menu";
@@ -154,20 +158,38 @@ function useSettledError(
 }
 
 /**
- * Placeholder blocks while the account is read, hidden from assistive
- * technology: the page's status region announces the read.
+ * The summary's layout while the account is read, hidden from assistive
+ * technology: the page's status region announces the read. The heading row
+ * holds bars as high as its text-lg heading (h-7) and its two small buttons
+ * (h-8), then come the four summary cards and the transactions table in their
+ * own loading states, so nothing below moves when the account arrives.
  */
 function OverviewSkeleton(): JSX.Element {
   return (
     <div aria-hidden="true" className="flex flex-col gap-4">
-      <Skeleton className="h-7 w-48" />
-      <div className="grid gap-4 lg:grid-cols-3">
-        <Skeleton className="h-32 rounded-xl" />
-        <Skeleton className="h-32 rounded-xl" />
-        <Skeleton className="h-32 rounded-xl" />
-        <Skeleton className="h-32 rounded-xl" />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Skeleton className="h-7 w-48" />
+        <div className="flex flex-wrap items-center gap-2">
+          <Skeleton className="h-8 w-32" />
+          <Skeleton className="h-8 w-32" />
+        </div>
       </div>
-      <Skeleton className="h-64 w-full rounded-xl" />
+      <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-4">
+        <SummaryCardSkeleton />
+        <SummaryCardSkeleton />
+        <SummaryCardSkeleton />
+        <SummaryCardSkeleton />
+      </div>
+      <DataTable
+        columns={transactionColumns}
+        data={NO_TRANSACTIONS}
+        prevKey={null}
+        nextKey={null}
+        onPrevious={() => undefined}
+        onNext={() => undefined}
+        caption={TRANSACTIONS_CAPTION}
+        loading
+      />
     </div>
   );
 }
@@ -181,9 +203,9 @@ type AccountOverviewProps = {
 
 /**
  * The summary of a submitted account: `GET /accounts/{id}`, then the reward
- * balance and the five most recent transactions of the account found. It is
- * remounted for every lookup, so it reports the lookup's status to the page,
- * whose status region stays mounted across lookups.
+ * balance and the five most recent transactions of the account found, newest
+ * first. It is remounted for every lookup, so it reports the lookup's status
+ * to the page, whose status region stays mounted across lookups.
  */
 function AccountOverview({
   accountId,
@@ -198,6 +220,20 @@ function AccountOverview({
   const found = account.isSuccess ? accountId : NO_ACCOUNT;
   const transactions = useRecentTransactions(found);
   const rewards = useRewardBalance(found);
+
+  // The backward page holds the account's five highest TRAN-IDs in ascending
+  // key order. CT02 and CB00 allocate each new TRAN-ID as the highest on file
+  // plus one, so the rows are shown in reverse, newest first. The reversal is
+  // a copy, leaving the cached page untouched, made once per page so the
+  // table keeps one array for each result.
+  const pageItems = transactions.data?.items;
+  const newestFirst = useMemo(
+    () =>
+      pageItems === undefined || pageItems.length === 0
+        ? NO_TRANSACTIONS
+        : [...pageItems].reverse(),
+    [pageItems],
+  );
 
   // A failed account read is shown as the account view shows it: the text as
   // a toast and at ACCTSID, and the cursor placed there, as COACTVWC
@@ -257,7 +293,7 @@ function AccountOverview({
       />
     );
   } else if (rewards.isPending) {
-    rewardCard = <Skeleton aria-hidden="true" className="h-32 rounded-xl" />;
+    rewardCard = <SummaryCardSkeleton />;
   }
 
   // BLITZY [A11Y]: the view and edit links keep the generated Button focus
@@ -288,9 +324,10 @@ function AccountOverview({
         </div>
       </div>
 
-      {/* One column at md, three at lg; the reward card starts the second
-          row, on the first column's track. */}
-      <div className="grid gap-4 lg:grid-cols-3">
+      {/* The four cards fill every row they take: one column at md, two
+          rows of two at lg and one row of four at xl. OverviewSkeleton uses
+          the same grid. */}
+      <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-4">
         <SummaryCard
           title="Current Balance"
           value={account.data.acct_curr_bal}
@@ -314,13 +351,13 @@ function AccountOverview({
       {transactions.isError ? null : (
         <DataTable
           columns={transactionColumns}
-          data={transactions.data?.items ?? NO_TRANSACTIONS}
+          data={newestFirst}
           prevKey={null}
           nextKey={null}
           onPrevious={() => undefined}
           onNext={() => undefined}
           emptyMessage="No transactions on file for this account."
-          caption="Recent transactions"
+          caption={TRANSACTIONS_CAPTION}
           loading={transactions.isPending}
         />
       )}

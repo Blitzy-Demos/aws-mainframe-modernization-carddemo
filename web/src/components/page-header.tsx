@@ -6,7 +6,8 @@
 // every handle as RouteHandle), so no route or label is written here. Layout
 // routes without a handle (guards, the app layout) contribute no crumb. Every
 // crumb but the last links back up the route hierarchy, the breadcrumb half of
-// the 3270 PF3 exit; the page's own "Back" link goes in `actions`.
+// the 3270 PF3 exit; the page's own "Back" link is the BackLink below, which
+// goes in `actions`.
 //
 // useMatches() needs a data router: App.tsx uses createBrowserRouter, and tests
 // that render a page use createMemoryRouter.
@@ -14,7 +15,8 @@
 // shadcn/ui has no heading component, so the title is a semantic h1 styled with
 // Tailwind type-scale utilities. Pages render no other h1.
 import { Fragment, type JSX, type ReactNode } from "react";
-import { Link, useMatches, type UIMatch } from "react-router";
+import { ArrowLeft } from "lucide-react";
+import { Link, useMatches, type To, type UIMatch } from "react-router";
 
 import {
   Breadcrumb,
@@ -24,6 +26,7 @@ import {
   BreadcrumbPage,
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
+import { Button } from "@/components/ui/button";
 
 /**
  * The `handle` of a route that appears in the breadcrumb trail.
@@ -96,6 +99,24 @@ function routeCrumbs(matches: readonly UIMatch[]): Crumb[] {
 export function usePageTitle(): string | undefined {
   const leaf = routeCrumbs(useMatches()).at(-1)?.handle;
   return leaf?.title ?? leaf?.crumb;
+}
+
+/**
+ * The page's PF3 "Back" link to `to`: an outline link button led by an
+ * ArrowLeft icon. It is the one form of the control on every page, so Back
+ * looks the same on every screen, and pages render it in PageHeader
+ * `actions`, unless a form's key order places Back after its other buttons.
+ * The accessible name is exactly "Back", the function map's name.
+ */
+export function BackLink({ to }: { to: To }): JSX.Element {
+  return (
+    <Button variant="outline" asChild>
+      <Link to={to}>
+        <ArrowLeft aria-hidden="true" />
+        Back
+      </Link>
+    </Button>
+  );
 }
 
 export function PageHeader({

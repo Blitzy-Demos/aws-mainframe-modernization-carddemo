@@ -26,16 +26,15 @@
 // Every outcome text is the server's and is shown through lib/api-errors.
 // Amounts stay the decimal strings the API sends.
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
-import { Link } from "react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm, type UseFormReturn } from "react-hook-form";
-import { Wallet } from "lucide-react";
+import { LoaderCircle, Wallet } from "lucide-react";
 
 import { useAccount } from "@/api/queries/accounts";
 import { usePaymentMutation } from "@/api/queries/payments";
 import type { components } from "@/api/schema";
-import { ConfirmDialog } from "@/components/confirm-dialog";
-import { PageHeader } from "@/components/page-header";
+import { ConfirmDialog, type AfterClose } from "@/components/confirm-dialog";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { SummaryCard } from "@/components/summary-card";
 import { Button } from "@/components/ui/button";
 import {
@@ -109,6 +108,8 @@ type Paid = { accountId: string; balance: string };
 type BalancePreviewProps = {
   accountId: string;
   paid: Paid | null;
+  /** Whether a confirmed payment, with the reloads after it, is running. */
+  paying: boolean;
   form: UseFormReturn<PaymentFormValues>;
   /** Whether the form still holds the entry this account was reviewed from. */
   ownsEntry: () => boolean;
@@ -120,10 +121,14 @@ type BalancePreviewProps = {
  * shares. The payment hook reloads that entry once a confirmed payment
  * settles, failures included (E-19), so the card follows the balance on file;
  * after a completed payment it shows the balance the 201 answered with.
+ * While the payment runs, and while the account is read again, the balance
+ * on file may be about to change, so the card is marked busy: dimmed, a
+ * spinner for its icon and a polite status. The 201's balance is final.
  */
 function BalancePreview({
   accountId,
   paid,
+  paying,
   form,
   ownsEntry,
 }: BalancePreviewProps): JSX.Element | null {
@@ -149,10 +154,13 @@ function BalancePreview({
   }, [accountError, form, ownsEntry]);
 
   let balance: string;
+  let updating: boolean;
   if (paid !== null && paid.accountId === accountId) {
     balance = paid.balance;
+    updating = false;
   } else if (account.isSuccess) {
     balance = account.data.acct_curr_bal;
+    updating = paying || account.isFetching;
   } else if (account.isError) {
     return null;
   } else {
@@ -165,12 +173,25 @@ function BalancePreview({
   }
 
   return (
-    <SummaryCard
-      title="Your current balance is"
-      value={balance}
-      description={`Account ${accountId}`}
-      icon={<Wallet className="size-4" />}
-    />
+    <div aria-busy={updating}>
+      {/* Rendered throughout, so the text is announced when it appears. */}
+      <div role="status" className="sr-only">
+        {updating ? "Updating the current balance" : null}
+      </div>
+      <SummaryCard
+        title="Your current balance is"
+        value={balance}
+        description={`Account ${accountId}`}
+        icon={
+          updating ? (
+            <LoaderCircle className="size-4 motion-safe:animate-spin" />
+          ) : (
+            <Wallet className="size-4" />
+          )
+        }
+        className={updating ? "opacity-60" : undefined}
+      />
+    </div>
   );
 }
 
@@ -211,6 +232,15 @@ export default function BillPaymentPage(): JSX.Element {
   // The dialog's action reports through onConfirm and then closes through
   // onOpenChange(false), as Cancel and Escape do; this tells them apart.
   const confirmedRef = useRef(false);
+  // The request in flight, one at a time, as the 3270 keyboard locks while
+  // the task runs. A mutation's isPending only changes with the next render,
+  // and handleSubmit runs the schema asynchronously, so two submits in one
+  // tick (a double click) would both pass a check of isPending and send two
+  // reviews, and two presses of Confirm two payments. The ref is set before
+  // each mutate call and released in its onSettled, which TanStack Query runs
+  // even when onSuccess or onError throws; clearScreen releases a review it
+  // drops, whose callbacks then never run.
+  const inFlightRef = useRef<"review" | "payment" | null>(null);
 
   // The account input itself, beside the Controller's ref, for the one
   // synchronous focus a review answer needs (see reviewPayment).
@@ -219,9 +249,10 @@ export default function BillPaymentPage(): JSX.Element {
   // Counts the replacements of the entry: each user edit of the account ID
   // and each clearing of the screen (Reset, Cancel, Escape), whose reset
   // fires no change event. The blanking after a payment is not counted. The
-  // account ID and Reset stay usable while a review or a payment runs, so
-  // reviewPayment, pay and the balance card compare it to tell whether the
-  // form still holds the entry their request was made for.
+  // account ID stays usable while a review or a payment runs, and Reset while
+  // a review runs (it abandons the review; it is disabled while the payment
+  // writes), so reviewPayment, pay and the balance card compare it to tell
+  // whether the form still holds the entry their request was made for.
   const entryRevision = useRef(0);
   useEffect(() => {
     const subscription = form.watch((_values, { type }) => {
@@ -250,9 +281,13 @@ export default function BillPaymentPage(): JSX.Element {
 
   // CLEAR-CURRENT-SCREEN [app/cbl/COBIL00C.cbl:L552-555]: the entry and the
   // balance. A review still in flight is dropped, so its answer opens no
-  // dialog over the cleared screen.
+  // dialog over the cleared screen, and its hold on inFlightRef is released
+  // so the next ENTER is sent.
   function clearScreen(): void {
     entryRevision.current += 1;
+    if (inFlightRef.current === "review") {
+      inFlightRef.current = null;
+    }
     review.reset();
     blankEntry();
     setPreviewId(null);
@@ -266,7 +301,7 @@ export default function BillPaymentPage(): JSX.Element {
   }
 
   function reviewPayment(values: PaymentFormValues): void {
-    if (review.isPending || payment.isPending) {
+    if (inFlightRef.current !== null) {
       return;
     }
     const accountId = values.account_id;
@@ -278,6 +313,7 @@ export default function BillPaymentPage(): JSX.Element {
     // one is read.
     setPreviewId(null);
     setPaid(null);
+    inFlightRef.current = "review";
     review.mutate(
       { account_id: accountId, confirm: CONFIRM_BLANK },
       {
@@ -305,13 +341,18 @@ export default function BillPaymentPage(): JSX.Element {
             showApiError(error);
           }
         },
+        onSettled: () => {
+          inFlightRef.current = null;
+        },
       },
     );
   }
 
-  function pay(): void {
+  function pay(afterClose: AfterClose): void {
+    // Set first, so a press the guard drops still closes the dialog as a
+    // Confirm, not as the Cancel that clears the screen.
     confirmedRef.current = true;
-    if (reviewed === null) {
+    if (reviewed === null || inFlightRef.current !== null) {
       return;
     }
     const { accountId } = reviewed;
@@ -323,6 +364,7 @@ export default function BillPaymentPage(): JSX.Element {
     // is newer too.
     const sentRevision = previewRevision.current;
     const ownsEntry = (): boolean => entryRevision.current === sentRevision;
+    inFlightRef.current = "payment";
     payment.mutate(
       { account_id: accountId, confirm: CONFIRM_YES },
       {
@@ -344,11 +386,19 @@ export default function BillPaymentPage(): JSX.Element {
         },
         onError: (error) => {
           const options = { unknownOutcome: PAYMENT_OUTCOME_UNKNOWN };
+          // The marking focuses ACTIDIN, which waits for the dialog to leave
+          // the page.
           if (ownsEntry()) {
-            applyApiError(error, form, billPaymentBmsFieldMap, options);
+            afterClose(() => {
+              applyApiError(error, form, billPaymentBmsFieldMap, options);
+            });
           } else {
             showApiError(error, options);
           }
+        },
+        // Runs once the hook's reloads after the payment have settled.
+        onSettled: () => {
+          inFlightRef.current = null;
         },
       },
     );
@@ -361,15 +411,18 @@ export default function BillPaymentPage(): JSX.Element {
     }
   }
 
+  // The task running: the review, or the payment with the reloads after it.
+  // The submit shows it through aria-disabled rather than disabled, because a
+  // focused button that becomes disabled drops the focus to the document;
+  // inFlightRef keeps the inert submit, and Enter in the input, from sending.
+  // Its text stays its function-map name, the spinner being hidden.
+  const busy = review.isPending || payment.isPending;
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
         description="Pay the current balance of an account in full."
-        actions={
-          <Button variant="outline" asChild>
-            <Link to="/">Back</Link>
-          </Button>
-        }
+        actions={<BackLink to="/" />}
       />
       {/* One column at md, two at lg. */}
       <div className="grid items-start gap-6 lg:grid-cols-2">
@@ -424,8 +477,28 @@ export default function BillPaymentPage(): JSX.Element {
             {/* The map's key line order: ENTER, then F4; F3 is the header's
                 Back link. */}
             <CardFooter className="flex-wrap gap-2">
-              <Button type="submit">Review payment</Button>
-              <Button type="button" variant="outline" onClick={resetScreen}>
+              <Button
+                type="submit"
+                aria-disabled={busy}
+                aria-busy={busy}
+                className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
+              >
+                {busy ? (
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="motion-safe:animate-spin"
+                  />
+                ) : null}
+                Review payment
+              </Button>
+              {/* Disabled while the payment writes. During the read-only
+                  review it stays usable, as the way to abandon it. */}
+              <Button
+                type="button"
+                variant="outline"
+                disabled={payment.isPending}
+                onClick={resetScreen}
+              >
                 Reset
               </Button>
             </CardFooter>
@@ -435,6 +508,7 @@ export default function BillPaymentPage(): JSX.Element {
           <BalancePreview
             accountId={previewId}
             paid={paid}
+            paying={payment.isPending}
             form={form}
             ownsEntry={ownsPreviewEntry}
           />

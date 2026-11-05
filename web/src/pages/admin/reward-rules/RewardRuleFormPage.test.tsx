@@ -4,10 +4,14 @@
 // with a toast and the cursor. In edit mode, the `PUT /admin/reward-rules/{id}`
 // body keeps each stored window instant whose date was left unchanged. In both
 // modes one Save sends one request, a double click included; Save keeps the
-// focus while it runs and after a rejection that names no field; and a saved
-// rule leaves the form inert until the list route has loaded. The page
-// runs with the real API client, query hooks and error helper; only the network
-// is stubbed, through the global the client looks up on every request.
+// focus while it runs and after a rejection that names no field; a saved rule
+// leaves the form inert until the list route has loaded; Reset restores the
+// starting values and clears every error, and Back, reached by Tab after Save
+// and Reset, returns to the list; neither writes. An edit route whose rule list
+// fails to load, or lacks the rule, shows the message in an alert with only
+// Back, never an editable form. The page runs with the real API client, query
+// hooks and error helper; only the network is stubbed, through the global the
+// client looks up on every request.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   cleanup,
@@ -27,7 +31,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
+import { UNEXPECTED_ERROR } from "@/lib/api-errors";
 import {
+  REWARD_RULE_FORM_MESSAGES,
   REWARD_RULE_MESSAGES,
   rewardRuleSchema,
   type RewardRuleFormInput,
@@ -243,6 +249,41 @@ describe("RewardRuleFormPage (new rule)", () => {
     expect(fetchMock.mock.calls).toHaveLength(0);
     expect(screen.queryByText(LIST_MARKER)).toBeNull();
   });
+
+  // Beyond S9(09)V99 the server's 400 names no field, so the schema refuses
+  // the bound and shows the refusal on the field itself.
+  it.each<[FieldName, string, string, string]>([
+    [
+      "max_transaction_amount",
+      "Maximum transaction amount",
+      "1000000000.00",
+      REWARD_RULE_FORM_MESSAGES.maxAmountInvalid,
+    ],
+    [
+      "min_transaction_amount",
+      "Minimum transaction amount",
+      "-1000000000.00",
+      REWARD_RULE_FORM_MESSAGES.minAmountInvalid,
+    ],
+  ])(
+    "rejects an out-of-range %s on its field, moves the cursor there and sends nothing",
+    async (field, label, value, message) => {
+      const user = userEvent.setup();
+      renderPage();
+
+      await fillForm(user, { ...VALID_INPUT, [field]: value });
+      await save(user);
+
+      const bound = textbox(label);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(bound);
+      });
+      expect(bound.getAttribute("aria-invalid")).toBe("true");
+      expect(fieldErrorText(bound)).toBe(message);
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
+      expect(fetchMock.mock.calls).toHaveLength(0);
+    },
+  );
 
   it("places a server 400 on its field, toasts it and moves the cursor there", async () => {
     const message = REWARD_RULE_MESSAGES.rateNegative;
@@ -488,6 +529,261 @@ describe("RewardRuleFormPage (edit rule)", () => {
     // Strict: the instants byte for byte, and no key beyond these.
     const body: RewardRuleRequest = await request.clone().json();
     expect(body).toStrictEqual(sent);
+  });
+});
+
+// Every field blank: the new-rule form's starting values.
+const BLANK: FormEntry = {
+  transaction_type_cd: "",
+  transaction_category_cd: "",
+  reward_rate: "",
+  min_transaction_amount: "",
+  max_transaction_amount: "",
+  active_from: "",
+  active_to: "",
+};
+
+// TIMED_RULE as its edit form shows it: each instant as its date, the absent
+// maximum as the empty input.
+const TIMED_RULE_SHOWN: FormEntry = {
+  transaction_type_cd: "07",
+  transaction_category_cd: "0001",
+  reward_rate: "1.2500",
+  min_transaction_amount: "5.00",
+  max_transaction_amount: "",
+  active_from: "2022-07-01",
+  active_to: "2030-01-01",
+};
+
+const TIMED_RULE_ROUTE = `${LIST_ROUTE}/${TIMED_RULE.rule_id}/edit`;
+
+// The value shown in every form field.
+function shownValues(): FormEntry {
+  const shown = { ...BLANK };
+  for (const [name, label] of FIELDS) {
+    shown[name] = inputValue(label);
+  }
+  return shown;
+}
+
+// The labels of the fields marked aria-invalid, in tab order.
+function invalidFields(): string[] {
+  return FIELDS.map(([, label]) => label).filter(
+    (label) => textbox(label).getAttribute("aria-invalid") === "true",
+  );
+}
+
+// The method of every request the client handed to the network, in order.
+function sentMethods(): string[] {
+  return fetchMock.mock.calls.map(
+    ([input, init]) =>
+      (input instanceof Request ? input : new Request(input, init)).method,
+  );
+}
+
+describe("RewardRuleFormPage (Reset and Back)", () => {
+  it("clears typed values and errors on Reset in a new rule and sends nothing", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    // Two valid values, a malformed rate, and the required category and
+    // start left blank.
+    await fillForm(user, {
+      ...BLANK,
+      transaction_type_cd: "01",
+      reward_rate: "abc",
+      max_transaction_amount: "50.00",
+    });
+    await save(user);
+    await waitFor(() => {
+      expect(invalidFields()).toEqual([
+        "Transaction category code",
+        "Reward rate",
+        "Active from",
+      ]);
+    });
+    expect(screen.getAllByRole("alert")).toHaveLength(3);
+
+    await user.click(screen.getByRole("button", { name: "Reset" }));
+
+    await waitFor(() => {
+      expect(invalidFields()).toEqual([]);
+    });
+    expect(shownValues()).toEqual(BLANK);
+    expect(screen.queryAllByRole("alert")).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("form", { name: "New reward rule" })).toBeTruthy();
+  });
+
+  it("restores the stored rule and clears errors on Reset in an edit and sends no PUT", async () => {
+    stubRuleApi(TIMED_RULE);
+    const user = userEvent.setup();
+    renderPage(TIMED_RULE_ROUTE);
+
+    expect(
+      await screen.findByRole("form", {
+        name: `Edit reward rule ${TIMED_RULE.rule_id}`,
+      }),
+    ).toBeTruthy();
+    expect(shownValues()).toEqual(TIMED_RULE_SHOWN);
+
+    await user.clear(textbox("Reward rate"));
+    await user.type(textbox("Reward rate"), "abc");
+    await user.type(textbox("Maximum transaction amount"), "99.00");
+    await user.clear(textbox("Active to"));
+    await user.type(textbox("Active to"), "2031-06-30");
+    await save(user);
+    await waitFor(() => {
+      expect(invalidFields()).toEqual(["Reward rate"]);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Reset" }));
+
+    await waitFor(() => {
+      expect(invalidFields()).toEqual([]);
+    });
+    expect(shownValues()).toEqual(TIMED_RULE_SHOWN);
+    expect(screen.queryAllByRole("alert")).toEqual([]);
+    expect(sentMethods()).toEqual(["GET"]);
+  });
+
+  it.each<{ mode: string; route: string; heading: string; sent: string[] }>([
+    {
+      mode: "a new rule",
+      route: NEW_ROUTE,
+      heading: "New reward rule",
+      sent: [],
+    },
+    {
+      mode: "an edit",
+      route: TIMED_RULE_ROUTE,
+      heading: `Edit reward rule ${TIMED_RULE.rule_id}`,
+      sent: ["GET"],
+    },
+  ])(
+    "reaches Back by Tab after Save and Reset in $mode and leaves for the list unsaved",
+    async ({ route, heading, sent }) => {
+      // Only the edit reads the rule list; a new rule sends no request.
+      stubRuleApi(TIMED_RULE);
+      const user = userEvent.setup();
+      renderPage(route);
+      await screen.findByRole("form", { name: heading });
+
+      // A change Back must leave unsaved.
+      await user.type(textbox("Maximum transaction amount"), "99.00");
+      // From the last field: Save (PF5), Reset (PF4), then Back (PF3).
+      await user.click(textbox("Active to"));
+      await user.tab();
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Save" }),
+      );
+      await user.tab();
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Reset" }),
+      );
+      await user.tab();
+      const back = screen.getByRole("link", { name: "Back" });
+      expect(document.activeElement).toBe(back);
+      expect(back.getAttribute("href")).toBe(LIST_ROUTE);
+
+      await user.keyboard("{Enter}");
+
+      expect(await screen.findByText(LIST_MARKER)).toBeTruthy();
+      expect(sentMethods()).toEqual(sent);
+    },
+  );
+});
+
+// The edit route shows no editable form: no field, no Save or Reset, only the
+// Back link to the list.
+function expectNoForm(): void {
+  expect(screen.queryByRole("form")).toBeNull();
+  expect(screen.queryAllByRole("textbox")).toEqual([]);
+  expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Reset" })).toBeNull();
+  expect(screen.getByRole("link", { name: "Back" }).getAttribute("href")).toBe(
+    LIST_ROUTE,
+  );
+}
+
+describe("RewardRuleFormPage (edit route without a rule)", () => {
+  it.each<{
+    name: string;
+    answer: () => Promise<Response>;
+    message: string;
+  }>([
+    {
+      name: "a 500",
+      answer: () =>
+        Promise.resolve(
+          Response.json(
+            {
+              code: "UNEXPECTED",
+              message: UNEXPECTED_ERROR,
+            } satisfies ErrorBody,
+            { status: 500 },
+          ),
+        ),
+      message: UNEXPECTED_ERROR,
+    },
+    {
+      // The server's admin gate, whatever the route guard showed.
+      name: "a 403",
+      answer: () =>
+        Promise.resolve(
+          Response.json(
+            {
+              code: "FORBIDDEN",
+              message: "Admin access required",
+            } satisfies ErrorBody,
+            { status: 403 },
+          ),
+        ),
+      message: "Admin access required",
+    },
+    {
+      name: "no answer",
+      answer: () => Promise.reject(new TypeError("Failed to fetch")),
+      message: UNEXPECTED_ERROR,
+    },
+  ])(
+    "toasts a failed rule-list load ($name) once and keeps its text in an alert, with no form",
+    async ({ answer, message }) => {
+      fetchMock.mockImplementation(answer);
+      const toastError = vi.spyOn(toast, "error");
+      const user = userEvent.setup();
+      renderPage(TIMED_RULE_ROUTE);
+
+      await waitFor(() => {
+        expect(screen.getByRole("alert").textContent).toBe(message);
+      });
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(toastError).toHaveBeenCalledWith(message);
+      expectNoForm();
+
+      await user.click(screen.getByRole("link", { name: "Back" }));
+
+      expect(await screen.findByText(LIST_MARKER)).toBeTruthy();
+      expect(sentMethods()).toEqual(["GET"]);
+    },
+  );
+
+  it("shows 'Reward rule not found' in an alert, with no form and no toast, for a rule the list lacks", async () => {
+    stubRuleApi(TIMED_RULE);
+    const toastError = vi.spyOn(toast, "error");
+    const user = userEvent.setup();
+    renderPage(`${LIST_ROUTE}/9999/edit`);
+
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      REWARD_RULE_MESSAGES.notFound,
+    );
+    expectNoForm();
+    expect(toastError).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("link", { name: "Back" }));
+
+    expect(await screen.findByText(LIST_MARKER)).toBeTruthy();
+    expect(sentMethods()).toEqual(["GET"]);
   });
 });
 

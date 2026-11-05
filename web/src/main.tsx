@@ -15,7 +15,11 @@
 //   and Tab order.
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  QueryClient,
+  QueryClientProvider,
+  type NetworkMode,
+} from "@tanstack/react-query";
 
 import App from "./App";
 import { ApiError, RequestTimeoutError } from "@/api/client";
@@ -60,6 +64,14 @@ function shouldRetryQuery(failureCount: number, error: Error): boolean {
 // window focus and network reconnection start none.
 const QUERY_STALE_TIME_MS = 0;
 
+// When a read or a write is sent: at once, whatever the browser reports about
+// its connection. While the browser is offline the request fails as a network
+// failure and is shown as `Unexpected error`, as when the server cannot be
+// reached. It is never held unsent and then sent by itself once the browser is
+// back online, which would apply a write the user did not repeat and start a
+// read the user did not ask for.
+const REQUEST_NETWORK_MODE: NetworkMode = "always";
+
 // Mutations are never retried: a write the server may already have applied is
 // sent exactly once, and its answer, success or COBOL message, is shown.
 const queryClient = new QueryClient({
@@ -69,9 +81,11 @@ const queryClient = new QueryClient({
       retry: shouldRetryQuery,
       refetchOnWindowFocus: false,
       refetchOnReconnect: false,
+      networkMode: REQUEST_NETWORK_MODE,
     },
     mutations: {
       retry: false,
+      networkMode: REQUEST_NETWORK_MODE,
     },
   },
 });
@@ -87,7 +101,27 @@ createRoot(container).render(
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <App />
-          <Toaster position="top-right" closeButton />
+          {/* Top-center, at Sonner's default offset, keeps toasts over the
+              empty middle of the header: clear of the sidebar toggle, theme
+              toggle and user menu at its ends, of the actions each page header
+              places at the top right of the content, and of the pagination,
+              row actions and form buttons that raise most toasts. A toast
+              under the pointer pauses and stays, so it would take the next
+              click meant for the control beneath it.
+              Sonner injects its stylesheet outside the cascade layers, so its
+              font-family on the toast list and its font-size on each toast
+              outrank any Tailwind utility on those elements. The app's font
+              and type scale therefore go one level in, where Sonner leaves
+              each unset: font-sans on the toast, which only inherits the
+              list's font-family, and text-sm on the content wrapper, which
+              has no font-size of its own and passes it to the title. */}
+          <Toaster
+            position="top-center"
+            closeButton
+            toastOptions={{
+              classNames: { toast: "font-sans", content: "text-sm" },
+            }}
+          />
         </TooltipProvider>
       </QueryClientProvider>
     </ThemeProvider>

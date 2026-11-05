@@ -22,8 +22,11 @@
 //! - let the app drop at the end of the test function, after `block_on` has
 //!   returned.
 //!
-//! Expected message texts come from `carddemo_domain::messages` in the
-//! calling test. The harness names only the seed credentials and route
+//! Expected message texts come from the calling test: a literal text from the
+//! `carddemo_domain::messages` catalog, and a STRING-built text expanded by
+//! the [`audit_text`] submodule from the reviewed template of its validation
+//! audit row, never by the production composers that build the response.
+//! The harness names only the seed credentials and route
 //! paths, and reaches SQL only through [`TestApp::stack`], whose
 //! `exec_sql` and `fetch_text_rows` run text-typed statements. Seeded
 //! fixture values come from its [`fixture_records`] submodule, which reads
@@ -55,6 +58,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+pub mod audit_text;
 pub mod fixture_records;
 
 /// The admin user of the seed: `ADMIN001`, type `A`, first `SYSUT1` row of

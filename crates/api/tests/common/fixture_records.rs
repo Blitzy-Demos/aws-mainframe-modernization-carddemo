@@ -21,17 +21,18 @@
 //!   implied decimals of its PIC, as the API writes a `Decimal`: `00000001940{`
 //!   under `S9(10)V99` is `194.00`, and a negative value starts with `-`.
 //!
-//! The layouts read are `ACCOUNT-RECORD` of `acctdata.txt` (P-CVACT01Y-001…013)
-//! and `CARD-XREF-RECORD` of `cardxref.txt` (P-CVACT03Y-001…004), whose records
-//! are stored as their first 36 bytes (E-04). A cross-reference is looked up by
-//! account or by card as exactly one record, because the seeded state gives
-//! every account exactly one card and every card exactly one cross-reference
-//! (P-CVACT03Y-006).
+//! The layouts read are `ACCOUNT-RECORD` of `acctdata.txt` (P-CVACT01Y-001…013),
+//! `CARD-RECORD` of `carddata.txt` (P-CVACT02Y-001…007) and `CARD-XREF-RECORD`
+//! of `cardxref.txt` (P-CVACT03Y-001…004), whose records are stored as their
+//! first 36 bytes (E-04). A cross-reference is looked up by account or by card
+//! as exactly one record, because the seeded state gives every account exactly
+//! one card and every card exactly one cross-reference (P-CVACT03Y-006).
 //!
 //! Its callers are the API parity tests whose expectations rest on seeded
-//! account and cross-reference records: the account-keyed adds of CT00, the
-//! account-only add of CT02, the payments of CB00 and the account update of
-//! CAUP.
+//! account, card and cross-reference records: the account-keyed adds of CT00,
+//! the account-only add of CT02, the payments of CB00, the account update of
+//! CAUP and the card list of CCLI, which decodes every card record and counts
+//! them against section D.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -44,6 +45,12 @@ const ACCOUNT_COPYBOOK: &str = "CVACT01Y";
 
 /// The ASCII fixture of `ACCTDAT`.
 const ACCOUNT_FILE: &str = "acctdata.txt";
+
+/// The copybook of `CARD-RECORD`, the `CARDDAT` layout (P-CVACT02Y-001).
+const CARD_COPYBOOK: &str = "CVACT02Y";
+
+/// The ASCII fixture of `CARDDAT`.
+const CARD_FILE: &str = "carddata.txt";
 
 /// The copybook of `CARD-XREF-RECORD`, the `CCXREF` layout (P-CVACT03Y-001).
 const XREF_COPYBOOK: &str = "CVACT03Y";
@@ -167,6 +174,17 @@ impl Layout {
         Self::load(parity, ACCOUNT_COPYBOOK, ACCOUNT_FILE)
     }
 
+    /// The `CVACT02Y` layout of `CARD-RECORD`, decoding `carddata.txt`
+    /// (P-CVACT02Y-001…007).
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Layout::load`] does.
+    #[must_use]
+    pub fn card(parity: &Document) -> Self {
+        Self::load(parity, CARD_COPYBOOK, CARD_FILE)
+    }
+
     /// The `CVACT03Y` layout of `CARD-XREF-RECORD`, decoding `cardxref.txt`
     /// (P-CVACT03Y-001…004).
     ///
@@ -192,23 +210,19 @@ impl Layout {
     #[must_use]
     pub fn records(&self, column: &str, key: &str) -> Vec<Record> {
         let field = self.field(column);
-        let path = fixtures::ascii_dir().join(&self.file);
-        let text = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("{} cannot be read: {error}", path.display()));
-        text.lines()
-            .enumerate()
-            .map(|(index, line)| (index + 1, line))
-            .filter(|&(number, line)| self.decode(number, line, field) == key)
-            .map(|(number, line)| Record {
-                file: self.file.clone(),
-                line: number,
-                values: self
-                    .fields
-                    .iter()
-                    .map(|stored| (stored.column.clone(), self.decode(number, line, stored)))
-                    .collect(),
-            })
-            .collect()
+        self.decode_records(|number, line| self.decode(number, line, field) == key)
+    }
+
+    /// Every record of the fixture, in file order, each decoded whole.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture cannot be read, if a record does not hold a field
+    /// at its offset and length, or if a signed field of it is no zoned
+    /// decimal with a trailing overpunch.
+    #[must_use]
+    pub fn every_record(&self) -> Vec<Record> {
+        self.decode_records(|_, _| true)
     }
 
     /// The one record of the fixture whose `column` decodes to `key`.
@@ -241,6 +255,28 @@ impl Layout {
                     self.copybook, self.file
                 )
             })
+    }
+
+    /// Every record of the fixture, in file order, that `keep` accepts given
+    /// its 1-based line number and its text, each decoded whole.
+    fn decode_records(&self, keep: impl Fn(usize, &str) -> bool) -> Vec<Record> {
+        let path = fixtures::ascii_dir().join(&self.file);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} cannot be read: {error}", path.display()));
+        text.lines()
+            .enumerate()
+            .map(|(index, line)| (index + 1, line))
+            .filter(|&(number, line)| keep(number, line))
+            .map(|(number, line)| Record {
+                file: self.file.clone(),
+                line: number,
+                values: self
+                    .fields
+                    .iter()
+                    .map(|stored| (stored.column.clone(), self.decode(number, line, stored)))
+                    .collect(),
+            })
+            .collect()
     }
 
     /// The value `field` holds in `line`, the record on 1-based line `number`

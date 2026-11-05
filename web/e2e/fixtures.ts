@@ -548,6 +548,15 @@ export const FIXTURE_KEYS = {
   /** XREF-CARD-NUM of account 50 (cardxref.txt record 1). */
   rewardCard: "0500024453765740",
   /**
+   * ACCT-ID of acctdata.txt record 37, an account POSTTRAN credits no reward
+   * points: every 01/0001 posting of its card is rejected as an overlimit
+   * transaction (P-CBTRN02C-027, -052, -053, -063 and -064) and its one
+   * posted record is a 03/0001 credit (P-CBTRN02C-189). It has no reward
+   * balance row and no accrual, so the API answers the zero balance and an
+   * empty history.
+   */
+  zeroRewardAccount: "00000000037",
+  /**
    * Type 07 Adjustment (trantype.txt record 7) and its category 0001 Sales
    * draft credit adjustment (trancatg.txt record 18): a pair no dailytran.txt
    * record and no seed reward rule uses, for the rules the specs create.
@@ -601,6 +610,7 @@ export function assertFixtureKeys(): void {
   expect(accounts.has(FIXTURE_KEYS.account), "account in acctdata.txt").toBe(true);
   expect(accounts.has(FIXTURE_KEYS.otherAccount), "other account in acctdata.txt").toBe(true);
   expect(accounts.has(FIXTURE_KEYS.rewardAccount), "reward account in acctdata.txt").toBe(true);
+  expect(accounts.has(FIXTURE_KEYS.zeroRewardAccount), "zero-reward account in acctdata.txt").toBe(true);
   expect(accounts.has(FIXTURE_KEYS.missingAccount), "missing account absent").toBe(false);
   expect(xrefOf(FIXTURE_KEYS.account)).toEqual({
     card: FIXTURE_KEYS.card,
@@ -1787,7 +1797,9 @@ export const REWARD_SCREENS = {
     redeemed: "Points redeemed",
     available: "Available points",
     historyCaption: "Reward history",
-    historyColumns: ["Accrual ID", "Transaction ID", "Rule ID", "Points earned", "Created at"],
+    historyColumns: ["Accrual ID", "Transaction row", "Rule ID", "Points earned", "Created at"],
+    /** The history table's text in place of the rows of an empty history. */
+    emptyHistory: "No reward points have been earned on this account.",
     /** HISTORY_PAGE_SIZE: the rows of one history page. */
     historyPageSize: "10",
   },

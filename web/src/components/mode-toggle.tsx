@@ -20,18 +20,19 @@ export function ModeToggle(): JSX.Element {
 
   // BLITZY [LAYOUT]: the shadcn mode-toggle example sizes the icons 1.2rem, an
   // arbitrary value outside the Tailwind default scale; snapped to size-5
-  // (1.25rem). The icon swap animates only without a reduced-motion request.
+  // (1.25rem). The icons swap at once: the theme provider turns transitions
+  // off while it changes the theme class.
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button variant="ghost" size="icon" className="relative">
           <Sun
             aria-hidden="true"
-            className="size-5 scale-100 rotate-0 motion-safe:transition-all dark:scale-0 dark:-rotate-90"
+            className="size-5 scale-100 rotate-0 dark:scale-0 dark:-rotate-90"
           />
           <Moon
             aria-hidden="true"
-            className="absolute size-5 scale-0 rotate-90 motion-safe:transition-all dark:scale-100 dark:rotate-0"
+            className="absolute size-5 scale-0 rotate-90 dark:scale-100 dark:rotate-0"
           />
           <span className="sr-only">Toggle theme</span>
         </Button>

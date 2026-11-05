@@ -4,9 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CardDemo</title>
+    <!-- The app ships no icon. Declaring an empty one stops the browser's
+         automatic request for /favicon.ico, which would answer 404. -->
+    <link rel="icon" href="data:," />
+    <!-- The entry module is render-blocking and sits in head, the only place
+         blocking="render" takes effect: the browser paints nothing until it
+         runs, and its module graph puts the style sheet and the tab's stored
+         light/dark class on the root element before the first frame. -->
+    <script type="module" src="/src/main.tsx" blocking="render"></script>
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

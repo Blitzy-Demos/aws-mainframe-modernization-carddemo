@@ -5,11 +5,19 @@
 //   strings exactly as sent, 9007199254740993 included, which a JavaScript
 //   number would read as 9007199254740992 (o8);
 // - an unknown account is reported by one toast and leaves the form usable;
+// - an account that has earned no points shows the zero balance and the
+//   empty-history text, and a failed history read is reported by one toast
+//   and shows no history rows or page controls;
 // - the history pages forward with Next and back with Previous, both reached
 //   and pressed from the keyboard;
 // - a repeated lookup of the same account keeps the history table loading
 //   until its new answer arrives, from the newest page or a later one, while
 //   a page Previous brings back from the cache keeps its rows as it is reread;
+// - a lookup shows skeletons, never a figure or row the cache or the previous
+//   account holds, until its own answers arrive, and Look up pressed again
+//   while the balance is read requests no history of an empty account;
+// - an entry rejected after a lookup takes its balance and history off the
+//   screen;
 // - the page's status region announces each balance lookup, a repeated one
 //   included, by its account and never by a points value, and stays empty for
 //   a failed one.
@@ -72,9 +80,10 @@ function accrual(
   accrual_id: string,
   transaction_id: string,
   points_earned: string,
+  account_id: string = ACCOUNT,
 ): RewardAccrual {
   return {
-    account_id: ACCOUNT,
+    account_id,
     accrual_id,
     transaction_id,
     rule_id: "1",
@@ -108,6 +117,54 @@ const PAGE_ONE_REREAD: RewardHistoryPage = {
   next_key: "41",
   prev_key: null,
 };
+
+// ACCOUNT's balance read again once the accrual PAGE_ONE_REREAD adds (25
+// points) has been earned.
+const BEYOND_DOUBLE_PLUS_25 = "9007199254741018";
+const balanceRereadBody: RewardBalance = {
+  account_id: ACCOUNT,
+  total_points_earned: BEYOND_DOUBLE_PLUS_25,
+  total_points_redeemed: "0",
+  available_points: BEYOND_DOUBLE_PLUS_25,
+};
+
+/** The second account of app/data/ASCII/acctdata.txt. */
+const OTHER_ACCOUNT = "00000000002";
+
+const otherBalanceBody: RewardBalance = {
+  account_id: OTHER_ACCOUNT,
+  total_points_earned: "57",
+  total_points_redeemed: "0",
+  available_points: "57",
+};
+
+// OTHER_ACCOUNT's only history page.
+const OTHER_PAGE: RewardHistoryPage = {
+  items: [accrual("39", "246", "57", OTHER_ACCOUNT)],
+  next_key: null,
+  prev_key: null,
+};
+
+/** An account on file that has earned no reward points. */
+const ZERO_ACCOUNT = "00000000037";
+
+// The zero balance the server answers for an account on file without
+// accruals, and its empty history (AAP 0.3.5).
+const zeroBalanceBody: RewardBalance = {
+  account_id: ZERO_ACCOUNT,
+  total_points_earned: "0",
+  total_points_redeemed: "0",
+  available_points: "0",
+};
+
+const EMPTY_PAGE: RewardHistoryPage = {
+  items: [],
+  next_key: null,
+  prev_key: null,
+};
+
+/** The text the history table shows in place of the rows of an empty history. */
+const EMPTY_HISTORY = "No reward points have been earned on this account.";
 
 // The server's answer for an account not on file (crates/api/src/error.rs
 // maps NotFound to 404 with this code).
@@ -405,6 +462,32 @@ function expectHistoryLoading(table: HTMLElement, heldRows: number): void {
   expect(historyStatus().textContent).toBe("");
 }
 
+function balanceSection(): HTMLElement {
+  return screen.getByRole("region", { name: "Reward balance" });
+}
+
+// Asserts the balance section's loading state: busy, its three hidden card
+// skeletons in place of the cards, and no card, so no figure, shown.
+function expectBalanceLoading(): void {
+  const section = balanceSection();
+  expect(section.getAttribute("aria-busy")).toBe("true");
+  const placeholders = Array.from(section.children);
+  expect(placeholders).toHaveLength(3);
+  for (const card of placeholders) {
+    expect(card.getAttribute("aria-hidden")).toBe("true");
+    expect(card.querySelector('[data-slot="skeleton"]')).not.toBeNull();
+  }
+  expect(within(section).queryAllByRole("group")).toEqual([]);
+}
+
+/** The history table's column headers, in screen order. */
+function historyHeaders(): string[] {
+  const table = screen.getByRole("table", { name: "Reward history" });
+  return within(table)
+    .getAllByRole("columnheader")
+    .map((header) => header.textContent ?? "");
+}
+
 beforeEach(() => {
   balances.clear();
   histories.clear();
@@ -451,6 +534,16 @@ describe("RewardsPage", () => {
     await waitFor(() => {
       expect(historyRows()).toEqual(rowsOf(PAGE_ONE));
     });
+    // `transaction_id` is the accrued transaction's row identity, so its
+    // column is not headed like the 16-digit TRAN-ID of the transaction
+    // screens.
+    expect(historyHeaders()).toEqual([
+      "Accrual ID",
+      "Transaction row",
+      "Rule ID",
+      "Points earned",
+      "Created at",
+    ]);
   });
 
   it.each([
@@ -635,6 +728,308 @@ describe("RewardsPage", () => {
     },
   );
 
+  it("reads the balance and the newest history page once, and no account-less page, when Look up is pressed again while the balance is read", async () => {
+    balances.set(ACCOUNT, { status: 200, body: balanceBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
+    const toastError = vi.spyOn(toast, "error");
+    const user = renderPage();
+    const heldBalance = deferred<void>();
+    gates.balance = heldBalance.promise;
+    const lookUpButton = screen.getByRole("button", { name: "Look up" });
+
+    // A double click: the second press arrives while the first press's
+    // balance read runs, before the history has been keyed to the account.
+    await user.type(accountInput(), ACCOUNT);
+    await user.click(lookUpButton);
+    await waitFor(() => {
+      expect(lookupStatus().textContent).toBe(BALANCE_LOADING);
+    });
+    await user.click(lookUpButton);
+    heldBalance.resolve();
+
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(PAGE_ONE));
+    });
+    expect(requestedPaths()).toEqual([
+      `GET /api/rewards/balance/${ACCOUNT}`,
+      `GET /api/rewards/history/${ACCOUNT}?page_size=10`,
+    ]);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("shows skeletons, never the balance the cache holds, while a lookup of an account read before reads its balance again", async () => {
+    balances.set(ACCOUNT, { status: 200, body: balanceBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
+    balances.set(OTHER_ACCOUNT, { status: 200, body: otherBalanceBody });
+    histories.set(historyKey(OTHER_ACCOUNT), { status: 200, body: OTHER_PAGE });
+    const user = renderPage();
+    await lookUp(user, ACCOUNT);
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(PAGE_ONE));
+    });
+    await lookUp(user, OTHER_ACCOUNT);
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(OTHER_PAGE));
+    });
+    const section = balanceSection();
+    const texts = recordTexts(section);
+    const busy = recordBusy(section);
+
+    // The first account again, as after its balance was read elsewhere (the
+    // dashboard's reward card fills the same cache): the cache holds its
+    // earlier balance, and both reads are held while it has grown.
+    balances.set(ACCOUNT, { status: 200, body: balanceRereadBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE_REREAD });
+    const heldBalance = deferred<void>();
+    const heldHistory = deferred<void>();
+    gates.balance = heldBalance.promise;
+    gates.history = heldHistory.promise;
+    await lookUp(user, ACCOUNT);
+
+    await waitFor(() => {
+      expect(lookupStatus().textContent).toBe(BALANCE_LOADING);
+    });
+    expectBalanceLoading();
+    expectHistoryLoading(
+      screen.getByRole("table", { name: "Reward history" }),
+      PAGE_ONE.items.length,
+    );
+    expect(screen.queryByText(BEYOND_DOUBLE)).toBeNull();
+
+    heldBalance.resolve();
+    heldHistory.resolve();
+
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(PAGE_ONE_REREAD));
+    });
+    expect(
+      within(summaryCard("Points earned")).getByText(BEYOND_DOUBLE_PLUS_25),
+    ).toBeDefined();
+    expect(
+      within(summaryCard("Available points")).getByText(BEYOND_DOUBLE_PLUS_25),
+    ).toBeDefined();
+    expect(section.hasAttribute("aria-busy")).toBe(false);
+    // The cached figure was never shown, and the section was busy once, from
+    // the lookup to its answer.
+    expect(texts.filter((text) => text.includes(BEYOND_DOUBLE))).toEqual([]);
+    expect(busy).toEqual(["true", null]);
+  });
+
+  it("shows the zero balance and the empty-history text of an account that has earned no points", async () => {
+    balances.set(ZERO_ACCOUNT, { status: 200, body: zeroBalanceBody });
+    histories.set(historyKey(ZERO_ACCOUNT), { status: 200, body: EMPTY_PAGE });
+    const toastError = vi.spyOn(toast, "error");
+    const user = renderPage();
+
+    await lookUp(user, ZERO_ACCOUNT);
+
+    await waitFor(() => {
+      expect(historyRows()).toEqual([[EMPTY_HISTORY]]);
+    });
+    for (const title of ["Points earned", "Points redeemed", "Available points"]) {
+      expect(within(summaryCard(title)).getByText("0")).toBeDefined();
+    }
+    // An empty history has neither key, so no page control is offered.
+    expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+    await waitFor(() => {
+      expect(historyStatus().textContent).toBe(
+        `Reward history: ${EMPTY_HISTORY}`,
+      );
+    });
+    expect(toastError).not.toHaveBeenCalled();
+    expect(requestedPaths()).toEqual([
+      `GET /api/rewards/balance/${ZERO_ACCOUNT}`,
+      `GET /api/rewards/history/${ZERO_ACCOUNT}?page_size=10`,
+    ]);
+  });
+
+  it.each([
+    { when: "on a first lookup", before: [] },
+    { when: "after a lookup that showed rows", before: [OTHER_ACCOUNT] },
+  ])(
+    "reports a failed history read with one toast and shows its balance with no history rows or page controls $when",
+    async ({ before }) => {
+      balances.set(OTHER_ACCOUNT, { status: 200, body: otherBalanceBody });
+      histories.set(historyKey(OTHER_ACCOUNT), {
+        status: 200,
+        body: OTHER_PAGE,
+      });
+      balances.set(ACCOUNT, { status: 200, body: balanceBody });
+      histories.set(historyKey(ACCOUNT), { status: 500, body: unexpectedError });
+      const toastError = vi.spyOn(toast, "error");
+      const user = renderPage();
+      for (const account of before) {
+        await lookUp(user, account);
+        await waitFor(() => {
+          expect(historyRows()).toEqual(rowsOf(OTHER_PAGE));
+        });
+      }
+
+      await lookUp(user, ACCOUNT);
+
+      await waitFor(() => {
+        expect(toastError).toHaveBeenCalledWith(unexpectedError.message);
+      });
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(
+        within(summaryCard("Points earned")).getByText(BEYOND_DOUBLE),
+      ).toBeDefined();
+      expect(
+        within(summaryCard("Available points")).getByText(BEYOND_DOUBLE),
+      ).toBeDefined();
+      expect(balanceSection().hasAttribute("aria-busy")).toBe(false);
+      expect(
+        screen.queryByRole("table", { name: "Reward history" }),
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+      expect(requestedPaths()).toEqual([
+        ...before.flatMap((account) => [
+          `GET /api/rewards/balance/${account}`,
+          `GET /api/rewards/history/${account}?page_size=10`,
+        ]),
+        `GET /api/rewards/balance/${ACCOUNT}`,
+        `GET /api/rewards/history/${ACCOUNT}?page_size=10`,
+      ]);
+    },
+  );
+
+  it("shows none of the previous account's figures or rows while another account's reads are held, then exactly that account's", async () => {
+    balances.set(ACCOUNT, { status: 200, body: balanceBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
+    balances.set(OTHER_ACCOUNT, { status: 200, body: otherBalanceBody });
+    histories.set(historyKey(OTHER_ACCOUNT), { status: 200, body: OTHER_PAGE });
+    const user = renderPage();
+    await lookUp(user, ACCOUNT);
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(PAGE_ONE));
+    });
+    const previousTexts = [
+      BEYOND_DOUBLE,
+      `Account ${ACCOUNT}`,
+      ...PAGE_ONE.items.map((item) => item.points_earned),
+    ];
+    const expectNoPreviousAccount = (): void => {
+      previousTexts.forEach((text) => {
+        expect(screen.queryByText(text)).toBeNull();
+      });
+    };
+
+    const heldBalance = deferred<void>();
+    const heldHistory = deferred<void>();
+    gates.balance = heldBalance.promise;
+    gates.history = heldHistory.promise;
+    await lookUp(user, OTHER_ACCOUNT);
+
+    // While the balance is held, the history waits for it.
+    await waitFor(() => {
+      expect(lookupStatus().textContent).toBe(BALANCE_LOADING);
+    });
+    expectBalanceLoading();
+    const table = screen.getByRole("table", { name: "Reward history" });
+    expect(table.getAttribute("aria-busy")).toBe("true");
+    expect(historyRows().flat().join("")).toBe("");
+    expectNoPreviousAccount();
+
+    // Once the balance has answered, the history is read for that account.
+    heldBalance.resolve();
+    await waitFor(() => {
+      expect(
+        within(summaryCard("Available points")).getByText(
+          otherBalanceBody.available_points,
+        ),
+      ).toBeDefined();
+    });
+    expect(table.getAttribute("aria-busy")).toBe("true");
+    expect(historyRows().flat().join("")).toBe("");
+    expectNoPreviousAccount();
+
+    heldHistory.resolve();
+
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(OTHER_PAGE));
+    });
+    expectNoPreviousAccount();
+    expect(requestedPaths()).toEqual([
+      `GET /api/rewards/balance/${ACCOUNT}`,
+      `GET /api/rewards/history/${ACCOUNT}?page_size=10`,
+      `GET /api/rewards/balance/${OTHER_ACCOUNT}`,
+      `GET /api/rewards/history/${OTHER_ACCOUNT}?page_size=10`,
+    ]);
+  });
+
+  it("takes the balance and history off the screen when an entry is rejected after a lookup, and looks the account up again afterwards", async () => {
+    balances.set(ACCOUNT, { status: 200, body: balanceBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
+    const user = renderPage();
+    await lookUp(user, ACCOUNT);
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(PAGE_ONE));
+    });
+    const region = lookupStatus();
+    await waitFor(() => {
+      expect(region.textContent).toBe(BALANCE_LOADED);
+    });
+
+    const rejectedEntry = "1234";
+    await lookUp(user, rejectedEntry);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      rewardsAccountSchema.safeParse({ account_id: rejectedEntry }).error
+        ?.issues[0]?.message,
+    );
+    expect(screen.queryByRole("region", { name: "Reward balance" })).toBeNull();
+    expect(screen.queryByRole("table", { name: "Reward history" })).toBeNull();
+    expect(screen.queryByText(BEYOND_DOUBLE)).toBeNull();
+    await waitFor(() => {
+      expect(region.textContent).toBe("");
+    });
+    // The rejected entry sends nothing.
+    expect(requestedPaths()).toHaveLength(2);
+
+    // The account again, now a new lookup whose earlier balance and rows
+    // the cache holds: neither is shown before the held answers arrive.
+    balances.set(ACCOUNT, { status: 200, body: balanceRereadBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE_REREAD });
+    const heldBalance = deferred<void>();
+    const heldHistory = deferred<void>();
+    gates.balance = heldBalance.promise;
+    gates.history = heldHistory.promise;
+    await lookUp(user, ACCOUNT);
+
+    await waitFor(() => {
+      expect(region.textContent).toBe(BALANCE_LOADING);
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expectBalanceLoading();
+    expectHistoryLoading(
+      screen.getByRole("table", { name: "Reward history" }),
+      PAGE_ONE.items.length,
+    );
+    expect(screen.queryByText(BEYOND_DOUBLE)).toBeNull();
+
+    heldBalance.resolve();
+    heldHistory.resolve();
+
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(PAGE_ONE_REREAD));
+    });
+    expect(
+      within(summaryCard("Points earned")).getByText(BEYOND_DOUBLE_PLUS_25),
+    ).toBeDefined();
+    await waitFor(() => {
+      expect(region.textContent).toBe(BALANCE_LOADED);
+    });
+    expect(requestedPaths()).toEqual([
+      `GET /api/rewards/balance/${ACCOUNT}`,
+      `GET /api/rewards/history/${ACCOUNT}?page_size=10`,
+      `GET /api/rewards/balance/${ACCOUNT}`,
+      `GET /api/rewards/history/${ACCOUNT}?page_size=10`,
+    ]);
+  });
+
   it("announces each balance lookup by its account, a repeated one included", async () => {
     balances.set(ACCOUNT, { status: 200, body: balanceBody });
     histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
@@ -715,5 +1110,39 @@ describe("RewardsPage", () => {
       `GET /api/rewards/history/${ACCOUNT}`,
       `GET /api/rewards/balance/${UNKNOWN_ACCOUNT}`,
     ]);
+  });
+
+  it("holds each balance card's lines with a card skeleton while the balance is read", async () => {
+    balances.set(ACCOUNT, { status: 200, body: balanceBody });
+    histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE });
+    const balanceGate = deferred<void>();
+    gates.balance = balanceGate.promise;
+    const user = renderPage();
+
+    await lookUp(user, ACCOUNT);
+
+    // The busy section holds three hidden cards, each with the title, value
+    // and description lines of the card it stands in for.
+    const section = await screen.findByRole("region", {
+      name: "Reward balance",
+    });
+    expect(section.getAttribute("aria-busy")).toBe("true");
+    const placeholders = Array.from(section.children);
+    expect(placeholders).toHaveLength(3);
+    for (const card of placeholders) {
+      expect(card.getAttribute("data-slot")).toBe("card");
+      expect(card.getAttribute("aria-hidden")).toBe("true");
+      expect(card.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(3);
+    }
+    expect(screen.queryByRole("group", { name: "Points earned" })).toBeNull();
+
+    balanceGate.resolve();
+    await screen.findByRole("group", { name: "Points earned" });
+    expect(section.hasAttribute("aria-busy")).toBe(false);
+    expect(within(section).getAllByRole("group")).toHaveLength(3);
+    expect(section.querySelector('[data-slot="skeleton"]')).toBeNull();
+    await waitFor(() => {
+      expect(historyRows()).toEqual(rowsOf(PAGE_ONE));
+    });
   });
 });

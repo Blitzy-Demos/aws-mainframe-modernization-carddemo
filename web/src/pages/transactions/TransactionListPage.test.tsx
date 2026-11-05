@@ -427,4 +427,41 @@ describe("TransactionListPage (CT00, COTRN00)", () => {
     ).toBe("true");
     expect(toastError).not.toHaveBeenCalled();
   });
+
+  // A TRAN-DESC X(100) at its full length without a space breaks anywhere and
+  // is clamped to one line, so it cannot widen the table past its card; the
+  // title and the text keep it whole.
+  it("clamps a 100-character description to one line with the full text as its title", async () => {
+    const longDescription = "ABCDEFGHIJ".repeat(10);
+    const longPage: TransactionPage = {
+      ...FIRST_PAGE,
+      items: [
+        { ...transaction(0), tran_desc: longDescription },
+        ...FIRST_PAGE.items.slice(1),
+      ],
+    };
+    answer = (request) =>
+      new URL(request.url).pathname === LIST_PATH &&
+      !queryOf(request).has("start_key")
+        ? jsonResponse(200, longPage)
+        : browse(request);
+    await renderPage();
+
+    const table = screen.getByRole("table");
+    const [headerRow, firstRow] = within(table).getAllByRole("row");
+    expect(within(headerRow).getAllByRole("columnheader")[2].textContent).toBe(
+      "Description",
+    );
+    const description = within(table).getByText(longDescription);
+    expect(within(firstRow).getAllByRole("cell")[2].contains(description)).toBe(
+      true,
+    );
+    expect(longDescription).toHaveLength(100);
+    expect(description.getAttribute("title")).toBe(longDescription);
+    expect(description.textContent).toBe(longDescription);
+    expect([...description.classList]).toEqual(
+      expect.arrayContaining(["line-clamp-1", "whitespace-normal", "wrap-anywhere"]),
+    );
+    expect(toastError).not.toHaveBeenCalled();
+  });
 });

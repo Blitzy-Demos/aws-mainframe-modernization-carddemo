@@ -32,8 +32,8 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useCards, type CardListParams } from "@/api/queries/cards";
 import type { components } from "@/api/schema";
 import { DataTable, type DataTableProps } from "@/components/data-table";
-import { PageHeader } from "@/components/page-header";
-import { Badge } from "@/components/ui/badge";
+import { FlagBadge } from "@/components/detail-list";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
@@ -154,9 +154,7 @@ function cardColumns(idPrefix: string): DataTableProps<CardSummary>["columns"] {
       // default py-0.5) to fit the cell's text line, like the row actions, so
       // a row keeps the height of DataTable's loading skeleton rows.
       cell: ({ row }) => (
-        <Badge variant="secondary" className="py-0">
-          {row.original.card_active_status}
-        </Badge>
+        <FlagBadge value={row.original.card_active_status} className="py-0" />
       ),
     },
     {
@@ -230,10 +228,16 @@ export default function CardListPage(): JSX.Element {
   // A first entry lists every card from the lowest card number.
   const [params, setParams] = useState<CardListParams>({});
   const query = useCards(params);
-  const page = query.isError ? undefined : query.data;
+  // The FieldError text of the filter the last key press was rejected for;
+  // null while the last key press passed the schema.
+  const [rejectedText, setRejectedText] = useState<string | null>(null);
+  const rejected = rejectedText !== null;
+  // A failed request and a rejected key press show no page.
+  const page = query.isError || rejected ? undefined : query.data;
 
   // The first card shown (WS-CA-FIRST-CARD-NUM): the `prev_key` of the last
-  // page received, kept while a failed request shows no page.
+  // page received, kept while a failed request or a rejected key press shows
+  // no page.
   const firstShownRef = useRef<string | undefined>(undefined);
   // Whether the next page received answers a key press, whose page text is
   // then shown once. A page a cached result is refreshed with answers none.
@@ -255,10 +259,31 @@ export default function CardListPage(): JSX.Element {
 
   // One key press: the filters on screen go through the schema first, so a
   // rejected filter sends nothing whichever key was pressed.
+  //
+  // A rejected key press also takes the rows and the paging keys off the
+  // screen, and the filter's text stands in their place. COCRDLIC answers
+  // INPUT-ERROR with a filter not OK without reading the file (it skips
+  // 9000-READ-FORWARD) and protects every row selector
+  // (FLG-PROTECT-SELECT-ROWS), so the rows still on its map can be neither
+  // viewed nor updated under the error [app/cbl/COCRDLIC.cbl:L419-438]
+  // (P-COCRDLIC-005, P-COCRDLIC-018). Here each row's actions are links of
+  // their own, so the previous rows are not shown at all. Both filters
+  // rejected show the account's text, the one COCRDLIC's message line keeps
+  // (P-COCRDLIC-023). An answer still on its way answers no key press on
+  // screen, so its page text is not shown.
   const pressKey = (cursor: Cursor, event?: BaseSyntheticEvent): void => {
-    void form.handleSubmit((filters) => {
-      send(toParams(filters, cursor));
-    })(event);
+    void form.handleSubmit(
+      (filters) => {
+        setRejectedText(null);
+        send(toParams(filters, cursor));
+      },
+      (errors) => {
+        announceRef.current = false;
+        setRejectedText(
+          errors.account_id?.message ?? errors.card_number?.message ?? "",
+        );
+      },
+    )(event);
   };
 
   // Each page received is handled once, StrictMode's repeated effects and
@@ -295,15 +320,20 @@ export default function CardListPage(): JSX.Element {
     setFailureText(applyApiError(error, form, cardListBmsFieldMap).message);
   }, [error, errorUpdatedAt, isError, form]);
 
+  // The text in place of the rows: the rejected filter's, the failed
+  // request's, or the page text of an empty page.
+  let emptyMessage: string | null | undefined = page?.message;
+  if (rejected) {
+    emptyMessage = rejectedText;
+  } else if (query.isError) {
+    emptyMessage = failureText;
+  }
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
         title="List Credit Cards"
-        actions={
-          <Button variant="outline" asChild>
-            <Link to="/">Back</Link>
-          </Button>
-        }
+        actions={<BackLink to="/" />}
       />
       <Card>
         <CardContent>
@@ -359,9 +389,9 @@ export default function CardListPage(): JSX.Element {
             direction: "forward",
           });
         }}
-        emptyMessage={query.isError ? failureText : page?.message}
+        emptyMessage={emptyMessage}
         caption="Credit cards"
-        loading={query.isFetching}
+        loading={!rejected && query.isFetching}
       />
     </div>
   );

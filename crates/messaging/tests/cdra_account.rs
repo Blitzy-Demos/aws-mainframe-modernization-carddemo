@@ -23,7 +23,9 @@
 //! consumers. It also proves the fixed reply queue and the identifier echo
 //! (`P-COACCT01-010`, `P-COACCT01-017`), the 15-byte request layout
 //! (`P-COACCT01-011`) and single settlement after a confirmed reply
-//! (`P-COACCT01-032`): each request is acknowledged once, gets one persistent
+//! (`P-COACCT01-032`): as the harness's AMQP tap sees the consumers'
+//! connection, each request is delivered once and settled by one `basic.ack`
+//! after its reply's confirm reached the consumer; it gets one persistent
 //! reply without expiry and one `replied` message span, and nothing reaches
 //! `CARD.DEMO.ERROR`.
 //!
@@ -42,6 +44,7 @@ use carddemo_messaging::error_queue::ERROR_QUEUE;
 use carddemo_messaging::flows::cdra::REPLY_QUEUE;
 use carddemo_testkit::{block_on, fixtures};
 use common::{Harness, audit_row, audit_texts};
+use futures_util::future::join_all;
 use lapin::message::Delivery;
 use lapin::types::ShortString;
 
@@ -208,9 +211,10 @@ fn audit_cdra_rows_agree_with_the_coacct01_rules_and_the_fixture() {
 /// (`P-COACCT01-013`); the missing account answers `NOTFND`
 /// (`P-COACCT01-014`); another function or a zero key answers the
 /// invalid-request text (`P-COACCT01-012`, `P-COACCT01-016`). Every request
-/// is a 15-byte `REQUEST-MSG-COPY` (`P-COACCT01-011`), settled once after its
-/// confirmed reply with one `replied` message span (`P-COACCT01-032`); nothing
-/// reaches the decoy or `CARD.DEMO.ERROR`.
+/// is a 15-byte `REQUEST-MSG-COPY` (`P-COACCT01-011`), delivered once and
+/// settled by one `basic.ack` after its reply's confirm, with one `replied`
+/// message span (`P-COACCT01-032`); nothing reaches the decoy or
+/// `CARD.DEMO.ERROR`.
 #[test]
 fn cdra_replies_equal_the_audited_coacct01_replies() {
     assert_queue_literals();
@@ -515,7 +519,8 @@ fn assert_bytes_eq(context: &str, actual: &[u8], expected: &[u8]) {
 
 /// Sends `case`'s request to `request_queue` with `decoy` as its ignored
 /// `reply_to`, then takes its reply from `CARD.DEMO.REPLY.ACCT` and checks the
-/// reply and its message span. One request is in flight at a time.
+/// reply, its message span and, on the wire, its acknowledgement after the
+/// reply's confirm. One request is in flight at a time.
 async fn exchange(h: &Harness, request_queue: &str, decoy: &str, case: &Case) {
     h.publish(
         request_queue,
@@ -528,6 +533,8 @@ async fn exchange(h: &Harness, request_queue: &str, decoy: &str, case: &Case) {
     let reply = h.next_message(REPLY_QUEUE, REPLY_WAIT).await;
     assert_reply(case, &reply);
     assert_replied_span(h, case).await;
+    h.assert_acked_after_confirm("CDRA", &case.message_id, REPLY_QUEUE)
+        .await;
 }
 
 /// The reply is the case's audited body, carries the request's message and
@@ -595,10 +602,20 @@ async fn assert_replied_span(h: &Harness, case: &Case) {
 }
 
 /// After every case: no second reply, nothing on the decoy or the error
-/// queue, no request left on `request_queue`, and exactly one CDRA message
-/// span per request (no redelivery), none of them rejected.
+/// queue, no request left on `request_queue`, one delivery and one
+/// settlement per request on the wire throughout the first wait (no
+/// redelivery), and exactly one CDRA message span per request, none of them
+/// rejected.
 async fn assert_settled(h: &Harness, request_queue: &str, decoy: &str, cases: &[Case]) {
-    h.assert_no_message(REPLY_QUEUE, ABSENCE_WAIT).await;
+    let delivered_once = join_all(
+        cases
+            .iter()
+            .map(|case| h.assert_delivered_once("CDRA", &case.message_id, ABSENCE_WAIT)),
+    );
+    tokio::join!(
+        h.assert_no_message(REPLY_QUEUE, ABSENCE_WAIT),
+        delivered_once
+    );
     h.assert_no_message(decoy, ABSENCE_WAIT).await;
     h.assert_no_message(ERROR_QUEUE, ABSENCE_WAIT).await;
     assert_eq!(

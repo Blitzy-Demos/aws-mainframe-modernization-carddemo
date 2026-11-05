@@ -5,13 +5,19 @@
 //! Every expectation is read from the repository rather than restated here:
 //!
 //! - the cards and their key order come from `app/data/ASCII/carddata.txt`,
-//!   read by the `CVACT02Y` offsets, once they agree with the fixture rows of
-//!   `docs/parity/parity-oracle-audit.md` section D;
+//!   every record decoded at the reviewed section A offsets of `CVACT02Y` and
+//!   counted against section D, through `common::fixture_records`, once they
+//!   agree with the fixture rows of `docs/parity/parity-oracle-audit.md`
+//!   section D;
 //! - the rows of a screen come from the `COCRDLIC` browse row of section B;
 //! - every status, error `kind`, BMS field, `Order` and example input comes
 //!   from the `COCRDLIC` rows of `docs/parity/validation-audit.md`, and every
-//!   text from `carddemo_domain::messages` once it equals the row's quoted
-//!   text.
+//!   literal text from `carddemo_domain::messages` once it equals the row's
+//!   quoted text;
+//! - the read-failure text of V-COCRDLIC-008 and V-COCRDLIC-010 is the
+//!   row's reviewed template, expanded through `common::audit_text` with the
+//!   injected `READ`, the `ERROR-FILE` the row names and the E-44 codes, and
+//!   cut at `WS-ERROR-MSG`, never composed by `carddemo_domain::messages`.
 //!
 //! The page state the COBOL keeps in its COMMAREA travels in the page keys
 //! (E-54): `next_key` is the card the look-ahead `READNEXT` found after a full
@@ -27,8 +33,6 @@ pub mod common;
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::fs;
-use std::ops::Range;
 use std::slice;
 
 use carddemo_api::pagination::MAX_PAGE_SIZE;
@@ -42,6 +46,8 @@ use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Value, json};
 
+use common::audit_text::{Operand, Template};
+use common::fixture_records::{self, Record};
 use common::{Resp, TestApp, assert_error};
 
 /// The program whose validation rows this file proves.
@@ -50,24 +56,12 @@ const PROGRAM: &str = "COCRDLIC";
 /// The `CCLI` list route.
 const CARDS: &str = "/cards";
 
-/// The fixture file the seed loads into the card master `CARDDAT`.
-const CARD_FIXTURE: &str = "carddata.txt";
+/// The fixture row of the seeded card master: `table=` the table the seed
+/// loads `carddata.txt` into, and `rows=` its record count.
+const CARD_COUNT_ROW: &str = "P-CVACT02Y-008";
 
-/// The records of [`CARD_FIXTURE`] [app/data/ASCII/carddata.txt:L1-50], the
-/// seeded card count.
-const FIXTURE_CARDS: usize = 50;
-
-/// `CARD-NUM PIC X(16)`, the first field of `CARD-RECORD`
-/// [app/cpy/CVACT02Y.cpy:L5].
-const CARD_NUM: Range<usize> = 0..16;
-
-/// `CARD-ACCT-ID PIC 9(11)`, after `CARD-NUM` [app/cpy/CVACT02Y.cpy:L6].
-const CARD_ACCT_ID: Range<usize> = 16..27;
-
-/// `CARD-ACTIVE-STATUS PIC X(01)`, after `CARD-CVV-CD 9(03)`,
-/// `CARD-EMBOSSED-NAME X(50)` and `CARD-EXPIRAION-DATE X(10)`
-/// [app/cpy/CVACT02Y.cpy:L7-10].
-const CARD_ACTIVE_STATUS: Range<usize> = 90..91;
+/// The table [`CARD_COUNT_ROW`] must name: the card master `CARDDAT`.
+const CARD_TABLE: &str = "cards";
 
 /// The `COCRDLIC` browse row: `page_size=` is `WS-MAX-SCREEN-LINES`, and the
 /// cards come in ascending `CARD-NUM` order.
@@ -226,19 +220,42 @@ const RESTORE_CARDS: &str = "ALTER TABLE cards_offline RENAME TO cards";
 /// [app/cbl/COCRDLIC.cbl:L1226] [app/cbl/COCRDLIC.cbl:L1312].
 const ERROR_OPNAME_READ: &str = "READ";
 
+/// `ERROR-OPNAME PIC X(8)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COCRDLIC.cbl:L156].
+const ERROR_OPNAME_WIDTH: usize = 8;
+
+/// `ERROR-FILE PIC X(9)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COCRDLIC.cbl:L160], which receives the 8-byte `LIT-CARD-FILE`.
+const ERROR_FILE_WIDTH: usize = 9;
+
+/// The digits of `WS-RESP-CD` and `WS-REAS-CD PIC S9(09) COMP`
+/// [app/cbl/COCRDLIC.cbl:L47] [app/cbl/COCRDLIC.cbl:L49], whose unsigned
+/// display a `MOVE` to an alphanumeric field gives.
+const RESP_DIGITS: usize = 9;
+
+/// `ERROR-RESP PIC X(10)` and `ERROR-RESP2 PIC X(10)` of
+/// `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDLIC.cbl:L165]
+/// [app/cbl/COCRDLIC.cbl:L169].
+const ERROR_RESP_WIDTH: usize = 10;
+
+/// `WS-ERROR-MSG PIC X(75)` [app/cbl/COCRDLIC.cbl:L117], the receiver
+/// `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDLIC.cbl:L153-171] is moved to.
+const ERROR_MSG_WIDTH: usize = 75;
+
 /// The `RESP` E-44 sets for a database failure: `IOERR`.
-const RESP_IOERR: u32 = 17;
+const RESP_IOERR: u64 = 17;
 
 /// The `RESP2` E-44 sets alongside [`RESP_IOERR`].
-const RESP2_IOERR: u32 = 0;
+const RESP2_IOERR: u64 = 0;
 
 /// The text an audit row expects.
 #[derive(Debug, Clone, Copy)]
 enum Text {
     /// A literal the catalog holds: the row's quoted text must equal it.
     Literal(&'static str),
-    /// `WS-FILE-ERROR-MESSAGE` with the `ERROR-FILE` the row names and the
-    /// E-44 codes of a database failure.
+    /// `WS-FILE-ERROR-MESSAGE`: the row's reviewed template expanded with
+    /// the injected `READ`, the `ERROR-FILE` the row names and the E-44
+    /// codes of a database failure ([`file_error_text`]).
     FileError,
 }
 
@@ -291,12 +308,7 @@ impl Audited {
                 );
                 catalog.to_owned()
             }
-            Text::FileError => messages::file_error_message(
-                ERROR_OPNAME_READ,
-                error_file(id, cell("Message text")),
-                RESP_IOERR,
-                RESP2_IOERR,
-            ),
+            Text::FileError => file_error_text(doc, id, error_file(id, cell("Message text"))),
         };
         Self {
             id,
@@ -357,6 +369,34 @@ fn error_file<'a>(id: &str, cell: &'a str) -> &'a str {
             || panic!("{id} names no quoted ERROR-FILE: {cell}"),
             |(file, _)| file,
         )
+}
+
+/// The `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDLIC.cbl:L153-171] the
+/// `WHEN OTHER` branch of `9000-READ-FORWARD` or `9100-READ-BACKWARDS` moves
+/// to `WS-ERROR-MSG`: the reviewed template of row `id` of `doc`, its operands
+/// bound to `READ`, the `ERROR-FILE` literal `file` and the E-44 `RESP` and
+/// `RESP2`, each laid out in its picture, and cut at the 75 bytes of the
+/// receiver.
+fn file_error_text(doc: &Document, id: &str, file: &str) -> String {
+    Template::load(doc, id).expand(
+        &[
+            Operand::alphanumeric("ERROR-OPNAME", ERROR_OPNAME_READ, ERROR_OPNAME_WIDTH),
+            Operand::alphanumeric("ERROR-FILE", file, ERROR_FILE_WIDTH),
+            Operand::unsigned_to_alphanumeric(
+                "ERROR-RESP",
+                RESP_IOERR,
+                RESP_DIGITS,
+                ERROR_RESP_WIDTH,
+            ),
+            Operand::unsigned_to_alphanumeric(
+                "ERROR-RESP2",
+                RESP2_IOERR,
+                RESP_DIGITS,
+                ERROR_RESP_WIDTH,
+            ),
+        ],
+        ERROR_MSG_WIDTH,
+    )
 }
 
 /// The value of the first `key=` pair of row `id`'s structured cell `pairs`.
@@ -453,18 +493,15 @@ struct FixtureCard {
 }
 
 impl FixtureCard {
-    /// The record on line `line_no` of [`CARD_FIXTURE`], cut at the
-    /// `CVACT02Y` offsets.
-    fn parse(line_no: usize, line: &str) -> Self {
-        let field = |range: Range<usize>| {
-            line.get(range.clone())
-                .unwrap_or_else(|| panic!("{CARD_FIXTURE}:L{line_no} has no bytes {range:?}"))
-                .to_owned()
-        };
+    /// The list row fields of `record`, a `CARD-RECORD` decoded at the
+    /// reviewed section A offsets of `CVACT02Y`: `card_number`
+    /// (P-CVACT02Y-001), `card_acct_id` (P-CVACT02Y-002) and
+    /// `card_active_status` (P-CVACT02Y-006).
+    fn decoded(record: &Record) -> Self {
         Self {
-            number: field(CARD_NUM),
-            account: field(CARD_ACCT_ID),
-            status: field(CARD_ACTIVE_STATUS),
+            number: record.value("card_number").to_owned(),
+            account: record.value("card_acct_id").to_owned(),
+            status: record.value("card_active_status").to_owned(),
         }
     }
 
@@ -494,18 +531,25 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Reads [`CARD_FIXTURE`] and checks it against the fixture rows of
-    /// `parity`.
+    /// Decodes every `CARD-RECORD` of the card fixture at the section A
+    /// offsets of `parity`, counts them against [`CARD_COUNT_ROW`], and checks
+    /// them against the fixture rows of `parity`.
     fn load(parity: &Document) -> Self {
-        let path = fixtures::ascii_dir().join(CARD_FIXTURE);
-        let text = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("{} cannot be read: {error}", path.display()));
-        let mut cards: Vec<FixtureCard> = text
-            .lines()
-            .enumerate()
-            .map(|(index, line)| FixtureCard::parse(index + 1, line))
-            .collect();
-        assert_eq!(cards.len(), FIXTURE_CARDS, "records of {CARD_FIXTURE}");
+        let records = fixture_records::Layout::card(parity).every_record();
+        assert_eq!(
+            fixture_records::section_d_value(parity, CARD_COUNT_ROW, "table"),
+            CARD_TABLE,
+            "{CARD_COUNT_ROW} table"
+        );
+        let count: usize = fixture_records::section_d_value(parity, CARD_COUNT_ROW, "rows")
+            .parse()
+            .unwrap_or_else(|error| panic!("{CARD_COUNT_ROW} rows is not a count: {error}"));
+        assert_eq!(
+            records.len(),
+            count,
+            "{CARD_COUNT_ROW}: the CARD-RECORDs of the card fixture"
+        );
+        let mut cards: Vec<FixtureCard> = records.iter().map(FixtureCard::decoded).collect();
         cards.sort_by(|left, right| left.number.cmp(&right.number));
         let browse = result_pairs(parity, BROWSE_ROW);
         let rows = pair(&browse, BROWSE_ROW, "page_size")

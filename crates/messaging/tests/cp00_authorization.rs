@@ -3,6 +3,12 @@
 //! CP00 consumer, their replies, and the pending-authorization rows the
 //! consumer writes once it has acknowledged each request.
 //!
+//! Each request's settlement is read off the consumers' connection through
+//! the harness's AMQP tap: an answered request is delivered once and settled
+//! by one `basic.ack` after its reply's confirm reached the consumer; the
+//! unknown card is settled by one `basic.reject` without requeue, with
+//! nothing published; none is delivered again.
+//!
 //! One [`Harness`] runs every case in sequence, its clock pinned to
 //! `2022-07-01T12:00:00Z` so the detail key of section F is fixed
 //! (`P-COPAUA0C-030`). Each section D row derives its result from the seeded
@@ -474,8 +480,11 @@ fn assert_span(span: &str, case: &Case, outcome: &str, location: &str) {
     }
 }
 
-/// `P-COPAUA0C-002`: the get removed the request of `case` from the request
-/// queue, replied or not; nothing is requeued.
+/// `P-COPAUA0C-002`: the request of `case` is no longer ready on the request
+/// queue, replied or not. How it left, acknowledged or rejected without
+/// requeue, and that it was never delivered again, is what the harness's
+/// AMQP tap shows ([`Harness::assert_acked_after_confirm`],
+/// [`Harness::assert_rejected`], [`Harness::assert_delivered_once`]).
 async fn assert_request_consumed(h: &Harness, case: &Case) {
     let queue = &h.settings.queue_pauth_request;
     let depth = h.queue_depth(queue).await;
@@ -888,6 +897,8 @@ async fn approved(h: &Harness, id: &'static str, message_ids: &mut HashSet<Strin
     assert_reply(&reply, &case, message_ids);
     let span = message_span(h, &case).await;
     assert_span(&span, &case, "replied", NO_LOCATION);
+    h.assert_acked_after_confirm("CP00", &case.message_id, &reply_queue)
+        .await;
     assert_request_consumed(h, &case).await;
 
     let (summary, details) = settled(h, fixture_account(), |summary, details| {
@@ -902,7 +913,10 @@ async fn approved(h: &Harness, id: &'static str, message_ids: &mut HashSet<Strin
     assert!(records.is_empty(), "{id}: error records {records:?}");
     let halts = halts_of(h, &case);
     assert!(halts.is_empty(), "{id}: unproven-input lines {halts:?}");
-    h.assert_no_message(&reply_queue, SETTLE).await;
+    tokio::join!(
+        h.assert_no_message(&reply_queue, SETTLE),
+        h.assert_delivered_once("CP00", &case.message_id, SETTLE),
+    );
 }
 
 /// `P-COPAUA0C-023`: the fixture card declined from the seeded state for one
@@ -934,8 +948,13 @@ async fn declined(
     assert_halted(h, &case, escalation, WRITE_PARAGRAPH);
     let records = records_of(h, &case);
     assert!(records.is_empty(), "{id}: error records {records:?}");
+    h.assert_acked_after_confirm("CP00", &case.message_id, &reply_queue)
+        .await;
     assert_request_consumed(h, &case).await;
-    h.assert_no_message(&reply_queue, SETTLE).await;
+    tokio::join!(
+        h.assert_no_message(&reply_queue, SETTLE),
+        h.assert_delivered_once("CP00", &case.message_id, SETTLE),
+    );
     let rows = all_rows(h).await;
     assert!(
         rows.is_empty(),
@@ -953,7 +972,8 @@ async fn declined(
 /// (E-41 at `halt`), so the row's `05`/`3100` reply is a proposal: the
 /// consumer logs the escalation at `6000-MAKE-DECISION`, sends no reply and
 /// rejects the request, which leaves the request queue as the COBOL's
-/// no-syncpoint get does (`P-COPAUA0C-002`).
+/// no-syncpoint get does (`P-COPAUA0C-002`). On the wire: no publish, then
+/// one `basic.reject` without requeue, and no second delivery.
 async fn unknown_card(h: &Harness, id: &'static str, escalation: &str) {
     let case = Case::new(id);
     assert_eq!(
@@ -967,8 +987,12 @@ async fn unknown_card(h: &Harness, id: &'static str, escalation: &str) {
     assert_span(&span, &case, "rejected", DECISION_PARAGRAPH);
     assert_a001(h, &case).await;
     assert_halted(h, &case, escalation, DECISION_PARAGRAPH);
+    h.assert_rejected("CP00", &case.message_id, &[]).await;
     assert_request_consumed(h, &case).await;
-    h.assert_no_message(&reply_queue, SETTLE).await;
+    tokio::join!(
+        h.assert_no_message(&reply_queue, SETTLE),
+        h.assert_delivered_once("CP00", &case.message_id, SETTLE),
+    );
     assert_eq!(
         all_rows(h).await,
         before,
@@ -1200,6 +1224,8 @@ fn a_request_during_a_purge_waits_for_it_and_writes_on_what_it_left() {
         assert_reply(&reply, &case, &mut HashSet::new());
         let span = message_span(&h, &case).await;
         assert_span(&span, &case, "replied", NO_LOCATION);
+        h.assert_acked_after_confirm("CP00", &case.message_id, &reply_queue)
+            .await;
         assert_request_consumed(&h, &case).await;
 
         let (summary, details) = settled(&h, fixture_account(), |summary, details| {
@@ -1219,7 +1245,10 @@ fn a_request_during_a_purge_waits_for_it_and_writes_on_what_it_left() {
         let records = records_of(&h, &case);
         assert!(records.is_empty(), "{}: error records {records:?}", case.id);
         assert_no_write_failures(&h);
-        h.assert_no_message(&reply_queue, SETTLE).await;
+        tokio::join!(
+            h.assert_no_message(&reply_queue, SETTLE),
+            h.assert_delivered_once("CP00", &case.message_id, SETTLE),
+        );
         h.shutdown().await;
     });
 }

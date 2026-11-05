@@ -121,4 +121,20 @@
   body {
     @apply bg-background text-foreground;
     }
+  /* Native scrollbars and form controls follow the active theme. .dark comes
+     second, so it wins over :root at equal specificity. */
+  :root {
+    @apply scheme-light;
+    }
+  .dark {
+    @apply scheme-dark;
+    }
+  /* theme-provider.tsx sets this class on the root element while it swaps the
+     theme class, so no transition replays the old theme's colours. Important,
+     so it outranks the transition utilities. */
+  .theme-switching *,
+  .theme-switching *::before,
+  .theme-switching *::after {
+    @apply transition-none!;
+    }
 }

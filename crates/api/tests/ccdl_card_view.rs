@@ -8,8 +8,12 @@
 //! literals of this file:
 //!
 //! - each `V-COCRDSLC-nnn` row gives the status, the kind, the BMS field and
-//!   the order of its answer, and its message text, which must equal the
-//!   `carddemo_domain::messages` constant the rule returns;
+//!   the order of its answer, and its message text: a literal text must
+//!   equal the `carddemo_domain::messages` constant the rule returns, and the
+//!   read-failure text of V-COCRDSLC-007 is the row's reviewed template,
+//!   expanded through `common::audit_text` with the injected `READ`, the
+//!   `ERROR-FILE` the row names and the E-44 codes, and cut at
+//!   `WS-RETURN-MSG`;
 //! - P-COCRDSLC-010 gives the information line of a found card, which must
 //!   equal its `carddemo_domain::messages` constant too;
 //! - section A of the parity audit gives the `CARD-RECORD` offsets each
@@ -62,6 +66,7 @@ use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, SET_COOKIE};
 use serde_json::{Map, Value};
 
+use common::audit_text::{Operand, Template};
 use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
 
 /// The program whose validation rows this file proves.
@@ -83,7 +88,7 @@ const V006: &str = "V-COCRDSLC-006";
 const V007: &str = "V-COCRDSLC-007";
 
 /// The catalog text each row with a literal message returns; V-COCRDSLC-007
-/// is composed by [`messages::file_error_message`] instead.
+/// is its reviewed template, expanded by [`file_error_text`] instead.
 const CATALOG: [(&str, &str); 6] = [
     (V001, messages::ACCOUNT_NUMBER_NOT_PROVIDED),
     (V002, messages::ACCOUNT_FILTER_IF_SUPPLIED_MUST_BE_11_DIGIT),
@@ -337,11 +342,34 @@ const OPNAME_LABEL: &str = "ERROR-OPNAME";
 /// `LIT-CARDFILENAME` [app/cbl/COCRDSLC.cbl:L768].
 const FILE_LABEL: &str = "ERROR-FILE";
 
+/// `ERROR-OPNAME PIC X(8)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COCRDSLC.cbl:L105].
+const ERROR_OPNAME_WIDTH: usize = 8;
+
+/// `ERROR-FILE PIC X(9)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COCRDSLC.cbl:L109], which receives the 8-byte
+/// `LIT-CARDFILENAME`.
+const ERROR_FILE_WIDTH: usize = 9;
+
+/// The digits of `WS-RESP-CD` and `WS-REAS-CD PIC S9(09) COMP`
+/// [app/cbl/COCRDSLC.cbl:L41] [app/cbl/COCRDSLC.cbl:L43], whose unsigned
+/// display a `MOVE` to an alphanumeric field gives.
+const RESP_DIGITS: usize = 9;
+
+/// `ERROR-RESP PIC X(10)` and `ERROR-RESP2 PIC X(10)` of
+/// `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDSLC.cbl:L114]
+/// [app/cbl/COCRDSLC.cbl:L118].
+const ERROR_RESP_WIDTH: usize = 10;
+
+/// `WS-RETURN-MSG PIC X(75)` [app/cbl/COCRDSLC.cbl:L134], the receiver
+/// `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDSLC.cbl:L102-121] is moved to.
+const RETURN_MSG_WIDTH: usize = 75;
+
 /// The `RESP` E-44 sets for a database failure: `IOERR`.
-const RESP_IOERR: u32 = 17;
+const RESP_IOERR: u64 = 17;
 
 /// The `RESP2` E-44 sets alongside [`RESP_IOERR`].
-const RESP2_IOERR: u32 = 0;
+const RESP2_IOERR: u64 = 0;
 
 /// Hides the card master: the card read then fails with SQLSTATE `42P01`.
 const HIDE_CARDS: &str = "ALTER TABLE cards RENAME TO cards_offline";
@@ -479,7 +507,7 @@ fn answer(doc: &Document, id: &str) -> Answer {
         id: id.to_owned(),
         status,
         code: kind_named(&kind.value, id).code(),
-        message: message(id, cell("Message text")),
+        message: message(doc, id, cell("Message text")),
         field: cell("BMS field").to_owned(),
         order,
     }
@@ -501,19 +529,20 @@ fn kind_named(name: &str, id: &str) -> ErrorKind {
     .unwrap_or_else(|| panic!("{id} names an unknown kind {name:?}"))
 }
 
-/// The message the row `id` answers with, given its `Message text` cell.
+/// The message the row `id` of `doc` answers with, given its `Message text`
+/// cell.
 ///
 /// A literal text must equal its [`CATALOG`] constant byte for byte. The
-/// read-failure text is [`messages::file_error_message`] of the `ERROR-OPNAME`
-/// and `ERROR-FILE` literals the cell's note names, with the RESP and RESP2
-/// E-44 sets for a database failure.
-fn message(id: &str, cell: &str) -> String {
+/// read-failure text is the row's reviewed template, expanded by
+/// [`file_error_text`] with the `ERROR-OPNAME` and `ERROR-FILE` literals the
+/// cell's note names and the RESP and RESP2 E-44 sets for a database failure.
+fn message(doc: &Document, id: &str, cell: &str) -> String {
     if id == V007 {
-        return messages::file_error_message(
+        return file_error_text(
+            doc,
+            id,
             quoted_after(cell, OPNAME_LABEL),
             quoted_after(cell, FILE_LABEL),
-            RESP_IOERR,
-            RESP2_IOERR,
         );
     }
     let (_, catalog) = CATALOG
@@ -527,6 +556,34 @@ fn message(id: &str, cell: &str) -> String {
         "{id}: the catalog text differs from the audited message"
     );
     (*catalog).to_owned()
+}
+
+/// The `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDSLC.cbl:L102-121] the
+/// `WHEN OTHER` branch of `9100-GETCARD-BYACCTCARD` moves to `WS-RETURN-MSG`:
+/// the reviewed template of row `id` of `doc`, its operands bound to the
+/// `ERROR-OPNAME` literal `operation`, the `ERROR-FILE` literal `file` and
+/// the E-44 `RESP` and `RESP2`, each laid out in its picture, and cut at the
+/// 75 bytes of the receiver.
+fn file_error_text(doc: &Document, id: &str, operation: &str, file: &str) -> String {
+    Template::load(doc, id).expand(
+        &[
+            Operand::alphanumeric("ERROR-OPNAME", operation, ERROR_OPNAME_WIDTH),
+            Operand::alphanumeric("ERROR-FILE", file, ERROR_FILE_WIDTH),
+            Operand::unsigned_to_alphanumeric(
+                "ERROR-RESP",
+                RESP_IOERR,
+                RESP_DIGITS,
+                ERROR_RESP_WIDTH,
+            ),
+            Operand::unsigned_to_alphanumeric(
+                "ERROR-RESP2",
+                RESP2_IOERR,
+                RESP_DIGITS,
+                ERROR_RESP_WIDTH,
+            ),
+        ],
+        RETURN_MSG_WIDTH,
+    )
 }
 
 /// The text between the single quotes that follow the last `label` of

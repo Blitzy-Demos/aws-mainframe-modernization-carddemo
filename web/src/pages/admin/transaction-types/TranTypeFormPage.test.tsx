@@ -3,8 +3,9 @@
 //
 // - /admin/transaction-types/new: "Look up" reads the typed code (F-COTRTUP-001),
 //   a code on file opens its edit route and an unknown one enables "Add", the
-//   F5 add and the legend's F6=Add (F-COTRTUP-003, -008, -011); "Cancel" resets
-//   to the key entry (F-COTRTUP-015).
+//   F5 add and the legend's F6=Add (F-COTRTUP-003, -008, -011), with the
+//   COTRTUPC not-found text on the key, as the edit route of an unknown code
+//   does; "Cancel" resets to the key entry (F-COTRTUP-015).
 // - /admin/transaction-types/:code/edit: "Save" is the PUT without `origin`
 //   (F-COTRTUP-002, -009); "Delete" opens the confirmation (F-COTRTUP-006),
 //   whose "Cancel" closes it (F-COTRTUP-012) and whose "Confirm" sends the
@@ -34,7 +35,11 @@ import userEvent, {
   PointerEventsCheckLevel,
 } from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { createMemoryRouter, RouterProvider } from "react-router";
+import {
+  createMemoryRouter,
+  RouterProvider,
+  type InitialEntry,
+} from "react-router";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -260,7 +265,7 @@ afterEach(() => {
 });
 
 /** The page at `path`, with the list route as the target of Back. */
-function renderAt(path: string) {
+function renderAt(path: InitialEntry) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -537,6 +542,232 @@ describe("key entry and add (/admin/transaction-types/new)", () => {
   });
 });
 
+// COTRTUPC TTUP-DETAILS-NOT-FOUND (F-COTRTUP-001, -008): a code no type has
+// opens its add whether the Look up or its edit route reads it, with the
+// read's text on the key (V-COTRTUPC-004) rather than the list's text of the
+// 404 that answered the read. Any other read failure stays on the edit route.
+describe("a code not on file (COTRTUPC key not found)", () => {
+  const EDIT_ROUTE_NEW = `${LIST_ROUTE}/${NEW_CODE}/edit`;
+  const STUB_READ_FAILED = "Stub: read failed";
+
+  /** The API, with the list read answered by `read` instead. */
+  function stubListRead(read: (url: URL) => Response): void {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (request: Request) => {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === LIST_PATH) {
+          sent.push({ method: "GET", url });
+          return read(url);
+        }
+        return serve(request);
+      }),
+    );
+  }
+
+  /** A 200 page of the types on file, none of them the code asked for. */
+  function pageWithoutTheCode(): Response {
+    return answer(
+      { items: stored, next_key: null, prev_key: null } satisfies TranTypePage,
+      200,
+    );
+  }
+
+  it.each([
+    { arrival: "Look up", read: "404", pageWithout: false, action: "POP" },
+    { arrival: "Look up", read: "200", pageWithout: true, action: "POP" },
+    {
+      arrival: "edit route",
+      read: "404",
+      pageWithout: false,
+      action: "REPLACE",
+    },
+    {
+      arrival: "edit route",
+      read: "200",
+      pageWithout: true,
+      action: "REPLACE",
+    },
+  ])(
+    "the $arrival read answered $read opens the add of the key, marked not found",
+    async ({ arrival, pageWithout, action }) => {
+      if (pageWithout) {
+        stubListRead(pageWithoutTheCode);
+      }
+      const { router, user } = renderAt(
+        arrival === "Look up" ? KEY_ENTRY_ROUTE : EDIT_ROUTE_NEW,
+      );
+      if (arrival === "Look up") {
+        await lookUpNewCode(user, NEW_CODE);
+      }
+
+      await screen.findByRole("button", { name: "Add" });
+      const typeCode = inputLabelled("Type code");
+      await waitFor(() => {
+        expect(fieldErrorOf(typeCode)).toBe(
+          TRAN_TYPE_UPSERT_MESSAGES.recordNotFound,
+        );
+      });
+      expect(typeCode.getAttribute("aria-invalid")).toBe("true");
+      expect(typeCode.value).toBe(NEW_CODE);
+      expect(typeCode.readOnly).toBe(true);
+      const description = inputLabelled("Description");
+      expect(description.disabled).toBe(false);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(description);
+      });
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeDefined();
+      expect(screen.queryByRole("button", { name: "Look up" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+      // The edit route is replaced, so Back does not return to it, and the
+      // hand-over is taken off the history entry once applied.
+      await waitFor(() => {
+        expect(router.state.location.pathname).toBe(KEY_ENTRY_ROUTE);
+        expect(router.state.location.state).toBeNull();
+      });
+      expect(router.state.historyAction).toBe(action);
+      // The list's text for the 404 is never shown.
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(screen.queryByText(STUB_NOT_ON_FILE)).toBeNull();
+      expect(sent.map((request) => request.method)).toEqual(["GET"]);
+      expect(sent[0].url.searchParams.get("type_code")).toBe(NEW_CODE);
+    },
+  );
+
+  it.each([
+    { action: "Add", phase: "add" },
+    { action: "Cancel", phase: "key entry" },
+  ])(
+    "$action clears the not-found text, leaving the $phase",
+    async ({ action }) => {
+      const { user } = renderAt(KEY_ENTRY_ROUTE);
+      await lookUpNewCode(user, NEW_CODE);
+      const typeCode = inputLabelled("Type code");
+      await waitFor(() => {
+        expect(fieldErrorOf(typeCode)).toBe(
+          TRAN_TYPE_UPSERT_MESSAGES.recordNotFound,
+        );
+      });
+
+      // The Add re-runs the edits, which refuse the blank description, and
+      // Cancel resets the entry: either way the key is no longer marked.
+      await user.click(screen.getByRole("button", { name: action }));
+
+      await waitFor(() => {
+        expect(typeCode.getAttribute("aria-invalid")).toBe("false");
+      });
+      expect(fieldErrorOf(typeCode)).toBeNull();
+      expect(
+        screen.queryByText(TRAN_TYPE_UPSERT_MESSAGES.recordNotFound),
+      ).toBeNull();
+      expect(writes()).toEqual([]);
+    },
+  );
+
+  it.each<{ handOver: string; entry: InitialEntry }>([
+    { handOver: "the edit route of 00", entry: `${LIST_ROUTE}/00/edit` },
+    {
+      handOver: "a code that is no string",
+      entry: { pathname: KEY_ENTRY_ROUTE, state: { notFoundTypeCode: 8 } },
+    },
+    {
+      handOver: "a code the read would change",
+      entry: { pathname: KEY_ENTRY_ROUTE, state: { notFoundTypeCode: "8" } },
+    },
+    {
+      handOver: "a state of another shape",
+      entry: { pathname: KEY_ENTRY_ROUTE, state: NEW_CODE },
+    },
+  ])(
+    "$handOver opens the empty key entry, as no add can take it",
+    async ({ entry }) => {
+      const { router } = renderAt(entry);
+
+      await screen.findByRole("button", { name: "Look up" });
+      expect(router.state.location.pathname).toBe(KEY_ENTRY_ROUTE);
+      const typeCode = inputLabelled("Type code");
+      expect(typeCode.value).toBe("");
+      expect(typeCode.readOnly).toBe(false);
+      expect(typeCode.getAttribute("aria-invalid")).toBe("false");
+      expect(fieldErrorOf(typeCode)).toBeNull();
+      expect(inputLabelled("Description").disabled).toBe(true);
+      expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(writes()).toEqual([]);
+    },
+  );
+
+  it("a read failing otherwise stays on the edit route and toasts once", async () => {
+    stubListRead(() =>
+      answer(
+        { code: "UNEXPECTED", message: STUB_READ_FAILED } satisfies ErrorBody,
+        500,
+      ),
+    );
+    const { router } = renderAt(EDIT_ROUTE_NEW);
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(STUB_READ_FAILED);
+    });
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(router.state.location.pathname).toBe(EDIT_ROUTE_NEW);
+    expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Look up" })).toBeNull();
+    expect(writes()).toEqual([]);
+  });
+});
+
+// The fields show their state as User Update's do: a read-only key on the
+// muted surface in both themes, the Input's own dark surface giving way, and
+// a disabled description's Field marked so that its label dims with it.
+describe("field cues of each state", () => {
+  it.each([
+    {
+      state: "key entry",
+      path: KEY_ENTRY_ROUTE,
+      keyReadOnly: false,
+      descriptionDisabled: true,
+    },
+    {
+      state: "add",
+      path: KEY_ENTRY_ROUTE,
+      keyReadOnly: true,
+      descriptionDisabled: false,
+    },
+    {
+      state: "edit",
+      path: EDIT_ROUTE_01,
+      keyReadOnly: true,
+      descriptionDisabled: false,
+    },
+  ])(
+    "the $state state shows whether the key is read-only and the description disabled",
+    async ({ state, path, keyReadOnly, descriptionDisabled }) => {
+      const { user } = renderAt(path);
+      if (state === "add") {
+        await lookUpNewCode(user, NEW_CODE);
+      }
+      if (state === "edit") {
+        await waitForPrefill(PURCHASE.description);
+      }
+
+      const typeCode = inputLabelled("Type code");
+      expect(typeCode.readOnly).toBe(keyReadOnly);
+      expect(typeCode.classList.contains("bg-muted")).toBe(keyReadOnly);
+      expect(typeCode.classList.contains("dark:bg-muted")).toBe(keyReadOnly);
+      expect(typeCode.classList.contains("dark:bg-input/30")).toBe(
+        !keyReadOnly,
+      );
+      const description = inputLabelled("Description");
+      expect(description.disabled).toBe(descriptionDisabled);
+      const field = description.closest('[data-slot="field"]');
+      expect(field?.getAttribute("data-disabled")).toBe(
+        String(descriptionDisabled),
+      );
+    },
+  );
+});
+
 describe("update and delete (/admin/transaction-types/:code/edit)", () => {
   it("saves the description with a PUT without origin", async () => {
     const { user } = renderAt(EDIT_ROUTE_01);
@@ -692,8 +923,10 @@ describe("update and delete (/admin/transaction-types/:code/edit)", () => {
 
   // The delete is stored but its answer lost: the toast says the type may
   // have been deleted, and the type read again answers 404, the delete's own
-  // outcome, which is not toasted as an error of the page.
-  it("toasts a DELETE whose answer is lost as possibly done and shows nothing for the 404 read after it", async () => {
+  // outcome, which is not toasted as an error of the page. That read finds
+  // the key not on file, so the key entry opens on its add with COTRTUPC's
+  // not-found text, which shows that the type is gone.
+  it("toasts a DELETE whose answer is lost as possibly done and toasts nothing for the 404 read after it", async () => {
     unanswered = "applied";
     const { router, user, queryClient } = renderAt(EDIT_ROUTE_01);
     await waitForPrefill(PURCHASE.description);
@@ -728,7 +961,15 @@ describe("update and delete (/admin/transaction-types/:code/edit)", () => {
     expect(toast.error).toHaveBeenCalledTimes(1);
     expect(toast.success).not.toHaveBeenCalled();
     expect(writes()).toHaveLength(1);
-    expect(router.state.location.pathname).toBe(EDIT_ROUTE_01);
+    await screen.findByRole("button", { name: "Add" });
+    const typeCode = inputLabelled("Type code");
+    await waitFor(() => {
+      expect(fieldErrorOf(typeCode)).toBe(
+        TRAN_TYPE_UPSERT_MESSAGES.recordNotFound,
+      );
+    });
+    expect(typeCode.value).toBe(PURCHASE.type_code);
+    expect(router.state.location.pathname).toBe(KEY_ENTRY_ROUTE);
   });
 
   it("Cancel leaves for the empty key entry without a request (F12)", async () => {
@@ -742,6 +983,106 @@ describe("update and delete (/admin/transaction-types/:code/edit)", () => {
     expect(inputLabelled("Type code").value).toBe("");
     expect(writes()).toEqual([]);
   });
+});
+
+// A refused confirmed delete (F-COTRTUP-007) keeps the type shown for update:
+// the toast carries the server's text, the field the answer names is marked
+// and takes the cursor (COTRTUPC names TRTYPCD for every delete failure,
+// V-COTRTUPC-025, -027, -028), the route keeps its Save and Delete, and nothing
+// reports success. Delete then asks again, and a confirmed retry deletes.
+describe("refused delete (/admin/transaction-types/:code/edit)", () => {
+  const STUB_DELETE_REFUSED = "Stub: delete refused";
+  const STUB_KEY_REFUSED = "Stub: key refused";
+
+  // A 4xx refuses the delete before anything is stored; a 5xx may follow a
+  // stored delete, so the type is read again (api/queries/transaction-types.ts
+  // mayHaveWritten), and it is still on file.
+  it.each([
+    { row: "V-COTRTUPC-025", status: 404, code: "NOT_FOUND", reread: false },
+    { row: "V-COTRTUPC-027", status: 409, code: "CONFLICT", reread: false },
+    { row: "V-COTRTUPC-028", status: 500, code: "UNEXPECTED", reread: true },
+  ])(
+    "a $status DELETE ($row) marks TRTYPCD and keeps the type for update",
+    async ({ status, code, reread }) => {
+      const field: TranTypeUpsertField = "TRTYPCD";
+      writeFailure = {
+        status,
+        body: {
+          code,
+          message: STUB_DELETE_REFUSED,
+          fields: [{ field, message: STUB_KEY_REFUSED }],
+        } satisfies ErrorBody,
+      };
+      const { router, user } = renderAt(EDIT_ROUTE_01);
+      await waitForPrefill(PURCHASE.description);
+
+      await user.click(screen.getByRole("button", { name: "Delete" }));
+      const asked = await screen.findByRole("alertdialog", {
+        name: "Delete transaction type",
+      });
+      await user.click(within(asked).getByRole("button", { name: "Confirm" }));
+
+      const typeCode = inputLabelled("Type code");
+      await waitFor(() => {
+        expect(fieldErrorOf(typeCode)).toBe(STUB_KEY_REFUSED);
+      });
+      expect(typeCode.getAttribute("aria-invalid")).toBe("true");
+      expect(toast.error).toHaveBeenCalledWith(STUB_DELETE_REFUSED);
+      expect(toast.error).toHaveBeenCalledTimes(1);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(typeCode);
+      });
+      expect(toast.success).not.toHaveBeenCalled();
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      // The type and its edit route stay; the page has not left for the key
+      // entry, and only a 5xx reads the type again.
+      expect(router.state.location.pathname).toBe(EDIT_ROUTE_01);
+      expect(typeCode.value).toBe(PURCHASE.type_code);
+      expect(inputLabelled("Description").value).toBe(PURCHASE.description);
+      expect(screen.getByRole("button", { name: "Save" }).textContent).toBe(
+        "Save",
+      );
+      expect(screen.queryByRole("button", { name: "Look up" })).toBeNull();
+      const [refused] = writes();
+      expect(writes()).toHaveLength(1);
+      expect(refused.method).toBe("DELETE");
+      expect(refused.url.pathname).toBe(`${LIST_PATH}/${PURCHASE.type_code}`);
+      expect(refused.url.searchParams.get("origin")).toBe("form");
+      await waitFor(() => {
+        expect(
+          sent
+            .slice(sent.indexOf(refused) + 1)
+            .map((request) => [
+              request.method,
+              request.url.searchParams.get("type_code"),
+            ]),
+        ).toEqual(reread ? [["GET", PURCHASE.type_code]] : []);
+      });
+      expect(fieldErrorOf(typeCode)).toBe(STUB_KEY_REFUSED);
+
+      // Delete asks again, and the confirmed retry, now accepted, deletes.
+      writeFailure = undefined;
+      const remove = screen.getByRole("button", { name: "Delete" });
+      expect(remove.hasAttribute("disabled")).toBe(false);
+      await user.click(remove);
+      const again = await screen.findByRole("alertdialog", {
+        name: "Delete transaction type",
+      });
+      await user.click(within(again).getByRole("button", { name: "Confirm" }));
+
+      await waitFor(() => {
+        expect(router.state.location.pathname).toBe(KEY_ENTRY_ROUTE);
+      });
+      expect(toast.success).toHaveBeenCalledWith(STUB_DELETED);
+      expect(writes().map((request) => request.method)).toEqual([
+        "DELETE",
+        "DELETE",
+      ]);
+      expect(toast.error).toHaveBeenCalledTimes(1);
+    },
+  );
 });
 
 it.each([KEY_ENTRY_ROUTE, EDIT_ROUTE_01])(

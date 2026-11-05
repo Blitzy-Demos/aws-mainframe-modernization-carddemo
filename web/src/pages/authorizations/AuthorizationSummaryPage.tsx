@@ -28,7 +28,6 @@ import {
   type JSX,
 } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeft, Search } from "lucide-react";
 import { Controller, useForm } from "react-hook-form";
 import { Link, useSearchParams } from "react-router";
 
@@ -39,7 +38,7 @@ import {
 } from "@/api/queries/authorizations";
 import type { components } from "@/api/schema";
 import { DataTable, type DataTableProps } from "@/components/data-table";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -415,9 +414,16 @@ function authorizationColumns(detailSearch: string, idPrefix: string): AuthColum
     },
     {
       id: "view",
-      header: () => <span className="sr-only">Actions</span>,
+      header: "Actions",
+      // BLITZY [LAYOUT]: the link button takes the height of the cell's text
+      // line (overrode the default h-9 px-4), as the row links of the other
+      // data tables do, so a row is as tall as its text and badges rather
+      // than the 36px button.
+      // BLITZY [A11Y]: the link is therefore a 20px-high target, below the
+      // 24px WCAG 2.2 minimum; the cell padding keeps neighbouring targets
+      // apart. Flagged for designer review.
       cell: ({ row }) => (
-        <Button asChild variant="link">
+        <Button asChild variant="link" className="h-auto p-0">
           <Link
             to={{
               pathname: `/authorizations/${encodeURIComponent(row.original.auth_id)}`,
@@ -636,47 +642,40 @@ export default function AuthorizationSummaryPage(): JSX.Element {
     <div className="flex flex-col gap-6">
       <PageHeader
         description="Enter an account ID to view its pending authorizations, newest first."
-        actions={
-          <Button asChild variant="outline">
-            <Link to="/">
-              <ArrowLeft aria-hidden="true" />
-              Back
-            </Link>
-          </Button>
-        }
+        actions={<BackLink to="/" />}
       />
-      <form noValidate onSubmit={handleSubmit(onSubmit)}>
-        <Controller
-          control={control}
-          name="account_id"
-          render={({ field, fieldState }) => (
-            <Field data-invalid={fieldState.invalid}>
-              <FieldLabel htmlFor={ACCOUNT_FIELD_ID}>Account ID</FieldLabel>
-              <div className="flex flex-col gap-2 md:flex-row">
-                {/* The cursor starts on ACCTID: COPAUS0C sends every screen
-                    with MOVE -1 TO ACCTIDL
-                    [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L188, L196]. */}
-                <Input
-                  {...field}
-                  id={ACCOUNT_FIELD_ID}
-                  maxLength={ACCOUNT_ID_LENGTH}
-                  inputMode="numeric"
-                  autoComplete="off"
-                  autoFocus
-                  aria-invalid={fieldState.invalid}
-                  aria-describedby={fieldState.invalid ? ACCOUNT_ERROR_ID : undefined}
-                  className="md:max-w-xs"
-                />
-                <Button type="submit">
-                  <Search aria-hidden="true" />
-                  Search
-                </Button>
-              </div>
-              <FieldError id={ACCOUNT_ERROR_ID} errors={[fieldState.error]} />
-            </Field>
-          )}
-        />
-      </form>
+      <Card>
+        <CardContent>
+          <form noValidate onSubmit={handleSubmit(onSubmit)}>
+            <Controller
+              control={control}
+              name="account_id"
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid} className="max-w-md">
+                  <FieldLabel htmlFor={ACCOUNT_FIELD_ID}>Account ID</FieldLabel>
+                  <div className="flex gap-2">
+                    {/* The cursor starts on ACCTID: COPAUS0C sends every screen
+                        with MOVE -1 TO ACCTIDL
+                        [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L188, L196]. */}
+                    <Input
+                      {...field}
+                      id={ACCOUNT_FIELD_ID}
+                      maxLength={ACCOUNT_ID_LENGTH}
+                      inputMode="numeric"
+                      autoComplete="off"
+                      autoFocus
+                      aria-invalid={fieldState.invalid}
+                      aria-describedby={fieldState.invalid ? ACCOUNT_ERROR_ID : undefined}
+                    />
+                    <Button type="submit">Search</Button>
+                  </div>
+                  <FieldError id={ACCOUNT_ERROR_ID} errors={[fieldState.error]} />
+                </Field>
+              )}
+            />
+          </form>
+        </CardContent>
+      </Card>
       {searchable ? (
         <AuthorizationResults
           key={accountParam}

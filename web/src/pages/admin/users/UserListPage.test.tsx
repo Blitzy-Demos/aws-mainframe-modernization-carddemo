@@ -25,6 +25,7 @@ import {
   describe,
   expect,
   it,
+  onTestFinished,
   vi,
   type MockInstance,
 } from "vitest";
@@ -33,6 +34,13 @@ import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
+import {
+  clearSession,
+  getSession,
+  setSession,
+  type Session,
+} from "@/lib/session";
+import { RequireAuth } from "@/routes/guards";
 
 import UserListPage from "./UserListPage";
 
@@ -99,6 +107,10 @@ const TOP_PAGE = {
   message: TOP_OF_PAGE,
 } satisfies UserPage;
 
+// V-COUSR00C-005: a forward page that reaches the end of the user file shows
+// its rows with this text.
+const BOTTOM_OF_PAGE = "You have reached the bottom of the page...";
+
 // Users `.` and `..`: COUSR01C stores any non-blank ID, and a URL drops
 // these two as dot segments, so their links and requests carry the key
 // segments `~.` and `~..` (lib/key-segment.ts).
@@ -142,6 +154,17 @@ const DELETED = {
   message: "User USER0001 has been deleted ...".padEnd(80, " "),
   user: USER0001,
 } satisfies UserMessageResponse;
+
+// ADMIN001 signed on for the next hour, as LoginPage stores the login answer.
+function admin001Session(): Session {
+  return {
+    token: "admin001-token",
+    user_id: ADMIN001.user_id,
+    usr_type: ADMIN001.usr_type,
+    landing: "/admin",
+    expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+  };
+}
 
 const USRIDIN: UserListField = "USRIDIN";
 
@@ -265,6 +288,36 @@ function listQueries(): URLSearchParams[] {
   return sentTo("GET", LIST_PATH).map(
     (request) => new URL(request.url).searchParams,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Toasts
+// ---------------------------------------------------------------------------
+
+// A page's text is raised through sonner's `toast()` itself, which a spy
+// cannot wrap, and a Toaster mounted again shows the toasts an earlier one
+// left open, so the screen cannot tell a new toast from an old one. Toasts are
+// therefore counted in toast.getHistory(), sonner's record of each toast
+// raised, against the ids it held before.
+type ToastId = ReturnType<typeof toast>;
+
+function raisedToastIds(): Set<ToastId> {
+  return new Set(toast.getHistory().map((raised) => raised.id));
+}
+
+// The title of each toast raised since `before` was taken, in order.
+function toastsRaisedSince(before: Set<ToastId>): unknown[] {
+  return toast
+    .getHistory()
+    .filter((raised) => !before.has(raised.id))
+    .map((raised) => ("title" in raised ? raised.title : undefined));
+}
+
+// The rendered toasts whose text includes `message`.
+function toastsShowing(message: string): HTMLElement[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>("[data-sonner-toast]"),
+  ).filter((element) => element.textContent?.includes(message) === true);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,12 +503,138 @@ describe("UserListPage CU00 browse", () => {
       expect(listQueries()).toHaveLength(2);
     },
   );
+
+  // A page read before comes back from the cache while it is read again: on
+  // a return to the list, which mounts the page again over the same cache, and
+  // on a Next onto a page already read. The copy shown meanwhile carries the
+  // text its earlier read found, which does not answer this browse, so nothing
+  // is toasted while the read is out. The read's own answer is then toasted
+  // once when it carries a text, and not at all when a user added since
+  // means the page no longer ends the file. Every visit mounts under
+  // StrictMode, as main.tsx mounts the app, so a toast a mount effect repeats
+  // counts twice.
+  it.each([
+    { reread: "a return to the list", fresh: "no text" },
+    { reread: "a return to the list", fresh: "the boundary text" },
+    { reread: "a Next onto a page read before", fresh: "no text" },
+    { reread: "a Next onto a page read before", fresh: "the boundary text" },
+  ] as const)(
+    "$reread toasts only its own answer, which carries $fresh",
+    async ({ reread, fresh }) => {
+      const returning = reread === "a return to the list";
+      // The page the browse comes back to, and the request that reads it.
+      const pageRequest = returning
+        ? `GET ${LIST_PATH}`
+        : `GET ${LIST_PATH}?direction=forward&start_key=${USER0003.user_id}`;
+      const rows = returning ? FIRST_PAGE.items : USER0003_PAGE.items;
+      const prevKey = returning ? FIRST_PAGE.prev_key : USER0003_PAGE.prev_key;
+      // The page as the earlier read found it: the end of the file.
+      const endOfFile = {
+        items: rows,
+        next_key: null,
+        prev_key: prevKey,
+        message: BOTTOM_OF_PAGE,
+      } satisfies UserPage;
+      // The page read again after a user was added behind it: more users
+      // follow, so it carries no text.
+      const runsOn = {
+        items: rows,
+        next_key: "USER0004",
+        prev_key: prevKey,
+      } satisfies UserPage;
+      const freshPage = fresh === "no text" ? runsOn : endOfFile;
+
+      // PF7 from the page from USER0003 reads the first page, whose next key
+      // leads back to it.
+      answer(
+        `GET ${LIST_PATH}?direction=backward&start_key=${USER0003.user_id}`,
+        200,
+        FIRST_PAGE,
+      );
+      answer(pageRequest, 200, endOfFile);
+      toast.dismiss();
+      const beforeVisit = raisedToastIds();
+      queryClient = newQueryClient();
+      const { user } = mountPage(queryClient, true);
+      await firstPageShown();
+      if (!returning) {
+        await user.click(screen.getByRole("button", { name: "Next" }));
+        await within(usersTable()).findByText(USER0003.user_id);
+      }
+      // The earlier read answered its browse, and its text was toasted once.
+      await waitFor(() => {
+        expect(toastsRaisedSince(beforeVisit)).toEqual([BOTTOM_OF_PAGE]);
+      });
+      if (!returning) {
+        await user.click(screen.getByRole("button", { name: "Previous" }));
+        await within(usersTable()).findByText(ADMIN001.user_id);
+        await waitFor(() => {
+          expect(queryClient.isFetching()).toBe(0);
+        });
+      }
+
+      const readsBefore = listQueries().length;
+      toast.dismiss();
+      const beforeReread = raisedToastIds();
+      answer(pageRequest, 200, freshPage);
+      const released = deferred<undefined>();
+      hold = released.promise;
+      if (returning) {
+        cleanup();
+        mountPage(queryClient, true);
+      } else {
+        await user.click(screen.getByRole("button", { name: "Next" }));
+      }
+
+      // While the read is out, the cache's copy is on screen, untoasted.
+      await waitFor(() => {
+        expect(listQueries().length).toBeGreaterThan(readsBefore);
+      });
+      for (const shown of rows) {
+        expect(
+          within(usersTable()).getByText(shown.user_id).textContent,
+        ).toBe(shown.user_id);
+      }
+      expect(toastsRaisedSince(beforeReread)).toEqual([]);
+
+      hold = null;
+      released.resolve(undefined);
+
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      // The answer is on screen once Next follows its next key.
+      await waitFor(() => {
+        expect(
+          screen
+            .getByRole("button", { name: "Next" })
+            .getAttribute("aria-disabled"),
+        ).toBe(freshPage.next_key === null ? "true" : null);
+      });
+      if (fresh === "no text") {
+        expect(toastsRaisedSince(beforeReread)).toEqual([]);
+      } else {
+        await waitFor(() => {
+          expect(toastsRaisedSince(beforeReread)).toEqual([BOTTOM_OF_PAGE]);
+        });
+        await waitFor(() => {
+          expect(toastsShowing(BOTTOM_OF_PAGE)).not.toEqual([]);
+        });
+      }
+    },
+  );
 });
 
 describe("UserListPage CU03 delete", () => {
   // F-COUSR00-006 and F-COUSR03-001 read the row's user into the dialog;
-  // F-COUSR03-004 (PF5) deletes it.
+  // F-COUSR03-004 (PF5) deletes it. The signed-on admin deletes another
+  // user, so their session stays.
   it("Delete reads the row's user into the dialog and Confirm deletes it", async () => {
+    const signedOn = admin001Session();
+    setSession(signedOn);
+    onTestFinished(() => {
+      clearSession();
+    });
     const { user } = renderPage();
     await firstPageShown();
 
@@ -510,6 +689,7 @@ describe("UserListPage CU03 delete", () => {
     });
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(toastError).not.toHaveBeenCalled();
+    expect(getSession()).toEqual(signedOn);
   });
 
   // F-COUSR03-002, F-COUSR03-003 and F-COUSR03-005: PF3, PF4 and PF12 are
@@ -535,6 +715,283 @@ describe("UserListPage CU03 delete", () => {
     expect(sentTo("DELETE", `${LIST_PATH}/USER0001`)).toEqual([]);
     expect(toastSuccess).not.toHaveBeenCalled();
   });
+
+  // P-COUSR03C-005 for an admin who deletes their own account. The DELETE
+  // answers 200 with the COUSR03C text; the session's token then names no
+  // stored user, so the server refuses every later request of it 401
+  // 'Authentication required'. The page ends the session as it shows the
+  // text, without a cause, so RequireAuth replaces the page with the sign-on
+  // route and the delete's text is the only toast: the list re-read already
+  // sent with the ended session's token is refused 401 and adds none.
+  it("Confirm on the signed-on admin's own row shows the deleted text alone and ends the session", async () => {
+    const signedOn = admin001Session();
+    const selfDeleted = {
+      message: `User ${ADMIN001.user_id} has been deleted ...`.padEnd(80, " "),
+      user: ADMIN001,
+    } satisfies UserMessageResponse;
+    const authenticationRequired = {
+      code: "UNAUTHENTICATED",
+      message: "Authentication required",
+    } satisfies ErrorBody;
+    answer(`GET ${LIST_PATH}/${ADMIN001.user_id}`, 200, ADMIN001);
+    answer(`DELETE ${LIST_PATH}/${ADMIN001.user_id}`, 200, selfDeleted);
+    setSession(signedOn);
+    onTestFinished(() => {
+      clearSession();
+    });
+
+    // The page as App.tsx guards it, so the end of the session unmounts it.
+    queryClient = newQueryClient();
+    const router = createMemoryRouter(
+      [
+        { path: "/login", element: <p>Sign on</p> },
+        {
+          element: <RequireAuth />,
+          children: [
+            {
+              path: "/admin/users",
+              element: <UserListPage />,
+              handle: {
+                crumb: "Users",
+                title: "List Users",
+              } satisfies RouteHandle,
+            },
+          ],
+        },
+      ],
+      { initialEntries: ["/admin/users"] },
+    );
+    render(
+      <ThemeProvider>
+        <QueryClientProvider client={queryClient}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>
+        <Toaster />
+      </ThemeProvider>,
+    );
+    const user = userEvent.setup();
+    await firstPageShown();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Delete",
+        description: ADMIN001.user_id,
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Delete User",
+    });
+    answer(`GET ${LIST_PATH}`, 401, authenticationRequired);
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+    expect((await screen.findByText("Sign on")).textContent).toBe("Sign on");
+    await waitFor(() => {
+      expect(queryClient.isMutating()).toBe(0);
+    });
+    // The re-read the delete started has been sent with the token of the
+    // session it outlived, and answered.
+    await waitFor(() => {
+      expect(sentTo("GET", LIST_PATH)).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.settledResults.every(
+          (settled) => settled.type === "fulfilled",
+        ),
+      ).toBe(true);
+    });
+    expect(sentTo("GET", LIST_PATH)[1]?.headers.get("Authorization")).toBe(
+      `Bearer ${signedOn.token}`,
+    );
+    expect(sentTo("DELETE", `${LIST_PATH}/${ADMIN001.user_id}`)).toHaveLength(
+      1,
+    );
+    expect(getSession()).toBeNull();
+    expect(toastSuccess.mock.calls).toEqual([[selfDeleted.message]]);
+    expect(toastError).not.toHaveBeenCalled();
+    // The text stays on screen over the sign-on route.
+    expect(toastsShowing(selfDeleted.message.trim())).not.toEqual([]);
+    expect(toastsShowing(authenticationRequired.message)).toEqual([]);
+  });
+});
+
+// A refused CU03 read or delete is reported and leaves the list as it was: the
+// toast carries the audited text, no dialog opens or stays open, the row stays
+// listed on this route, nothing reports success, and the row's Delete reads
+// and deletes again. The page renders no COUSR03 key field (E-58), so the
+// fields an error names mark nothing, the search field's USRIDIN included.
+describe("UserListPage CU03 delete failures", () => {
+  function deleteOfUser0001(): HTMLElement {
+    return screen.getByRole("button", {
+      name: "Delete",
+      description: USER0001.user_id,
+    });
+  }
+
+  // Still this route's list, with USER0001 listed and USRIDIN unmarked.
+  function listKept(): void {
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+      "List Users",
+    );
+    expect(screen.queryByText("Update User")).toBeNull();
+    expect(screen.queryByText("Admin menu")).toBeNull();
+    expect(within(usersTable()).getByText(USER0001.user_id).textContent).toBe(
+      USER0001.user_id,
+    );
+    expect(startKeyInput().getAttribute("aria-invalid")).toBe("false");
+    expect(fieldError(startKeyInput())).toBeNull();
+  }
+
+  // The read the row's Delete makes, READ-USER-SEC-FILE, fails.
+  it.each([
+    {
+      row: "V-COUSR03C-002",
+      status: 404,
+      body: {
+        code: "NOT_FOUND",
+        message: "User ID NOT found...",
+        fields: [
+          {
+            field: "USRIDIN" satisfies Schemas["UserUpdateField"],
+            message: "User ID NOT found...",
+          },
+        ],
+      } satisfies ErrorBody,
+    },
+    {
+      row: "V-COUSR03C-003",
+      status: 500,
+      body: {
+        code: "UNEXPECTED",
+        message: "Unable to lookup User...",
+        fields: [
+          {
+            field: "FNAME" satisfies Schemas["UserUpdateField"],
+            message: "Unable to lookup User...",
+          },
+        ],
+      } satisfies ErrorBody,
+    },
+  ])(
+    "a $status read ($row) toasts its text and opens no dialog; Delete reads again",
+    async ({ status, body }) => {
+      answer(`GET ${LIST_PATH}/USER0001`, status, body);
+      const { user } = renderPage();
+      await firstPageShown();
+
+      await user.click(deleteOfUser0001());
+
+      await waitFor(() => {
+        expect(toastError).toHaveBeenCalledWith(body.message);
+      });
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(sentTo("GET", `${LIST_PATH}/USER0001`)).toHaveLength(1);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(sentTo("DELETE", `${LIST_PATH}/USER0001`)).toEqual([]);
+      expect(toastSuccess).not.toHaveBeenCalled();
+      listKept();
+
+      // The next read is answered: the row's Delete reads the user again and
+      // opens the dialog, whose Cancel still deletes nothing.
+      answer(`GET ${LIST_PATH}/USER0001`, 200, USER0001);
+      await user.click(deleteOfUser0001());
+
+      const dialog = await screen.findByRole("alertdialog", {
+        name: "Delete User",
+      });
+      expect(sentTo("GET", `${LIST_PATH}/USER0001`)).toHaveLength(2);
+      expect(within(dialog).getByText(USER0001.first_name).textContent).toBe(
+        USER0001.first_name,
+      );
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      expect(sentTo("DELETE", `${LIST_PATH}/USER0001`)).toEqual([]);
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(toastSuccess).not.toHaveBeenCalled();
+    },
+  );
+
+  // The read found the user, and the delete Confirm sends,
+  // DELETE-USER-SEC-FILE, fails.
+  it.each([
+    {
+      row: "V-COUSR03C-006",
+      status: 404,
+      body: {
+        code: "NOT_FOUND",
+        message: "User ID NOT found...",
+        fields: [
+          {
+            field: "USRIDIN" satisfies Schemas["UserDeleteField"],
+            message: "User ID NOT found...",
+          },
+        ],
+      } satisfies ErrorBody,
+    },
+    {
+      row: "V-COUSR03C-007",
+      status: 500,
+      body: {
+        code: "UNEXPECTED",
+        message: "Unable to Update User...",
+        fields: [
+          {
+            field: "FNAME" satisfies Schemas["UserDeleteField"],
+            message: "Unable to Update User...",
+          },
+        ],
+      } satisfies ErrorBody,
+    },
+  ])(
+    "a $status delete ($row) toasts its text and keeps the row; Confirm deletes again",
+    async ({ status, body }) => {
+      answer(`DELETE ${LIST_PATH}/USER0001`, status, body);
+      const { user } = renderPage();
+      await firstPageShown();
+
+      await user.click(deleteOfUser0001());
+      const dialog = await screen.findByRole("alertdialog", {
+        name: "Delete User",
+      });
+      await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+      await waitFor(() => {
+        expect(toastError).toHaveBeenCalledWith(body.message);
+      });
+      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(sentTo("DELETE", `${LIST_PATH}/USER0001`)).toHaveLength(1);
+      expect(toastSuccess).not.toHaveBeenCalled();
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      // Only a delete that succeeded reads the list again.
+      expect(listQueries()).toHaveLength(1);
+      listKept();
+
+      // The next delete is accepted: the row's Delete reads the user again,
+      // and Confirm deletes it.
+      answer(`DELETE ${LIST_PATH}/USER0001`, 200, DELETED);
+      answer(`GET ${LIST_PATH}`, 200, AFTER_DELETE_PAGE);
+      await user.click(deleteOfUser0001());
+      const again = await screen.findByRole("alertdialog", {
+        name: "Delete User",
+      });
+      expect(sentTo("GET", `${LIST_PATH}/USER0001`)).toHaveLength(2);
+      await user.click(within(again).getByRole("button", { name: "Confirm" }));
+
+      await waitFor(() => {
+        expect(toastSuccess).toHaveBeenCalledWith(DELETED.message);
+      });
+      expect(toastSuccess).toHaveBeenCalledTimes(1);
+      expect(sentTo("DELETE", `${LIST_PATH}/USER0001`)).toHaveLength(2);
+      await waitFor(() => {
+        expect(within(usersTable()).queryByText(USER0001.user_id)).toBeNull();
+      });
+      expect(toastError).toHaveBeenCalledTimes(1);
+    },
+  );
 });
 
 // A user ID that is a dot segment keeps its own edit route and its own

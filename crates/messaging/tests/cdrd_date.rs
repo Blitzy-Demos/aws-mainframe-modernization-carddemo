@@ -19,8 +19,11 @@
 //! - `P-CODATE01-013`, `P-CODATE01-014`, `P-CODATE01-020`, `P-CODATE01-021`:
 //!   the 1000-byte reply, its labels, date and time formats and positions, and
 //!   its identifier echo to the fixed reply queue;
-//! - `P-CODATE01-024`: each request is settled once, after its reply is
-//!   confirmed;
+//! - `P-CODATE01-024`: each request is settled once, as the harness's AMQP
+//!   tap sees it on the consumers' connection: a replied request by one
+//!   `basic.ack` after its reply's confirm reached the consumer, a request
+//!   without a reply by one `basic.reject` without requeue after its error
+//!   record's confirm, and neither is delivered again;
 //! - `P-CODATE01-001` to `P-CODATE01-009` and `P-CODATE01-016`: the
 //!   `MQ-ERR-DISPLAY` layout and its 1000-byte buffer, for the get-failure
 //!   record.
@@ -40,6 +43,7 @@ use std::time::Duration;
 use carddemo_messaging::error_queue::ERROR_QUEUE;
 use carddemo_messaging::flows::cdrd::REPLY_QUEUE;
 use carddemo_testkit::block_on;
+use common::amqp_tap::Outcome;
 use common::{Harness, audit_row, audit_texts};
 use lapin::message::Delivery;
 use lapin::types::ShortString;
@@ -561,9 +565,11 @@ async fn assert_settled(
 /// `P-CODATE01-024`.
 ///
 /// Asserts, once the absence checks have waited, that the request
-/// `message_id` was settled exactly once, so it was neither redelivered nor
-/// requeued (single delivery), and that no captured line holds an outcome
-/// other than `outcome`.
+/// `message_id` has exactly one message span, so the consumer handled it
+/// once, and that no captured line holds an outcome other than `outcome`.
+/// How it was settled, and that it was never delivered again, is what the
+/// tap's journal shows ([`Harness::assert_acked_after_confirm`],
+/// [`Harness::assert_rejected`], [`Harness::assert_delivered_once`]).
 fn assert_settled_once(h: &Harness, message_id: &str, outcome: &str) {
     let id = attribute("message_id", message_id);
     let lines = h.logs();
@@ -575,7 +581,7 @@ fn assert_settled_once(h: &Harness, message_id: &str, outcome: &str) {
                 .all(|needle| line.contains(needle))
         })
         .count();
-    assert_eq!(spans, 1, "{message_id} was settled {spans} time(s)");
+    assert_eq!(spans, 1, "{message_id} was handled {spans} time(s)");
     for other in OUTCOMES.into_iter().filter(|&other| other != outcome) {
         let other = attribute("outcome", other);
         assert!(
@@ -628,7 +634,8 @@ async fn assert_rejection_logged(h: &Harness, message_id: &str, display: &[u8], 
 /// reply echoes the request's IDs, is persistent and does not expire. The
 /// `reply_to` queue stays empty, because `CODATE01` never reads the saved
 /// `REPLYTOQ`, and so does the error queue. The request leaves its queue and
-/// is settled once, as replied, after its reply is confirmed.
+/// is settled once, by a `basic.ack` after its reply's confirm, and is never
+/// delivered again.
 #[test]
 fn cdrd_reply_has_audited_format_with_system_clock() {
     block_on(async {
@@ -650,8 +657,13 @@ fn cdrd_reply_has_audited_format_with_system_clock() {
         assert_reply_properties(&reply, MESSAGE_ID_A, CORRELATION_ID_A);
         assert_audit_says("P-CODATE01-014", "(the request reply-to is not used)");
         assert_settled(&h, MESSAGE_ID_A, CORRELATION_ID_A, "replied", "none").await;
+        h.assert_acked_after_confirm("CDRD", MESSAGE_ID_A, REPLY_QUEUE)
+            .await;
         h.assert_no_message(&decoy, ABSENCE_WAIT).await;
-        h.assert_no_message(ERROR_QUEUE, ABSENCE_WAIT).await;
+        tokio::join!(
+            h.assert_no_message(ERROR_QUEUE, ABSENCE_WAIT),
+            h.assert_delivered_once("CDRD", MESSAGE_ID_A, ABSENCE_WAIT),
+        );
         assert_eq!(
             h.queue_depth(request_queue).await,
             0,
@@ -669,8 +681,8 @@ fn cdrd_reply_has_audited_format_with_system_clock() {
 /// whole get buffer, whose content `CODATE01` never reads, gets exactly
 /// `SYSTEM DATE : 07-01-2022SYSTEM TIME : 12:00:00` followed by 954 spaces,
 /// built from the audited labels and lengths, with the request's IDs echoed.
-/// Nothing reaches the error queue, and the request is settled once, as
-/// replied.
+/// Nothing reaches the error queue, and the request is settled once, by a
+/// `basic.ack` after its reply's confirm, and is never delivered again.
 #[test]
 fn cdrd_reply_uses_pinned_clock() {
     block_on(async {
@@ -691,7 +703,12 @@ fn cdrd_reply_uses_pinned_clock() {
         );
         assert_reply_properties(&reply, MESSAGE_ID_B, CORRELATION_ID_B);
         assert_settled(&h, MESSAGE_ID_B, CORRELATION_ID_B, "replied", "none").await;
-        h.assert_no_message(ERROR_QUEUE, ABSENCE_WAIT).await;
+        h.assert_acked_after_confirm("CDRD", MESSAGE_ID_B, REPLY_QUEUE)
+            .await;
+        tokio::join!(
+            h.assert_no_message(ERROR_QUEUE, ABSENCE_WAIT),
+            h.assert_delivered_once("CDRD", MESSAGE_ID_B, ABSENCE_WAIT),
+        );
         assert_eq!(
             h.queue_depth(request_queue).await,
             0,
@@ -709,9 +726,10 @@ fn cdrd_reply_uses_pinned_clock() {
 /// [CODATE01.cbl:L291-335]: no reply is put, and the `MQ-ERR-DISPLAY` record
 /// with return message `INP MQGET ERR:` and the request queue's name, in its
 /// 1000-byte buffer, goes to the error queue, once. The request is rejected
-/// without requeue, because no path requeues (AAP 0.3.3), so it leaves its
-/// queue and is settled once, with the record published. The rejection is an
-/// `ERROR` event that holds the record's `MQ-ERR-DISPLAY`, not the body.
+/// without requeue, because no path requeues (AAP 0.3.3): its only publish is
+/// the record, confirmed, then one `basic.reject` settles it, and it is never
+/// delivered again. The rejection is an `ERROR` event that holds the record's
+/// `MQ-ERR-DISPLAY`, not the body.
 #[test]
 fn cdrd_oversize_request_gets_get_failure_record_and_no_reply() {
     block_on(async {
@@ -725,10 +743,15 @@ fn cdrd_oversize_request_gets_get_failure_record_and_no_reply() {
         let record = h.next_message(ERROR_QUEUE, REPLY_WAIT).await;
         layout.assert_get_failure(&record.data, request_queue);
         assert_settled(&h, MESSAGE_ID_C, CORRELATION_ID_C, "rejected", "published").await;
+        h.assert_rejected("CDRD", MESSAGE_ID_C, &[(ERROR_QUEUE, Outcome::Confirmed)])
+            .await;
         let display = &record.data[..layout.queue_name.end];
         assert_rejection_logged(&h, MESSAGE_ID_C, display, &body).await;
         h.assert_no_message(REPLY_QUEUE, ABSENCE_WAIT).await;
-        h.assert_no_message(ERROR_QUEUE, ABSENCE_WAIT).await;
+        tokio::join!(
+            h.assert_no_message(ERROR_QUEUE, ABSENCE_WAIT),
+            h.assert_delivered_once("CDRD", MESSAGE_ID_C, ABSENCE_WAIT),
+        );
         assert_eq!(
             h.queue_depth(request_queue).await,
             0,

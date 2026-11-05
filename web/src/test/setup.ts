@@ -6,6 +6,7 @@
 // installed only when jsdom lacks the API, so a jsdom release that adds one
 // keeps its own implementation.
 import { cleanup } from "@testing-library/react";
+import { toast } from "sonner";
 import { afterEach } from "vitest";
 
 // sessionStorage holds the signed-on session (lib/session.ts) and the theme
@@ -13,8 +14,14 @@ import { afterEach } from "vitest";
 // persistent stores are deliberately left alone: the no-persistent-preferences
 // test asserts they stay empty, and wiping them here would hide a leak from an
 // earlier test in the same file.
+//
+// Sonner keeps its toasts in module state, and an unmounted Toaster's timers
+// never retire them, so the Toaster the next test mounts would replay them and
+// that test could find an earlier test's toast. Dismissing them all once
+// cleanup() has unmounted every Toaster leaves no subscriber to update.
 afterEach(() => {
   cleanup();
+  toast.dismiss();
   sessionStorage.clear();
 });
 

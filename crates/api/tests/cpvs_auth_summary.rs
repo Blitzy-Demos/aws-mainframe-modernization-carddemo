@@ -8,12 +8,15 @@
 //! inserted out of key order, so a page that follows the `PAUT9CTS` key cannot be the
 //! identity order by accident.
 //!
-//! Expected texts come from `carddemo_domain::messages`, the `STRING`-built ones through its
-//! composers, with the `RESP`, `RESP2` and IMS status values E-44 sets. Each error's status
-//! and BMS field are read from its `COPAUS0C` row of the validation audit, and each literal
-//! text is checked against the row's quoted text. A test cites every audit row it proves as
-//! a string literal; [`every_copaus0c_audit_row_is_exercised_here`] holds both tables of
-//! cited rows to the audits and to their passing reviews.
+//! A literal text is the `carddemo_domain::messages` constant, held to its row's quoted
+//! text. A `STRING`-built text is the row's reviewed template expanded by
+//! `common::audit_text` into the 80 bytes of `WS-MESSAGE`, with the key the test injected
+//! and the `RESP`, `RESP2` and IMS status values E-44 sets, never by the catalog's
+//! composers; the catalog constants of its literal runs are held to the template's runs.
+//! Each error's status and BMS field are read from its `COPAUS0C` row of the validation
+//! audit, and the whole text is compared byte for byte. A test cites every audit row it
+//! proves as a string literal; [`every_copaus0c_audit_row_is_exercised_here`] holds both
+//! tables of cited rows to the audits and to their passing reviews.
 //!
 //! Docker must be running for the three tests that start a [`TestApp`].
 
@@ -29,10 +32,11 @@ use carddemo_api::error::ApiQuery;
 use carddemo_api::handlers::authorizations::list_authorizations;
 use carddemo_audit::{Document, IdKind, code_span, ids_with_prefix};
 use carddemo_domain::error::ErrorKind;
-use carddemo_domain::messages::{self, AuthLookupFailure};
+use carddemo_domain::messages;
 use carddemo_persistence::Db;
 use carddemo_runtime::config::Settings;
 use carddemo_testkit::block_on;
+use common::audit_text::{Operand, Template};
 use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -72,13 +76,18 @@ const XREF_WITHOUT_CUSTOMER: &str = "99999999997";
 const MISSING_CUSTOMER: &str = "999999997";
 
 /// The `RESP` and `RESP2` of a `READ` that ends `NOTFND` (E-44).
-const RESP_NOTFND: (u32, u32) = (13, 80);
+const RESP_NOTFND: (u64, u64) = (13, 80);
 
 /// The `RESP` (`IOERR`) and `RESP2` E-44 sets for any other database failure.
-const RESP_IOERR: (u32, u32) = (17, 0);
+const RESP_IOERR: (u64, u64) = (17, 0);
 
 /// The IMS status E-44 sets for any failed authorization-store access.
 const IMS_STATUS_OTHER: &str = "AO";
+
+/// `WS-MESSAGE PIC X(80)`, the field every `COPAUS0C` text is built or moved into
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L37], and so the width an expected
+/// text is cut at.
+const WS_MESSAGE: usize = 80;
 
 /// `PA-AUTH-RESP-CODE` of an approved authorization, which `POPULATE-AUTH-LIST` lists as
 /// [`APPROVED_FLAG`], every other code as [`DECLINED_FLAG`]
@@ -376,7 +385,22 @@ struct Fault {
     /// Whether the request continues from a key (PF7), whose first DL/I call repositions.
     keyed: bool,
     /// The text the answer carries.
-    message: String,
+    text: Text,
+}
+
+/// The text an error answer of a validation row carries, as [`assert_row_error`] builds the
+/// expected bytes from it.
+enum Text {
+    /// A literal row: the catalog constant, which must be the row's quoted text.
+    Literal(&'static str),
+    /// A `STRING`-built row: the catalog constants of the template's literal runs, in order,
+    /// and the bytes the injected failure leaves in each field the template writes.
+    Built {
+        /// The catalog constants the template's literal runs must equal.
+        literals: Vec<&'static str>,
+        /// The operands the template is expanded with.
+        operands: Vec<Operand>,
+    },
 }
 
 #[test]
@@ -580,7 +604,7 @@ async fn key_edits(app: &TestApp, token: &str, validation: &Document, parity: &D
             validation,
             "V-COPAUS0C-001",
             ErrorKind::Empty,
-            messages::PLEASE_ENTER_ACCT_ID,
+            &Text::Literal(messages::PLEASE_ENTER_ACCT_ID),
         );
     }
     for entered in ["ABC", "0000000000A", "123", "000000000012"] {
@@ -590,7 +614,7 @@ async fn key_edits(app: &TestApp, token: &str, validation: &Document, parity: &D
             validation,
             "V-COPAUS0C-002",
             ErrorKind::Invalid,
-            messages::ACCT_ID_MUST_BE_NUMERIC,
+            &Text::Literal(messages::ACCT_ID_MUST_BE_NUMERIC),
         );
     }
 }
@@ -604,26 +628,46 @@ async fn failed_lookups(app: &TestApp, token: &str, validation: &Document, parit
         (
             "V-COPAUS0C-004",
             UNKNOWN_ACCOUNT,
-            AuthLookupFailure::XrefNotFound,
-            UNKNOWN_ACCOUNT,
+            lookup(
+                [
+                    messages::ACCOUNT_LABEL,
+                    messages::NOT_FOUND_IN_XREF_FILE_RESP,
+                    messages::REAS,
+                ],
+                entered_account(UNKNOWN_ACCOUNT),
+                RESP_NOTFND,
+            ),
         ),
         (
             "V-COPAUS0C-006",
             XREF_WITHOUT_ACCOUNT,
-            AuthLookupFailure::AccountNotFound,
-            XREF_WITHOUT_ACCOUNT,
+            lookup(
+                [
+                    messages::ACCOUNT_LABEL,
+                    messages::NOT_FOUND_IN_ACCT_FILE_RESP,
+                    messages::REAS,
+                ],
+                key_account(XREF_WITHOUT_ACCOUNT),
+                RESP_NOTFND,
+            ),
         ),
         (
             "V-COPAUS0C-008",
             XREF_WITHOUT_CUSTOMER,
-            AuthLookupFailure::CustomerNotFound,
-            MISSING_CUSTOMER,
+            lookup(
+                [
+                    messages::CUSTOMER_LABEL,
+                    messages::NOT_FOUND_IN_CUST_FILE_RESP,
+                    messages::REAS,
+                ],
+                key_customer(MISSING_CUSTOMER),
+                RESP_NOTFND,
+            ),
         ),
     ];
-    for (id, account, failure, key) in cases {
-        let message = messages::auth_lookup_message(failure, key, RESP_NOTFND.0, RESP_NOTFND.1);
+    for (id, account, text) in cases {
         let resp = app.get(&summary_path(account), Some(token)).await;
-        assert_row_error(&resp, validation, id, ErrorKind::NotFound, &message);
+        assert_row_error(&resp, validation, id, ErrorKind::NotFound, &text);
     }
 }
 
@@ -660,7 +704,7 @@ fn cpvs_failed_reads_answer_with_the_system_error_text() {
                 &validation,
                 fault.id,
                 ErrorKind::Unexpected,
-                &fault.message,
+                &fault.text,
             );
             let restored = page_ok(&app, &token, &summary_path(ACCOUNT_1)).await;
             assert_eq!(restored, healthy, "the page once {} is restored", fault.id);
@@ -682,53 +726,107 @@ fn cpvs_failed_reads_answer_with_the_system_error_text() {
 /// The read failures of CPVS, each injected by hiding the table the read names: the three
 /// `READ` failures of `GATHER-ACCOUNT-DETAILS` and the three DL/I failures.
 fn faults() -> [Fault; 6] {
-    let lookup = |failure: AuthLookupFailure, key: &str| {
-        messages::auth_lookup_message(failure, key, RESP_IOERR.0, RESP_IOERR.1)
-    };
     [
         Fault {
             id: "V-COPAUS0C-005",
             hide: HIDE_XREF,
             restore: RESTORE_XREF,
             keyed: false,
-            message: lookup(AuthLookupFailure::XrefReadError, ACCOUNT_1),
+            text: lookup(
+                [
+                    messages::ACCOUNT_LABEL,
+                    messages::SYSTEM_ERROR_WHILE_READING_XREF_FILE_RESP,
+                    messages::REAS,
+                ],
+                key_account(ACCOUNT_1),
+                RESP_IOERR,
+            ),
         },
         Fault {
             id: "V-COPAUS0C-007",
             hide: HIDE_ACCOUNTS,
             restore: RESTORE_ACCOUNTS,
             keyed: false,
-            message: lookup(AuthLookupFailure::AccountReadError, ACCOUNT_1),
+            text: lookup(
+                [
+                    messages::ACCOUNT_LABEL,
+                    messages::SYSTEM_ERROR_WHILE_READING_ACCT_FILE_RESP,
+                    messages::REAS,
+                ],
+                key_account(ACCOUNT_1),
+                RESP_IOERR,
+            ),
         },
         Fault {
             id: "V-COPAUS0C-009",
             hide: HIDE_CUSTOMERS,
             restore: RESTORE_CUSTOMERS,
             keyed: false,
-            message: lookup(AuthLookupFailure::CustomerReadError, CUSTOMER_1),
+            text: lookup(
+                [
+                    messages::CUSTOMER_LABEL,
+                    messages::SYSTEM_ERROR_WHILE_READING_CUST_FILE_RESP,
+                    messages::REAS,
+                ],
+                key_customer(CUSTOMER_1),
+                RESP_IOERR,
+            ),
         },
         Fault {
             id: "V-COPAUS0C-011",
             hide: HIDE_SUMMARIES,
             restore: RESTORE_SUMMARIES,
             keyed: false,
-            message: ims(messages::SYSTEM_ERROR_WHILE_READING_AUTH_SUMMARY_COPAUS0C),
+            text: ims(messages::SYSTEM_ERROR_WHILE_READING_AUTH_SUMMARY_COPAUS0C),
         },
         Fault {
             id: "V-COPAUS0C-012",
             hide: HIDE_DETAILS,
             restore: RESTORE_DETAILS,
             keyed: false,
-            message: ims(messages::SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS0C),
+            text: ims(messages::SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS0C),
         },
         Fault {
             id: "V-COPAUS0C-015",
             hide: HIDE_DETAILS,
             restore: RESTORE_DETAILS,
             keyed: true,
-            message: ims(messages::SYSTEM_ERROR_WHILE_REPOS_AUTH_DETAILS),
+            text: ims(messages::SYSTEM_ERROR_WHILE_REPOS_AUTH_DETAILS),
         },
     ]
+}
+
+/// `WS-ACCT-ID PIC X(11)` [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L44] holding
+/// the entered `account`, which the cross-reference not-found text writes.
+fn entered_account(account: &str) -> Operand {
+    Operand::alphanumeric("WS-ACCT-ID", account, 11)
+}
+
+/// `WS-CARD-RID-ACCT-ID-X PIC X(11)`, the redefinition of the 11-digit read key
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L71-72], holding `account`.
+fn key_account(account: &str) -> Operand {
+    Operand::alphanumeric("WS-CARD-RID-ACCT-ID-X", account, 11)
+}
+
+/// `WS-CARD-RID-CUST-ID-X PIC X(09)`, the redefinition of the 9-digit read key
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L68-69], holding `customer`.
+fn key_customer(customer: &str) -> Operand {
+    Operand::alphanumeric("WS-CARD-RID-CUST-ID-X", customer, 9)
+}
+
+/// A `GATHER-ACCOUNT-DETAILS` lookup text: the catalog constants of its three literal runs,
+/// the read key `key` the template writes, and `WS-RESP-CD-DIS` and `WS-REAS-CD-DIS PIC
+/// 9(09)` [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L49-50] holding the `RESP`
+/// and `RESP2` of the failed read.
+fn lookup(literals: [&'static str; 3], key: Operand, (resp, resp2): (u64, u64)) -> Text {
+    Text::Built {
+        literals: literals.to_vec(),
+        operands: vec![
+            key,
+            Operand::unsigned("WS-RESP-CD-DIS", resp, 9),
+            Operand::unsigned("WS-REAS-CD-DIS", resp2, 9),
+        ],
+    }
 }
 
 /// The answer of a CPVS request whose authorization store cannot be opened, the
@@ -1004,28 +1102,42 @@ fn assert_boundary(body: &Value, validation: &Document, id: &str, message: &str)
 }
 
 /// Asserts `resp` is the error answer of the validation row `id`: its status and BMS field,
-/// the error code of `kind`, which the row names, and `message`, which must be the row's
-/// quoted text or, for a `STRING`-built text, start with the literal before its first slot.
-fn assert_row_error(resp: &Resp, doc: &Document, id: &str, kind: ErrorKind, message: &str) {
+/// the error code of `kind`, which the row names, and the whole expected text, byte for
+/// byte, as both its `message` and its one `fields` entry.
+///
+/// The expected text is the row's reviewed template, loaded by [`Template::load`] and
+/// expanded into [`WS_MESSAGE`]. For a [`Text::Literal`] row the template has no operand,
+/// and the catalog constant must equal its text. For a [`Text::Built`] row the catalog
+/// constants must equal the template's literal runs, in order, and the template is
+/// expanded with the operands, so the catalog's composers never build the expected bytes.
+fn assert_row_error(resp: &Resp, doc: &Document, id: &str, kind: ErrorKind, text: &Text) {
     assert_kind(doc, id, Some(kind));
-    let literal = audited_literal(doc, id);
-    match literal.split_once('{') {
-        Some((head, _)) => assert!(
-            message.starts_with(head),
-            "{id}: {message:?} does not start with the audit's text {head:?}"
-        ),
-        None => assert_eq!(
-            message, literal,
-            "{id}: the catalog text differs from the audit"
-        ),
-    }
+    let template = Template::load(doc, id);
+    let message = match text {
+        Text::Literal(constant) => {
+            let audited = template.expand(&[], WS_MESSAGE);
+            assert_eq!(
+                *constant, audited,
+                "{id}: the catalog text differs from the audit"
+            );
+            audited
+        }
+        Text::Built { literals, operands } => {
+            assert_eq!(
+                template.literals(),
+                *literals,
+                "{id}: the catalog constants differ from the literal runs of the audit's template"
+            );
+            template.expand(operands, WS_MESSAGE)
+        }
+    };
     let field = audit_cell(doc, id, "BMS field");
     assert_error(
         resp,
         audited_status(doc, id),
         kind.code(),
-        message,
-        &[(field, message)],
+        &message,
+        &[(field, &message)],
     );
 }
 
@@ -1102,10 +1214,18 @@ fn last_verdict<'a>(doc: &'a Document, id: &str) -> Option<&'a str> {
     verdict
 }
 
-/// A failed authorization-store access: the IMS system-error `head` with the status E-44
-/// sets.
-fn ims(head: &str) -> String {
-    messages::ims_status_message(head, IMS_STATUS_OTHER)
+/// A failed authorization-store access: the catalog constant `head` of the IMS system-error
+/// template's one literal run, and `IMS-RETURN-CODE PIC X(02)`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L78] holding the status E-44 sets.
+fn ims(head: &'static str) -> Text {
+    Text::Built {
+        literals: vec![head],
+        operands: vec![Operand::alphanumeric(
+            "IMS-RETURN-CODE",
+            IMS_STATUS_OTHER,
+            2,
+        )],
+    }
 }
 
 /// The JSON string `value`.

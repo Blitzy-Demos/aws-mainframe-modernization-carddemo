@@ -6,7 +6,8 @@
 //!   of failing requests, each keyed by the V-ID whose row gives its answer,
 //!   must exercise every `COACTVWC` row the audit defines, and each request
 //!   must answer with that row's status, the `code` of its kind, its BMS field
-//!   and the text `carddemo_domain::messages` composes for it. States the
+//!   and the whole text the row records for the injected key and `RESP`
+//!   codes, as its message and as the message of its field. States the
 //!   fixture corpus does not hold are set up with SQL on the test database: a
 //!   table renamed away fails its read (`SQLSTATE` `42P01`), a deleted row is
 //!   not found.
@@ -28,10 +29,13 @@
 //! navigation link with no request.
 //!
 //! Statuses, kinds, BMS fields and record values come from the audits through
-//! `carddemo_audit`; message texts come from `carddemo_domain::messages` and are
-//! checked against the audit's message cells. The `RESP` and `RESP2` codes the
-//! texts embed are those E-44 sets: 13 and 80 for `NOTFND`, 17 and 0 for a
-//! database failure. Docker must be running.
+//! `carddemo_audit`. A literal message text is the constant of
+//! `carddemo_domain::messages`, checked to equal the audit's message cell. A
+//! `STRING`-built text is expanded by `common::audit_text` from the reviewed
+//! template of its row, with the injected key and the `RESP` and `RESP2` codes
+//! E-44 sets, 13 and 80 for `NOTFND`, 17 and 0 for a database failure, each
+//! moved into its COBOL picture; it is never composed by
+//! `carddemo_domain::messages`. Docker must be running.
 
 pub mod common;
 
@@ -53,6 +57,7 @@ use carddemo_domain::rules::account_view::edit_account_id;
 use carddemo_persistence::Db;
 use carddemo_runtime::config::Settings;
 use carddemo_testkit::{block_on, fixtures};
+use common::audit_text::{Operand, Template};
 use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, SET_COOKIE};
@@ -69,17 +74,42 @@ const RETURN_MSG_LEN: usize = 75;
 /// [app/cbl/COACTVWC.cbl:L762].
 const ERROR_OPNAME_READ: &str = "READ";
 
+/// `ERROR-OPNAME PIC X(8)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COACTVWC.cbl:L89].
+const ERROR_OPNAME_LEN: usize = 8;
+
+/// `ERROR-FILE PIC X(9)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COACTVWC.cbl:L93].
+const ERROR_FILE_LEN: usize = 9;
+
+/// The digits of `WS-RESP-CD` and `WS-REAS-CD`, both `PIC S9(09) COMP`
+/// [app/cbl/COACTVWC.cbl:L40-42], which `MOVE` sends to `ERROR-RESP` and
+/// `ERROR-RESP2` as their 9-digit display.
+const RESP_DIGITS: usize = 9;
+
+/// `ERROR-RESP PIC X(10)` and `ERROR-RESP2 PIC X(10)`
+/// [app/cbl/COACTVWC.cbl:L98-103].
+const ERROR_RESP_LEN: usize = 10;
+
+/// `WS-CARD-RID-ACCT-ID-X PIC X(11)`, the account number of the
+/// cross-reference and account not-found texts [app/cbl/COACTVWC.cbl:L79-80].
+const ACCT_ID_X_LEN: usize = 11;
+
+/// `WS-CARD-RID-CUST-ID-X PIC X(09)`, the customer number of the customer
+/// not-found text [app/cbl/COACTVWC.cbl:L76-77].
+const CUST_ID_X_LEN: usize = 9;
+
 /// The CICS `RESP` of `NOTFND` on `READ` (E-44).
-const RESP_NOTFND: u32 = 13;
+const RESP_NOTFND: u64 = 13;
 
 /// The `RESP2` of `NOTFND` on `READ` (E-44).
-const RESP2_NOTFND: u32 = 80;
+const RESP2_NOTFND: u64 = 80;
 
 /// The `RESP` E-44 sets for a database failure: `IOERR`.
-const RESP_IOERR: u32 = 17;
+const RESP_IOERR: u64 = 17;
 
 /// The `RESP2` E-44 sets alongside [`RESP_IOERR`].
-const RESP2_IOERR: u32 = 0;
+const RESP2_IOERR: u64 = 0;
 
 /// The `Expected result` column of the parity audit.
 const EXPECTED_RESULT: &str = "Expected result";
@@ -194,19 +224,25 @@ impl Keys {
     }
 }
 
-/// The message a failing request must answer with, as
-/// `carddemo_domain::messages` composes it.
+/// The message a failing request must answer with: a literal of the
+/// `carddemo_domain::messages` catalog, checked to equal the audit's text, or
+/// a `STRING`-built text, expanded from the row's reviewed audit template with
+/// the injected key and the E-44 `RESP` codes.
 enum Text {
-    /// A literal message constant.
+    /// A literal message constant of the catalog, equal to the row's text.
     Literal(&'static str),
-    /// The 9200-GETCARDXREF-BYACCT `NOTFND` text of an account number.
+    /// The 9200-GETCARDXREF-BYACCT `NOTFND` text of an account number: the
+    /// template with `WS-CARD-RID-ACCT-ID-X` and the `NOTFND` codes.
     XrefNotFound(String),
-    /// The 9300-GETACCTDATA-BYACCT `NOTFND` text of an account number.
+    /// The 9300-GETACCTDATA-BYACCT `NOTFND` text of an account number: the
+    /// template with `WS-CARD-RID-ACCT-ID-X` and the `NOTFND` codes.
     AccountNotFound(String),
-    /// The 9400-GETCUSTDATA-BYCUST `NOTFND` text of a customer number.
+    /// The 9400-GETCUSTDATA-BYCUST `NOTFND` text of a customer number: the
+    /// template with `WS-CARD-RID-CUST-ID-X` and the `NOTFND` codes.
     CustomerNotFound(String),
     /// The `WS-FILE-ERROR-MESSAGE` of a failed `READ` of the file the audit
-    /// row's `ERROR-FILE` names.
+    /// row's `ERROR-FILE` names: the template with `ERROR-OPNAME`,
+    /// `ERROR-FILE` and the `IOERR` codes.
     FileError,
 }
 
@@ -405,65 +441,52 @@ fn error_file<'a>(id: &str, cell: &'a str) -> &'a str {
     file
 }
 
-/// The literal parts of a `STRING` template, the text around its
-/// `{<COBOL-FIELD>}` operands, in order.
-fn literal_parts(template: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut rest = template;
-    while let Some((before, after)) = rest.split_once('{') {
-        parts.push(before);
-        rest = after.split_once('}').map_or("", |(_, tail)| tail);
-    }
-    parts.push(rest);
-    parts.retain(|part| !part.is_empty());
-    parts
+/// `ERROR-RESP PIC X(10)` or `ERROR-RESP2 PIC X(10)`, as `name` says
+/// [app/cbl/COACTVWC.cbl:L98-103], after `MOVE WS-RESP-CD` or
+/// `MOVE WS-REAS-CD`, `PIC S9(09) COMP` [app/cbl/COACTVWC.cbl:L40-42],
+/// holding `code`: its 9-digit display and a space.
+fn resp(name: &str, code: u64) -> Operand {
+    Operand::unsigned_to_alphanumeric(name, code, RESP_DIGITS, ERROR_RESP_LEN)
 }
 
-/// Asserts that `message` is the text the message cell of row `id` records:
-/// exactly its literal, or, for a `STRING`-built text, every literal part of
-/// its template in order, where a part may be missing only because the text
-/// was cut at the 75 bytes of `WS-RETURN-MSG`.
-fn assert_audit_text(id: &str, cell: &str, message: &str) {
-    let span = code_span(cell).unwrap_or_else(|| panic!("{id} has no message text: {cell}"));
-    let template = span
-        .text
-        .strip_prefix('"')
-        .and_then(|text| text.strip_suffix('"'))
-        .unwrap_or_else(|| panic!("{id} quotes no message text: {cell}"));
-    assert!(
-        message.len() <= RETURN_MSG_LEN,
-        "{id}: {message:?} is longer than WS-RETURN-MSG"
-    );
-    if !template.contains('{') {
-        assert_eq!(
-            message, template,
-            "{id}: the message is the audit's literal"
-        );
-        return;
-    }
-    let mut rest = message;
-    for (index, part) in literal_parts(template).into_iter().enumerate() {
-        if index == 0 && !template.starts_with('{') {
-            assert!(
-                message.starts_with(part),
-                "{id}: {message:?} must start with `{part}` of `{template}`"
-            );
-        }
-        let Some(at) = rest.find(part) else {
-            assert_eq!(
-                message.len(),
-                RETURN_MSG_LEN,
-                "{id}: `{part}` of `{template}` is missing from {message:?}, which is not cut"
-            );
-            return;
-        };
-        rest = &rest[at + part.len()..];
+/// The `NOTFND` bindings of the not-found templates of V-COACTVWC-003,
+/// V-COACTVWC-005 and V-COACTVWC-007: the injected `key`, then `ERROR-RESP`
+/// and `ERROR-RESP2` of the `NOTFND` codes E-44 sets.
+fn not_found(key: Operand) -> Vec<Operand> {
+    vec![
+        key,
+        resp("ERROR-RESP", RESP_NOTFND),
+        resp("ERROR-RESP2", RESP2_NOTFND),
+    ]
+}
+
+/// The bindings the template of row `id`, whose message cell is `cell`, is
+/// expanded with for `text`: each injected key or status moved into the
+/// COBOL picture of the field the template names, and none for a literal.
+fn operands(id: &str, cell: &str, text: &Text) -> Vec<Operand> {
+    match text {
+        Text::Literal(_) => Vec::new(),
+        Text::XrefNotFound(account) | Text::AccountNotFound(account) => not_found(
+            Operand::alphanumeric("WS-CARD-RID-ACCT-ID-X", account, ACCT_ID_X_LEN),
+        ),
+        Text::CustomerNotFound(customer) => not_found(Operand::alphanumeric(
+            "WS-CARD-RID-CUST-ID-X",
+            customer,
+            CUST_ID_X_LEN,
+        )),
+        Text::FileError => vec![
+            Operand::alphanumeric("ERROR-OPNAME", ERROR_OPNAME_READ, ERROR_OPNAME_LEN),
+            Operand::alphanumeric("ERROR-FILE", error_file(id, cell), ERROR_FILE_LEN),
+            resp("ERROR-RESP", RESP_IOERR),
+            resp("ERROR-RESP2", RESP2_IOERR),
+        ],
     }
 }
 
 /// The answer the validation row of `case` gives: its status, the code of its
-/// kind, its BMS field, and the composed message, checked against the row's
-/// message text.
+/// kind, its BMS field, and its whole message: the row's reviewed template
+/// expanded with the bindings of the case into the 75 bytes of
+/// `WS-RETURN-MSG`, which a literal of the catalog must equal.
 fn expected(validation: &Document, case: &Case) -> Expected {
     let id = case.id;
     let (table, row) = validation
@@ -485,26 +508,17 @@ fn expected(validation: &Document, case: &Case) -> Expected {
         .rfind(|pair| pair.key == "kind")
         .unwrap_or_else(|| panic!("{id} records no kind="))
         .value;
-    let message_cell = cell("Message text");
-    let message = match &case.text {
-        Text::Literal(text) => (*text).to_owned(),
-        Text::XrefNotFound(account) => {
-            messages::xref_not_found_message(account, RESP_NOTFND, RESP2_NOTFND)
-        }
-        Text::AccountNotFound(account) => {
-            messages::account_master_not_found_message(account, RESP_NOTFND, RESP2_NOTFND)
-        }
-        Text::CustomerNotFound(customer) => {
-            messages::customer_master_not_found_message(customer, RESP_NOTFND, RESP2_NOTFND)
-        }
-        Text::FileError => messages::file_error_message(
-            ERROR_OPNAME_READ,
-            error_file(id, message_cell),
-            RESP_IOERR,
-            RESP2_IOERR,
-        ),
+    let bindings = operands(id, cell("Message text"), &case.text);
+    let expanded = Template::load(validation, id).expand(&bindings, RETURN_MSG_LEN);
+    let message = if let Text::Literal(text) = &case.text {
+        assert_eq!(
+            *text, expanded,
+            "{id}: the catalog constant is the audit's literal"
+        );
+        (*text).to_owned()
+    } else {
+        expanded
     };
-    assert_audit_text(id, message_cell, &message);
     Expected {
         status,
         code: error_code(id, &kind),

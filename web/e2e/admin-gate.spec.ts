@@ -27,6 +27,7 @@ import {
   apiToken,
   APP_ROUTES,
   bearer,
+  checkpoint,
   errorBodySchema,
   expect,
   expectScreen,
@@ -43,9 +44,11 @@ import {
   sidebar,
   signIn,
   signOut,
+  sqlLiteral,
   test,
   urlPath,
   USERS,
+  type Checkpoint,
   type RouteParams,
 } from "./fixtures";
 
@@ -137,6 +140,31 @@ async function firstRuleId(): Promise<string> {
 }
 
 test.describe("server gate", () => {
+  // Every row the probes address, taken before each test and put back after
+  // it, failed or not, so an admitted write cannot outlast the test that
+  // caught it: the probed and the added user, the probed and the added type
+  // with their categories (listed after the type they reference), and every
+  // reward rule, since an admitted add takes a new rule ID. Each test compares
+  // ADMIN_DATA_DIGEST itself, before this restore runs. The admin endpoints
+  // write no other table: no table references users, and the reward-rule
+  // delete only ends a rule, leaving the accruals that reference it as they
+  // are.
+  let saved: Checkpoint | undefined;
+
+  test.beforeEach(async () => {
+    const typeCodes = `${sqlLiteral(FIXTURE_KEYS.tranType)}, ${sqlLiteral(UNUSED_TYPE_CODE)}`;
+    saved = await checkpoint([
+      { table: "users", where: `user_id IN (${sqlLiteral(TARGET_USER)}, ${sqlLiteral(UNUSED_USER_ID)})` },
+      { table: "transaction_types", where: `tr_type IN (${typeCodes})` },
+      { table: "transaction_categories", where: `trc_type_code IN (${typeCodes})` },
+      { table: "reward_rules", where: "TRUE" },
+    ]);
+  });
+
+  test.afterEach(async () => {
+    await saved?.restore();
+  });
+
   test("every admin endpoint answers 401 without a token", async ({ request }) => {
     const before = await psql(ADMIN_DATA_DIGEST);
     for (const call of adminCalls(await firstRuleId())) {

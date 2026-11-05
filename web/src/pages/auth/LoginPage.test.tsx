@@ -1,8 +1,10 @@
 // FN tests of the CC00 sign-on page (LoginPage; COSGN00C, map COSGN00): Enter
 // sends the values as typed and lands on the response's route, an empty user
 // ID is rejected before anything is sent, and a failed sign-on shows the
-// server's message on the field it names, with the cursor there and both
-// values kept.
+// server's message on the field it names, moves the cursor there from the
+// Sign on button, keeps both values and lets the next attempt be sent. A
+// second press while a sign-on is out sends nothing, and the page stays busy
+// until the landing route replaces it.
 //
 // The network is the global the API client looks up on every request, stubbed
 // per test; openapi-fetch hands it the Request it built. No Toaster is
@@ -10,7 +12,7 @@
 // toast is observed through a spy on the `sonner` object lib/api-errors.ts
 // calls.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   createMemoryRouter,
@@ -44,17 +46,30 @@ const WRONG_PASSWORD = "Wrong Password. Try again ...";
 // PageHeader reads the matched routes' handles through useMatches(), so the
 // page needs a data router, as App.tsx gives it. The two landing routes stand
 // in for the menus COSGN00C transfers to [app/cbl/COSGN00C.cbl:L230-240].
-function renderLogin() {
+// With `holdUserHome`, `/` is a lazy route that loads only once it settles,
+// so the sign-on page stays on screen meanwhile, as it does while App.tsx
+// loads a landing page's chunk.
+function renderLogin(options: { holdUserHome?: Promise<void> } = {}) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
+  const { holdUserHome } = options;
+  const userHome = <p>User home</p>;
   const routes: RouteObject[] = [
     {
       path: "/login",
       element: <LoginPage />,
       handle: { title: "Sign on", crumb: "Sign on" } satisfies RouteHandle,
     },
-    { path: "/", element: <p>User home</p> },
+    holdUserHome === undefined
+      ? { path: "/", element: userHome }
+      : {
+          path: "/",
+          lazy: async () => {
+            await holdUserHome;
+            return { element: userHome };
+          },
+        },
     { path: "/admin", element: <p>Admin home</p> },
   ];
   const router = createMemoryRouter(routes, { initialEntries: ["/login"] });
@@ -66,15 +81,31 @@ function renderLogin() {
   return { router };
 }
 
+// A promise and the function that settles it, for an answer a test holds.
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 // Answers every request with `status` and the JSON of `body`, a new Response
-// per call.
-function stubFetch(status: number, body: unknown) {
+// per call, once `held` has settled, so a test can see the page while a
+// sign-on is out.
+function stubFetch(
+  status: number,
+  body: unknown,
+  held: Promise<void> = Promise.resolve(),
+) {
   const fetchMock = vi.fn(
-    async (_input: RequestInfo | URL, _init?: RequestInit) =>
-      new Response(JSON.stringify(body), {
+    async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      await held;
+      return new Response(JSON.stringify(body), {
         status,
         headers: { "Content-Type": "application/json" },
-      }),
+      });
+    },
   );
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
@@ -90,6 +121,14 @@ function inputByLabel(label: string): HTMLInputElement {
 
 function describedBy(element: HTMLElement): string[] {
   return element.getAttribute("aria-describedby")?.split(" ") ?? [];
+}
+
+function signOnButton(): HTMLButtonElement {
+  const element = screen.getByRole("button", { name: "Sign on" });
+  if (!(element instanceof HTMLButtonElement)) {
+    throw new Error('"Sign on" is not a button element');
+  }
+  return element;
 }
 
 afterEach(() => {
@@ -114,8 +153,10 @@ describe("LoginPage (CC00 sign-on)", () => {
       screen.getByRole("form", { name: "Sign on to CardDemo" }),
     ).toBeTruthy();
 
-    await user.type(inputByLabel("User ID"), "USER0001");
-    await user.type(inputByLabel("Password"), "PASSWORD{Enter}");
+    // Mixed case, so a case change on the way would show in the body; the
+    // stubbed answer carries the user ID as the server upper-cases it.
+    await user.type(inputByLabel("User ID"), "User0001");
+    await user.type(inputByLabel("Password"), "passWord{Enter}");
 
     // Awaited first, so every update the sign-on causes lands while Testing
     // Library is waiting.
@@ -131,8 +172,8 @@ describe("LoginPage (CC00 sign-on)", () => {
     expect(new URL(request.url).pathname).toBe("/api/auth/login");
     // No case change on the way: the server upper-cases (E-20).
     expect(await request.clone().json()).toEqual({
-      user_id: "USER0001",
-      password: "PASSWORD",
+      user_id: "User0001",
+      password: "passWord",
     });
   });
 
@@ -155,20 +196,37 @@ describe("LoginPage (CC00 sign-on)", () => {
   it("shows a failed sign-on on the field the server names and keeps both values", async () => {
     const toastError = vi.spyOn(toast, "error");
     // The audited status of a wrong password is 401 (V-COSGN00C-005); the
-    // client leaves a 401 from the sign-on path to the page.
-    const fetchMock = stubFetch(401, {
-      code: "SIGNON_FAILED",
-      message: WRONG_PASSWORD,
-      fields: [{ field: "PASSWD", message: WRONG_PASSWORD }],
-    } satisfies ErrorBody);
+    // client leaves a 401 from the sign-on path to the page. The answer is
+    // held, so the focus before it arrives can be checked.
+    const answer = deferred<void>();
+    const fetchMock = stubFetch(
+      401,
+      {
+        code: "SIGNON_FAILED",
+        message: WRONG_PASSWORD,
+        fields: [{ field: "PASSWD", message: WRONG_PASSWORD }],
+      } satisfies ErrorBody,
+      answer.promise,
+    );
     const user = userEvent.setup();
     const { router } = renderLogin();
 
     await user.type(inputByLabel("User ID"), "USER0001");
-    await user.type(inputByLabel("Password"), "WRONGPWD{Enter}");
+    await user.type(inputByLabel("Password"), "WRONGPWD");
+    // Submitted from the button, so the cursor is off the password until the
+    // answer puts it there.
+    await user.tab();
+    const signOn = signOnButton();
+    expect(document.activeElement).toBe(signOn);
+    await user.keyboard("{Enter}");
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    const password = inputByLabel("Password");
+    expect(document.activeElement).not.toBe(password);
+    answer.resolve();
 
     const fieldError = await screen.findByText(WRONG_PASSWORD);
-    const password = inputByLabel("Password");
     expect(fieldError.getAttribute("role")).toBe("alert");
     expect(password.getAttribute("aria-invalid")).toBe("true");
     expect(describedBy(password)).toContain(fieldError.id);
@@ -184,5 +242,68 @@ describe("LoginPage (CC00 sign-on)", () => {
     expect(router.state.location.pathname).toBe("/login");
     expect(inputByLabel("User ID").value).toBe("USER0001");
     expect(password.value).toBe("WRONGPWD");
+
+    // The failure releases the form, so Enter sends the next attempt.
+    expect(signOn.disabled).toBe(false);
+    await user.keyboard("{Enter}");
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledTimes(2);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends one sign-on when Sign on is pressed twice before the answer", async () => {
+    const answer = deferred<void>();
+    const fetchMock = stubFetch(200, USER_SIGN_ON, answer.promise);
+    // No delay between the two clicks, so the second lands before the page
+    // re-renders as busy.
+    const user = userEvent.setup({ delay: null });
+    renderLogin();
+
+    await user.type(inputByLabel("User ID"), "USER0001");
+    await user.type(inputByLabel("Password"), "PASSWORD");
+    await user.dblClick(signOnButton());
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
+    answer.resolve();
+
+    await screen.findByText("User home");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays busy after a sign-on until the landing route replaces the page", async () => {
+    stubFetch(200, USER_SIGN_ON);
+    const userHome = deferred<void>();
+    const user = userEvent.setup();
+    const { router } = renderLogin({ holdUserHome: userHome.promise });
+
+    await user.type(inputByLabel("User ID"), "USER0001");
+    await user.type(inputByLabel("Password"), "PASSWORD{Enter}");
+    // The sign-on has succeeded: the router is loading the landing route.
+    await waitFor(() => {
+      expect(router.state.navigation.location?.pathname).toBe("/");
+    });
+    // TanStack Query hands the settled mutation to the page in a timer, so
+    // one timer turn lets the page render it before the checks.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(router.state.location.pathname).toBe("/login");
+    const signOn = signOnButton();
+    expect(signOn.disabled).toBe(true);
+    expect(signOn.querySelector("svg")).not.toBeNull();
+    expect(
+      screen
+        .getByRole("form", { name: "Sign on to CardDemo" })
+        .getAttribute("aria-busy"),
+    ).toBe("true");
+
+    userHome.resolve();
+    await screen.findByText("User home");
+    expect(router.state.location.pathname).toBe("/");
   });
 });

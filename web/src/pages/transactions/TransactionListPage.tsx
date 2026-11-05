@@ -32,7 +32,7 @@ import {
 } from "@/api/queries/transactions";
 import type { components } from "@/api/schema";
 import { DataTable, type DataTableProps } from "@/components/data-table";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
@@ -122,7 +122,24 @@ function transactionColumns(
         </span>
       ),
     },
-    { accessorKey: "tran_desc", header: "Description" },
+    {
+      accessorKey: "tran_desc",
+      header: "Description",
+      // BLITZY [LAYOUT]: the description may break anywhere (overrode the
+      // cell's whitespace-nowrap), so a TRAN-DESC X(100) without spaces no
+      // longer sets the column's minimum width: the column takes the width the
+      // other columns leave, and Amount and View stay inside the card. It is
+      // clamped to one line, so a row stays as tall as the skeleton rows, and
+      // the title gives the full text the clamp hides.
+      cell: ({ row }) => (
+        <span
+          title={row.original.tran_desc}
+          className="line-clamp-1 whitespace-normal wrap-anywhere"
+        >
+          {row.original.tran_desc}
+        </span>
+      ),
+    },
     {
       accessorKey: "tran_amt",
       header: () => <span className="block text-end">Amount</span>,
@@ -254,9 +271,7 @@ export default function TransactionListPage(): JSX.Element {
         description="Browse the transactions in Transaction ID order, ten per page, from the first or from a Transaction ID you enter."
         actions={
           // PF3: XCTL COMEN01C, the main menu [app/cbl/COTRN00C.cbl:L122-124].
-          <Button variant="outline" asChild>
-            <Link to="/">Back</Link>
-          </Button>
+          <BackLink to="/" />
         }
       />
       <Card>
@@ -273,30 +288,32 @@ export default function TransactionListPage(): JSX.Element {
               name="start_key"
               control={form.control}
               render={({ field, fieldState }) => (
-                <Field data-invalid={fieldState.invalid} className="max-w-sm">
+                <Field data-invalid={fieldState.invalid} className="max-w-md">
                   <FieldLabel htmlFor={TRNIDIN}>Transaction ID</FieldLabel>
-                  {/* The cursor starts on TRNIDIN: COTRN00C sends every
-                      screen with MOVE -1 TO TRNIDINL. */}
-                  <Input
-                    {...field}
-                    value={field.value ?? ""}
-                    id={TRNIDIN}
-                    maxLength={TRAN_ID_LENGTH}
-                    inputMode="numeric"
-                    autoComplete="off"
-                    autoFocus
-                    aria-invalid={fieldState.invalid}
-                    aria-describedby={fieldState.invalid ? errorId : undefined}
-                  />
+                  <div className="flex gap-2">
+                    {/* The cursor starts on TRNIDIN: COTRN00C sends every
+                        screen with MOVE -1 TO TRNIDINL. */}
+                    <Input
+                      {...field}
+                      value={field.value ?? ""}
+                      id={TRNIDIN}
+                      maxLength={TRAN_ID_LENGTH}
+                      inputMode="numeric"
+                      autoComplete="off"
+                      autoFocus
+                      aria-invalid={fieldState.invalid}
+                      aria-describedby={
+                        fieldState.invalid ? errorId : undefined
+                      }
+                    />
+                    <Button type="submit">Search</Button>
+                  </div>
                   {fieldState.invalid ? (
                     <FieldError id={errorId} errors={[fieldState.error]} />
                   ) : null}
                 </Field>
               )}
             />
-            <div className="flex">
-              <Button type="submit">Search</Button>
-            </div>
           </form>
         </CardContent>
       </Card>

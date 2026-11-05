@@ -60,10 +60,12 @@
 //! # Record files
 //!
 //! Record files use the ASCII codec layouts at full copybook width, each record followed by `LF`
-//! ([`PendingGeneration::append_records`]). [`read_records`] reads them back frame by frame, each
-//! frame the copybook width of record bytes and then that `LF`. Alphanumeric fields copy bytes,
-//! so an `LF` or `CR` inside a record is record data and never a record boundary, and a file that
-//! is not a whole number of such frames does not decode. Print and statement files are
+//! ([`PendingGeneration::append_records`]). [`RecordReader`] reads them back frame by frame, each
+//! frame the copybook width of record bytes and then that `LF`, one record at a time, so no job
+//! holds a whole file; its records and errors are those `read_records`, the whole-file decode the
+//! tests hold it to, gives for the same file. Alphanumeric fields copy bytes, so an `LF` or `CR` inside a record is
+//! record data and never a record boundary, and a file that is not a whole number of such frames
+//! does not decode. Print and statement files are
 //! fixed-width text lines with `LF` terminators, checked by [`encode_fixed_lines`]: `TRANREPT`
 //! 133 bytes (`LRECL=133` [app/jcl/TRANREPT.jcl:L78]), STMTFILE 80 and HTMLFILE 100
 //! [app/cbl/CBSTM03A.CBL:L44-47]. A line must have exactly that width and hold no `LF` or `CR`,
@@ -72,13 +74,28 @@
 //! and nothing is written. The statement files are cataloged datasets, not GDGs, and are
 //! replaced whole by [`write_replacing`].
 //!
+//! # Sort work files
+//!
+//! A SORT step whose input does not fit its memory spills sorted runs to work datasets, the
+//! `SORTWK` files DFSORT allocates for the step and deletes when it ends.
+//! [`Generations::create_work_file`] creates one in the catalog directory, exclusively, as the
+//! hidden temporary file `.SORTWK.tmp-<pid>-<seq>`, opened for reading and writing, and unlinks
+//! that name at once: nothing names the file while the step runs, the system frees its space
+//! when the step drops it, and a job killed at any point leaves nothing behind. Where the name
+//! cannot be unlinked it stays until the work file is dropped, which deletes it. Neither
+//! [`Generations::list`] nor the orphan sweep of [`Generations::begin_next`] ever takes such a
+//! name for a generation or its temporary file. A [`WorkFileWriter`] appends through a buffer;
+//! once finished, the [`WorkFile`] reads any part written back through buffered readers, as
+//! often as the step needs. Every failure is a [`GenerationError::Io`] on the work file.
+//!
 //! # Execution
 //!
 //! Every file-system, codec and CPU operation of a generation is synchronous, and a job, a future
 //! on Tokio's multi-threaded runtime, runs each one on Tokio's blocking pool: through
 //! [`Generations::begin_next_async`], [`PendingGeneration::append_records_async`],
 //! [`PendingGeneration::append_lines_async`], [`PendingGeneration::catalog_async`],
-//! [`PendingGeneration::discard_async`] and [`read_records_async`], or through [`blocking`] for
+//! [`PendingGeneration::discard_async`], [`RecordReader::open_async`],
+//! [`RecordReader::next_batch_async`] and [`count_records_async`], or through [`blocking`] for
 //! any other phase. The work runs inside the caller's span, so its events and span records land
 //! in the job span. The errors and outcomes are those of the synchronous operation each one runs;
 //! a blocking task the runtime cancels because it is shutting down is reported as a
@@ -86,16 +103,19 @@
 //! abandons with [`PendingGeneration::discard_async`]; dropping a [`PendingGeneration`]
 //! uncataloged stays the safety net of a panic.
 
+use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use carddemo_codec::layouts::{CodecError, Layout, decode_ascii_lf, encode_ascii_lf};
+use carddemo_codec::layouts::{CodecError, Layout, encode_ascii_lf};
+use carddemo_codec::{Charset, CodecErrorKind};
 use tracing::Dispatch;
 
 /// `LIMIT(5) SCRATCH`: the number of generations each GDG keeps [app/jcl/DEFGDGB.jcl:STEP05]
@@ -118,6 +138,10 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The error of a write to, or a catalog of, a generation whose temporary file is closed.
 const CLOSED: &str = "generation file is already closed";
+
+/// The name every sort work file is created under, as the hidden temporary file
+/// `.SORTWK.tmp-<pid>-<seq>` of the catalog directory: DFSORT's `SORTWK` work datasets.
+const SORT_WORK: &str = "SORTWK";
 
 /// A GDG base that an in-scope job writes. `TCATBALF.BKUP`, also defined by DEFGDGB, has no
 /// variant because no in-scope job writes it.
@@ -409,6 +433,35 @@ impl Generations {
         blocking(move || generations.begin_next(dataset))
             .await
             .unwrap_or_else(|cancelled| Err(io_error(&self.root, io::Error::other(cancelled))))
+    }
+
+    /// Creates a sort work file in the catalog directory, the module's "Sort work files"
+    /// section: the hidden temporary file `.SORTWK.tmp-<pid>-<seq>`, created exclusively and
+    /// opened for reading and writing, whose name is unlinked at once. A name that cannot be
+    /// unlinked is logged at `warn` and deleted when the work file is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::Io`] on the work file when it cannot be created, as for a temporary
+    /// generation file.
+    pub(crate) fn create_work_file(&self) -> Result<WorkFileWriter, GenerationError> {
+        let (path, file) = create_temp(&self.root.join(SORT_WORK), OsStr::new(SORT_WORK))?;
+        let linked = match fs::remove_file(&path) {
+            Ok(()) => false,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "sort work file not unlinked; it is deleted when its step ends"
+                );
+                true
+            }
+        };
+        Ok(WorkFileWriter {
+            writer: BufWriter::new(file),
+            offset: 0,
+            name: WorkName { path, linked },
+        })
     }
 }
 
@@ -782,27 +835,371 @@ impl Drop for PendingGeneration {
 /// first record that does not decode, located at its 1-based record number: a final frame
 /// shorter than `L::LEN` bytes and its `LF`, a byte other than `LF` after a record, or a field
 /// error of the layout.
+///
+/// Jobs read record files only through [`RecordReader`], which never holds a whole file; this
+/// whole-file form, the codec's own decode of the file, is the reference the tests hold it to.
+#[cfg(test)]
 pub(crate) fn read_records<L: Layout>(path: &Path) -> Result<Vec<L::Record>, GenerationError> {
     let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
-    Ok(decode_ascii_lf::<L>(&bytes)?)
+    Ok(carddemo_codec::layouts::decode_ascii_lf::<L>(&bytes)?)
 }
 
-/// [`read_records`] on Tokio's blocking pool, inside the caller's span (see [`blocking`]): the
-/// whole file is read and decoded there.
+/// A record file read one record at a time through a buffer: `read_records` streamed, so a
+/// job holds one frame of the file instead of the whole file. COMBTRAN reads its SORTIN
+/// `TRANSACT.BKUP(0)` and `SYSTRAN(0)` [app/jcl/COMBTRAN.jcl:L23-26] and its `REPRO` input
+/// `TRANSACT.COMBINED(+1)` [app/jcl/COMBTRAN.jcl:L43-44] this way, and TRANREPT its SORTIN
+/// `TRANSACT.BKUP(+1)` [app/jcl/TRANREPT.jcl:L38-39] and the CBTRN03C `TRANFILE`
+/// `TRANSACT.DALY(+1)`.
 ///
-/// # Errors
+/// Frames are read as `read_records` reads them: `L::LEN` record bytes, decoded whole, then
+/// `LF`. The iterator yields the records in file order and then `None`. In place of the first
+/// record that does not decode it yields the error `read_records` returns for the same file,
+/// and `None` after it:
 ///
-/// The errors of [`read_records`], and a [`GenerationError::Io`] on `path` when the runtime
-/// cancels the read because it is shutting down.
-pub(crate) async fn read_records_async<L>(path: PathBuf) -> Result<Vec<L::Record>, GenerationError>
+/// - [`GenerationError::Io`] on the path when the file cannot be read;
+/// - [`GenerationError::Codec`] located at the record's 1-based number: a final frame shorter
+///   than `L::LEN` bytes and its `LF` ([`CodecErrorKind::PartialFrame`], carrying the bytes left
+///   in the file), a byte other than `LF` after a record ([`CodecErrorKind::Separator`]), or a
+///   field error of the layout.
+pub(crate) struct RecordReader<L: Layout> {
+    /// The record file, as errors name it.
+    path: PathBuf,
+    /// The open file, read through its buffer.
+    file: BufReader<File>,
+    /// One frame: `L::LEN` record bytes and the byte after them.
+    frame: Vec<u8>,
+    /// The records yielded so far, which numbers the next one.
+    records: usize,
+    /// Whether the end of the file or an error has been met: every later item is `None`.
+    done: bool,
+    /// The layout, which only types the records.
+    layout: PhantomData<fn() -> L>,
+}
+
+impl<L: Layout> RecordReader<L> {
+    /// Opens the record file `path` at its first record.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::Io`] on `path` when the file cannot be opened, as `read_records`
+    /// reports it.
+    pub(crate) fn open(path: &Path) -> Result<Self, GenerationError> {
+        let file = File::open(path).map_err(|source| io_error(path, source))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: BufReader::new(file),
+            frame: vec![0; L::LEN + 1],
+            records: 0,
+            done: false,
+            layout: PhantomData,
+        })
+    }
+
+    /// The next records of the file in file order, `limit` of them, or fewer at the end of the
+    /// file. Record numbers run on from the batch before, so an error names the record as
+    /// `read_records` does.
+    ///
+    /// # Errors
+    ///
+    /// The error the iterator yields in place of a record; the records read before it in this
+    /// batch are dropped.
+    pub(crate) fn next_batch(&mut self, limit: usize) -> Result<Vec<L::Record>, GenerationError> {
+        self.by_ref().take(limit).collect()
+    }
+
+    /// Reads and decodes the next frame: `None` at the end of the file.
+    fn read_record(&mut self) -> Result<Option<L::Record>, GenerationError> {
+        let filled =
+            fill(&mut self.file, &mut self.frame).map_err(|source| io_error(&self.path, source))?;
+        if filled == 0 {
+            return Ok(None);
+        }
+        let number = self.records + 1;
+        let error = |kind| GenerationError::Codec(CodecError::new(L::NAME, kind).at_record(number));
+        if filled < self.frame.len() {
+            return Err(error(CodecErrorKind::PartialFrame { frame_len: filled }));
+        }
+        let (body, separator) = self.frame.split_at(L::LEN);
+        if let Some(&byte) = separator.first().filter(|byte| **byte != b'\n') {
+            return Err(error(CodecErrorKind::Separator { byte }));
+        }
+        let record = L::decode(body, Charset::Ascii).map_err(|e| e.at_record(number))?;
+        self.records = number;
+        Ok(Some(record))
+    }
+}
+
+impl<L> RecordReader<L>
 where
     L: Layout + 'static,
     L::Record: Send + 'static,
 {
+    /// [`RecordReader::open`] on Tokio's blocking pool, inside the caller's span (see
+    /// [`blocking`]).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`RecordReader::open`], and a [`GenerationError::Io`] on `path` when the
+    /// runtime cancels the open because it is shutting down.
+    pub(crate) async fn open_async(path: PathBuf) -> Result<Self, GenerationError> {
+        let error_path = path.clone();
+        blocking(move || Self::open(&path))
+            .await
+            .unwrap_or_else(|cancelled| Err(io_error(&error_path, io::Error::other(cancelled))))
+    }
+
+    /// [`RecordReader::next_batch`] on Tokio's blocking pool, inside the caller's span (see
+    /// [`blocking`]): the reader is lent to the blocking work and returned with the batch, so
+    /// the next batch reads on from where this one ended.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`RecordReader::next_batch`], and a [`GenerationError::Io`] on the file
+    /// when the runtime cancels the read because it is shutting down. Either way the reader is
+    /// consumed, because the file is read no further.
+    pub(crate) async fn next_batch_async(
+        mut self,
+        limit: usize,
+    ) -> Result<(Self, Vec<L::Record>), GenerationError> {
+        let error_path = self.path.clone();
+        blocking(move || self.next_batch(limit).map(|batch| (self, batch)))
+            .await
+            .unwrap_or_else(|cancelled| Err(io_error(&error_path, io::Error::other(cancelled))))
+    }
+}
+
+impl<L: Layout> Iterator for RecordReader<L> {
+    type Item = Result<L::Record, GenerationError>;
+
+    /// The next record, or the error that ends the reading; `None` once either has ended it.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let item = self.read_record().transpose();
+        self.done = !matches!(item, Some(Ok(_)));
+        item
+    }
+}
+
+/// The number of records of the record file `path`, each read and decoded as `read_records`
+/// reads it but none kept, on Tokio's blocking pool, inside the caller's span (see
+/// [`blocking`]): the check that the whole file reads, holding one frame at a time.
+///
+/// # Errors
+///
+/// The errors of `read_records` for the same file, and a [`GenerationError::Io`] on `path`
+/// when the runtime cancels the read because it is shutting down.
+pub(crate) async fn count_records_async<L>(path: PathBuf) -> Result<usize, GenerationError>
+where
+    L: Layout + 'static,
+{
     let error_path = path.clone();
-    blocking(move || read_records::<L>(&path))
-        .await
-        .unwrap_or_else(|cancelled| Err(io_error(&error_path, io::Error::other(cancelled))))
+    blocking(move || {
+        RecordReader::<L>::open(&path)?.try_fold(0, |records, record| record.map(|_| records + 1))
+    })
+    .await
+    .unwrap_or_else(|cancelled| Err(io_error(&error_path, io::Error::other(cancelled))))
+}
+
+/// A sort work file being written: one of the `SORTWK` work datasets DFSORT allocates for a
+/// SORT step whose input does not fit its memory and deletes when the step ends, such as
+/// COMBTRAN `STEP05R` [app/jcl/COMBTRAN.jcl:L22-37]; see the module's "Sort work files"
+/// section. [`Generations::create_work_file`] creates it.
+///
+/// Bytes are appended through a buffer ([`WorkFileWriter::write`]), and
+/// [`WorkFileWriter::finish`] flushes them and returns the [`WorkFile`] they are read back
+/// from.
+pub(crate) struct WorkFileWriter {
+    /// The file, written through its buffer. Declared before `name`, so the file is closed
+    /// before a name still linking it is deleted.
+    writer: BufWriter<File>,
+    /// The bytes appended so far.
+    offset: u64,
+    /// The name the file was created under.
+    name: WorkName,
+}
+
+impl WorkFileWriter {
+    /// Appends `bytes` through the buffer.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::Io`] on the work file when it cannot be written.
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), GenerationError> {
+        self.writer
+            .write_all(bytes)
+            .map_err(|source| io_error(&self.name.path, source))?;
+        self.offset = self.offset.saturating_add(byte_count(bytes.len()));
+        Ok(())
+    }
+
+    /// The bytes appended so far: the offset in the file at which the next write starts.
+    pub(crate) const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Ends the writing: flushes the buffer and returns the file to read back.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::Io`] on the work file when the buffer cannot be flushed. The file is
+    /// then closed and deleted.
+    pub(crate) fn finish(self) -> Result<WorkFile, GenerationError> {
+        let Self { writer, name, .. } = self;
+        match writer.into_inner() {
+            Ok(file) => Ok(WorkFile { file, name }),
+            Err(error) => Err(io_error(&name.path, error.into_error())),
+        }
+    }
+}
+
+/// A sort work file once written ([`WorkFileWriter::finish`]): read back through
+/// [`WorkFile::reader`], from any offset and as many times as the step needs, and deleted when
+/// dropped.
+pub(crate) struct WorkFile {
+    /// The file, shared by every reader of it. Declared before `name`, so the file is closed
+    /// before a name still linking it is deleted.
+    file: File,
+    /// The name the file was created under.
+    name: WorkName,
+}
+
+impl WorkFile {
+    /// A buffered reader of the `len` bytes written from offset `start`: the file rewound to a
+    /// part written earlier. Readers of one file read side by side, each from its own position,
+    /// because each read seeks to that position first.
+    pub(crate) fn reader(&self, start: u64, len: u64) -> WorkReader<'_> {
+        WorkReader {
+            path: &self.name.path,
+            reader: BufReader::new(WorkSegment {
+                file: &self.file,
+                position: start,
+                end: start.saturating_add(len),
+            }),
+        }
+    }
+}
+
+/// A buffered reader of one part of a [`WorkFile`].
+pub(crate) struct WorkReader<'a> {
+    /// The work file, as errors name it.
+    path: &'a Path,
+    /// The part, read through its buffer.
+    reader: BufReader<WorkSegment<'a>>,
+}
+
+impl WorkReader<'_> {
+    /// Reads the next `frame.len()` bytes of the part into `frame`: `true` when they were read
+    /// whole, `false` at the end of the part.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::Io`] on the work file when it cannot be read, or when the part ends
+    /// inside the frame (`UnexpectedEof`).
+    pub(crate) fn read_frame(&mut self, frame: &mut [u8]) -> Result<bool, GenerationError> {
+        match fill(&mut self.reader, frame) {
+            Ok(read) if read == frame.len() => Ok(true),
+            Ok(0) => Ok(false),
+            Ok(read) => Err(io_error(
+                self.path,
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the sort work file ends {read} bytes into a {}-byte frame",
+                        frame.len()
+                    ),
+                ),
+            )),
+            Err(source) => Err(io_error(self.path, source)),
+        }
+    }
+
+    /// The [`GenerationError::Io`] on the work file for a frame read whole whose bytes are not
+    /// what the step wrote: `error` says why (`InvalidData`).
+    pub(crate) fn invalid_data(
+        &self,
+        error: impl Into<Box<dyn Error + Send + Sync>>,
+    ) -> GenerationError {
+        io_error(self.path, io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
+/// The bytes of a [`WorkFile`] from `position` to `end`, read through the handle every reader of
+/// the file shares: each read seeks to this part's own position first.
+struct WorkSegment<'a> {
+    /// The shared handle.
+    file: &'a File,
+    /// The offset of the next byte to read.
+    position: u64,
+    /// The offset just past the part.
+    end: u64,
+}
+
+impl Read for WorkSegment<'_> {
+    /// Reads at most the bytes left in the part: 0 once it is read whole.
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let left = self.end.saturating_sub(self.position);
+        let wanted = usize::try_from(left).map_or(buffer.len(), |left| left.min(buffer.len()));
+        if wanted == 0 {
+            return Ok(0);
+        }
+        let mut file = self.file;
+        file.seek(SeekFrom::Start(self.position))?;
+        let read = file.read(&mut buffer[..wanted])?;
+        self.position = self.position.saturating_add(byte_count(read));
+        Ok(read)
+    }
+}
+
+/// The name a sort work file was created under, and whether that name still links the file.
+struct WorkName {
+    /// The hidden temporary path, `<root>/.SORTWK.tmp-<pid>-<seq>`.
+    path: PathBuf,
+    /// Whether the unlink right after creation failed, so the name still links the file.
+    linked: bool,
+}
+
+impl Drop for WorkName {
+    /// Deletes the name when it still links the file, once the file is closed. Best effort,
+    /// because a destructor has no caller to report to: a failure other than an absent file is
+    /// logged.
+    fn drop(&mut self) {
+        if !self.linked {
+            return;
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "sort work file not deleted"
+            ),
+        }
+    }
+}
+
+/// Reads from `reader` until `buffer` is full or the input ends, retrying a read the operating
+/// system interrupted, as `read_exact` does. Returns the bytes read: fewer than `buffer` holds
+/// only at the end of the input.
+fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while let Some(rest) = buffer.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+        match reader.read(rest) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// `len` bytes as a file offset. No length reaches `u64::MAX`; the conversion saturates there
+/// rather than fail.
+fn byte_count(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// Runs `work` on Tokio's blocking pool and returns its value: the boundary every synchronous
@@ -936,7 +1333,8 @@ fn write_synced(mut file: File, path: &Path, bytes: &[u8]) -> Result<(), Generat
 
 /// Creates the hidden temporary sibling of `path`, whose file name is `file_name`, exclusively:
 /// a name that already exists is never opened, truncated or deleted, and the next sequence
-/// number is tried instead.
+/// number is tried instead. The file is opened for reading as well as writing, so a sort work
+/// file is read back through the handle it was written through.
 ///
 /// # Errors
 ///
@@ -948,6 +1346,7 @@ fn create_temp(path: &Path, file_name: &OsStr) -> Result<(PathBuf, File), Genera
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp_path = path.with_file_name(temp_name(file_name, sequence));
         match OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&temp_path)
@@ -1232,15 +1631,17 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use carddemo_codec::{Charset, CodecError, CodecErrorKind, FieldKind, FieldSpec, Layout};
+    use carddemo_codec::{
+        Charset, CodecError, CodecErrorKind, FieldKind, FieldSpec, Layout, TransactionLayout,
+    };
     use carddemo_runtime::telemetry::subscriber_with_writer;
     use tracing::field::Empty;
     use tracing::{Instrument, Span};
 
     use super::{
-        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, LockHolder, blocking,
-        create_temp, encode_fixed_lines, exited_pid, process_running, read_records,
-        read_records_async, remove_temp, write_replacing, write_synced,
+        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, LockHolder,
+        RecordReader, blocking, count_records_async, create_temp, encode_fixed_lines, exited_pid,
+        process_running, read_records, remove_temp, write_replacing, write_synced,
     };
 
     /// A test directory under the system temporary directory, removed when the test ends.
@@ -1989,6 +2390,224 @@ pub(crate) mod tests {
         }
     }
 
+    /// A 350-byte `CVTRA05Y` record with `tran_id` and `desc`, the other fields fixed and FILLER
+    /// spaces: `TRAN-AMT` `0000001000{` is +100.00.
+    fn cvtra05y(tran_id: &str, desc: &str) -> String {
+        let record = format!(
+            "{tran_id:<16}010001{source:<10}{desc:<100}0000001000{{800000000{name:<50}\
+             {city:<50}{zip:<10}4111111111111111{ts}{ts}{filler:<20}",
+            source = "POS TERM",
+            name = "MERCHANT",
+            city = "CITY",
+            zip = "12345",
+            ts = "2022-07-18 00:00:00.000000",
+            filler = "",
+        );
+        assert_eq!(record.len(), 350, "{record:?}");
+        record
+    }
+
+    /// For a sound file and for each fault `read_records` reports, the reader yields what
+    /// `read_records` returns: the same records, or the records before the fault and then the
+    /// same error, and nothing after it.
+    #[test]
+    fn record_reader_yields_the_records_and_the_error_read_records_gives() {
+        let dir = TestDir::new("record-reader");
+        fs::create_dir_all(dir.path()).expect("directory creates");
+        let first = cvtra05y("0000000000000001", "FIRST");
+        // An `X(n)` field copies bytes, so `LF` and `CR` inside a record are record data.
+        let second = cvtra05y("2022\n71800000001", "SECOND\r\nLINE");
+        let mut bad_amount = cvtra05y("0000000000000003", "BAD").into_bytes();
+        bad_amount[132..143].copy_from_slice(b"00000XX145F");
+        // (case, the file's bytes; `None` leaves the file absent)
+        let cases: [(&str, Option<Vec<u8>>); 6] = [
+            ("sound", Some(format!("{first}\n{second}\n").into_bytes())),
+            (
+                "amount",
+                Some(
+                    [
+                        format!("{first}\n").into_bytes(),
+                        bad_amount,
+                        b"\n".to_vec(),
+                    ]
+                    .concat(),
+                ),
+            ),
+            (
+                "truncated",
+                Some(format!("{first}\n{}", &second[..341]).into_bytes()),
+            ),
+            ("crlf", Some(format!("{first}\r\n").into_bytes())),
+            ("empty", Some(Vec::new())),
+            ("missing", None),
+        ];
+        for (case, bytes) in cases {
+            let path = dir.path().join(format!("SYSTRAN.G0001V00.{case}"));
+            if let Some(bytes) = &bytes {
+                fs::write(&path, bytes).expect("file writes");
+            }
+            let expected = read_records::<TransactionLayout>(&path);
+            let actual = RecordReader::<TransactionLayout>::open(&path).and_then(|mut reader| {
+                let items: Vec<_> = reader.by_ref().collect();
+                assert!(
+                    reader.next().is_none(),
+                    "{case}: nothing after the end or the error"
+                );
+                assert!(
+                    items.iter().skip_while(|item| item.is_ok()).count() <= 1,
+                    "{case}: an error is the last item"
+                );
+                items.into_iter().collect::<Result<Vec<_>, _>>()
+            });
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{case}");
+            assert_eq!(
+                actual.err().map(|error| error.to_string()),
+                expected.err().map(|error| error.to_string()),
+                "{case}"
+            );
+        }
+    }
+
+    /// Batches read on where the batch before ended, so record numbers run on across them, and
+    /// the asynchronous forms read what the synchronous ones do; the count reads the whole file
+    /// as `read_records` does.
+    #[tokio::test]
+    async fn record_batches_and_counts_read_what_read_records_reads() {
+        let dir = TestDir::new("record-batches");
+        fs::create_dir_all(dir.path()).expect("directory creates");
+        let sound = dir.path().join("SYSTRAN.G0001V00");
+        fs::write(&sound, b"AAAAAA\nBBBBBB\nCCCCCC\nDDDDDD\nEEEEEE\n").expect("file writes");
+        let short = dir.path().join("SYSTRAN.G0002V00");
+        fs::write(&short, b"AAAAAA\nBBBBBB\nCCCCCC\nDDD").expect("file writes");
+        let missing = dir.path().join("SYSTRAN.G0003V00");
+
+        let mut reader = RecordReader::<SixBytes>::open(&sound).expect("file opens");
+        let batches: Vec<_> = (0..4)
+            .map(|_| reader.next_batch(2).expect("batch reads"))
+            .collect();
+        assert_eq!(
+            batches,
+            [
+                vec![*b"AAAAAA", *b"BBBBBB"],
+                vec![*b"CCCCCC", *b"DDDDDD"],
+                vec![*b"EEEEEE"],
+                vec![],
+            ]
+        );
+        let mut reader = RecordReader::<SixBytes>::open_async(sound.clone())
+            .await
+            .expect("file opens");
+        let mut lent = Vec::new();
+        for _ in 0..4 {
+            let (returned, batch) = reader.next_batch_async(2).await.expect("batch reads");
+            reader = returned;
+            lent.push(batch);
+        }
+        assert_eq!(lent, batches);
+
+        let expected = read_records::<SixBytes>(&short).expect_err("record 4 is partial");
+        let mut reader = RecordReader::<SixBytes>::open(&short).expect("file opens");
+        assert_eq!(reader.next_batch(2).expect("batch reads").len(), 2);
+        let error = reader
+            .next_batch(2)
+            .expect_err("the second batch meets record 4");
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+        let reader = RecordReader::<SixBytes>::open_async(short.clone())
+            .await
+            .expect("file opens");
+        let (reader, _) = reader.next_batch_async(2).await.expect("batch reads");
+        let error = reader
+            .next_batch_async(2)
+            .await
+            .err()
+            .expect("the second batch meets record 4");
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+        let opened = RecordReader::<SixBytes>::open_async(missing.clone())
+            .await
+            .err();
+        assert_eq!(
+            format!("{opened:?}"),
+            format!("{:?}", read_records::<SixBytes>(&missing).err())
+        );
+
+        for path in [sound, short, missing] {
+            let expected = format!(
+                "{:?}",
+                read_records::<SixBytes>(&path).map(|records| records.len())
+            );
+            let actual = format!("{:?}", count_records_async::<SixBytes>(path.clone()).await);
+            assert_eq!(actual, expected, "{}", path.display());
+        }
+    }
+
+    /// A work file is unlinked as soon as it is created, reads back any part written to it, side
+    /// by side and more than once, and reports a part that ends inside a frame and bytes that
+    /// are not what was written as I/O errors on its path.
+    #[test]
+    fn work_files_read_back_their_parts_and_leave_no_file() {
+        let dir = TestDir::new("work-file");
+        fs::create_dir_all(dir.path()).expect("directory creates");
+        let generations = Generations::new(dir.path());
+
+        let mut writer = generations.create_work_file().expect("work file creates");
+        let path = writer.name.path.clone();
+        let name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("work file name is UTF-8");
+        assert!(
+            name.starts_with(&format!(".SORTWK.tmp-{}-", process::id())),
+            "{name}"
+        );
+        assert!(dir.names().is_empty(), "the name is unlinked at once");
+        writer.write(b"AAAA").expect("work file writes");
+        let middle = writer.offset();
+        writer.write(b"BBBBCCCC").expect("work file writes");
+        assert_eq!((middle, writer.offset()), (4, 12));
+        let work = writer.finish().expect("work file flushes");
+
+        for _ in 0..2 {
+            let mut readers = [work.reader(0, middle), work.reader(middle, 8)];
+            let mut frame = [0_u8; 4];
+            let mut read = Vec::new();
+            for index in [1, 0, 1, 0, 1] {
+                let whole = readers[index]
+                    .read_frame(&mut frame)
+                    .expect("work file reads");
+                read.push(whole.then(|| frame.to_vec()));
+            }
+            assert_eq!(
+                read,
+                [
+                    Some(b"BBBB".to_vec()),
+                    Some(b"AAAA".to_vec()),
+                    Some(b"CCCC".to_vec()),
+                    None,
+                    None,
+                ]
+            );
+        }
+
+        let mut odd = work.reader(0, 6);
+        let mut frame = [0_u8; 4];
+        assert!(odd.read_frame(&mut frame).expect("work file reads"));
+        let error = odd
+            .read_frame(&mut frame)
+            .expect_err("the part ends inside a frame");
+        assert!(
+            matches!(&error, GenerationError::Io { path: at, source }
+                if *at == path && source.kind() == io::ErrorKind::UnexpectedEof),
+            "{error:?}"
+        );
+        let error = odd.invalid_data("not a frame");
+        assert_eq!(
+            error.to_string(),
+            format!("I/O error on {}: not a frame", path.display())
+        );
+        drop(work);
+        assert!(dir.names().is_empty(), "no work file is left");
+    }
+
     #[test]
     fn begin_next_stops_after_g9999() {
         let dir = TestDir::new("exhausted");
@@ -2206,7 +2825,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn async_methods_write_and_read_what_the_sync_methods_do() {
+    async fn async_methods_write_what_the_sync_methods_do() {
         let sync_dir = TestDir::new("sync-path");
         let async_dir = TestDir::new("async-path");
         let sync = Generations::new(sync_dir.path());
@@ -2282,19 +2901,6 @@ pub(crate) mod tests {
             sync_dir.names(),
             "no lock or temporary file is left"
         );
-
-        let long = async_dir.path().join("TRANSACT.BKUP.G0001V00");
-        fs::write(&long, b"ABCDEF\nGHIJKLM\n").expect("file writes");
-        let paths = [
-            cataloged[0].1.path.clone(),
-            async_dir.path().join("SYSTRAN.G0009V00"),
-            long,
-        ];
-        for path in paths {
-            let expected = format!("{:?}", read_records::<SixBytes>(&path));
-            let actual = format!("{:?}", read_records_async::<SixBytes>(path.clone()).await);
-            assert_eq!(actual, expected, "{}", path.display());
-        }
     }
 
     #[tokio::test]

@@ -177,7 +177,9 @@ function TextField({
             maxLength={MAX_LENGTH[name]}
             readOnly={readOnly}
             aria-readonly={readOnly ? "true" : undefined}
-            className={readOnly ? "bg-muted" : undefined}
+            // The dark variant is repeated so it replaces the Input's own
+            // dark:bg-input/30, which a plain bg-muted leaves in place.
+            className={readOnly ? "bg-muted dark:bg-muted" : undefined}
             disabled={disabled}
             autoComplete={autoComplete}
             spellCheck={false}
@@ -406,7 +408,7 @@ function UserEditFormCard({
               form={form}
               name="usr_type"
               label="User Type"
-              description="A=Admin, U=User"
+              description="(A=Admin, U=User)"
             />
           </FieldGroup>
           <div className="flex flex-wrap gap-2">

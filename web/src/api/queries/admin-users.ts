@@ -171,8 +171,16 @@ export function useUserUpdateMutation(userId: string) {
  * `User <id> has been deleted ...`. The deleted user's cached detail is
  * dropped, so no mounted view re-reads a user that no longer exists, and the
  * user lists are refreshed, so the row leaves the page it was on. Other
- * users' details are left alone. The refresh is returned, so the mutation
- * settles once the active lists have reloaded.
+ * users' details are left alone.
+ *
+ * The refresh is started, not returned, so the mutation settles on the
+ * delete's own answer and the caller's `mutate` callbacks report it before
+ * the lists have reloaded. When an admin deletes their own account, the
+ * server answers the refresh 401, because the token's user no longer exists;
+ * a mutation still waiting on the refresh would let that 401 end the session
+ * and unmount the page before the caller's callbacks reported the delete.
+ * invalidateQueries does not throw on error by default, so the promise it
+ * returns never rejects and nothing is left unhandled.
  */
 export function useUserDeleteMutation() {
   const queryClient = useQueryClient();
@@ -185,7 +193,7 @@ export function useUserDeleteMutation() {
       ),
     onSuccess: (_data, userId) => {
       queryClient.removeQueries({ queryKey: userKeys.detail(userId) });
-      return queryClient.invalidateQueries({ queryKey: userKeys.lists() });
+      void queryClient.invalidateQueries({ queryKey: userKeys.lists() });
     },
   });
 }

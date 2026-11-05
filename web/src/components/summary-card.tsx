@@ -16,6 +16,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
 export type SummaryCardProps = {
@@ -63,6 +64,36 @@ export function SummaryCard({
         {description ? (
           <CardDescription>{description}</CardDescription>
         ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+export type SummaryCardSkeletonProps = {
+  /** Whether the card it stands in for shows a description. */
+  description?: boolean;
+  className?: string;
+};
+
+/**
+ * A SummaryCard while its figure is read: the same card, header and content
+ * with a pulse bar as high as each text line of the loaded card (h-5 for the
+ * text-sm title and description, h-8 for the text-2xl value), so the card and
+ * whatever follows it keep their place when the figure arrives. Hidden from
+ * assistive technology; the page tells of the read.
+ */
+export function SummaryCardSkeleton({
+  description = false,
+  className,
+}: SummaryCardSkeletonProps): JSX.Element {
+  return (
+    <Card aria-hidden="true" className={cn(className)}>
+      <CardHeader>
+        <Skeleton className="h-5 w-24" />
+      </CardHeader>
+      <CardContent className="flex flex-col gap-1">
+        <Skeleton className="h-8 w-32" />
+        {description ? <Skeleton className="h-5 w-28" /> : null}
       </CardContent>
     </Card>
   );

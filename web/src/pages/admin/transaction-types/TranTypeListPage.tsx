@@ -30,7 +30,7 @@ import {
 import { Link } from "react-router";
 import { Controller, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeft, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 
 import {
   useTranTypeDeleteMutation,
@@ -41,7 +41,7 @@ import {
 } from "@/api/queries/transaction-types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { DataTable, type DataTableProps } from "@/components/data-table";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
@@ -68,6 +68,15 @@ const TYPE_CODE_MAX_LENGTH = 2;
 
 /** `TRDESC` and the row `TRTYPDn`, `X(50)`. */
 const DESCRIPTION_MAX_LENGTH = 50;
+
+/**
+ * The one width of `TRTYPDn`, shown or open for input. With a 50-character
+ * description on the page, the table fits its card at 768px beside the icon
+ * rail and at 1024px beside the expanded sidebar, and from `lg` the input
+ * shows a typical 50-character description whole: Save sits under it below
+ * `xl` and beside it from `xl`.
+ */
+const DESCRIPTION_WIDTH = "w-112 lg:w-125 xl:w-144";
 
 /** One array for every page without rows, so the table sees one empty result. */
 const NO_ROWS: TranType[] = [];
@@ -155,11 +164,22 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
   const { finishEdit } = useRowActions();
   const inputId = useId();
   const errorId = useId();
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const updateMutation = useTranTypeUpdateMutation();
   const rowForm = useForm<TranTypeInlineEditValues>({
     resolver: zodResolver(tranTypeInlineEditSchema),
     defaultValues: { description: tranType.description },
   });
+
+  // The cursor opens at the start of TRTYPDn, as on the 3270 screen, so a
+  // description wider than the input reads from its first character.
+  useEffect(() => {
+    const input = inputRef.current;
+    if (input !== null) {
+      input.setSelectionRange(0, 0);
+      input.scrollLeft = 0;
+    }
+  }, []);
 
   // One update at a time: a second click or Enter before the busy state
   // re-renders would send the PUT again, and its answer would replace the
@@ -179,11 +199,16 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
       },
       {
         onSuccess: (answer) => {
-          showSuccess(answer.message);
-          // The info line differs from the message only on a change of case
-          // alone, which COTRTLIC stores under its no-change text.
+          // The info line differs from the message only for a description
+          // equal to the stored one but for case and surrounding spaces:
+          // COTRTLIC answers its no-change text, a neutral notice as on the
+          // CTTU screen, yet stores the entered text, which the info line
+          // reports as a success. Otherwise the one text is the update's.
           if (answer.info !== undefined && answer.info !== answer.message) {
-            showMessage(answer.info);
+            showMessage(answer.message);
+            showSuccess(answer.info);
+          } else {
+            showSuccess(answer.message);
           }
           finishEdit(tranType.type_code);
         },
@@ -212,7 +237,7 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
       noValidate
       aria-busy={busy}
       onSubmit={rowForm.handleSubmit(onSave)}
-      className="flex w-80 items-start gap-2"
+      className={`flex flex-col gap-2 xl:flex-row xl:items-start ${DESCRIPTION_WIDTH}`}
     >
       <Controller
         name="description"
@@ -229,6 +254,10 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
                 on the selected row's TRTYPDn. */}
             <Input
               {...field}
+              ref={(element) => {
+                field.ref(element);
+                inputRef.current = element;
+              }}
               id={inputId}
               maxLength={DESCRIPTION_MAX_LENGTH}
               autoComplete="off"
@@ -240,7 +269,11 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
           </Field>
         )}
       />
-      <Button type="submit" aria-disabled={busy} className={busyClass}>
+      <Button
+        type="submit"
+        aria-disabled={busy}
+        className={`self-start ${busyClass}`}
+      >
         Save
       </Button>
     </form>
@@ -249,13 +282,20 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
 
 /**
  * `TRTYPDn`: the description, or its inline form while the row is selected.
- * The text and the form take the same width (`w-80` / `min-w-80`), so the
- * table's automatic column widths do not move when a row opens.
+ * The text and the form take the one fixed width, DESCRIPTION_WIDTH, and the
+ * text wraps inside it rather than widening the cell, so the table's automatic
+ * column widths do not move when a row opens or closes.
  */
 function DescriptionCell({ tranType }: RowCellProps): JSX.Element {
   const { editingCode } = useRowActions();
   if (editingCode !== tranType.type_code) {
-    return <span className="inline-block min-w-80">{tranType.description}</span>;
+    return (
+      <span
+        className={`block whitespace-normal wrap-break-word ${DESCRIPTION_WIDTH}`}
+      >
+        {tranType.description}
+      </span>
+    );
   }
   return (
     <InlineDescriptionForm key={tranType.type_code} tranType={tranType} />
@@ -276,16 +316,22 @@ function RowActionsCell({ tranType, rowIndex }: RowCellProps): JSX.Element {
   const describedBy = typeCodeCellId(idPrefix, rowIndex);
 
   // A save removes the focused Save button with the form; focus returns to
-  // this row's Edit rather than the start of the document. A row closed
-  // because another one opened leaves focus in the newly opened input.
+  // this row's Edit rather than the start of the document. A press of the
+  // pressed Edit leaves focus on it. Either way the Edit, with the margin its
+  // focus ring takes, is scrolled into the visible part of the table, which
+  // scrolls inside its card. A row closed because another one opened leaves
+  // focus in the newly opened input.
   useEffect(() => {
+    const edit = editRef.current;
     const active = document.activeElement;
     if (
+      edit !== null &&
       wasEditing.current &&
       !editing &&
-      (active === null || active === document.body)
+      (active === null || active === document.body || active === edit)
     ) {
-      editRef.current?.focus();
+      edit.focus();
+      edit.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
     wasEditing.current = editing;
   }, [editing]);
@@ -298,7 +344,7 @@ function RowActionsCell({ tranType, rowIndex }: RowCellProps): JSX.Element {
         variant="link"
         aria-pressed={editing}
         aria-describedby={describedBy}
-        className="aria-pressed:underline"
+        className="scroll-mx-1 aria-pressed:underline"
         onClick={() => toggleEdit(tranType.type_code)}
       >
         Edit
@@ -536,12 +582,7 @@ export default function TranTypeListPage(): JSX.Element {
                 Add transaction type
               </Link>
             </Button>
-            <Button asChild variant="outline">
-              <Link to="/admin">
-                <ArrowLeft aria-hidden="true" />
-                Back
-              </Link>
-            </Button>
+            <BackLink to="/admin" />
           </>
         }
       />

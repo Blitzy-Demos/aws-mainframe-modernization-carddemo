@@ -3,15 +3,23 @@
 // input the form schema rejects is never sent, and a server rejection lands on
 // the form: its message as a toast, each `fields[]` entry on its form field,
 // and the cursor on the first of them. An answer that arrives after the entry
-// was edited is still shown but leaves the newer entry as typed. Controls are
-// found by the accessible names of the F-CORPT00 rows in
-// docs/parity/function-map.md; expected texts are the CORPT00C rows of
+// was edited is still shown but leaves the newer entry as typed. While a
+// report runs, Run report keeps the focus the dialog returns to it and sends
+// nothing more. Controls are found by the accessible names of the F-CORPT00
+// rows in docs/parity/function-map.md; expected texts are the CORPT00C rows of
 // docs/parity/validation-audit.md and docs/parity/parity-oracle-audit.md.
 //
 // The network is the global the API client looks up on every request, stubbed
 // per test; the client passes it the Request it built.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
@@ -23,6 +31,7 @@ import {
   it,
   vi,
   type Mock,
+  type MockInstance,
 } from "vitest";
 
 import type { components, paths } from "@/api/schema";
@@ -294,6 +303,75 @@ const LATE_ANSWERS: readonly LateAnswer[] = [
   },
 ];
 
+/** The hint shown above a record box narrower than its records. */
+const SCROLL_HINT = "Scroll sideways to see each line in full.";
+
+/**
+ * Lays every element out with the given sizes: jsdom performs no layout, so
+ * each reports 0. vi.restoreAllMocks puts the real getters back.
+ */
+function stubLayout(
+  scrollWidth: number,
+  clientWidth: number,
+): { scrollLeft: MockInstance<() => number> } {
+  vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockReturnValue(
+    scrollWidth,
+  );
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(
+    clientWidth,
+  );
+  const scrollLeft = vi
+    .spyOn(HTMLElement.prototype, "scrollLeft", "get")
+    .mockReturnValue(0);
+  return { scrollLeft };
+}
+
+/** Runs a confirmed Monthly report and returns the box holding its records. */
+async function showMonthlyRecords(): Promise<HTMLPreElement> {
+  fetchMock.mockResolvedValueOnce(
+    jsonResponse(200, report("Monthly", "2022-07-01", "2022-07-31")),
+  );
+  const { user } = renderPage();
+  await user.click(screen.getByRole("radio", { name: MONTHLY }));
+  await runAndConfirm(user);
+  const shown = await screen.findByRole("region", { name: "Monthly" });
+  const box = shown.querySelector("pre");
+  if (box === null) {
+    throw new Error("the report shows no record box");
+  }
+  return box;
+}
+
+/** The sides of the record box an edge fade covers. */
+function fadedSides(box: HTMLElement): string[] {
+  return Array.from(box.parentElement?.children ?? [])
+    .filter((element) => element.getAttribute("aria-hidden") === "true")
+    .map((fade) => {
+      if (fade.classList.contains("start-0")) {
+        return "start";
+      }
+      return fade.classList.contains("end-0") ? "end" : "unplaced";
+    });
+}
+
+/**
+ * The margin-top utility that applies to a field description where it stands
+ * among its field's children: the generated FieldDescription varies it with
+ * the `last:` and `nth-last-2:` variants.
+ */
+function positionalMarginTop(description: Element): string | undefined {
+  let variant = "";
+  if (description.matches(":last-child")) {
+    variant = "last:";
+  } else if (description.matches(":nth-last-child(2)")) {
+    variant = "nth-last-2:";
+  }
+  return Array.from(description.classList)
+    .filter((name) => name.startsWith(variant))
+    .map((name) => name.slice(variant.length))
+    .find((utility) => /^-?mt-/.test(utility));
+}
+
 /** Lets the timer task pass on which react-hook-form's setFocus moves focus. */
 async function nextTask(): Promise<void> {
   await act(async () => {
@@ -498,6 +576,90 @@ describe("TransactionReportPage (CR00)", () => {
     },
   );
 
+  it.each<{ how: string; press: (user: User, run: HTMLElement) => Promise<void> }>([
+    { how: "a click", press: (user, run) => user.click(run) },
+    { how: "Enter", press: (user) => user.keyboard("{Enter}") },
+  ])(
+    "keeps focus on the inert Run report while the report runs and ignores $how on it",
+    async ({ press }) => {
+      // The answer is held until the second press has been made.
+      let release: (response: Response) => void = () => undefined;
+      fetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+      );
+      const { user } = renderPage();
+
+      await user.click(screen.getByRole("radio", { name: MONTHLY }));
+      await runAndConfirm(user);
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      // The dialog's opener takes focus back: it is inert, not disabled.
+      const run = screen.getByRole("button", { name: "Run report" });
+      expect(run.getAttribute("aria-disabled")).toBe("true");
+      expect(run.hasAttribute("disabled")).toBe(false);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(run);
+      });
+
+      await press(user, run);
+      await nextTask();
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(screen.queryAllByRole("alert")).toEqual([]);
+      expect(onlyQuery()).toEqual({ report_type: "monthly", confirm: "Y" });
+      expect(document.activeElement).toBe(run);
+
+      release(jsonResponse(200, report("Monthly", "2022-07-01", "2022-07-31")));
+      await screen.findByRole("region", { name: "Monthly" });
+      expect(run.getAttribute("aria-disabled")).toBe("false");
+      // INITIALIZE-ALL-FIELDS, then MOVE -1 TO MONTHLYL.
+      await waitFor(() => {
+        expect(document.activeElement).toBe(
+          screen.getByRole("radio", { name: MONTHLY }),
+        );
+      });
+      expect(
+        screen.getByRole("radio", { name: MONTHLY }).getAttribute("aria-checked"),
+      ).toBe("false");
+    },
+  );
+
+  it("ignores Enter in a date text while the report runs, before any edit", async () => {
+    // The date texts stay editable while a report runs; Enter in one submits
+    // the form, whose submit is inert until the answer arrives.
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => undefined));
+    const { user } = renderPage();
+
+    const { start, end } = await enterCustomRange(
+      user,
+      "2022-01-01",
+      "2022-07-06",
+    );
+    await runAndConfirm(user);
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    // A blank end date, which the submitted form marks as it changes. The
+    // edits of a submit would also move the cursor onto it.
+    await user.clear(end);
+    await waitFor(() => {
+      expect(end.getAttribute("aria-invalid")).toBe("true");
+    });
+    await user.type(start, "{Enter}");
+    await nextTask();
+
+    expect(document.activeElement).toBe(start);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(onlyQuery()).toEqual({
+      report_type: "custom",
+      start_date: "2022-01-01",
+      end_date: "2022-07-06",
+      confirm: "Y",
+    });
+  });
+
   it("closes the dialog on Cancel without sending, keeping the entries", async () => {
     // F-CORPT00-003: the entries stay, so the same request can run again.
     const { user } = renderPage();
@@ -520,14 +682,120 @@ describe("TransactionReportPage (CR00)", () => {
     expect([start.value, end.value]).toEqual(["2022-01-01", "2022-07-06"]);
   });
 
+  it.each(["Start date", "End date"])(
+    "hints the %s format as (YYYY-MM-DD), as CT02 does",
+    async (name) => {
+      const { user } = renderPage();
+
+      await user.click(screen.getByRole("radio", { name: CUSTOM }));
+
+      const input = textbox(name);
+      expect(input.placeholder).toBe("YYYY-MM-DD");
+      const [descriptionId] = (
+        input.getAttribute("aria-describedby") ?? ""
+      ).split(" ");
+      expect(document.getElementById(descriptionId)?.textContent).toBe(
+        "(YYYY-MM-DD)",
+      );
+    },
+  );
+
   it("returns to the main menu through Back", async () => {
     // F-CORPT00-004: F3=Back, XCTL to COMEN01C [app/cbl/CORPT00C.cbl:L187-189].
     const { user, router } = renderPage();
+    const back = screen.getByRole("link", { name: "Back" });
+    // In the page header's actions, as on every screen, not the form's keys.
+    expect(back.closest("header")).not.toBeNull();
+    expect(back.closest("form")).toBeNull();
 
-    await user.click(screen.getByRole("link", { name: "Back" }));
+    await user.click(back);
 
     expect(await screen.findByText("Main menu")).not.toBeNull();
     expect(router.state.location.pathname).toBe("/");
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("keeps both date hints on one line when only the start date has an error", async () => {
+    // Empty dates stop at the first edit, the start month, so only the start
+    // date is marked [app/cbl/CORPT00C.cbl:L259-265].
+    const { user } = renderPage();
+
+    await user.click(screen.getByRole("radio", { name: CUSTOM }));
+    await user.click(screen.getByRole("button", { name: "Run report" }));
+
+    expect(await shownFieldErrors()).toEqual([
+      "Start Date - Month can NOT be empty...",
+    ]);
+    const hints = screen.getAllByText("(YYYY-MM-DD)");
+    // The error under the start hint makes it its field's second-to-last
+    // child, while the end hint stays the last of its field.
+    expect(hints.map((hint) => hint.matches(":nth-last-child(2)"))).toEqual([
+      true,
+      false,
+    ]);
+    expect(hints.map(positionalMarginTop)).toEqual(["mt-0", "mt-0"]);
+  });
+
+  it.each([
+    {
+      layout: "fits its box",
+      scrollWidth: 926,
+      clientWidth: 926,
+      description: null,
+      sides: [],
+    },
+    {
+      layout: "is wider than its box",
+      scrollWidth: 1117,
+      clientWidth: 926,
+      description: SCROLL_HINT,
+      sides: ["end"],
+    },
+  ] satisfies {
+    layout: string;
+    scrollWidth: number;
+    clientWidth: number;
+    description: string | null;
+    sides: string[];
+  }[])(
+    "says the records scroll sideways only when a record $layout",
+    async ({ scrollWidth, clientWidth, description, sides }) => {
+      // The records are never wrapped, so a wide one scrolls inside its box;
+      // the hint and the edge fade make the hidden text visible as such.
+      stubLayout(scrollWidth, clientWidth);
+
+      const box = await showMonthlyRecords();
+
+      const describedBy = box.getAttribute("aria-describedby");
+      expect(
+        describedBy === null
+          ? null
+          : document.getElementById(describedBy)?.textContent,
+      ).toBe(description);
+      expect(screen.queryAllByText(SCROLL_HINT)).toHaveLength(
+        description === null ? 0 : 1,
+      );
+      expect(fadedSides(box)).toEqual(sides);
+    },
+  );
+
+  it.each([
+    { position: "mid-line", scrolled: 95, sides: ["start", "end"] },
+    { position: "to the line ends", scrolled: 191, sides: ["start"] },
+  ])(
+    "fades the hidden sides of a wide record scrolled $position",
+    async ({ scrolled, sides }) => {
+      // 1117px of record in a 926px box: 191px lie out of view.
+      const { scrollLeft } = stubLayout(1117, 926);
+      const box = await showMonthlyRecords();
+      expect(fadedSides(box)).toEqual(["end"]);
+
+      scrollLeft.mockReturnValue(scrolled);
+      fireEvent.scroll(box);
+
+      expect(fadedSides(box)).toEqual(sides);
+      // The hint stays while any record is wider than the box.
+      expect(screen.queryAllByText(SCROLL_HINT)).toHaveLength(1);
+    },
+  );
 });

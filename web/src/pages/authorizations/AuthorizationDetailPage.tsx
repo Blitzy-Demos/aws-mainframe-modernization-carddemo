@@ -15,8 +15,8 @@
 // POPULATE-AUTH-DETAILS makes on the move to the screen, as text only, so no
 // amount passes through a JavaScript number.
 import { useEffect, useRef, useState, type JSX } from "react";
-import { Link, useNavigate, useParams, useSearchParams, type To } from "react-router";
-import { ArrowLeft, ChevronRight } from "lucide-react";
+import { useNavigate, useParams, useSearchParams, type To } from "react-router";
+import { ChevronRight } from "lucide-react";
 
 import { ApiError } from "@/api/client";
 import {
@@ -27,7 +27,7 @@ import {
   type AuthSummaryParams,
 } from "@/api/queries/authorizations";
 import { ConfirmDialog } from "@/components/confirm-dialog";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -596,12 +596,7 @@ export default function AuthorizationDetailPage(): JSX.Element {
   // it; a second mark is a second PF5, which the server serializes.
   const actions = (
     <>
-      <Button asChild variant="outline">
-        <Link to={withAccount(SUMMARY_PATH, accountId)}>
-          <ArrowLeft aria-hidden="true" />
-          Back
-        </Link>
-      </Button>
+      <BackLink to={withAccount(SUMMARY_PATH, accountId)} />
       {detail === undefined ? null : (
         <>
           <Button

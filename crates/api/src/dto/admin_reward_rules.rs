@@ -80,17 +80,22 @@ pub struct RewardRuleRequest {
     // `validate_rule` and is answered with its own message.
     #[schema(pattern = r"^-?[0-9]+(\.[0-9]+)?$", example = "1.0000")]
     pub reward_rate: String,
-    /// The inclusive lower bound of a qualifying amount, a decimal string with
-    /// at most 2 fraction digits (`S9(09)V99`). Absent or `null` is
+    /// The inclusive lower bound of a qualifying amount, a decimal string from
+    /// -999999999.99 to 999999999.99 with at most 2 fraction digits
+    /// (`S9(09)V99`); leading zeros are allowed. Absent or `null` is
     /// unbounded.
+    // The pattern is exactly the text `optional_amount` accepts: at most 9
+    // integer digits after any leading zeros, a magnitude below 10^9.
     #[serde(default)]
-    #[schema(pattern = r"^-?[0-9]+(\.[0-9]{1,2})?$", example = "10.00")]
+    #[schema(pattern = r"^-?0*[0-9]{1,9}(\.[0-9]{1,2})?$", example = "10.00")]
     pub min_transaction_amount: Option<String>,
-    /// The inclusive upper bound of a qualifying amount, a decimal string with
-    /// at most 2 fraction digits (`S9(09)V99`). Absent or `null` is
+    /// The inclusive upper bound of a qualifying amount, a decimal string from
+    /// -999999999.99 to 999999999.99 with at most 2 fraction digits
+    /// (`S9(09)V99`); leading zeros are allowed. Absent or `null` is
     /// unbounded.
+    // The same pattern as `min_transaction_amount`.
     #[serde(default)]
-    #[schema(pattern = r"^-?[0-9]+(\.[0-9]{1,2})?$", example = "500.00")]
+    #[schema(pattern = r"^-?0*[0-9]{1,9}(\.[0-9]{1,2})?$", example = "500.00")]
     pub max_transaction_amount: Option<String>,
     /// The first instant the rule is active, inclusive, as an RFC 3339
     /// date-time of at most microsecond precision, converted to UTC: a
@@ -142,7 +147,8 @@ impl RewardRuleRequest {
     /// - `reward_rate`: not `-?[0-9]+(.[0-9]+)?`, or more digits than a
     ///   `Decimal` holds.
     /// - `min_transaction_amount`, `max_transaction_amount`: not
-    ///   `-?[0-9]+(.[0-9]{1,2})?`, or a magnitude of 10^9 or more.
+    ///   `-?[0-9]+(.[0-9]{1,2})?`, or a magnitude of 10^9 or more; together,
+    ///   the text the published `^-?0*[0-9]{1,9}(\.[0-9]{1,2})?$` rejects.
     /// - `active_from`, `active_to`: not an RFC 3339 date-time; a fraction
     ///   digit after the 6th that is not `0`, finer than a microsecond;
     ///   second `60`, a leap second; or, checked after those, an instant
@@ -428,7 +434,9 @@ fn decimal(field: &str, text: &str) -> Result<Decimal, ApiError> {
 /// with; `None` stays unbounded.
 ///
 /// More than two fraction digits are rejected as written, even trailing zeros
-/// (`1.230`), as the published pattern rejects them.
+/// (`1.230`), as the published pattern rejects them. So is a magnitude of
+/// 10^9 or more (`1000000000.00`), the published pattern's limit of 9 integer
+/// digits after any leading zeros (`0000000001.00` is accepted).
 fn optional_amount(field: &str, text: Option<&str>) -> Result<Option<Money<9>>, ApiError> {
     text.map(|text| {
         let value = decimal(field, text)?;
@@ -703,6 +711,55 @@ mod tests {
                 error.body().message
             );
             assert!(error.body().fields.is_empty(), "{field} {value}");
+        }
+    }
+
+    /// The published amount pattern `^-?0*[0-9]{1,9}(\.[0-9]{1,2})?$` holds the
+    /// range `optional_amount` enforces: up to 9 integer digits after any
+    /// leading zeros convert, at both bounds of `S9(09)V99`; a tenth
+    /// significant integer digit is out of range, however many zeros lead.
+    #[test]
+    fn amount_bounds_convert_up_to_nine_integer_digits_after_leading_zeros() {
+        let leading_zeros = format!("{}1.00", "0".repeat(40));
+        let accepted = [
+            ("999999999.99", 99_999_999_999),
+            ("-999999999.99", -99_999_999_999),
+            ("0000000001.00", 100),
+            ("000000000999999999.99", 99_999_999_999),
+            (leading_zeros.as_str(), 100),
+            ("123456789.5", 12_345_678_950),
+            ("0", 0),
+            ("-0.00", 0),
+        ];
+        for field in ["min_transaction_amount", "max_transaction_amount"] {
+            for (text, cents) in accepted {
+                let draft = request(body_with(field, json!(text)))
+                    .into_draft()
+                    .unwrap_or_else(|error| panic!("{field} {text}: {}", error.body().message));
+                let bound = if field == "min_transaction_amount" {
+                    draft.min_transaction_amount
+                } else {
+                    draft.max_transaction_amount
+                };
+                assert_eq!(
+                    bound,
+                    Some(Money::<9>::from_cents(cents).expect("an S9(09)V99 amount")),
+                    "{field} {text}"
+                );
+            }
+            for text in [
+                "1000000000.00",
+                "-1000000000",
+                "01000000000",
+                "0000000001000000000.5",
+                "-9999999999.99",
+            ] {
+                assert_eq!(
+                    rejection(body_with(field, json!(text))).body().message,
+                    format!("{field}: value is outside the range of the field"),
+                    "{text}"
+                );
+            }
         }
     }
 
@@ -1149,7 +1206,7 @@ mod tests {
         for bound in ["min_transaction_amount", "max_transaction_amount"] {
             assert_eq!(
                 property(bound)["pattern"],
-                json!(r"^-?[0-9]+(\.[0-9]{1,2})?$"),
+                json!(r"^-?0*[0-9]{1,9}(\.[0-9]{1,2})?$"),
                 "{bound}"
             );
         }

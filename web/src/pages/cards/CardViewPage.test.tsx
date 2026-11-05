@@ -199,6 +199,57 @@ describe("CardViewPage with valid keys", () => {
     expect(network).toHaveBeenCalledTimes(1);
   });
 
+  // CRDSTCD as a badge carrying its letter: N, the inactive state, is
+  // destructive.
+  it.each([
+    { flag: "Y", variant: "secondary" },
+    { flag: "N", variant: "destructive" },
+  ])(
+    "shows the active flag $flag as a $variant badge",
+    async ({ flag, variant }) => {
+      stubNetwork(() => Response.json({ ...FOUND, card_active_status: flag }));
+      renderPage(VALID_ENTRY);
+      await within(cardRegion()).findByText("Aniya Von");
+
+      const badge = valueOf("Card Active Y/N").querySelector(
+        '[data-slot="badge"]',
+      );
+      expect(badge?.textContent).toBe(flag);
+      expect(badge?.getAttribute("data-variant")).toBe(variant);
+    },
+  );
+
+  it("holds the message line's place while the card is read", async () => {
+    let answer: (response: Response) => void = () => undefined;
+    const held = new Promise<Response>((settle) => {
+      answer = settle;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<Network>(async () => held),
+    );
+    renderPage(VALID_ENTRY);
+
+    // One message line throughout: a hidden placeholder line while busy,
+    // then INFOMSG.
+    const region = cardRegion();
+    expect(region.getAttribute("aria-busy")).toBe("true");
+    const placeholder = region.querySelectorAll(
+      '[data-slot="card-description"]',
+    );
+    expect(placeholder).toHaveLength(1);
+    expect(placeholder[0].getAttribute("aria-hidden")).toBe("true");
+    expect(placeholder[0].querySelector('[data-slot="skeleton"]')).not.toBeNull();
+
+    answer(Response.json(FOUND));
+    await within(region).findByText("Aniya Von");
+    const line = region.querySelectorAll('[data-slot="card-description"]');
+    expect(line).toHaveLength(1);
+    expect(line[0].textContent).toBe(FOUND.message);
+    expect(line[0].hasAttribute("aria-hidden")).toBe(false);
+    expect(region.getAttribute("aria-busy")).toBe("false");
+  });
+
   it("leaves for the card list by Back, F3=Exit (F-COCRDSL-002)", async () => {
     stubNetwork(() => Response.json(FOUND));
     const router = renderPage(VALID_ENTRY);

@@ -4596,18 +4596,18 @@
               "string",
               "null"
             ],
-            "description": "The inclusive upper bound of a qualifying amount, a decimal string with\nat most 2 fraction digits (`S9(09)V99`). Absent or `null` is\nunbounded.",
+            "description": "The inclusive upper bound of a qualifying amount, a decimal string from\n-999999999.99 to 999999999.99 with at most 2 fraction digits\n(`S9(09)V99`); leading zeros are allowed. Absent or `null` is\nunbounded.",
             "example": "500.00",
-            "pattern": "^-?[0-9]+(\\.[0-9]{1,2})?$"
+            "pattern": "^-?0*[0-9]{1,9}(\\.[0-9]{1,2})?$"
           },
           "min_transaction_amount": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The inclusive lower bound of a qualifying amount, a decimal string with\nat most 2 fraction digits (`S9(09)V99`). Absent or `null` is\nunbounded.",
+            "description": "The inclusive lower bound of a qualifying amount, a decimal string from\n-999999999.99 to 999999999.99 with at most 2 fraction digits\n(`S9(09)V99`); leading zeros are allowed. Absent or `null` is\nunbounded.",
             "example": "10.00",
-            "pattern": "^-?[0-9]+(\\.[0-9]{1,2})?$"
+            "pattern": "^-?0*[0-9]{1,9}(\\.[0-9]{1,2})?$"
           },
           "reward_rate": {
             "type": "string",

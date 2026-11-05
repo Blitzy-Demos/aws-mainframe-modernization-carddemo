@@ -27,6 +27,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   act,
+  fireEvent,
   getDefaultNormalizer,
   render,
   screen,
@@ -283,6 +284,31 @@ function findBalanceCard(): Promise<HTMLElement> {
   return screen.findByRole("group", { name: BALANCE_TITLE, hidden: true });
 }
 
+/** The status text of a CURBAL card whose balance may be about to change. */
+const BALANCE_UPDATING = "Updating the current balance";
+
+// The busy cues of the CURBAL card: its wrapper's aria-busy and status text
+// (the status is rendered throughout, so its text is announced when it
+// appears), and the card's dimming and spinning icon. `hidden` lets the query
+// reach the status behind the open dialog.
+function balanceCuesOf(card: HTMLElement): {
+  busy: string | null;
+  status: string | null;
+  dimmed: boolean;
+  spinning: boolean;
+} {
+  const wrapper = card.parentElement;
+  if (wrapper === null) {
+    throw new Error("The balance card has no wrapper");
+  }
+  return {
+    busy: wrapper.getAttribute("aria-busy"),
+    status: within(wrapper).getByRole("status", { hidden: true }).textContent,
+    dimmed: card.classList.contains("opacity-60"),
+    spinning: card.querySelector('[class*="animate-spin"]') !== null,
+  };
+}
+
 // ENTER on `entry` typed into ACTIDIN, answered by the review stub; resolves
 // to the confirmation dialog the 200 opens.
 async function review(user: UserEvent, entry: string = ACCOUNT_ID): Promise<HTMLElement> {
@@ -435,6 +461,106 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
       expect(toast.error).not.toHaveBeenCalled();
     },
   );
+
+  // Two activations in one tick, before the page re-renders, as a double click
+  // can send them. The mutations' isPending only changes with the next
+  // render, so only the page's synchronous guard drops the second. `bodies`
+  // is every POST /payments the page then sends.
+  const DOUBLE_ACTIVATIONS: readonly {
+    control: string;
+    activateTwice: (user: UserEvent) => Promise<void>;
+    bodies: readonly PaymentRequest[];
+  }[] = [
+    {
+      control: "Review payment (F-COBIL00-001)",
+      activateTwice: async (user) => {
+        await user.type(accountInput(), ACCOUNT_ID);
+        const form = accountInput().form;
+        if (form === null) {
+          throw new Error("The account input is outside a form");
+        }
+        // handleSubmit runs the schema asynchronously, so both submits reach
+        // the review after this tick.
+        fireEvent.submit(form);
+        fireEvent.submit(form);
+        await screen.findByRole("alertdialog", { name: DIALOG_TITLE });
+        await findBalanceCard();
+      },
+      bodies: [REVIEW_BODY],
+    },
+    {
+      control: "Confirm (F-COBIL00-002)",
+      activateTwice: async (user) => {
+        const dialog = await review(user);
+        await findBalanceCard();
+        const confirm = within(dialog).getByRole("button", { name: "Confirm" });
+        // One act scope: the dialog neither closes nor disables its action
+        // between the presses.
+        act(() => {
+          fireEvent.click(confirm);
+          fireEvent.click(confirm);
+        });
+        await waitFor(() => {
+          expect(toast.success).toHaveBeenCalledWith(PAID_MESSAGE);
+        });
+      },
+      bodies: [REVIEW_BODY, PAY_BODY],
+    },
+  ];
+
+  it.each(DOUBLE_ACTIVATIONS)(
+    "sends one request for two activations of $control in one tick",
+    async ({ activateTwice, bodies }) => {
+      const user = renderPage();
+
+      await activateTwice(user);
+
+      await nextTask();
+      expect(await bodiesOf(requestsOf("POST"))).toEqual(bodies);
+      expect(toast.error).not.toHaveBeenCalled();
+    },
+  );
+
+  it("marks the submit busy while the review runs and lets Reset abandon it (F-COBIL00-001, F-COBIL00-005)", async () => {
+    const release = hold("review");
+    const user = renderPage();
+
+    await user.type(accountInput(), `${ACCOUNT_ID}{Enter}`);
+    // The exact function-map name, the spinner being hidden from it.
+    const submit = screen.getByRole<HTMLButtonElement>("button", { name: "Review payment" });
+    const reset = screen.getByRole<HTMLButtonElement>("button", { name: "Reset" });
+    await waitFor(() => {
+      expect(requestsOf("POST")).toHaveLength(1);
+      expect(submit.getAttribute("aria-busy")).toBe("true");
+    });
+    // Inert but focusable, and Reset, the way to abandon the read-only
+    // review, stays usable.
+    expect(submit.getAttribute("aria-disabled")).toBe("true");
+    expect(submit.disabled).toBe(false);
+    expect(reset.disabled).toBe(false);
+
+    await user.click(reset);
+
+    const input = accountInput();
+    await waitFor(() => {
+      expect(input.value).toBe("");
+      expect(document.activeElement).toBe(input);
+      expect(submit.getAttribute("aria-busy")).toBe("false");
+    });
+    expect(submit.getAttribute("aria-disabled")).toBe("false");
+    // The abandoned review's answer opens nothing over the cleared screen.
+    release([200, reviewed]);
+    await nextTask();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByRole("group", { name: BALANCE_TITLE })).toBeNull();
+
+    // The next ENTER is sent and answered.
+    stubs.review = [200, reviewed];
+    await review(user);
+    await findBalanceCard();
+    expect(await bodiesOf(requestsOf("POST"))).toEqual([REVIEW_BODY, REVIEW_BODY]);
+    expect(toast.error).not.toHaveBeenCalled();
+  });
 
   // ACTIDINI = SPACES OR LOW-VALUES, the one COBIL00C edit the form repeats.
   const BLANK_ENTRIES: readonly {
@@ -655,8 +781,9 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
   // The entry typed while the review or the confirmed payment is still running.
   const NEWER_ACCOUNT = "00000000002";
 
-  // Ways the entry is replaced while the payment runs. Reset also clears the
-  // balance card, so only a typed entry still shows it.
+  // Ways the entry is replaced while the payment runs, with the balance cards
+  // then shown. Reset is not among them: it is disabled while the payment
+  // writes (see the busy-state test of the payment).
   const ENTRY_CHANGES: readonly {
     how: string;
     change: (user: UserEvent) => Promise<void>;
@@ -669,14 +796,6 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
         await user.type(accountInput(), NEWER_ACCOUNT);
       },
       cards: 1,
-    },
-    {
-      how: "an account typed after Reset",
-      change: async (user) => {
-        await user.click(screen.getByRole("button", { name: "Reset" }));
-        await user.type(accountInput(), NEWER_ACCOUNT);
-      },
-      cards: 0,
     },
   ];
 
@@ -783,6 +902,69 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
       const card = screen.getByRole("group", { name: BALANCE_TITLE });
       expect(within(card).getByText(balance)).toBeTruthy();
       expect(within(card).getByText(`Account ${ACCOUNT_ID}`)).toBeTruthy();
+    },
+  );
+
+  it.each(LATE_PAYMENT_ANSWERS)(
+    "marks the submit, Reset and the balance busy while the payment runs until its $outcome settles (F-COBIL00-002)",
+    async ({ reply, toast: kind, message, balance }) => {
+      const release = hold("pay");
+      const user = renderPage();
+
+      const dialog = await review(user);
+      const card = await findBalanceCard();
+      expect(balanceCuesOf(card)).toEqual({
+        busy: "false",
+        status: "",
+        dimmed: false,
+        spinning: false,
+      });
+      await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+        expect(requestsOf("POST")).toHaveLength(2);
+      });
+
+      const submit = screen.getByRole<HTMLButtonElement>("button", { name: "Review payment" });
+      const reset = screen.getByRole<HTMLButtonElement>("button", { name: "Reset" });
+      await waitFor(() => {
+        expect(submit.getAttribute("aria-busy")).toBe("true");
+      });
+      expect(submit.getAttribute("aria-disabled")).toBe("true");
+      expect(submit.disabled).toBe(false);
+      // The write is in flight, so the screen cannot be cleared under it.
+      expect(reset.disabled).toBe(true);
+      // The balance on file, which the payment may change, is shown busy.
+      const paying = screen.getByRole("group", { name: BALANCE_TITLE });
+      expect(within(paying).getByText(account.acct_curr_bal)).toBeTruthy();
+      expect(balanceCuesOf(paying)).toEqual({
+        busy: "true",
+        status: BALANCE_UPDATING,
+        dimmed: true,
+        spinning: true,
+      });
+
+      release(reply);
+
+      await waitFor(() => {
+        expect(toast[kind]).toHaveBeenCalledWith(message);
+      });
+      // Once the payment and the reload after it have settled: the 201's
+      // balance, or the reloaded one after a refusal (E-19), and nothing busy.
+      await waitFor(() => {
+        const settled = screen.getByRole("group", { name: BALANCE_TITLE });
+        expect(within(settled).getByText(balance)).toBeTruthy();
+        expect(balanceCuesOf(settled)).toEqual({
+          busy: "false",
+          status: "",
+          dimmed: false,
+          spinning: false,
+        });
+        expect(submit.getAttribute("aria-busy")).toBe("false");
+        expect(submit.getAttribute("aria-disabled")).toBe("false");
+        expect(reset.disabled).toBe(false);
+      });
+      expect(await bodiesOf(requestsOf("POST"))).toEqual([REVIEW_BODY, PAY_BODY]);
     },
   );
 

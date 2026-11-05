@@ -43,17 +43,49 @@ function isTheme(value: string | null): value is Theme {
   return value === "light" || value === "dark";
 }
 
+// Carried by the root element while its theme class changes; index.css turns
+// every CSS transition off under it.
+const THEME_SWITCHING_CLASS = "theme-switching";
+
+// The theme stored in this tab, or null for a missing or unrecognised value.
 // Reading sessionStorage throws where the browser blocks storage (sandboxed
-// frames, some privacy settings); the default theme applies then, as it does
-// for a missing or unrecognised stored value.
-function readStoredTheme(fallback: Theme): Theme {
+// frames, some privacy settings); that also gives null, so the caller's
+// default applies.
+function readStoredTheme(): Theme | null {
   try {
     const stored = window.sessionStorage.getItem(THEME_STORAGE_KEY);
-    return isTheme(stored) ? stored : fallback;
+    return isTheme(stored) ? stored : null;
   } catch {
-    return fallback;
+    return null;
   }
 }
+
+// Whether the root element carries this theme's class and not the other's.
+function hasThemeClass(root: HTMLElement, theme: Theme): boolean {
+  const other: Theme = theme === "light" ? "dark" : "light";
+  return root.classList.contains(theme) && !root.classList.contains(other);
+}
+
+function setThemeClass(root: HTMLElement, theme: Theme): void {
+  root.classList.remove("light", "dark");
+  root.classList.add(theme);
+}
+
+// Puts the theme stored in this tab on the root element, or leaves the element
+// untouched when none is stored: the :root tokens of index.css are then the
+// light theme, which is also the provider's default.
+function applyStoredTheme(): void {
+  const stored = readStoredTheme();
+  if (stored !== null) {
+    setThemeClass(window.document.documentElement, stored);
+  }
+}
+
+// Runs once, while main.tsx's module graph is evaluated and before React
+// renders anything. index.html loads that graph as a render-blocking script, so
+// a reload or a direct visit in a tab that chose dark paints its first frame
+// dark rather than light.
+applyStoredTheme();
 
 // A blocked or full sessionStorage only loses the choice on the next reload;
 // the theme still changes for the page being shown.
@@ -72,21 +104,33 @@ export function ThemeProvider({
   children,
   defaultTheme = "light",
 }: ThemeProviderProps): JSX.Element {
-  const [theme, setThemeState] = useState<Theme>(() =>
-    readStoredTheme(defaultTheme),
+  const [theme, setThemeState] = useState<Theme>(
+    () => readStoredTheme() ?? defaultTheme,
   );
 
-  // The theme class is applied after React commits the provider's render and
-  // before the browser paints that commit, so the first frame React renders,
-  // and every later theme change, already shows the chosen theme's tokens. It
-  // does not govern what the document paints before the bundle runs and React
-  // mounts, when the :root (light) defaults of index.css apply. index.css
-  // switches the tokens on the `dark` class of the root element; `light` is
-  // set for symmetry and selects the :root defaults.
+  // Keeps the root element's class on the theme, after React commits and
+  // before the browser paints that commit. index.css switches the tokens on the
+  // `dark` class; `light` is set for symmetry and selects the :root defaults.
+  // A class already in place, as applyStoredTheme leaves it for the first
+  // mount, is not touched.
+  //
+  // Any other change happens under the theme-switching class, which turns CSS
+  // transitions off. Reading a computed value makes the browser compute the
+  // new theme's styles while they are off, so once the class goes again no
+  // colour has a change left to animate. Without this, controls with colour
+  // transitions would fade in from the old theme's colours over the new
+  // background, unreadable for a moment.
   useLayoutEffect(() => {
     const root = window.document.documentElement;
-    root.classList.remove("light", "dark");
-    root.classList.add(theme);
+    if (!hasThemeClass(root, theme)) {
+      root.classList.add(THEME_SWITCHING_CLASS);
+      try {
+        setThemeClass(root, theme);
+        void window.getComputedStyle(root).getPropertyValue("color");
+      } finally {
+        root.classList.remove(THEME_SWITCHING_CLASS);
+      }
+    }
     return () => {
       root.classList.remove(theme);
     };

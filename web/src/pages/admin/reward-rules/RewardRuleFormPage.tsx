@@ -14,9 +14,10 @@
 //   rule's dates are sent as midnight UTC. An edit validates with the stored
 //   rule's schema, which sends a date left unchanged as the stored instant,
 //   time of day included, and only a changed date as midnight UTC.
-// - The former PF keys are buttons in DOM order after the fields: Save (PF5),
-//   Reset (PF4) and Back (PF3). Enter in any field submits through
-//   handleSubmit.
+// - The former PF keys are controls in DOM order after the fields: Save (PF5),
+//   Reset (PF4) and Back (PF3), the shared BackLink, which therefore sits in
+//   the form's footer rather than the page header. Enter in any field submits
+//   through handleSubmit.
 import {
   useEffect,
   useId,
@@ -26,7 +27,7 @@ import {
   type ComponentProps,
   type JSX,
 } from "react";
-import { Link, useNavigate, useParams } from "react-router";
+import { useNavigate, useParams } from "react-router";
 import { Controller, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 
@@ -35,7 +36,7 @@ import {
   useRewardRuleCreateMutation,
   useRewardRuleUpdateMutation,
 } from "@/api/queries/reward-rules";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import {
@@ -137,14 +138,6 @@ const FIELDS: readonly FieldSpec[] = [
     inputProps: DATE_INPUT,
   },
 ];
-
-function BackButton(): JSX.Element {
-  return (
-    <Button variant="ghost" asChild>
-      <Link to={LIST_ROUTE}>Back</Link>
-    </Button>
-  );
-}
 
 type RewardRuleFormProps = {
   /** The routed rule ID in edit mode; `undefined` creates a rule. */
@@ -289,7 +282,7 @@ function RewardRuleForm({
           >
             Reset
           </Button>
-          <BackButton />
+          <BackLink to={LIST_ROUTE} />
         </CardFooter>
       </form>
     </Card>
@@ -329,15 +322,19 @@ function FormSkeleton(): JSX.Element {
 }
 
 // A card in place of the form, with the Back link: the not-found text, or the
-// message of a failed rule-list load.
+// message of a failed rule-list load. The text is an assertive live region, so
+// it is announced when the card appears and stays readable after the load
+// failure's toast has gone, as the user edit page's inline error does.
 function MessageCard({ message }: { message: string }): JSX.Element {
   return (
     <Card>
       <CardContent>
-        <p className="text-sm">{message}</p>
+        <p role="alert" className="text-sm">
+          {message}
+        </p>
       </CardContent>
       <CardFooter>
-        <BackButton />
+        <BackLink to={LIST_ROUTE} />
       </CardFooter>
     </Card>
   );

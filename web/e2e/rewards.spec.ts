@@ -7,6 +7,9 @@
 //   nowhere. The balance of account 1 is set through `docker compose exec
 //   postgres psql` and restored afterwards; every accrual-producing step uses
 //   the reward account (50) instead, so nothing else moves that balance.
+// - An account that has earned no points (no balance row, no accrual) shows
+//   "0" in each balance card and the empty-history text, with no paging
+//   control.
 // - The reward history pages newest first, HISTORY_PAGE_SIZE rows at a time:
 //   Next shows the next page and Previous returns to the first, where it is
 //   disabled. The spec tops the account's history up through CT02 adds when
@@ -354,6 +357,26 @@ test("RewardsPage answers an account not on file with the API's text", async ({ 
   await expectMessage(page, MESSAGES.ACCOUNT_NOT_FOUND);
 });
 
+test("RewardsPage shows the zero balance and the empty history of an account that has earned no points", async ({ page }) => {
+  const account = `${sqlLiteral(FIXTURE_KEYS.zeroRewardAccount)}::bigint`;
+  expect(
+    await psql(
+      `SELECT (SELECT count(*) FROM reward_balances WHERE account_id = ${account})
+           || '|' || (SELECT count(*) FROM reward_accruals WHERE account_id = ${account})`,
+    ),
+    "reward balance rows|accruals of the zero-reward account",
+  ).toBe("0|0");
+  await signIn(page, "user");
+  await openRewards(page, FIXTURE_KEYS.zeroRewardAccount);
+  for (const title of [SCREENS.rewards.earned, SCREENS.rewards.redeemed, SCREENS.rewards.available]) {
+    await expectCardValue(page, title, "0");
+  }
+  await expect(dataRows(history(page))).toHaveText([SCREENS.rewards.emptyHistory]);
+  // An empty history has neither key, so no paging control is offered.
+  await expect(pagingControl(page, "Previous")).toHaveCount(0);
+  await expect(pagingControl(page, "Next")).toHaveCount(0);
+});
+
 test.describe("reward history pagination", () => {
   const pageSize = SCREENS.rewards.historyPageSize;
   const account = `${sqlLiteral(FIXTURE_KEYS.rewardAccount)}::bigint`;
@@ -506,7 +529,7 @@ test.describe("a CT02 add through the screens", () => {
     const table = history(page);
     const newest = dataRows(table).first();
     await expect(await cellUnder(table, newest, "Points earned")).toHaveText(points);
-    await expect(await cellUnder(table, newest, "Transaction ID")).toHaveText(transactionId);
+    await expect(await cellUnder(table, newest, "Transaction row")).toHaveText(transactionId);
   });
 });
 

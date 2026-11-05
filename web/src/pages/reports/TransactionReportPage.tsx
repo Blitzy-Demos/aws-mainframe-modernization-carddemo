@@ -14,6 +14,7 @@
 import {
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -27,14 +28,13 @@ import {
   useWatch,
   type DefaultValues,
 } from "react-hook-form";
-import { Link } from "react-router";
 
 import {
   useTransactionReportMutation,
   type TransactionReport,
 } from "@/api/queries/reports";
-import { ConfirmDialog } from "@/components/confirm-dialog";
-import { PageHeader } from "@/components/page-header";
+import { ConfirmDialog, type AfterClose } from "@/components/confirm-dialog";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -93,7 +93,11 @@ const DATE_FIELDS = [
 /** The OpenAPI maxLength of a date text: X(4), X(2), X(2) and two hyphens. */
 const DATE_TEXT_MAX_LENGTH = 10;
 
-/** The format each date text takes, the CSUTLDTC picture of the request. */
+/**
+ * The format each date text takes, the CSUTLDTC picture of the request: the
+ * placeholder, and in parentheses the description, as the maps write their
+ * format hints [app/bms/CORPT00.bms:L160] and CT02 shows its dates.
+ */
 const DATE_FORMAT_HINT = "YYYY-MM-DD";
 
 /**
@@ -129,6 +133,118 @@ function describeRequest(request: ReportRequestFormValues): ReactNode {
         {range}
       </p>
       <p>{CONFIRM_PROMPT}</p>
+    </>
+  );
+}
+
+/** Which sides of the report box hold record text scrolled out of view. */
+interface ReportOverflow {
+  /** A record is wider than the box, so the box scrolls sideways. */
+  readonly overflowing: boolean;
+  /** Text lies before the scroll position: the line starts are hidden. */
+  readonly start: boolean;
+  /** Text lies past the box's end: the line ends are hidden. */
+  readonly end: boolean;
+}
+
+const NO_OVERFLOW: ReportOverflow = {
+  overflowing: false,
+  start: false,
+  end: false,
+};
+
+/**
+ * Measures the report box. scrollLeft runs negative in a right-to-left box,
+ * hence its magnitude, and the one-pixel tolerance absorbs a fractional
+ * scroll position at either end.
+ */
+function measureOverflow(box: HTMLElement): ReportOverflow {
+  const hidden = box.scrollWidth - box.clientWidth;
+  if (hidden <= 0) {
+    return NO_OVERFLOW;
+  }
+  const scrolled = Math.abs(box.scrollLeft);
+  return {
+    overflowing: true,
+    start: scrolled >= 1,
+    end: hidden - scrolled >= 1,
+  };
+}
+
+/**
+ * The CVTRA07Y records exactly as returned: fixed width, with significant
+ * trailing spaces, so they are never trimmed or wrapped. Focusable so the
+ * keyboard can scroll the wide lines.
+ *
+ * A 133-column record at text-sm is about 1117px wide, wider than the report
+ * card at a 1280px viewport, which cut off the Amount column. The records
+ * therefore take text-xs with tighter tracking (about 878px) and return to
+ * text-sm once the enclosing container is 72rem wide. Where a record is still
+ * wider than the box, an edge fade marks each side holding hidden text and a
+ * hint above the box says it scrolls sideways.
+ */
+function ReportRecords({ text }: { text: string }): JSX.Element {
+  const hintId = useId();
+  const boxRef = useRef<HTMLPreElement>(null);
+  const [overflow, setOverflow] = useState<ReportOverflow>(NO_OVERFLOW);
+
+  // Measured before each report is first painted, then on every resize of
+  // the box (the window, the sidebar or the container breakpoint changing
+  // its width) and on every scroll.
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (box === null) {
+      return;
+    }
+    const update = (): void => {
+      const next = measureOverflow(box);
+      setOverflow((current) =>
+        current.overflowing === next.overflowing &&
+        current.start === next.start &&
+        current.end === next.end
+          ? current
+          : next,
+      );
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(box);
+    box.addEventListener("scroll", update, { passive: true });
+    return () => {
+      observer.disconnect();
+      box.removeEventListener("scroll", update);
+    };
+  }, [text]);
+
+  return (
+    <>
+      {overflow.overflowing ? (
+        <p id={hintId} className="mb-2 text-sm text-muted-foreground">
+          Scroll sideways to see each line in full.
+        </p>
+      ) : null}
+      <div className="relative">
+        <pre
+          ref={boxRef}
+          tabIndex={0}
+          aria-describedby={overflow.overflowing ? hintId : undefined}
+          className="overflow-x-auto font-mono text-xs tracking-tighter whitespace-pre @6xl:text-sm @6xl:tracking-normal"
+        >
+          {text}
+        </pre>
+        {overflow.start ? (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-y-0 start-0 w-8 bg-linear-to-r from-card to-transparent rtl:bg-linear-to-l"
+          />
+        ) : null}
+        {overflow.end ? (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-y-0 end-0 w-8 bg-linear-to-l from-card to-transparent rtl:bg-linear-to-r"
+          />
+        ) : null}
+      </div>
     </>
   );
 }
@@ -185,13 +301,15 @@ export default function TransactionReportPage(): JSX.Element {
     setConfirming(true);
   };
 
-  const runReport = (): void => {
+  const runReport = (afterClose: AfterClose): void => {
     if (request === null) {
       return;
     }
     // An answer that arrives after the entry was edited belongs to the entry
     // sent, not to the one on the form: its report and message are still
-    // shown, but the newer entry is neither cleared, marked nor focused.
+    // shown, but the newer entry is neither cleared, marked nor focused. The
+    // clear and the marking move the cursor, so they wait for the dialog to
+    // leave the page.
     const sentRevision = entryRevision.current;
     const ownsEntry = (): boolean => entryRevision.current === sentRevision;
     mutation.mutate(
@@ -203,17 +321,21 @@ export default function TransactionReportPage(): JSX.Element {
           // in green after INITIALIZE-ALL-FIELDS, the cursor on MONTHLY
           // [app/cbl/CORPT00C.cbl:L445-454].
           showSuccess(data.message);
-          if (!ownsEntry()) {
-            return;
-          }
-          // keepFieldsRef keeps the registered elements, so setFocus finds
-          // the MONTHLY item now rather than after the fields re-register.
-          form.reset(DEFAULT_VALUES, { keepFieldsRef: true });
-          form.setFocus("report_type");
+          afterClose(() => {
+            if (!ownsEntry()) {
+              return;
+            }
+            // keepFieldsRef keeps the registered elements, so setFocus finds
+            // the MONTHLY item now rather than after the fields re-register.
+            form.reset(DEFAULT_VALUES, { keepFieldsRef: true });
+            form.setFocus("report_type");
+          });
         },
         onError: (error) => {
           if (ownsEntry()) {
-            applyApiError(error, form, reportRequestBmsFieldMap);
+            afterClose(() => {
+              applyApiError(error, form, reportRequestBmsFieldMap);
+            });
           } else {
             showApiError(error);
           }
@@ -224,14 +346,22 @@ export default function TransactionReportPage(): JSX.Element {
 
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader />
+      <PageHeader actions={<BackLink to="/" />} />
 
       <Card>
         <CardContent>
           <form
             className="flex flex-col gap-6"
             noValidate
-            onSubmit={form.handleSubmit(askForConfirmation)}
+            onSubmit={(event) => {
+              // ENTER while a report runs is ignored before the edits run, so
+              // it neither marks a field nor opens the confirm dialog.
+              if (mutation.isPending) {
+                event.preventDefault();
+                return;
+              }
+              void form.handleSubmit(askForConfirmation)(event);
+            }}
           >
             <Controller
               control={form.control}
@@ -311,8 +441,16 @@ export default function TransactionReportPage(): JSX.Element {
                                 : descriptionId
                             }
                           />
-                          <FieldDescription id={descriptionId}>
-                            {DATE_FORMAT_HINT}
+                          {/* BLITZY [LAYOUT]: the description keeps the
+                              field's gap above it when an error follows it
+                              (overrode the default nth-last-2:-mt-1), so the
+                              start and end hints stay on one line whichever
+                              of them has an error under it. */}
+                          <FieldDescription
+                            id={descriptionId}
+                            className="nth-last-2:mt-0"
+                          >
+                            ({DATE_FORMAT_HINT})
                           </FieldDescription>
                           <FieldError
                             id={errorId}
@@ -327,11 +465,17 @@ export default function TransactionReportPage(): JSX.Element {
             ) : null}
 
             <div className="flex flex-wrap items-center gap-2">
-              <Button type="submit" disabled={mutation.isPending}>
+              {/* aria-disabled rather than disabled: Run report opens the
+                  confirm dialog, which gives focus back to it on close, and a
+                  disabled button takes no focus, so a keyboard user would be
+                  left on the document while the report runs. The form's
+                  submit guard keeps the inert button from acting. */}
+              <Button
+                type="submit"
+                aria-disabled={mutation.isPending}
+                className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
+              >
                 Run report
-              </Button>
-              <Button asChild variant="outline">
-                <Link to="/">Back</Link>
               </Button>
             </div>
           </form>
@@ -354,17 +498,10 @@ export default function TransactionReportPage(): JSX.Element {
                 {report.start_date} – {report.end_date}
               </CardDescription>
             </CardHeader>
-            <CardContent>
-              {/* The CVTRA07Y records exactly as returned: fixed width, with
-                  significant trailing spaces, so they are never trimmed or
-                  wrapped. Focusable so the keyboard can scroll the wide
-                  lines. */}
-              <pre
-                tabIndex={0}
-                className="overflow-x-auto font-mono text-sm whitespace-pre"
-              >
-                {reportText}
-              </pre>
+            {/* The content box is the query container that sizes the
+                records' text to the card's width. */}
+            <CardContent className="@container">
+              <ReportRecords text={reportText} />
             </CardContent>
           </Card>
         </section>

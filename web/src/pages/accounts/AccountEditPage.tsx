@@ -25,19 +25,19 @@ import {
   type JSX,
   type ReactNode,
 } from "react";
-import { Link, useParams } from "react-router";
+import { useParams } from "react-router";
 import { Controller, useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeft, LoaderCircle } from "lucide-react";
+import { LoaderCircle } from "lucide-react";
 
 import {
   useAccount,
   useAccountUpdateMutation,
 } from "@/api/queries/accounts";
 import type { components } from "@/api/schema";
-import { PageHeader } from "@/components/page-header";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
+import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import {
   Field,
   FieldError,
@@ -266,14 +266,16 @@ const SSN_PARTS: readonly [Part, Part, Part] = [
  * children fill the rows in order, so the reading order is the visual order
  * at both widths. Each row pairs two fields of one shape, two single fields or
  * two three-part values, so the inputs of a row line up; a lone field ends its
- * row.
+ * row. The form's last group carries the form's actions in its card footer.
  */
 function FormSection({
   legend,
   children,
+  footer,
 }: {
   legend: string;
   children: ReactNode;
+  footer?: ReactNode;
 }): JSX.Element {
   return (
     <Card>
@@ -283,6 +285,9 @@ function FormSection({
           <div className="grid gap-4 lg:grid-cols-2">{children}</div>
         </FieldSet>
       </CardContent>
+      {footer === undefined ? null : (
+        <CardFooter className="flex-wrap gap-2">{footer}</CardFooter>
+      )}
     </Card>
   );
 }
@@ -581,7 +586,39 @@ function AccountEditForm({
         />
       </FormSection>
 
-      <FormSection legend="Contact and other details">
+      <FormSection
+        legend="Contact and other details"
+        footer={
+          <>
+            <Button type="submit" aria-disabled={busy} className={busyClass}>
+              {mutation.isPending ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="motion-safe:animate-spin"
+                />
+              ) : null}
+              Save
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              aria-disabled={busy}
+              className={busyClass}
+              onClick={() => {
+                void onCancel();
+              }}
+            >
+              {reading ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="motion-safe:animate-spin"
+                />
+              ) : null}
+              Cancel
+            </Button>
+          </>
+        }
+      >
         <PartsField
           control={control}
           legend="Phone 1"
@@ -620,35 +657,6 @@ function AccountEditForm({
           maxLength={1}
         />
       </FormSection>
-
-      <div className="flex flex-wrap gap-2">
-        <Button type="submit" aria-disabled={busy} className={busyClass}>
-          {mutation.isPending ? (
-            <LoaderCircle
-              aria-hidden="true"
-              className="motion-safe:animate-spin"
-            />
-          ) : null}
-          Save
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          aria-disabled={busy}
-          className={busyClass}
-          onClick={() => {
-            void onCancel();
-          }}
-        >
-          {reading ? (
-            <LoaderCircle
-              aria-hidden="true"
-              className="motion-safe:animate-spin"
-            />
-          ) : null}
-          Cancel
-        </Button>
-      </div>
     </form>
   );
 }
@@ -744,12 +752,7 @@ export default function AccountEditPage(): JSX.Element {
         title={TITLE}
         actions={
           accountId === "" ? null : (
-            <Button asChild variant="outline">
-              <Link to={`/accounts/${encodeURIComponent(accountId)}`}>
-                <ArrowLeft aria-hidden="true" />
-                Back
-              </Link>
-            </Button>
+            <BackLink to={`/accounts/${encodeURIComponent(accountId)}`} />
           )
         }
       />

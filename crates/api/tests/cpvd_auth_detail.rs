@@ -20,10 +20,15 @@
 //! account 1 and three details under it, the rows the CP00 consumer writes, in
 //! an insertion order unlike their `PAUT9CTS` key order, so the identity order
 //! cannot stand in for the twin order. Expected values are read back from the
-//! stored rows with `fetch_text_rows`, and the texts come from
-//! `carddemo_domain::messages` and the audits. Statuses, error codes and BMS
-//! fields come from the `V-COPAUS1C` rows of the validation audit; every row a
-//! test proves is checked to have passed its review first.
+//! stored rows with `fetch_text_rows`. A literal text comes from the
+//! `carddemo_domain::messages` catalog. A STRING-built error text is expanded
+//! by `common::audit_text` from the reviewed template of its validation row,
+//! with the IMS status (E-44) or the Db2 codes (E-30) of the injected failure
+//! in the row's pictures and receiving width, never by the production
+//! composers; the catalog head of the text is checked to be the template's
+//! leading literal. Statuses, error codes and BMS fields come from the
+//! `V-COPAUS1C` rows of the validation audit; every row a test proves is
+//! checked to have passed its review first.
 //!
 //! The API carries the stored fields as stored: the original date `YYMMDD`,
 //! time `HHMMSS` and card expiry `MMYY`, which `POPULATE-AUTH-DETAILS` cuts into
@@ -61,6 +66,7 @@ use carddemo_persistence::Db;
 use carddemo_runtime::config::Settings;
 use carddemo_testkit::{TestStack, block_on, fixtures};
 use chrono::{DateTime, Datelike, NaiveDate};
+use common::audit_text::{Operand, Template};
 use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -102,11 +108,34 @@ const RESP_APPROVED: &str = "00";
 /// failure: `AO`.
 const IMS_IO_ERROR: &str = "AO";
 
+/// `IMS-RETURN-CODE PIC X(02)`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L79], the status slot of
+/// every `COPAUS1C` IMS failure text.
+const IMS_RETURN_CODE_WIDTH: usize = 2;
+
+/// `WS-MESSAGE PIC X(80)`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L37], the receiver of
+/// every `COPAUS1C` IMS failure text.
+const WS_MESSAGE_WIDTH: usize = 80;
+
 /// SQLCODE +100, no row, in the `WS-SQLCODE` slot (E-30).
 const SQLCODE_NO_ROW: i32 = 100;
 
 /// SQLSTATE `02000`, no row, as `WS-SQLSTATE PIC +9(09)` holds it (E-30).
 const SQLSTATE_NO_ROW: u32 = 2_000;
+
+/// The digits of `WS-SQLCODE PIC +9(06)`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS2C.cbl:L55].
+const WS_SQLCODE_DIGITS: usize = 6;
+
+/// The digits of `WS-SQLSTATE PIC +9(09)`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS2C.cbl:L56].
+const WS_SQLSTATE_DIGITS: usize = 9;
+
+/// `WS-FRD-ACT-MSG PIC X(50)`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS2C.cbl:L86], the receiver of
+/// the `COPAUS2C` fraud-table failure texts.
+const WS_FRD_ACT_MSG_WIDTH: usize = 50;
 
 /// `999999999`, from which `COPAUS2C` complements `PA-AUTH-TIME-9C`
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUS2C.cbl:L107].
@@ -458,6 +487,34 @@ struct Audited {
     message: String,
 }
 
+/// The message [`assert_row`] holds the answer of a validation audit row to.
+#[derive(Clone, Copy)]
+enum Expected<'a> {
+    /// A STRING-built text: the reviewed template of the row, whose leading
+    /// literal is the catalog head `head`, expanded with `operands` and cut at
+    /// the `receiver` bytes of the receiving field.
+    Expanded {
+        /// The `carddemo_domain::messages` head the template must lead with.
+        head: &'static str,
+        /// The template's fields, each holding the value the injected failure
+        /// sets.
+        operands: &'a [Operand],
+        /// The width of the `PIC X` field the text is built into.
+        receiver: usize,
+    },
+    /// `text` in place of the reviewed template of the row, whose leading
+    /// literal is the catalog head `head`: the injected failure has no code
+    /// the template's slots can carry (E-30).
+    Fallback {
+        /// The `carddemo_domain::messages` head the template must lead with.
+        head: &'static str,
+        /// The whole message the answer carries instead.
+        text: &'static str,
+    },
+    /// A `no-message` row: an empty message, on the body and on the field.
+    NoMessage,
+}
+
 /// The day of [`CLOCK`], as `COPAUS2C` stamps it.
 struct ReportDate {
     /// The date itself, whose century completes the two-digit `AUTH_TS` year.
@@ -524,38 +581,80 @@ fn error_code(id: &str, kind: &str) -> &'static str {
     kind.code()
 }
 
+/// The reviewed template of the validation row `id` of `doc`, once its leading
+/// literal is asserted to be the catalog head `head`.
+fn template_led_by(doc: &Document, id: &str, head: &str) -> Template {
+    let template = Template::load(doc, id);
+    assert!(
+        template.text().starts_with(head) && template.literals().first() == Some(&head),
+        "{id}: the catalog head {head:?} is not the leading literal of the template {:?}",
+        template.text()
+    );
+    template
+}
+
 /// Asserts that `resp` is the error answer of the validation audit row `id`:
-/// its status, the code of its kind, and `message` both as the body's message
-/// and on the row's BMS field. `head` is the literal the row's message cell
-/// quotes, and is empty for a `no-message` row.
-fn assert_row(resp: &Resp, doc: &Document, id: &str, head: &str, message: &str) {
+/// its status, the code of its kind, and the whole message `expected` derives,
+/// byte for byte, both as the body's message and as the only entry, on the
+/// row's BMS field.
+///
+/// The message is the row's template expanded by `common::audit_text`, the
+/// fallback text in its place, or empty for a `no-message` row; it is never
+/// built with the composers of `carddemo_domain::messages`.
+fn assert_row(resp: &Resp, doc: &Document, id: &str, expected: Expected<'_>) {
     let row = audited(doc, id);
-    if head.is_empty() {
-        assert!(
-            is_no_message(&row.message),
-            "{id} records a message: {}",
-            row.message
-        );
-    } else {
-        assert!(
-            row.message.contains(head),
-            "{id} does not quote {head:?}: {}",
-            row.message
-        );
-    }
+    let message = match expected {
+        Expected::Expanded {
+            head,
+            operands,
+            receiver,
+        } => template_led_by(doc, id, head).expand(operands, receiver),
+        Expected::Fallback { head, text } => {
+            template_led_by(doc, id, head);
+            text.to_owned()
+        }
+        Expected::NoMessage => {
+            assert!(
+                is_no_message(&row.message),
+                "{id} records a message: {}",
+                row.message
+            );
+            NO_MESSAGE.to_owned()
+        }
+    };
     assert_error(
         resp,
         row.status,
         error_code(id, &row.kind),
-        message,
-        &[(row.field.as_str(), message)],
+        &message,
+        &[(row.field.as_str(), message.as_str())],
     );
 }
 
 /// [`assert_row`] for a `no-message` row: the body's message and its field's
 /// message are both empty.
 fn assert_no_message(resp: &Resp, doc: &Document, id: &str) {
-    assert_row(resp, doc, id, NO_MESSAGE, NO_MESSAGE);
+    assert_row(resp, doc, id, Expected::NoMessage);
+}
+
+/// [`assert_row`] for a `COPAUS1C` IMS failure row whose template leads with
+/// the catalog head `head`: the template expanded with `IMS-RETURN-CODE`
+/// holding the status E-44 sets, [`IMS_IO_ERROR`], into `WS-MESSAGE`.
+fn assert_ims_row(resp: &Resp, doc: &Document, id: &str, head: &'static str) {
+    assert_row(
+        resp,
+        doc,
+        id,
+        Expected::Expanded {
+            head,
+            operands: &[Operand::alphanumeric(
+                "IMS-RETURN-CODE",
+                IMS_IO_ERROR,
+                IMS_RETURN_CODE_WIDTH,
+            )],
+            receiver: WS_MESSAGE_WIDTH,
+        },
+    );
 }
 
 /// The `Expected result` cell of the parity audit row `id`, once it has
@@ -963,16 +1062,11 @@ async fn replace_fails(
 ) {
     app.stack().exec_sql(FAIL_DETAIL_REPLACES).await;
     let failed = press_pf5(app, token, path).await;
-    let message = messages::ims_status_message(
-        messages::SYSTEM_ERROR_WHILE_FRAUD_TAGGING_ROLLBACK,
-        IMS_IO_ERROR,
-    );
-    assert_row(
+    assert_ims_row(
         &failed,
         validation,
         "V-COPAUS1C-011",
         messages::SYSTEM_ERROR_WHILE_FRAUD_TAGGING_ROLLBACK,
-        &message,
     );
     assert_eq!(
         &stored_marks(app).await,
@@ -1009,8 +1103,10 @@ fn a_fraud_mark_that_fails_to_write_rolls_back_both_writes() {
             &failed,
             &validation,
             "V-COPAUS1C-009",
-            messages::SYSTEM_ERROR_DB2_CODE,
-            messages::UNEXPECTED_ERROR,
+            Expected::Fallback {
+                head: messages::SYSTEM_ERROR_DB2_CODE,
+                text: messages::UNEXPECTED_ERROR,
+            },
         );
         assert_eq!(stored_marks(&app).await, unmarked, "after a failed insert");
         app.stack().exec_sql(RESTORE_FRAUD_WRITES).await;
@@ -1019,17 +1115,23 @@ fn a_fraud_mark_that_fails_to_write_rolls_back_both_writes() {
         // report to update: SQLCODE +100, SQLSTATE 02000.
         app.stack().exec_sql(DUPLICATE_FRAUD_INSERTS).await;
         let failed = press_pf5(&app, &token, &newest).await;
-        let no_row = messages::fraud_db2_error_message(
-            messages::UPDT_ERROR_DB2_CODE,
-            SQLCODE_NO_ROW,
-            SQLSTATE_NO_ROW,
-        );
+        let no_row = [
+            Operand::signed_edited("WS-SQLCODE", i64::from(SQLCODE_NO_ROW), WS_SQLCODE_DIGITS),
+            Operand::signed_edited(
+                "WS-SQLSTATE",
+                i64::from(SQLSTATE_NO_ROW),
+                WS_SQLSTATE_DIGITS,
+            ),
+        ];
         assert_row(
             &failed,
             &validation,
             "V-COPAUS1C-010",
-            messages::UPDT_ERROR_DB2_CODE,
-            &no_row,
+            Expected::Expanded {
+                head: messages::UPDT_ERROR_DB2_CODE,
+                operands: &no_row,
+                receiver: WS_FRD_ACT_MSG_WIDTH,
+            },
         );
         assert_eq!(stored_marks(&app).await, unmarked, "after a failed update");
         app.stack().exec_sql(RESTORE_FRAUD_INSERTS).await;
@@ -1186,12 +1288,11 @@ fn a_failed_read_answers_with_the_text_of_the_read_that_failed() {
             ),
         ];
         for (hide, restore, id, head) in faults {
-            let message = messages::ims_status_message(head, IMS_IO_ERROR);
             app.stack().exec_sql(hide).await;
             let viewed = app.get(&newest, Some(&token)).await;
-            assert_row(&viewed, &validation, id, head, &message);
+            assert_ims_row(&viewed, &validation, id, head);
             let marked = press_pf5(&app, &token, &newest).await;
-            assert_row(&marked, &validation, id, head, &message);
+            assert_ims_row(&marked, &validation, id, head);
             app.stack().exec_sql(restore).await;
         }
         assert_eq!(
@@ -1204,16 +1305,11 @@ fn a_failed_read_answers_with_the_text_of_the_read_that_failed() {
         let middle = path(&ids[1]);
         app.stack().exec_sql(BREAK_OLDEST_DETAIL).await;
         let stepped = app.get(&middle, Some(&token)).await;
-        let message = messages::ims_status_message(
-            messages::SYSTEM_ERROR_WHILE_READING_NEXT_AUTH,
-            IMS_IO_ERROR,
-        );
-        assert_row(
+        assert_ims_row(
             &stepped,
             &validation,
             "V-COPAUS1C-013",
             messages::SYSTEM_ERROR_WHILE_READING_NEXT_AUTH,
-            &message,
         );
         app.stack().exec_sql(RESTORE_OLDEST_DETAIL).await;
         let (status, body, raw) = app.get(&middle, Some(&token)).await;
@@ -1275,20 +1371,17 @@ fn a_store_that_cannot_be_opened_answers_the_psb_scheduling_text() {
     };
     let state = AppState::new(Db::from_pool(stack.pool().clone()), settings)
         .unwrap_or_else(|error| panic!("the test settings were rejected: {error}"));
-    let message =
-        messages::ims_status_message(messages::SYSTEM_ERROR_WHILE_SCHEDULING_PSB, IMS_IO_ERROR);
     block_on(async {
         state.db().close().await;
         let selected = || ApiPath(AuthIdPath { id: "1".to_owned() });
         let viewed = get_authorization(State(state.clone()), signed_on_user(), selected()).await;
         let marked = toggle_fraud(State(state.clone()), signed_on_user(), selected()).await;
         for answer in [handler_answer(viewed), handler_answer(marked)] {
-            assert_row(
+            assert_ims_row(
                 &answer,
                 &validation,
                 "V-COPAUS1C-002",
                 messages::SYSTEM_ERROR_WHILE_SCHEDULING_PSB,
-                &message,
             );
         }
     });

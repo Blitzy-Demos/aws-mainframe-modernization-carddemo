@@ -1,14 +1,15 @@
 // FN tests of DashboardPage (CM00: COMEN01C, map COMEN01). The page's one
 // input is the CAVW account lookup, ACCTSID: a valid account number reads the
-// account, then its five most recent transactions and its reward balance, and
-// shows them beside the COMEN02Y menu (F-COACTVW-001, F-COACTVW-002,
-// F-COMEN01-001 to F-COMEN01-011); a number COACTVWC 2210-EDIT-ACCOUNT refuses
-// is rejected without a request (V-COACTVWC-001, V-COACTVWC-002); and a server
-// rejection at ACCTSID is shown as a toast, as the field error and with the
-// cursor on ACCTSID [app/cbl/COACTVWC.cbl:L545-552]. The page's status region
-// announces each lookup, a repeated one included, by its account number and
-// never by a figure, once the account and its reward balance have answered,
-// and is empty for a rejected key.
+// account, then its five most recent transactions (shown newest first) and its
+// reward balance, and shows them beside the COMEN02Y menu (F-COACTVW-001,
+// F-COACTVW-002, F-COMEN01-001 to F-COMEN01-011); a number COACTVWC
+// 2210-EDIT-ACCOUNT refuses is rejected without a request (V-COACTVWC-001,
+// V-COACTVWC-002); and a server rejection at ACCTSID is shown as a toast, as
+// the field error and with the cursor on ACCTSID
+// [app/cbl/COACTVWC.cbl:L545-552]. The page's status region announces each
+// lookup, a repeated one included, by its account number and never by a
+// figure, once the account and its reward balance have answered, and is empty
+// for a rejected key.
 //
 // The API is the stubbed global the client sends every Request through, so
 // each test sees the exact requests the page made.
@@ -19,6 +20,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 
+import { transactionKeys } from "@/api/queries/transactions";
 import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -108,6 +110,27 @@ const transaction: TransactionResponse = {
 /** The five most recent transactions: here the one above, with no paging. */
 const transactionPage: TransactionPage = {
   items: [transaction],
+  next_key: null,
+  prev_key: null,
+};
+
+/**
+ * A full backward page as the API answers it: the account's five highest
+ * TRAN-IDs in ascending key order, the last of them a CB00 payment whose
+ * TRAN-ID is the highest on file plus one.
+ */
+const ascendingTranIds = [
+  "0000000503557384",
+  "0000000532120892",
+  "0000000555363230",
+  "0000000624335286",
+  "2022071800000053",
+] as const;
+const fullPage: TransactionPage = {
+  items: ascendingTranIds.map((tranId) => ({
+    ...transaction,
+    tran_id: tranId,
+  })),
   next_key: null,
   prev_key: null,
 };
@@ -233,7 +256,8 @@ function requestTo(pathname: string): Request {
   return sent;
 }
 
-function renderPage(): void {
+/** Renders the page at `/`; returns the query cache it reads through. */
+function renderPage(): QueryClient {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -258,6 +282,7 @@ function renderPage(): void {
       </QueryClientProvider>
     </ThemeProvider>,
   );
+  return queryClient;
 }
 
 /** ACCTSID, by the label F-COACTVW-001 gives it. */
@@ -384,6 +409,94 @@ describe("DashboardPage", () => {
     });
 
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("lists the five most recent transactions newest first, leaving the page as answered", async () => {
+    stubApi({ ...SUCCESS, transactions: [200, fullPage] });
+    const user = userEvent.setup();
+    const queryClient = renderPage();
+
+    await user.type(accountInput(), `${ACCOUNT_ID}{Enter}`);
+    const table = await screen.findByRole("table", {
+      name: "Recent transactions",
+    });
+
+    // Each row's TRAN-ID link, top to bottom: the highest key first.
+    await waitFor(() => {
+      expect(
+        within(table)
+          .getAllByRole("link")
+          .map((link) => link.textContent),
+      ).toEqual([...ascendingTranIds].reverse());
+    });
+
+    // The cached page keeps the API's ascending order: the rows are a
+    // reversed copy, never the cached array reversed in place.
+    const cached = queryClient.getQueryData<TransactionPage>(
+      transactionKeys.list({
+        account_id: ACCOUNT_ID,
+        direction: "backward",
+        page_size: 5,
+      }),
+    );
+    expect(cached?.items.map((item) => item.tran_id)).toEqual([
+      ...ascendingTranIds,
+    ]);
+  });
+
+  it("holds the summary's place with its loading shells while the account and then its reward balance are read", async () => {
+    stubApi(SUCCESS);
+    const releaseAccount = holdReply(`/api/accounts/${ACCOUNT_ID}`);
+    const releaseRewards = holdReply(`/api/rewards/balance/${ACCOUNT_ID}`);
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(accountInput(), `${ACCOUNT_ID}{Enter}`);
+
+    // While the account is read, all hidden from assistive technology: the
+    // heading row, four card skeletons (title and value lines) and the
+    // transactions table in its loading state, under its caption.
+    const table = await screen.findByRole("table", {
+      name: "Recent transactions",
+      hidden: true,
+    });
+    const overview = table.closest('[aria-hidden="true"]');
+    if (overview === null) {
+      throw new Error("the loading summary is not hidden");
+    }
+    const tiles = overview.querySelectorAll(
+      '[data-slot="card"][aria-hidden="true"]',
+    );
+    expect(tiles).toHaveLength(4);
+    tiles.forEach((tile) => {
+      expect(tile.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(2);
+    });
+    expect(table.getAttribute("aria-busy")).toBe("true");
+    expect(table.querySelectorAll("tbody tr").length).toBeGreaterThan(0);
+    expect(
+      screen.queryByRole("group", { name: "Current Balance" }),
+    ).toBeNull();
+
+    // Once the account is found, the reward card's skeleton takes its place
+    // in the grid until the reward balance answers.
+    releaseAccount(SUCCESS.account);
+    const balance = await summaryCard("Current Balance");
+    const grid = balance.parentElement;
+    if (grid === null) {
+      throw new Error("the summary card is in no grid");
+    }
+    expect(grid.children).toHaveLength(4);
+    const rewardTile = grid.children[3];
+    expect(rewardTile.getAttribute("aria-hidden")).toBe("true");
+    expect(rewardTile.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(
+      2,
+    );
+
+    releaseRewards(SUCCESS.rewards);
+    const reward = await summaryCard("Reward Points");
+    expect(reward.parentElement).toBe(grid);
+    expect(grid.children).toHaveLength(4);
+    expect(grid.querySelector('[data-slot="skeleton"]')).toBeNull();
   });
 
   it.each([

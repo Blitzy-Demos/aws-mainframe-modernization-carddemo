@@ -3,8 +3,15 @@
 //! `docs/parity/validation-audit.md`.
 //!
 //! Each test takes its statuses, BMS fields, kinds, orders and failing inputs
-//! from the audit rows and its texts from `carddemo_domain::messages`, and
-//! checks that the catalog text equals the row's quoted text. Every request
+//! from the audit rows. A literal text comes from `carddemo_domain::messages`,
+//! checked to equal the row's quoted text. A field-edit text is the row's
+//! quoted template with `{WS-EDIT-VARIABLE-NAME}` replaced by the name its
+//! note gives, cut at the 75 bytes of `WS-RETURN-MSG`; the `messages`
+//! composer is only checked to give the same text. A read text built from a
+//! record key and the `RESP` codes (the cross-reference, not-found and
+//! file-error texts) is expanded by `common::audit_text` from
+//! the row's reviewed template with the key and codes the test injected,
+//! never by a `messages` composer, and compared whole. Every request
 //! starts from the `GET /accounts/00000000001` answer turned back into the
 //! `COACTUP` input fields (P-COACTUPC-004, P-COACTUPC-019).
 //!
@@ -72,6 +79,7 @@ use carddemo_domain::rules::date_edit::{
 };
 use carddemo_domain::rules::date_validation::{DatePicture, DateValidationError};
 use carddemo_testkit::{block_on, fixtures};
+use common::audit_text::{Operand, Template};
 use common::{
     Resp, TestApp, assert_error, fixture_records, parity_audit, validation_audit, validation_ids,
 };
@@ -247,15 +255,21 @@ const FIELD_EDIT_ROWS: [&str; 109] = [
 ];
 
 /// The `RESP` and `RESP2` E-44 gives a CICS `NOTFND`.
-const RESP_NOTFND: (u32, u32) = (13, 80);
+const RESP_NOTFND: (u64, u64) = (13, 80);
 
 /// The `RESP` and `RESP2` E-44 gives a database failure (`IOERR`).
-const RESP_IOERR: (u32, u32) = (17, 0);
+const RESP_IOERR: (u64, u64) = (17, 0);
 
 /// `MOVE 'READ' TO ERROR-OPNAME` of the `WHEN OTHER` branch of each read
 /// [app/cbl/COACTUPC.cbl:L3689] [app/cbl/COACTUPC.cbl:L3739]
 /// [app/cbl/COACTUPC.cbl:L3788].
 const ERROR_OPNAME_READ: &str = "READ";
+
+/// `WS-RETURN-MSG PIC X(75)` [app/cbl/COACTUPC.cbl:L479]: the receiver each
+/// field-edit and read text is built into, by `STRING … DELIMITED BY SIZE`
+/// or the `MOVE` of `WS-FILE-ERROR-MESSAGE`, so the expansion of its
+/// template is cut there.
+const RETURN_MSG: usize = 75;
 
 /// `{WS-EDIT-VARIABLE-NAME}` of a STRING-built message cell.
 const PLACEHOLDER: &str = "{WS-EDIT-VARIABLE-NAME}";
@@ -655,14 +669,17 @@ fn quoted_text(cell: &str, id: &str) -> String {
     text
 }
 
-/// The `carddemo_domain::messages` text of `row`, checked against the text
-/// the row quotes.
+/// The text `row` puts in `WS-RETURN-MSG`, taken from the audit, with the
+/// `carddemo_domain::messages` catalog checked to give the same text.
 ///
 /// A STRING-built row, `{WS-EDIT-VARIABLE-NAME}` followed by a field-edit
-/// text, is composed from the `FIELD_*` label its note names and the
-/// catalog's field-edit text: through `messages::date_edit_message` for a
-/// `CSUTLDPY` date edit, `messages::field_edit_message` otherwise. Any other
-/// row quotes one catalog text whole.
+/// text, expands to its quoted template with the placeholder replaced by the
+/// name its note gives, which the audit records already cut to the `X(25)`
+/// receiver and trimmed (E-45), and the result cut at the [`RETURN_MSG`]
+/// bytes of `WS-RETURN-MSG`. The `FIELD_*` label of that name and the
+/// catalog's field-edit text, composed by `messages::date_edit_message` for a
+/// `CSUTLDPY` date edit and by `messages::field_edit_message` otherwise, must
+/// give that expansion. Any other row quotes one catalog text whole.
 fn catalog_text(row: &AuditRow) -> String {
     let id = &row.id;
     let template = row
@@ -690,17 +707,23 @@ fn catalog_text(row: &AuditRow) -> String {
         .iter()
         .find(|suffix| **suffix == tail)
         .unwrap_or_else(|| panic!("{id}: no catalog field-edit text is {tail:?}"));
-    let text = if row.csutldpy {
+    let mut audited = template.replacen(PLACEHOLDER, name, 1);
+    assert!(
+        audited.is_ascii(),
+        "{id}: the audited text {audited:?} is not ASCII, so a cut at {RETURN_MSG} bytes is not \
+         exact"
+    );
+    audited.truncate(RETURN_MSG);
+    let composed = if row.csutldpy {
         messages::date_edit_message(label, suffix)
     } else {
         messages::field_edit_message(label, suffix)
     };
     assert_eq!(
-        text,
-        template.replacen(PLACEHOLDER, name, 1),
+        composed, audited,
         "{id}: the catalog text differs from the audited one"
     );
-    text
+    audited
 }
 
 /// The `ERROR-FILE` literal a file-error row's message cell names: the
@@ -714,6 +737,57 @@ fn error_file(row: &AuditRow) -> &str {
             || panic!("{}: no quoted ERROR-FILE: {}", row.id, row.message_cell),
             |(file, _)| file,
         )
+}
+
+/// The text `row` builds into `WS-RETURN-MSG`: its reviewed template expanded
+/// with `operands` and cut at [`RETURN_MSG`] bytes.
+fn audited_text(doc: &Document, row: &AuditRow, operands: &[Operand]) -> String {
+    Template::load(doc, &row.id).expand(operands, RETURN_MSG)
+}
+
+/// `ERROR-RESP` and `ERROR-RESP2`, each `PIC X(10)`
+/// [app/cbl/COACTUPC.cbl:L401-406], after `MOVE WS-RESP-CD TO ERROR-RESP` and
+/// `MOVE WS-REAS-CD TO ERROR-RESP2` of the `RESP` and `RESP2` `codes`: the
+/// 9-digit display of each `PIC S9(09) COMP` code
+/// [app/cbl/COACTUPC.cbl:L40-42] and a space.
+fn resp_operands(codes: (u64, u64)) -> [Operand; 2] {
+    [
+        Operand::unsigned_to_alphanumeric("ERROR-RESP", codes.0, 9, 10),
+        Operand::unsigned_to_alphanumeric("ERROR-RESP2", codes.1, 9, 10),
+    ]
+}
+
+/// The bindings of `row`'s `WS-FILE-ERROR-MESSAGE` template: `ERROR-OPNAME
+/// PIC X(8)` holding [`ERROR_OPNAME_READ`] [app/cbl/COACTUPC.cbl:L392-393],
+/// `ERROR-FILE PIC X(9)` holding the file its message cell names
+/// [app/cbl/COACTUPC.cbl:L396-397], and the [`RESP_IOERR`] codes.
+fn file_error_operands(row: &AuditRow) -> [Operand; 4] {
+    let [resp, resp2] = resp_operands(RESP_IOERR);
+    [
+        Operand::alphanumeric("ERROR-OPNAME", ERROR_OPNAME_READ, 8),
+        Operand::alphanumeric("ERROR-FILE", error_file(row), 9),
+        resp,
+        resp2,
+    ]
+}
+
+/// The bindings of a `NOTFND` read text: `key`, the record key the read
+/// used, and the [`RESP_NOTFND`] codes.
+fn not_found_operands(key: Operand) -> [Operand; 3] {
+    let [resp, resp2] = resp_operands(RESP_NOTFND);
+    [key, resp, resp2]
+}
+
+/// `WS-CARD-RID-ACCT-ID-X PIC X(11)` [app/cbl/COACTUPC.cbl:L382-383], the key
+/// of the cross-reference and account reads, holding `account`.
+fn account_key(account: &str) -> Operand {
+    Operand::alphanumeric("WS-CARD-RID-ACCT-ID-X", account, 11)
+}
+
+/// `WS-CARD-RID-CUST-ID-X PIC X(09)` [app/cbl/COACTUPC.cbl:L379-380], the key
+/// of the customer read, holding `customer`.
+fn customer_key(customer: &str) -> Operand {
+    Operand::alphanumeric("WS-CARD-RID-CUST-ID-X", customer, 9)
 }
 
 /// The JSON body field of the `COACTUP` input field `bms`.
@@ -1260,14 +1334,21 @@ async fn century_and_leap_years(
     base: &Map<String, Value>,
     plan: &EditPlan,
 ) {
-    let century =
-        messages::date_edit_message(messages::FIELD_OPEN_DATE, messages::CENTURY_NOT_VALID);
-    assert_eq!(century, plan.row("V-COACTUPC-015").text);
-    let leap = messages::date_edit_message(
-        messages::FIELD_OPEN_DATE,
-        messages::NOT_A_LEAP_YEAR_CANNOT_HAVE_29_DAYS,
+    let century = &plan.row("V-COACTUPC-015").text;
+    assert_eq!(
+        &messages::date_edit_message(messages::FIELD_OPEN_DATE, messages::CENTURY_NOT_VALID),
+        century,
+        "V-COACTUPC-015: the catalog text differs from the audited one"
     );
-    assert_eq!(leap, plan.row("V-COACTUPC-022").text);
+    let leap = &plan.row("V-COACTUPC-022").text;
+    assert_eq!(
+        &messages::date_edit_message(
+            messages::FIELD_OPEN_DATE,
+            messages::NOT_A_LEAP_YEAR_CANNOT_HAVE_29_DAYS,
+        ),
+        leap,
+        "V-COACTUPC-022: the catalog text differs from the audited one"
+    );
     // The Open Date fields of the year, month and day rows.
     let [year, month, day] = ["V-COACTUPC-013", "V-COACTUPC-016", "V-COACTUPC-018"]
         .map(|id| plan.row(id).row.field.as_str());
@@ -1399,7 +1480,7 @@ async fn key_edit_and_cross_reference(
     }));
     let unknown = audit_row(doc, "V-COACTUPC-004");
     let account = example_account(&unknown);
-    let not_found = messages::xref_not_found_message(account, RESP_NOTFND.0, RESP_NOTFND.1);
+    let not_found = audited_text(doc, &unknown, &not_found_operands(account_key(account)));
     assert_eq!(
         not_found,
         worked_text(&unknown),
@@ -1492,21 +1573,17 @@ fn failed_and_missing_reads_answer_with_their_file_texts() {
             app.stack().exec_sql(hide).await;
             let resp = app.put(ACCOUNT_PATH, Some(&token), &body).await;
             app.stack().exec_sql(restore).await;
-            assert_file_error(&resp, &row);
+            assert_file_error(&resp, &doc, &row);
         }
         missing_records(&app, &token, &doc, &body).await;
     });
 }
 
-/// Asserts that `resp` is `row`'s file-error answer: the `READ` of the file
-/// its message cell names, with the `IOERR` codes, at its field.
-fn assert_file_error(resp: &Resp, row: &AuditRow) {
-    let text = messages::file_error_message(
-        ERROR_OPNAME_READ,
-        error_file(row),
-        RESP_IOERR.0,
-        RESP_IOERR.1,
-    );
+/// Asserts that `resp` is `row`'s file-error answer: its reviewed template
+/// expanded with the `READ` of the file its message cell names and the
+/// `IOERR` codes, whole as the message and at its field.
+fn assert_file_error(resp: &Resp, doc: &Document, row: &AuditRow) {
+    let text = audited_text(doc, row, &file_error_operands(row));
     assert_error(
         resp,
         row.status,
@@ -1543,10 +1620,16 @@ async fn missing_records(app: &TestApp, token: &str, doc: &Document, body: &Valu
     );
     app.stack().exec_sql(DELETE_ACCOUNT_2).await;
     app.stack().exec_sql(DELETE_CUSTOMER_OF_ACCOUNT_3).await;
-    let account_text =
-        messages::account_master_not_found_message(ACCOUNT_2, RESP_NOTFND.0, RESP_NOTFND.1);
-    let customer_text =
-        messages::customer_master_not_found_message(missing_customer, RESP_NOTFND.0, RESP_NOTFND.1);
+    let account_text = audited_text(
+        doc,
+        &account_row,
+        &not_found_operands(account_key(ACCOUNT_2)),
+    );
+    let customer_text = audited_text(
+        doc,
+        &customer_row,
+        &not_found_operands(customer_key(missing_customer)),
+    );
     let missing = [
         (ACCOUNT_2, &account_row, account_text),
         (ACCOUNT_3, &customer_row, customer_text),
@@ -1568,7 +1651,7 @@ async fn missing_records(app: &TestApp, token: &str, doc: &Document, body: &Valu
         .put(&format!("/accounts/{ACCOUNT_2}"), Some(token), body)
         .await;
     app.stack().exec_sql(RESTORE_CUSTOMERS).await;
-    assert_file_error(&replaced, &customer_failure);
+    assert_file_error(&replaced, doc, &customer_failure);
 }
 
 /// A change every edit passes, sent with the current token, with a token

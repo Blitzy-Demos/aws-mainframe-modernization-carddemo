@@ -25,19 +25,22 @@ import {
   type ReactNode,
 } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeft } from "lucide-react";
 import { Controller, useForm } from "react-hook-form";
-import { Link, useNavigate, useParams } from "react-router";
+import { useNavigate, useParams } from "react-router";
 
 import { useAccount, type Account } from "@/api/queries/accounts";
-import { PageHeader } from "@/components/page-header";
-import { Badge } from "@/components/ui/badge";
+import {
+  DetailItem,
+  DetailList,
+  DetailValueSkeleton,
+  FlagBadge,
+} from "@/components/detail-list";
+import { BackLink, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
-import { Skeleton } from "@/components/ui/skeleton";
 import { applyApiError } from "@/lib/api-errors";
 import {
   accountKeyError,
@@ -62,8 +65,16 @@ const ACCOUNT_ID_LENGTH = 11;
 // still announced as a change; the delay is the one DataTable uses.
 const STATUS_ANNOUNCE_DELAY_MS = 150;
 
-/** One label and value of a read-only detail list. */
-type Detail = { label: string; value: ReactNode };
+/**
+ * One caption of the account view, the value it shows from the account read
+ * and, for a value of more than one line, the placeholder that stands in for
+ * it while the account is read.
+ */
+type AccountField = {
+  label: string;
+  value: (account: Account) => ReactNode;
+  placeholder?: ReactNode;
+};
 
 /**
  * ACSTSSN as 1200-SETUP-SCREEN-VARS builds it: `CUST-SSN(1:3) '-'
@@ -77,42 +88,111 @@ function ssnText(ssn: string): string {
     : ssn;
 }
 
-/**
- * A Y/N flag as a badge carrying its own letter, so the state is read from the
- * text and not from colour. A blank flag renders nothing rather than an empty
- * pill.
- */
-function flagBadge(value: string): ReactNode {
-  return value === "" ? null : <Badge variant="secondary">{value}</Badge>;
-}
+// The map's two columns: status, dates and group on the left, amounts on the
+// right [app/bms/COACTVW.bms:L93-198]. From `lg` the list fills column by
+// column, five entries each, so the columns keep that meaning.
+const ACCOUNT_FIELDS: readonly AccountField[] = [
+  {
+    label: "Active Y/N",
+    value: (account) => <FlagBadge value={account.acct_active_status} />,
+  },
+  { label: "Opened", value: (account) => account.acct_open_date },
+  { label: "Expiry", value: (account) => account.acct_expiraion_date },
+  { label: "Reissue", value: (account) => account.acct_reissue_date },
+  { label: "Account Group", value: (account) => account.acct_group_id },
+  { label: "Credit Limit", value: (account) => account.acct_credit_limit },
+  {
+    label: "Cash credit Limit",
+    value: (account) => account.acct_cash_credit_limit,
+  },
+  { label: "Current Balance", value: (account) => account.acct_curr_bal },
+  {
+    label: "Current Cycle Credit",
+    value: (account) => account.acct_curr_cyc_credit,
+  },
+  {
+    label: "Current Cycle Debit",
+    value: (account) => account.acct_curr_cyc_debit,
+  },
+];
+
+// Customer Details, in the map's row groups [app/bms/COACTVW.bms:L199-353]:
+// identity, names, postal address, then contact and references.
+const IDENTITY_FIELDS: readonly AccountField[] = [
+  { label: "Customer id", value: (account) => account.customer_id },
+  { label: "SSN", value: (account) => ssnText(account.cust_ssn) },
+  { label: "Date of birth", value: (account) => account.cust_dob_yyyy_mm_dd },
+  { label: "FICO Score", value: (account) => account.cust_fico_credit_score },
+];
+const NAME_FIELDS: readonly AccountField[] = [
+  { label: "First Name", value: (account) => account.cust_first_name },
+  { label: "Middle Name", value: (account) => account.cust_middle_name },
+  { label: "Last Name", value: (account) => account.cust_last_name },
+];
+const ADDRESS_FIELDS: readonly AccountField[] = [
+  // ACSADL1 and ACSADL2 sit under the one "Address:" caption, as the two
+  // lines of one value.
+  {
+    label: "Address",
+    value: (account) => (
+      <span className="flex flex-col">
+        <span>{account.cust_addr_line_1}</span>
+        <span>{account.cust_addr_line_2}</span>
+      </span>
+    ),
+    placeholder: (
+      <div>
+        <DetailValueSkeleton className="w-48" />
+        <DetailValueSkeleton />
+      </div>
+    ),
+  },
+  { label: "City", value: (account) => account.cust_addr_line_3 },
+  { label: "State", value: (account) => account.cust_addr_state_cd },
+  { label: "Zip", value: (account) => account.cust_addr_zip },
+  { label: "Country", value: (account) => account.cust_addr_country_cd },
+];
+const CONTACT_FIELDS: readonly AccountField[] = [
+  { label: "Phone 1", value: (account) => account.cust_phone_num_1 },
+  {
+    label: "Government Issued Id Ref",
+    value: (account) => account.cust_govt_issued_id,
+  },
+  { label: "Phone 2", value: (account) => account.cust_phone_num_2 },
+  { label: "EFT Account Id", value: (account) => account.cust_eft_account_id },
+  {
+    label: "Primary Card Holder Y/N",
+    value: (account) => <FlagBadge value={account.cust_pri_card_holder_ind} />,
+  },
+];
+const CARD_FIELDS: readonly AccountField[] = [
+  { label: "Card Number", value: (account) => account.card_number },
+];
 
 /**
- * Labels and values as a definition list: one column below `lg`, two from
- * `lg`. `layout` adds grid placement classes for lists whose columns carry
- * meaning.
+ * One list of account fields, each value from the account read or, while it
+ * is read (`account` undefined), its placeholder: one text line unless the
+ * field names its own.
  */
-function DetailList({
-  details,
-  layout = "",
+function AccountFieldList({
+  fields,
+  account,
+  className,
 }: {
-  details: readonly Detail[];
-  layout?: string;
+  fields: readonly AccountField[];
+  account: Account | undefined;
+  className?: string;
 }): JSX.Element {
   return (
-    <dl
-      className={
-        layout === ""
-          ? "grid gap-4 lg:grid-cols-2"
-          : `grid gap-4 lg:grid-cols-2 ${layout}`
-      }
-    >
-      {details.map(({ label, value }) => (
-        <div key={label} className="flex flex-col gap-1">
-          <dt className="text-sm text-muted-foreground">{label}</dt>
-          <dd className="wrap-break-word tabular-nums">{value}</dd>
-        </div>
+    <DetailList className={className}>
+      {fields.map(({ label, value, placeholder }) => (
+        <DetailItem key={label} label={label}>
+          {account === undefined
+            ? (placeholder ?? <DetailValueSkeleton />)
+            : value(account)}
+        </DetailItem>
       ))}
-    </dl>
+    </DetailList>
   );
 }
 
@@ -141,100 +221,41 @@ function DetailsCard({
  * customer records [app/cbl/COACTVWC.cbl:L473-522], labelled with the map
  * captions without their colons [app/bms/COACTVW.bms:L93-353], plus the
  * cross-referenced card number the API adds.
+ *
+ * While the account is read (`account` undefined) the same cards, captions
+ * and lines hold placeholders, so nothing moves when the record arrives. The
+ * details are then hidden from assistive technology: the page's status region
+ * announces the read.
  */
-function AccountDetails({ account }: { account: Account }): JSX.Element {
-  // The map's two columns: status, dates and group on the left, amounts on the
-  // right [app/bms/COACTVW.bms:L93-198]. From `lg` the list fills column by
-  // column, five entries each, so the columns keep that meaning.
-  const accountDetails: readonly Detail[] = [
-    { label: "Active Y/N", value: flagBadge(account.acct_active_status) },
-    { label: "Opened", value: account.acct_open_date },
-    { label: "Expiry", value: account.acct_expiraion_date },
-    { label: "Reissue", value: account.acct_reissue_date },
-    { label: "Account Group", value: account.acct_group_id },
-    { label: "Credit Limit", value: account.acct_credit_limit },
-    { label: "Cash credit Limit", value: account.acct_cash_credit_limit },
-    { label: "Current Balance", value: account.acct_curr_bal },
-    { label: "Current Cycle Credit", value: account.acct_curr_cyc_credit },
-    { label: "Current Cycle Debit", value: account.acct_curr_cyc_debit },
-  ];
-
-  // Customer Details, in the map's row groups [app/bms/COACTVW.bms:L199-353]:
-  // identity, names, postal address, then contact and references.
-  const identity: readonly Detail[] = [
-    { label: "Customer id", value: account.customer_id },
-    { label: "SSN", value: ssnText(account.cust_ssn) },
-    { label: "Date of birth", value: account.cust_dob_yyyy_mm_dd },
-    { label: "FICO Score", value: account.cust_fico_credit_score },
-  ];
-  const names: readonly Detail[] = [
-    { label: "First Name", value: account.cust_first_name },
-    { label: "Middle Name", value: account.cust_middle_name },
-    { label: "Last Name", value: account.cust_last_name },
-  ];
-  // ACSADL1 and ACSADL2 sit under the one "Address:" caption.
-  const address: readonly Detail[] = [
-    {
-      label: "Address",
-      value: (
-        <>
-          <span className="block">{account.cust_addr_line_1}</span>
-          <span className="block">{account.cust_addr_line_2}</span>
-        </>
-      ),
-    },
-    { label: "City", value: account.cust_addr_line_3 },
-    { label: "State", value: account.cust_addr_state_cd },
-    { label: "Zip", value: account.cust_addr_zip },
-    { label: "Country", value: account.cust_addr_country_cd },
-  ];
-  const contact: readonly Detail[] = [
-    { label: "Phone 1", value: account.cust_phone_num_1 },
-    { label: "Government Issued Id Ref", value: account.cust_govt_issued_id },
-    { label: "Phone 2", value: account.cust_phone_num_2 },
-    { label: "EFT Account Id", value: account.cust_eft_account_id },
-    {
-      label: "Primary Card Holder Y/N",
-      value: account.cust_pri_card_holder_ind,
-    },
-  ];
-
+function AccountDetails({
+  account,
+}: {
+  account: Account | undefined;
+}): JSX.Element {
   return (
-    <div className="flex flex-col gap-6">
+    <div
+      aria-hidden={account === undefined ? true : undefined}
+      className="flex flex-col gap-6"
+    >
       <DetailsCard title="Account">
-        <DetailList
-          details={accountDetails}
-          layout="lg:grid-flow-col lg:grid-rows-5"
+        <AccountFieldList
+          fields={ACCOUNT_FIELDS}
+          account={account}
+          className="lg:grid-flow-col lg:grid-rows-5"
         />
       </DetailsCard>
       <DetailsCard title="Customer Details">
-        <DetailList details={identity} />
+        <AccountFieldList fields={IDENTITY_FIELDS} account={account} />
         <Separator />
-        <DetailList details={names} />
+        <AccountFieldList fields={NAME_FIELDS} account={account} />
         <Separator />
-        <DetailList details={address} />
+        <AccountFieldList fields={ADDRESS_FIELDS} account={account} />
         <Separator />
-        <DetailList details={contact} />
+        <AccountFieldList fields={CONTACT_FIELDS} account={account} />
       </DetailsCard>
       <DetailsCard title="Card">
-        <DetailList
-          details={[{ label: "Card Number", value: account.card_number }]}
-        />
+        <AccountFieldList fields={CARD_FIELDS} account={account} />
       </DetailsCard>
-    </div>
-  );
-}
-
-/**
- * Placeholder blocks while the account is read, hidden from assistive
- * technology: the page's status region announces the read.
- */
-function AccountDetailsSkeleton(): JSX.Element {
-  return (
-    <div aria-hidden="true" className="flex flex-col gap-6">
-      <Skeleton className="h-56 w-full rounded-xl" />
-      <Skeleton className="h-96 w-full rounded-xl" />
-      <Skeleton className="h-24 w-full rounded-xl" />
     </div>
   );
 }
@@ -335,7 +356,7 @@ export default function AccountViewPage(): JSX.Element {
     if (account.isSuccess) {
       details = <AccountDetails account={account.data} />;
     } else if (account.isPending) {
-      details = <AccountDetailsSkeleton />;
+      details = <AccountDetails account={undefined} />;
     }
   }
 
@@ -348,44 +369,42 @@ export default function AccountViewPage(): JSX.Element {
           // [app/cbl/COACTVWC.cbl:L324-352]. COACTVW offers no key into the
           // update screen, so there is no Edit link here: the function map
           // places "Edit account" on the dashboard lookup (F-COACTUP-001).
-          <Button asChild variant="link">
-            <Link to="/">
-              <ArrowLeft aria-hidden="true" />
-              Back
-            </Link>
-          </Button>
+          <BackLink to="/" />
         }
       />
-      <form
-        className="flex flex-col gap-4"
-        onSubmit={form.handleSubmit(onSubmit)}
-        noValidate
-      >
-        {/* ACCTSID with the label and submit names of the CAVW account lookup
-            (F-COACTVW-001), the same key and function wherever it appears. */}
-        <Controller
-          control={form.control}
-          name="account_id"
-          render={({ field, fieldState }) => (
-            <Field data-invalid={fieldState.invalid} className="max-w-sm">
-              <FieldLabel htmlFor={inputId}>Account number</FieldLabel>
-              <Input
-                {...field}
-                id={inputId}
-                maxLength={ACCOUNT_ID_LENGTH}
-                inputMode="numeric"
-                autoComplete="off"
-                aria-invalid={fieldState.invalid}
-                aria-describedby={fieldState.invalid ? errorId : undefined}
-              />
-              <FieldError id={errorId} errors={[fieldState.error]} />
-            </Field>
-          )}
-        />
-        <Button type="submit" className="w-fit">
-          Look up account
-        </Button>
-      </form>
+      <Card>
+        <CardContent>
+          <form onSubmit={form.handleSubmit(onSubmit)} noValidate>
+            {/* ACCTSID with the label and submit names of the CAVW account
+                lookup (F-COACTVW-001), the same key and function wherever it
+                appears. */}
+            <Controller
+              control={form.control}
+              name="account_id"
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid} className="max-w-md">
+                  <FieldLabel htmlFor={inputId}>Account number</FieldLabel>
+                  <div className="flex gap-2">
+                    <Input
+                      {...field}
+                      id={inputId}
+                      maxLength={ACCOUNT_ID_LENGTH}
+                      inputMode="numeric"
+                      autoComplete="off"
+                      aria-invalid={fieldState.invalid}
+                      aria-describedby={
+                        fieldState.invalid ? errorId : undefined
+                      }
+                    />
+                    <Button type="submit">Look up account</Button>
+                  </div>
+                  <FieldError id={errorId} errors={[fieldState.error]} />
+                </Field>
+              )}
+            />
+          </form>
+        </CardContent>
+      </Card>
       {/* Always rendered, across reads and outside every busy element, so
           assistive technology tracks the region from the start and announces
           its changes politely. */}

@@ -16,24 +16,35 @@
 //!
 //! Each test starts its own stack and breaks it for good: a deleted reply
 //! queue, a dropped `accounts` table, a reply queue that never existed, a
-//! requester on `RabbitMQ` direct reply-to. What the tests observe:
+//! requester on `RabbitMQ` direct reply-to, a deleted error queue; one test
+//! holds reply confirms back instead. What the tests observe:
 //!
 //! - **Error record**: the body on `CARD.DEMO.ERROR`, compared field by field
 //!   with the record laid out from the audit's section A rows of
 //!   `MQ-ERR-DISPLAY`, each field held to its row's Offset, Length and
 //!   `rust=` type.
-//! - **Rejected, not acknowledged**: the request queue is empty and the
-//!   request's message span records `outcome` `rejected`.
-//! - **Settled**: each consumer has a prefetch of 1, so the broker hands it a
-//!   later request only once the earlier one is acknowledged or rejected; a
-//!   later request answered proves the earlier one settled. A consumer that
-//!   acknowledged before the confirm could not reject afterwards, and would
-//!   lose its channel instead.
-//! - **Never redelivered**: after a settle wait, no second error record has
+//! - **Settlement, on the wire**: the consumers reach the broker through the
+//!   harness's AMQP tap, which journals the frames of their connection. Each
+//!   request shows one delivery to its flow's consumer, not redelivered, then
+//!   every publish it caused with the broker's answer (a plain confirm, or a
+//!   return and then the confirm), then the one frame that settled it. A
+//!   replied request is settled by a single `basic.ack`, after its reply's
+//!   plain confirm reached the consumer. A request without a confirmed reply
+//!   is settled by a single `basic.reject` with `requeue` clear, after the
+//!   confirm of every publish it caused, its error record's included, and by
+//!   no `basic.ack` or `basic.nack`.
+//! - **Held confirm**: while the tap keeps a reply's confirm from the
+//!   consumers, the reply sits on its queue and no frame settles the request,
+//!   and CP00 writes nothing; once the confirm goes through, one `basic.ack`
+//!   follows it.
+//! - **Never redelivered**: over a settle wait the journal still holds one
+//!   delivery and one settlement per request, no second error record has
 //!   arrived and exactly one message span exists per request.
 //! - **Logged**: each request rejected with an error record is one `ERROR`
 //!   event whose own fields name the request and hold the published
-//!   `MQ-ERR-DISPLAY` group, never the request body.
+//!   `MQ-ERR-DISPLAY` group, never the request body. When the error record
+//!   cannot be published either, that event is the `DISPLAY MQ-ERR-DISPLAY`
+//!   text instead, written before the rejection left the consumer.
 //!
 //! Every expected text comes from `docs/parity/parity-oracle-audit.md`
 //! through [`audit_texts`] and [`audit_row`], never from the code under test.
@@ -45,17 +56,22 @@ pub mod common;
 use std::ops::Range;
 use std::time::Duration;
 
+use carddemo_domain::entities::pending_auth_detail::PendingAuthDetail;
+use carddemo_domain::entities::pending_auth_summary::PendingAuthSummary;
 use carddemo_domain::numeric::ids::AccountId;
 use carddemo_domain::numeric::{Alnum, NumericCode, NumericError};
 use carddemo_domain::ports::{AuthorizationStore, Browse, Direction, PortError};
+use carddemo_messaging::connection::BROKER_TIMEOUT;
 use carddemo_messaging::error_queue::ERROR_QUEUE;
 use carddemo_messaging::flows::{cdra, cdrd};
 use carddemo_testkit::{block_on, fixtures};
+use common::amqp_tap::{ConfirmHold, Outcome, Settlement};
 use common::audit_tables::{Citation, citations};
-use common::{Harness, audit_row, audit_texts};
+use common::{Harness, audit_row, audit_texts, bounded};
 use futures_util::{FutureExt, StreamExt};
-use lapin::options::{BasicConsumeOptions, QueueDeleteOptions};
-use lapin::types::FieldTable;
+use lapin::message::Delivery;
+use lapin::options::BasicConsumeOptions;
+use lapin::types::{FieldTable, ShortString};
 
 /// How long an error record, a reply or a log line may take to appear.
 const ARRIVAL: Duration = Duration::from_secs(30);
@@ -63,6 +79,12 @@ const ARRIVAL: Duration = Duration::from_secs(30);
 /// How long a queue is watched for a message that must not come: a reply, a
 /// second error record, a redelivery's record.
 const SETTLE: Duration = Duration::from_secs(3);
+
+/// How long the tap holds a reply's confirm from the consumers: well inside
+/// `carddemo_messaging::connection::BROKER_TIMEOUT`, the consumers' bound on
+/// a publish and its confirm, past which the reply would count as not
+/// confirmed and the request would be rejected instead.
+const HOLD: Duration = Duration::from_secs(3);
 
 /// `ERROR-MESSAGE PIC X(1000)`, which `9000-ERROR` moves `MQ-ERR-DISPLAY` into
 /// and puts with `MOVE 1000 TO MQ-BUFFER-LENGTH`
@@ -185,6 +207,30 @@ const REJECTED_WITH_RECORD: [&str; 3] = [
 /// record was published and confirmed.
 const REJECTED_EVENT: &str = "request rejected: MQ-ERR-DISPLAY published to the error queue";
 
+/// The message span of a request rejected after its error record, whose own
+/// publish failed too, was displayed in the log.
+const REJECTED_WITH_DISPLAY: [&str; 3] = [
+    "\"outcome\":\"rejected\"",
+    "\"error_record\":\"logged\"",
+    "\"location\":\"none\"",
+];
+
+/// The message of the `ERROR` event that displays a record that could not be
+/// published, as `DISPLAY MQ-ERR-DISPLAY` prints it.
+const DISPLAYED_EVENT: &str = "\"message\":\"MQ-ERR-DISPLAY\"";
+
+/// `9000-ERROR` `WHEN OTHER` after a failed error put, in order: the failed
+/// put's codes, `ERROR-QUEUE-NAME` and `'MQPUT ERR'` moved into the record,
+/// then `DISPLAY MQ-ERR-DISPLAY` [app/app-vsam-mq/cbl/CODATE01.cbl:L433-438]
+/// [app/app-vsam-mq/cbl/COACCT01.cbl:L529-534].
+const DISPLAY_STATEMENTS: [&str; 5] = [
+    "MOVE MQ-CONDITION-CODE TO MQ-APPL-CONDITION-CODE",
+    "MOVE MQ-REASON-CODE TO MQ-APPL-REASON-CODE",
+    "MOVE ERROR-QUEUE-NAME TO MQ-APPL-QUEUE-NAME",
+    "MOVE 'MQPUT ERR' TO MQ-APPL-RETURN-MESSAGE",
+    "DISPLAY MQ-ERR-DISPLAY",
+];
+
 /// The requests of the tests, each with its own `message_id`.
 const CDRD_RETURNED: &str = "ACK-CDRD-RETURNED-1";
 const CDRD_AFTER: &str = "ACK-CDRD-RETURNED-2";
@@ -194,6 +240,15 @@ const CDRA_RETURNED: &str = "ACK-CDRA-RETURNED-3";
 const CP00_RETURNED: &str = "ACK-CP00-M004-1";
 const CP00_ANSWERED: &str = "ACK-CP00-ANSWERED-2";
 const CP00_DIRECT_REPLY_TO: &str = "ACK-CP00-DIRECT-REPLY-TO-3";
+const CDRD_HELD: &str = "ACK-CDRD-HELD-1";
+const CDRA_HELD: &str = "ACK-CDRA-HELD-2";
+const CP00_HELD: &str = "ACK-CP00-HELD-3";
+const CDRD_DISPLAYED: &str = "ACK-CDRD-DISPLAYED-1";
+const CDRA_DISPLAYED: &str = "ACK-CDRA-DISPLAYED-2";
+
+/// The body of [`CDRD_DISPLAYED`]: `CODATE01` never reads it, so it is
+/// written to be recognised if a log line carried it.
+const CDRD_DISPLAYED_BODY: &str = "CDRD REQUEST BODY NEVER LOGGED";
 
 /// The message span of a CP00 request rejected after its logged `M004`.
 /// `error_record` names the fate of an MQ-ERR-DISPLAY record, which only CDRD
@@ -497,16 +552,12 @@ fn ccpauery_value(name: &str) -> String {
         .to_owned()
 }
 
-/// Deletes `queue`, which must be empty, on the test's channel. Nothing
-/// declares it again: the definitions file declares it at broker boot and no
-/// consumer declares a queue. No helper names it afterwards, since touching a
-/// missing queue closes the channel.
+/// Deletes `queue`, which must be empty, on the test's channel, within the
+/// harness's broker bound. Nothing declares it again: the definitions file
+/// declares it at broker boot and no consumer declares a queue. No helper
+/// names it afterwards, since touching a missing queue closes the channel.
 async fn delete_queue(h: &Harness, queue: &str) {
-    let held = h
-        .channel
-        .queue_delete(queue, QueueDeleteOptions::default())
-        .await
-        .unwrap_or_else(|error| panic!("cannot delete {queue}: {error}"));
+    let held = h.delete_queue(queue).await;
     assert_eq!(held, 0, "{queue} held {held} message(s) when deleted");
 }
 
@@ -693,7 +744,8 @@ fn cdrd_put_failure_message() -> ExpectedRecord {
 
 /// CDRD: a reply the broker returns as unroutable is no reply. The request
 /// gets the `MQPUT ERR` record on `CARD.DEMO.ERROR` and is rejected without
-/// requeue, never acknowledged and never redelivered.
+/// requeue, never acknowledged and never redelivered. On the wire: the reply
+/// returned and confirmed, the record confirmed, then one `basic.reject`.
 ///
 /// Proves `P-CODATE01-014` (the reply goes to the fixed queue, the request's
 /// reply-to unused), `P-CODATE01-015` (the `MQPUT ERR` record, then
@@ -728,6 +780,11 @@ fn cdrd_returned_reply_publishes_error_record_and_rejects() {
         assert_eq!(texts::<1>("P-CODATE01-011"), [ERROR_QUEUE]);
         let expected = cdrd_put_failure_message();
 
+        let returned_reply = [
+            (cdrd::REPLY_QUEUE, Outcome::Returned),
+            (ERROR_QUEUE, Outcome::Confirmed),
+        ];
+
         let h = Harness::start(None).await;
         let queue = request_queue(&h.settings.queue_date_request, DATE_REQUEST_QUEUE);
         let decoy = h.temp_reply_queue().await;
@@ -743,6 +800,8 @@ fn cdrd_returned_reply_publishes_error_record_and_rejects() {
         .await;
         let record = h.next_message(ERROR_QUEUE, ARRIVAL).await;
         assert_error_message(&record.data, &expected, CDRD_RETURNED);
+        h.assert_rejected("CDRD", CDRD_RETURNED, &returned_reply)
+            .await;
         assert_eq!(
             h.queue_depth(&queue).await,
             0,
@@ -750,7 +809,10 @@ fn cdrd_returned_reply_publishes_error_record_and_rejects() {
         );
         // The reply-to is not used: nothing reaches it, not even a redirected reply.
         h.assert_no_message(&decoy, SETTLE).await;
-        h.assert_no_message(ERROR_QUEUE, SETTLE).await;
+        tokio::join!(
+            h.assert_no_message(ERROR_QUEUE, SETTLE),
+            h.assert_delivered_once("CDRD", CDRD_RETURNED, SETTLE),
+        );
         assert_eq!(
             h.queue_depth(&queue).await,
             0,
@@ -762,7 +824,11 @@ fn cdrd_returned_reply_publishes_error_record_and_rejects() {
             .await;
         let record = h.next_message(ERROR_QUEUE, ARRIVAL).await;
         assert_error_message(&record.data, &expected, CDRD_AFTER);
-        h.assert_no_message(ERROR_QUEUE, SETTLE).await;
+        h.assert_rejected("CDRD", CDRD_AFTER, &returned_reply).await;
+        tokio::join!(
+            h.assert_no_message(ERROR_QUEUE, SETTLE),
+            h.assert_delivered_once("CDRD", CDRD_AFTER, SETTLE),
+        );
 
         for message_id in [CDRD_RETURNED, CDRD_AFTER] {
             assert_single_span(&h, "CDRD", message_id, &REJECTED_WITH_RECORD).await;
@@ -835,10 +901,12 @@ fn cdra_put_failure_message() -> ExpectedRecord {
 }
 
 /// Two inquiries whose account read fails: each gets its read-error record and
-/// no reply, the second although it names a reply-to.
+/// no reply, the second although it names a reply-to. On the wire each one's
+/// only publish is its record, confirmed, then one `basic.reject`.
 async fn cdra_read_errors(h: &Harness, queue: &str) {
     let expected = cdra_read_error_message(queue);
     let inquiry = audited_request("P-COACCT01-020");
+    let recorded = [(ERROR_QUEUE, Outcome::Confirmed)];
     h.publish(
         queue,
         inquiry.as_bytes(),
@@ -849,13 +917,17 @@ async fn cdra_read_errors(h: &Harness, queue: &str) {
     .await;
     let record = h.next_message(ERROR_QUEUE, ARRIVAL).await;
     assert_error_message(&record.data, &expected, CDRA_READ_ERROR);
+    h.assert_rejected("CDRA", CDRA_READ_ERROR, &recorded).await;
     h.assert_no_message(cdra::REPLY_QUEUE, SETTLE).await;
     assert_eq!(
         h.queue_depth(queue).await,
         0,
         "{CDRA_READ_ERROR} left on {queue}"
     );
-    h.assert_no_message(ERROR_QUEUE, SETTLE).await;
+    tokio::join!(
+        h.assert_no_message(ERROR_QUEUE, SETTLE),
+        h.assert_delivered_once("CDRA", CDRA_READ_ERROR, SETTLE),
+    );
 
     // Prefetch 1: this request is delivered only once the first is settled.
     let decoy = h.temp_reply_queue().await;
@@ -869,9 +941,14 @@ async fn cdra_read_errors(h: &Harness, queue: &str) {
     .await;
     let record = h.next_message(ERROR_QUEUE, ARRIVAL).await;
     assert_error_message(&record.data, &expected, CDRA_READ_ERROR_AGAIN);
+    h.assert_rejected("CDRA", CDRA_READ_ERROR_AGAIN, &recorded)
+        .await;
     h.assert_no_message(&decoy, SETTLE).await;
     h.assert_no_message(cdra::REPLY_QUEUE, SETTLE).await;
-    h.assert_no_message(ERROR_QUEUE, SETTLE).await;
+    tokio::join!(
+        h.assert_no_message(ERROR_QUEUE, SETTLE),
+        h.assert_delivered_once("CDRA", CDRA_READ_ERROR_AGAIN, SETTLE),
+    );
     assert_eq!(
         h.queue_depth(queue).await,
         0,
@@ -890,7 +967,8 @@ async fn cdra_read_errors(h: &Harness, queue: &str) {
 
 /// A request that reads no account, here an unknown function, reaches
 /// `4100-PUT-REPLY`; with the reply queue deleted its reply is returned and it
-/// gets the `MQPUT ERR` record instead.
+/// gets the `MQPUT ERR` record instead. On the wire: the reply returned and
+/// confirmed, the record confirmed, then one `basic.reject`.
 async fn cdra_returned_reply(h: &Harness, queue: &str) {
     let expected = cdra_put_failure_message();
     delete_queue(h, cdra::REPLY_QUEUE).await;
@@ -905,7 +983,19 @@ async fn cdra_returned_reply(h: &Harness, queue: &str) {
     .await;
     let record = h.next_message(ERROR_QUEUE, ARRIVAL).await;
     assert_error_message(&record.data, &expected, CDRA_RETURNED);
-    h.assert_no_message(ERROR_QUEUE, SETTLE).await;
+    h.assert_rejected(
+        "CDRA",
+        CDRA_RETURNED,
+        &[
+            (cdra::REPLY_QUEUE, Outcome::Returned),
+            (ERROR_QUEUE, Outcome::Confirmed),
+        ],
+    )
+    .await;
+    tokio::join!(
+        h.assert_no_message(ERROR_QUEUE, SETTLE),
+        h.assert_delivered_once("CDRA", CDRA_RETURNED, SETTLE),
+    );
     assert_eq!(
         h.queue_depth(queue).await,
         0,
@@ -1041,9 +1131,14 @@ async fn assert_m004_logged(h: &Harness, message_id: &str, correlation_id: &str)
     }
 }
 
-/// Asserts that account `00000000001` has no pending authorization: no
-/// summary (`GE`) and no detail.
-async fn assert_no_pending_authorization(h: &Harness) {
+/// The pending authorization of account `00000000001`, read in a unit of work
+/// that is rolled back: its summary and its details.
+async fn pending_authorization(
+    h: &Harness,
+) -> (
+    Result<PendingAuthSummary, PortError>,
+    Result<Vec<PendingAuthDetail>, PortError>,
+) {
     let account: AccountId = ACCOUNT_1
         .parse()
         .unwrap_or_else(|error| panic!("account {ACCOUNT_1}: {error:?}"));
@@ -1065,6 +1160,27 @@ async fn assert_no_pending_authorization(h: &Harness) {
     uow.rollback()
         .await
         .expect("end the read of the authorizations");
+    (summary, details)
+}
+
+/// Asserts that account `00000000001` has a pending authorization: a summary
+/// and exactly one detail, the approval of one request.
+async fn assert_pending_authorization_written(h: &Harness) {
+    let (summary, details) = pending_authorization(h).await;
+    assert!(
+        summary.is_ok(),
+        "no summary was written for {ACCOUNT_1}: {summary:?}"
+    );
+    assert!(
+        matches!(&details, Ok(rows) if rows.len() == 1),
+        "not one detail was written for {ACCOUNT_1}: {details:?}"
+    );
+}
+
+/// Asserts that account `00000000001` has no pending authorization: no
+/// summary (`GE`) and no detail.
+async fn assert_no_pending_authorization(h: &Harness) {
+    let (summary, details) = pending_authorization(h).await;
     assert!(
         matches!(summary, Err(PortError::NotFound)),
         "a summary was written for {ACCOUNT_1}: {summary:?}"
@@ -1079,9 +1195,39 @@ async fn assert_no_pending_authorization(h: &Harness) {
 /// the first 63 as audited; the last one `COPAUA0C` never sets (E-25).
 fn assert_audited_reply(body: &[u8]) {
     let [reply] = texts::<1>("P-COPAUA0C-021");
+    assert_reply_text(body, &reply);
+}
+
+/// Asserts that `body` is the reply to [`account_1_request`]: the audited
+/// reply of `P-COPAUA0C-021` with the card of account `00000000001` as its
+/// first field, since the reply's first field is the request's card
+/// (`P-COPAUA0C-011`: `MOVE PA-RQ-CARD-NUM TO PA-RL-CARD-NUM`
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L660]).
+fn assert_account_1_reply(body: &[u8]) {
+    assert!(
+        audit_row("P-COPAUA0C-011").contains("body=STRING {PA-RL-CARD-NUM}"),
+        "P-COPAUA0C-011 no longer starts the reply with the card"
+    );
+    let request = audited_request("P-COPAUA0C-021");
+    let audited_card = request
+        .split(',')
+        .nth(CP00_CARD_FIELD)
+        .unwrap_or_else(|| panic!("P-COPAUA0C-021 request has no card: {request}"));
+    let [reply] = texts::<1>("P-COPAUA0C-021");
+    let rest = reply
+        .strip_prefix(audited_card)
+        .and_then(|rest| rest.strip_prefix(','))
+        .unwrap_or_else(|| panic!("P-COPAUA0C-021 reply does not start with its card: {reply:?}"));
+    assert_reply_text(body, &format!("{ACCOUNT_1_CARD},{rest}"));
+}
+
+/// Asserts that `body` is the CP00 reply `reply`, an audited text whose last
+/// byte `COPAUA0C` never sets (E-25): one byte longer than the text before
+/// it, which it starts with.
+fn assert_reply_text(body: &[u8], reply: &str) {
     let set = reply
         .strip_suffix(UNSET_REPLY_BYTE)
-        .unwrap_or_else(|| panic!("P-COPAUA0C-021 reply does not end unset: {reply:?}"));
+        .unwrap_or_else(|| panic!("the CP00 reply does not end unset: {reply:?}"));
     assert_eq!(body.len(), set.len() + 1, "reply length");
     assert_eq!(
         String::from_utf8_lossy(&body[..set.len()]),
@@ -1090,13 +1236,30 @@ fn assert_audited_reply(body: &[u8]) {
     );
 }
 
+/// Asserts that `reply` echoes the request `message_id`, as every CDRD and
+/// CDRA reply does [app/app-vsam-mq/cbl/CODATE01.cbl:L373-374]
+/// [app/app-vsam-mq/cbl/COACCT01.cbl:L469-470].
+fn assert_reply_of(reply: &Delivery, message_id: &str) {
+    assert_eq!(
+        reply
+            .properties
+            .message_id()
+            .as_ref()
+            .map(ShortString::as_str),
+        Some(message_id),
+        "the reply taken is not the reply of {message_id}"
+    );
+}
+
 /// CP00: a reply the broker returns, because the request's reply-to names no
 /// queue, is no reply. The critical `M004` record is logged, the request is
 /// rejected without requeue, never redelivered, and nothing is written: the
-/// pending-authorization writes run only after an acknowledgement.
+/// pending-authorization writes run only after an acknowledgement. On the
+/// wire: the reply returned and confirmed, then one `basic.reject`.
 ///
-/// A later approve request, answered to a queue that exists, shows the
-/// consumer settled the first one (prefetch 1) and goes on serving.
+/// A later approve request, answered to a queue that exists and acknowledged
+/// once its reply's confirm reached the consumer, shows the consumer goes on
+/// serving.
 ///
 /// Proves `P-COPAUA0C-002` (the request consumed at get time),
 /// `P-COPAUA0C-012` (`7100-SEND-RESPONSE`: `M004` critical, the task ends, no
@@ -1130,6 +1293,12 @@ fn cp00_failed_reply_logs_m004_and_writes_nothing() {
         .await;
         assert_reply_not_confirmed(&h, "CP00", CP00_RETURNED, correlation).await;
         assert_m004_logged(&h, CP00_RETURNED, correlation).await;
+        h.assert_rejected(
+            "CP00",
+            CP00_RETURNED,
+            &[(MISSING_REPLY_QUEUE, Outcome::Returned)],
+        )
+        .await;
         assert_eq!(
             h.queue_depth(&queue).await,
             0,
@@ -1148,7 +1317,13 @@ fn cp00_failed_reply_logs_m004_and_writes_nothing() {
         .await;
         let reply = h.next_message(&decoy, ARRIVAL).await;
         assert_audited_reply(&reply.data);
-        h.assert_no_message(&decoy, SETTLE).await;
+        h.assert_acked_after_confirm("CP00", CP00_ANSWERED, &decoy)
+            .await;
+        tokio::join!(
+            h.assert_no_message(&decoy, SETTLE),
+            h.assert_delivered_once("CP00", CP00_RETURNED, SETTLE),
+            h.assert_delivered_once("CP00", CP00_ANSWERED, SETTLE),
+        );
         assert_eq!(
             h.queue_depth(&queue).await,
             0,
@@ -1181,11 +1356,13 @@ fn cp00_failed_reply_logs_m004_and_writes_nothing() {
 /// as unroutable, so the reply would reach the requester while the request
 /// went unwritten. CP00 publishes nothing to it: a warning names the
 /// pseudo-queue, the critical `M004` record is logged, the request is
-/// rejected without requeue, never redelivered, and nothing is written.
+/// rejected without requeue, never redelivered, and nothing is written. On
+/// the wire: no publish, then one `basic.reject`.
 ///
 /// The requester consumes [`DIRECT_REPLY_TO`] with `no_ack` on the test's
-/// channel and publishes the request on that channel, as the broker requires,
-/// so the request reaches CP00 with the `reply_to` the broker rewrote.
+/// channel, within the harness's broker bound, and publishes the request on
+/// that channel, as the broker requires, so the request reaches CP00 with the
+/// `reply_to` the broker rewrote.
 ///
 /// Proves `P-COPAUA0C-002` (the request consumed at get time),
 /// `P-COPAUA0C-012` (`7100-SEND-RESPONSE`: `M004` critical, no reply, no
@@ -1205,9 +1382,8 @@ fn cp00_direct_reply_to_logs_m004_without_a_reply_or_a_write() {
 
         let h = Harness::start(None).await;
         let queue = request_queue(&h.settings.queue_pauth_request, PAUTH_REQUEST_QUEUE);
-        let mut replies = h
-            .channel
-            .basic_consume(
+        let mut replies = bounded("basic.consume", DIRECT_REPLY_TO, || {
+            h.channel.basic_consume(
                 DIRECT_REPLY_TO,
                 "ack-cp00-direct-reply-to",
                 BasicConsumeOptions {
@@ -1216,8 +1392,9 @@ fn cp00_direct_reply_to_logs_m004_without_a_reply_or_a_write() {
                 },
                 FieldTable::default(),
             )
-            .await
-            .unwrap_or_else(|error| panic!("cannot consume {DIRECT_REPLY_TO}: {error}"));
+        })
+        .await
+        .unwrap_or_else(|error| panic!("cannot consume {DIRECT_REPLY_TO}: {error}"));
         h.publish(
             &queue,
             approvable.as_bytes(),
@@ -1241,10 +1418,15 @@ fn cp00_direct_reply_to_logs_m004_without_a_reply_or_a_write() {
             "the direct reply-to warning carries the card: {warning}"
         );
         assert_m004_logged(&h, CP00_DIRECT_REPLY_TO, "ACK-CP00-CORREL-3").await;
+        // No publish at all, then one `basic.reject`.
+        h.assert_rejected("CP00", CP00_DIRECT_REPLY_TO, &[]).await;
 
         // CP00 has no error queue, and nothing reaches it; the wait also gives
         // a reply time to reach the requester.
-        h.assert_no_message(ERROR_QUEUE, SETTLE).await;
+        tokio::join!(
+            h.assert_no_message(ERROR_QUEUE, SETTLE),
+            h.assert_delivered_once("CP00", CP00_DIRECT_REPLY_TO, SETTLE),
+        );
         let reply = replies.next().now_or_never();
         assert!(
             reply.is_none(),
@@ -1258,6 +1440,472 @@ fn cp00_direct_reply_to_logs_m004_without_a_reply_or_a_write() {
         assert_single_span(&h, "CP00", CP00_DIRECT_REPLY_TO, &CP00_REJECTED_M004).await;
         assert_no_pending_authorization(&h).await;
         assert_never_replied(&h, "CP00");
+        h.shutdown().await;
+    });
+}
+
+/// Waits until the tap holds the confirm `hold` was armed for, and asserts
+/// that it is the plain confirm of the reply of the `flow` request
+/// `message_id`: the request's only publish so far, on its channel, to
+/// `reply_queue`, where the reply already sits, while the consumer has had no
+/// confirm of it. Then watches the request for [`HOLD`]: no frame settles it
+/// while the confirm is held.
+async fn assert_held_reply(
+    h: &Harness,
+    hold: &ConfirmHold<'_>,
+    flow: &str,
+    message_id: &str,
+    reply_queue: &str,
+) {
+    let confirm = hold.wait_held(ARRIVAL).await;
+    let journal = h.journal();
+    let handling = journal
+        .handling(message_id)
+        .unwrap_or_else(|problem| panic!("{flow} request {message_id}: {problem}\n{journal}"))
+        .unwrap_or_else(|| {
+            panic!("{flow} request {message_id} not delivered before the held confirm\n{journal}")
+        });
+    let [reply] = handling.publishes.as_slice() else {
+        panic!(
+            "{flow} request {message_id}: {} publishes before the held confirm, not one reply\n\
+             {journal}",
+            handling.publishes.len()
+        );
+    };
+    assert_eq!(
+        (
+            reply.routing_key.as_str(),
+            reply.outcome,
+            confirm.channel,
+            Some(confirm.tag),
+            confirm.ack
+        ),
+        (
+            reply_queue,
+            Outcome::Unconfirmed,
+            handling.channel,
+            reply.seq,
+            true
+        ),
+        "{flow} request {message_id}: the held confirm is not its reply's plain confirm\n{journal}"
+    );
+    assert_eq!(
+        h.queue_depth(reply_queue).await,
+        1,
+        "the reply of {message_id} is not on {reply_queue} while its confirm is held"
+    );
+    h.assert_unsettled_during(flow, message_id, HOLD).await;
+}
+
+/// Acknowledge after confirm, held: for a CDRD request, a CDRA inquiry and a
+/// CP00 approval in turn, the tap keeps the reply's confirm from the
+/// consumers. The reply is routed and on its queue, yet for [`HOLD`] no frame
+/// settles the request and CP00 writes no pending authorization. Once the
+/// confirm goes through, one `basic.ack` follows it, and CP00 then writes the
+/// summary and the detail. [`HOLD`] is well inside the consumers' own bound on
+/// a publish and its confirm, so the held confirm still counts as the reply's.
+///
+/// Proves `P-CODATE01-024` and `P-COACCT01-032` (each request acknowledged
+/// only after its reply's confirm), with the inquiry of `P-COACCT01-020` and
+/// its audited reply, and `P-COPAUA0C-035` (the writes follow the reply's
+/// confirm and the request's acknowledgement), with the approve request of
+/// `P-COPAUA0C-021` and its reply (`P-COPAUA0C-011`).
+#[test]
+fn acknowledgement_waits_for_the_held_reply_confirm() {
+    assert!(
+        HOLD * 3 <= BROKER_TIMEOUT,
+        "a hold of {HOLD:?} is not well inside the consumers' {BROKER_TIMEOUT:?}"
+    );
+    block_on(async {
+        assert_cited(&[
+            "P-CODATE01-024",
+            "P-COACCT01-020",
+            "P-COACCT01-032",
+            "P-COPAUA0C-011",
+            "P-COPAUA0C-021",
+            "P-COPAUA0C-035",
+        ]);
+        let inquiry = audited_request("P-COACCT01-020");
+        let [inquiry_reply] = texts::<1>("P-COACCT01-020");
+        let approvable = account_1_request(&audited_request("P-COPAUA0C-021"));
+
+        let h = Harness::start(None).await;
+        let date_queue = request_queue(&h.settings.queue_date_request, DATE_REQUEST_QUEUE);
+        let acct_queue = request_queue(&h.settings.queue_acct_request, ACCT_REQUEST_QUEUE);
+        let pauth_queue = request_queue(&h.settings.queue_pauth_request, PAUTH_REQUEST_QUEUE);
+
+        let hold = h.hold_next_confirm();
+        h.publish(&date_queue, b"DATE", CDRD_HELD, "ACK-CDRD-CORREL-6", None)
+            .await;
+        assert_held_reply(&h, &hold, "CDRD", CDRD_HELD, cdrd::REPLY_QUEUE).await;
+        hold.release();
+        h.assert_acked_after_confirm("CDRD", CDRD_HELD, cdrd::REPLY_QUEUE)
+            .await;
+        let reply = h.next_message(cdrd::REPLY_QUEUE, ARRIVAL).await;
+        assert_reply_of(&reply, CDRD_HELD);
+
+        let hold = h.hold_next_confirm();
+        h.publish(
+            &acct_queue,
+            inquiry.as_bytes(),
+            CDRA_HELD,
+            "ACK-CDRA-CORREL-6",
+            None,
+        )
+        .await;
+        assert_held_reply(&h, &hold, "CDRA", CDRA_HELD, cdra::REPLY_QUEUE).await;
+        hold.release();
+        h.assert_acked_after_confirm("CDRA", CDRA_HELD, cdra::REPLY_QUEUE)
+            .await;
+        let reply = h.next_message(cdra::REPLY_QUEUE, ARRIVAL).await;
+        assert_reply_of(&reply, CDRA_HELD);
+        assert_eq!(
+            String::from_utf8_lossy(&reply.data),
+            inquiry_reply,
+            "the reply to the P-COACCT01-020 inquiry"
+        );
+
+        let decoy = h.temp_reply_queue().await;
+        let hold = h.hold_next_confirm();
+        h.publish(
+            &pauth_queue,
+            approvable.as_bytes(),
+            CP00_HELD,
+            "ACK-CP00-CORREL-6",
+            Some(&decoy),
+        )
+        .await;
+        assert_held_reply(&h, &hold, "CP00", CP00_HELD, &decoy).await;
+        assert_no_pending_authorization(&h).await;
+        hold.release();
+        h.assert_acked_after_confirm("CP00", CP00_HELD, &decoy)
+            .await;
+        let reply = h.next_message(&decoy, ARRIVAL).await;
+        assert_account_1_reply(&reply.data);
+        // The span closes once the writes after the acknowledgement are done.
+        assert_single_span(&h, "CP00", CP00_HELD, &[REPLIED, "\"location\":\"none\""]).await;
+        assert_pending_authorization_written(&h).await;
+
+        for (flow, message_id) in [("CDRD", CDRD_HELD), ("CDRA", CDRA_HELD)] {
+            assert_single_span(&h, flow, message_id, &[REPLIED]).await;
+        }
+        tokio::join!(
+            h.assert_no_message(&decoy, SETTLE),
+            h.assert_delivered_once("CDRD", CDRD_HELD, SETTLE),
+            h.assert_delivered_once("CDRA", CDRA_HELD, SETTLE),
+            h.assert_delivered_once("CP00", CP00_HELD, SETTLE),
+        );
+        h.shutdown().await;
+    });
+}
+
+/// Asserts that the audit row `id` records that an error put that fails is
+/// only displayed (`phrase`), and that its Paragraph cell cites `program`'s
+/// `9000-ERROR` as a line range whose last `WHEN OTHER` runs
+/// [`DISPLAY_STATEMENTS`], in order, before its `END-EVALUATE`. Each COBOL
+/// line is compared with its runs of spaces collapsed.
+fn assert_display_only(id: &str, program: &str, phrase: &str) {
+    let row = audit_row(id);
+    assert!(
+        row.contains(phrase),
+        "audit row {id} no longer records {phrase:?}"
+    );
+    let paragraph = row
+        .split('|')
+        .map(str::trim)
+        .nth(3)
+        .unwrap_or_else(|| panic!("audit row {id} has no Paragraph cell: {row}"));
+    assert!(
+        paragraph.starts_with("9000-ERROR "),
+        "audit row {id} is not a 9000-ERROR row: {paragraph}"
+    );
+    let cited = citations(paragraph);
+    let Some(Citation { path, start, end }) = cited.first() else {
+        panic!("audit row {id} cites no COBOL lines: {paragraph}");
+    };
+    assert!(
+        path.ends_with(&format!("/{program}.cbl")),
+        "audit row {id} cites {path}, not {program}"
+    );
+    let file = fixtures::repo_root().join(path);
+    let source = std::fs::read_to_string(&file)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", file.display()));
+    let lines: Vec<String> = source
+        .lines()
+        .skip(start.saturating_sub(1))
+        .take(end + 1 - start)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        end + 1 - start,
+        "audit row {id}: {path} has no lines {start}-{end}"
+    );
+    let when_other = lines
+        .iter()
+        .rposition(|line| line.contains("WHEN OTHER"))
+        .unwrap_or_else(|| panic!("audit row {id}: {path}:L{start}-{end} has no WHEN OTHER"));
+    let mut branch = lines[when_other + 1..]
+        .iter()
+        .take_while(|line| !line.contains("END-EVALUATE"));
+    for statement in DISPLAY_STATEMENTS {
+        assert!(
+            branch.any(|line| line.contains(statement)),
+            "audit row {id}: the WHEN OTHER of {path}:L{start}-{end} does not {statement} \
+             after the statements before it"
+        );
+    }
+}
+
+/// The 113-byte `MQ-ERR-DISPLAY` text of `record`.
+fn displayed(record: &ExpectedRecord) -> String {
+    String::from_utf8_lossy(&record.bytes[..ERR_DISPLAY_LEN]).into_owned()
+}
+
+/// CODATE01 9000-ERROR `WHEN OTHER`: what `DISPLAY MQ-ERR-DISPLAY` shows when
+/// the `MQPUT ERR` record of a returned reply cannot be put either. The
+/// record's `MQ-ERROR-PARA` keeps the spaces of the `INITIALIZE`
+/// (`P-CODATE01-022`). The failed put moves its codes, those E-39 proposes
+/// for a returned publish, then `ERROR-QUEUE-NAME`, `CARD.DEMO.ERROR`
+/// (`P-CODATE01-011`), and `'MQPUT ERR'` (`P-CODATE01-015`)
+/// [app/app-vsam-mq/cbl/CODATE01.cbl:L433-438]; `P-CODATE01-016` records the
+/// display as all that happens.
+fn cdrd_displayed_record() -> String {
+    assert_display_only(
+        "P-CODATE01-016",
+        "CODATE01",
+        "DISPLAY of the error record only",
+    );
+    assert!(
+        audit_row("P-CODATE01-022").contains("MQ-ERROR-PARA spaces (from the INITIALIZE)"),
+        "P-CODATE01-022 no longer records the INITIALIZEd MQ-ERROR-PARA"
+    );
+    let [return_message] = texts::<1>("P-CODATE01-015");
+    let [error_queue] = texts::<1>("P-CODATE01-011");
+    displayed(&expected_error_message(
+        CODATE01_ERR_DISPLAY,
+        [
+            "",
+            "",
+            &return_message,
+            "",
+            PUBLISH_FAILED_CONDITION,
+            "",
+            PUBLISH_FAILED_REASON,
+            "",
+            &error_queue,
+        ],
+    ))
+}
+
+/// COACCT01 9000-ERROR `WHEN OTHER`: what `DISPLAY MQ-ERR-DISPLAY` shows when
+/// the read-error record of an inquiry cannot be put. The record's
+/// `MQ-ERROR-PARA` keeps the spaces of the `INITIALIZE` (`P-COACCT01-030`).
+/// The failed put moves its codes, those E-39 proposes for a returned
+/// publish, then `ERROR-QUEUE-NAME`, `CARD.DEMO.ERROR` (`P-COACCT01-010`),
+/// and `'MQPUT ERR'`, the text of `P-COACCT01-017`
+/// [app/app-vsam-mq/cbl/COACCT01.cbl:L529-534]; `P-COACCT01-018` records
+/// the display as all that happens.
+fn cdra_displayed_record() -> String {
+    assert_display_only("P-COACCT01-018", "COACCT01", "put failure -> DISPLAY only");
+    assert!(
+        audit_row("P-COACCT01-030").contains("MQ-ERROR-PARA spaces (from the INITIALIZE)"),
+        "P-COACCT01-030 no longer records the INITIALIZEd MQ-ERROR-PARA"
+    );
+    let [return_message] = texts::<1>("P-COACCT01-017");
+    let [_reply_queue, error_queue] = texts::<2>("P-COACCT01-010");
+    displayed(&expected_error_message(
+        COACCT01_ERR_DISPLAY,
+        [
+            "",
+            "",
+            &return_message,
+            "",
+            PUBLISH_FAILED_CONDITION,
+            "",
+            PUBLISH_FAILED_REASON,
+            "",
+            &error_queue,
+        ],
+    ))
+}
+
+/// Asserts that `flow` logged exactly one `ERROR` event displaying the record
+/// of the request `message_id`, and that it was written before `rejection`,
+/// the request's settlement, left the consumer. The event's own fields name
+/// the request's IDs, the failure of the record's publish and `display`, the
+/// expected `MQ-ERR-DISPLAY` text; its line carries nothing of `body`, the
+/// request body; and no event logs the record as published.
+fn assert_displayed_before(
+    h: &Harness,
+    rejection: &Settlement,
+    flow: &str,
+    display: &str,
+    message_id: &str,
+    correlation_id: &str,
+    body: &str,
+) {
+    let id_field = format!("\"message_id\":\"{message_id}\"");
+    let displays = |lines: Vec<String>| -> Vec<String> {
+        lines
+            .into_iter()
+            .filter(|line| line.contains(DISPLAYED_EVENT) && line.contains(&id_field))
+            .collect()
+    };
+    let before = displays(h.logs_before(rejection));
+    let [line] = before.as_slice() else {
+        panic!(
+            "{flow} request {message_id}: {} MQ-ERR-DISPLAY events before its rejection: \
+             {before:#?}",
+            before.len()
+        );
+    };
+    assert!(
+        line.contains("\"level\":\"ERROR\""),
+        "the MQ-ERR-DISPLAY event of {message_id} is not an ERROR: {line}"
+    );
+    let display_field = format!("\"mq_err_display\":\"{display}\"");
+    let fields = event_fields(line);
+    for field in [
+        format!("\"flow\":\"{flow}\""),
+        id_field.clone(),
+        format!("\"correlation_id\":\"{correlation_id}\""),
+        "\"failure\":\"returned unroutable\"".to_owned(),
+        display_field.clone(),
+    ] {
+        assert!(
+            fields.contains(&field),
+            "the MQ-ERR-DISPLAY event of {message_id} lacks {field}: {line}"
+        );
+    }
+    assert!(
+        !line.replace(&display_field, "").contains(body),
+        "the MQ-ERR-DISPLAY event of {message_id} carries its body: {line}"
+    );
+    let all = displays(h.logs());
+    assert_eq!(
+        all.len(),
+        1,
+        "MQ-ERR-DISPLAY events of {message_id}: {all:#?}"
+    );
+    let published: Vec<String> = h
+        .logs()
+        .into_iter()
+        .filter(|line| line.contains(REJECTED_EVENT) && line.contains(&id_field))
+        .collect();
+    assert!(
+        published.is_empty(),
+        "the record of {message_id} is logged as published: {published:#?}"
+    );
+}
+
+/// CDRD and CDRA: an error record whose own publish fails is displayed, not
+/// lost. With `CARD.DEMO.REPLY.DATE` and `CARD.DEMO.ERROR` deleted, a CDRD
+/// reply is returned and so is its `MQPUT ERR` record; with `accounts`
+/// dropped too, a CDRA inquiry's read-error record is returned. Each request
+/// is rejected without requeue once everything it published was answered by
+/// the broker and the `ERROR` event displaying its record was written, as
+/// `DISPLAY MQ-ERR-DISPLAY` writes it; it is never acknowledged and never
+/// redelivered. Nothing is read from the deleted queues: the tap's journal
+/// and the logs are what is observed.
+///
+/// Proves `P-CODATE01-016` and `P-COACCT01-018` (an error put that fails is
+/// only displayed, and the task ends normally: the request consumed), with
+/// the record values of `P-CODATE01-011`, `P-CODATE01-015`, `P-COACCT01-010`
+/// and `P-COACCT01-017`, the read error of `P-COACCT01-015` on the inquiry of
+/// `P-COACCT01-020`, and the codes E-39 proposes (`P-CODATE01-019`).
+#[test]
+fn unpublishable_error_record_is_displayed_before_the_rejection() {
+    block_on(async {
+        assert_cited(&[
+            "P-CODATE01-011",
+            "P-CODATE01-015",
+            "P-CODATE01-016",
+            "P-CODATE01-019",
+            "P-COACCT01-010",
+            "P-COACCT01-015",
+            "P-COACCT01-017",
+            "P-COACCT01-018",
+            "P-COACCT01-020",
+        ]);
+        assert_proposed_codes();
+        let date_display = cdrd_displayed_record();
+        let account_display = cdra_displayed_record();
+        let inquiry = audited_request("P-COACCT01-020");
+
+        let h = Harness::start(None).await;
+        let date_queue = request_queue(&h.settings.queue_date_request, DATE_REQUEST_QUEUE);
+        let acct_queue = request_queue(&h.settings.queue_acct_request, ACCT_REQUEST_QUEUE);
+        delete_queue(&h, cdrd::REPLY_QUEUE).await;
+        delete_queue(&h, ERROR_QUEUE).await;
+
+        h.publish(
+            &date_queue,
+            CDRD_DISPLAYED_BODY.as_bytes(),
+            CDRD_DISPLAYED,
+            "ACK-CDRD-CORREL-5",
+            None,
+        )
+        .await;
+        let rejection = h
+            .assert_rejected(
+                "CDRD",
+                CDRD_DISPLAYED,
+                &[
+                    (cdrd::REPLY_QUEUE, Outcome::Returned),
+                    (ERROR_QUEUE, Outcome::Returned),
+                ],
+            )
+            .await;
+        assert_reply_not_confirmed(&h, "CDRD", CDRD_DISPLAYED, "ACK-CDRD-CORREL-5").await;
+        assert_displayed_before(
+            &h,
+            &rejection,
+            "CDRD",
+            &date_display,
+            CDRD_DISPLAYED,
+            "ACK-CDRD-CORREL-5",
+            CDRD_DISPLAYED_BODY,
+        );
+
+        // Before any CDRA request, so no read has run on the table.
+        h.stack.exec_sql("DROP TABLE accounts CASCADE").await;
+        h.publish(
+            &acct_queue,
+            inquiry.as_bytes(),
+            CDRA_DISPLAYED,
+            "ACK-CDRA-CORREL-5",
+            None,
+        )
+        .await;
+        let rejection = h
+            .assert_rejected("CDRA", CDRA_DISPLAYED, &[(ERROR_QUEUE, Outcome::Returned)])
+            .await;
+        assert_displayed_before(
+            &h,
+            &rejection,
+            "CDRA",
+            &account_display,
+            CDRA_DISPLAYED,
+            "ACK-CDRA-CORREL-5",
+            &inquiry,
+        );
+
+        tokio::join!(
+            h.assert_delivered_once("CDRD", CDRD_DISPLAYED, SETTLE),
+            h.assert_delivered_once("CDRA", CDRA_DISPLAYED, SETTLE),
+        );
+        for (queue, message_id) in [(&date_queue, CDRD_DISPLAYED), (&acct_queue, CDRA_DISPLAYED)] {
+            assert_eq!(
+                h.queue_depth(queue).await,
+                0,
+                "{message_id} left on or redelivered to {queue}"
+            );
+        }
+        assert_single_span(&h, "CDRD", CDRD_DISPLAYED, &REJECTED_WITH_DISPLAY).await;
+        assert_single_span(&h, "CDRA", CDRA_DISPLAYED, &REJECTED_WITH_DISPLAY).await;
+        assert_never_replied(&h, "CDRD");
+        assert_never_replied(&h, "CDRA");
         h.shutdown().await;
     });
 }

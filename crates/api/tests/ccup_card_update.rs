@@ -25,7 +25,11 @@
 //!
 //! Each expected answer is read from its audit row through `carddemo_audit`,
 //! and only from a row whose review verdict is `pass`; every message text is
-//! also matched against its `carddemo_domain::messages` constant. Every V-ID
+//! also matched against its `carddemo_domain::messages` constant, except the
+//! file-error text of V-COCRDUPC-008, which is the row's reviewed template
+//! expanded through `common::audit_text` with the injected `READ`, the
+//! `ERROR-FILE` the row names and the E-44 codes, and cut at
+//! `WS-RETURN-MSG`, never composed by `carddemo_domain::messages`. Every V-ID
 //! of `COCRDUPC` is exercised, which `every_cocrdupc_row_is_exercised` checks
 //! without a container. The Docker-backed tests each start one seeded
 //! `postgres:16.15` container; Docker must be running.
@@ -44,6 +48,7 @@ use carddemo_audit::{
 use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages;
 use carddemo_testkit::{block_on, fixtures};
+use common::audit_text::{Operand, Template};
 use common::{Resp, TestApp, assert_error, parity_audit, validation_audit, validation_ids};
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
@@ -129,10 +134,33 @@ const NO_BMS_FIELD: &str = "—";
 const NO_KIND: &str = "none";
 
 /// The `RESP` E-44 proposes for a database failure: `IOERR`.
-const RESP_IOERR: u32 = 17;
+const RESP_IOERR: u64 = 17;
 
 /// The `RESP2` E-44 proposes alongside [`RESP_IOERR`].
-const RESP2_IOERR: u32 = 0;
+const RESP2_IOERR: u64 = 0;
+
+/// `ERROR-OPNAME PIC X(8)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COCRDUPC.cbl:L136].
+const ERROR_OPNAME_WIDTH: usize = 8;
+
+/// `ERROR-FILE PIC X(9)` of `WS-FILE-ERROR-MESSAGE`
+/// [app/cbl/COCRDUPC.cbl:L140], which receives the 8-byte
+/// `LIT-CARDFILENAME`.
+const ERROR_FILE_WIDTH: usize = 9;
+
+/// The digits of `WS-RESP-CD` and `WS-REAS-CD PIC S9(09) COMP`
+/// [app/cbl/COCRDUPC.cbl:L41] [app/cbl/COCRDUPC.cbl:L43], whose unsigned
+/// display a `MOVE` to an alphanumeric field gives.
+const RESP_DIGITS: usize = 9;
+
+/// `ERROR-RESP PIC X(10)` and `ERROR-RESP2 PIC X(10)` of
+/// `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDUPC.cbl:L145]
+/// [app/cbl/COCRDUPC.cbl:L149].
+const ERROR_RESP_WIDTH: usize = 10;
+
+/// `WS-RETURN-MSG PIC X(75)` [app/cbl/COCRDUPC.cbl:L173], the receiver
+/// `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDUPC.cbl:L133-152] is moved to.
+const RETURN_MSG_WIDTH: usize = 75;
 
 /// A changed embossed name: letters and spaces only, in mixed case, so the
 /// stored text shows the name is kept as entered (P-COCRDUPC-013).
@@ -573,8 +601,9 @@ const ORDER_PROBES: [&str; 6] = [
 enum FaultText {
     /// A catalog constant.
     Catalog(&'static str),
-    /// `WS-FILE-ERROR-MESSAGE`, composed from the `ERROR-OPNAME` and
-    /// `ERROR-FILE` literals of the row's message cell and the E-44 codes.
+    /// `WS-FILE-ERROR-MESSAGE`: the row's reviewed template expanded with
+    /// the `ERROR-OPNAME` and `ERROR-FILE` literals of its message cell and
+    /// the E-44 codes ([`file_error_text`]).
     FileError,
 }
 
@@ -807,15 +836,43 @@ fn fault_answer(doc: &Document, fault: &Fault) -> Answer {
             let cell = table
                 .cell(row, "Message text")
                 .unwrap_or_else(|| panic!("{} has no `Message text` cell", fault.id));
-            expected.message = messages::file_error_message(
+            expected.message = file_error_text(
+                doc,
+                fault.id,
                 quoted_literal(cell, "ERROR-OPNAME"),
                 quoted_literal(cell, "ERROR-FILE"),
-                RESP_IOERR,
-                RESP2_IOERR,
             );
         }
     }
     expected
+}
+
+/// The `WS-FILE-ERROR-MESSAGE` [app/cbl/COCRDUPC.cbl:L133-152] the
+/// `WHEN OTHER` branch of `9100-GETCARD-BYACCTCARD` moves to `WS-RETURN-MSG`:
+/// the reviewed template of row `id` of `doc`, its operands bound to the
+/// `ERROR-OPNAME` literal `operation`, the `ERROR-FILE` literal `file` and
+/// the E-44 `RESP` and `RESP2`, each laid out in its picture, and cut at the
+/// 75 bytes of the receiver.
+fn file_error_text(doc: &Document, id: &str, operation: &str, file: &str) -> String {
+    Template::load(doc, id).expand(
+        &[
+            Operand::alphanumeric("ERROR-OPNAME", operation, ERROR_OPNAME_WIDTH),
+            Operand::alphanumeric("ERROR-FILE", file, ERROR_FILE_WIDTH),
+            Operand::unsigned_to_alphanumeric(
+                "ERROR-RESP",
+                RESP_IOERR,
+                RESP_DIGITS,
+                ERROR_RESP_WIDTH,
+            ),
+            Operand::unsigned_to_alphanumeric(
+                "ERROR-RESP2",
+                RESP2_IOERR,
+                RESP_DIGITS,
+                ERROR_RESP_WIDTH,
+            ),
+        ],
+        RETURN_MSG_WIDTH,
+    )
 }
 
 /// Asserts that `resp` is the error answer `expected` gives: its status, the

@@ -2270,15 +2270,17 @@ export interface components {
              */
             active_to?: string | null;
             /**
-             * @description The inclusive upper bound of a qualifying amount, a decimal string with
-             *     at most 2 fraction digits (`S9(09)V99`). Absent or `null` is
+             * @description The inclusive upper bound of a qualifying amount, a decimal string from
+             *     -999999999.99 to 999999999.99 with at most 2 fraction digits
+             *     (`S9(09)V99`); leading zeros are allowed. Absent or `null` is
              *     unbounded.
              * @example 500.00
              */
             max_transaction_amount?: string | null;
             /**
-             * @description The inclusive lower bound of a qualifying amount, a decimal string with
-             *     at most 2 fraction digits (`S9(09)V99`). Absent or `null` is
+             * @description The inclusive lower bound of a qualifying amount, a decimal string from
+             *     -999999999.99 to 999999999.99 with at most 2 fraction digits
+             *     (`S9(09)V99`); leading zeros are allowed. Absent or `null` is
              *     unbounded.
              * @example 10.00
              */

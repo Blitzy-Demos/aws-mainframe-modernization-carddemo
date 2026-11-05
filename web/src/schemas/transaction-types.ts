@@ -78,7 +78,10 @@ export const TRAN_TYPE_LIST_MESSAGES = {
     "Transaction Desc can have numbers or alphabets only.",
 } as const;
 
-/** The COTRTUPC texts of the edits this module repeats, byte for byte. */
+/**
+ * The COTRTUPC texts of the edits this module repeats, byte for byte, and of
+ * the key read the CTTU page repeats for a code not on file.
+ */
 export const TRAN_TYPE_UPSERT_MESSAGES = {
   // V-COTRTUPC-001, V-COTRTUPC-012
   typeCodeMustBeSupplied: "Tran Type code must be supplied.",
@@ -91,6 +94,8 @@ export const TRAN_TYPE_UPSERT_MESSAGES = {
   // V-COTRTUPC-008, V-COTRTUPC-018
   descriptionAlphanumericOnly:
     "Transaction Desc can have numbers or alphabets only.",
+  // V-COTRTUPC-004
+  recordNotFound: "No record found for this key in database",
 } as const;
 
 /** The two description texts, which both programs build alike. */

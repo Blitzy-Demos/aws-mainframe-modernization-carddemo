@@ -7,7 +7,10 @@
 //
 // Controls and inputs come from docs/parity/function-map.md by F-ID; inputs
 // the map does not list come from UNMAPPED_LABELS. Each describe that writes
-// takes a checkpoint first and restores it in afterAll.
+// takes a checkpoint first and restores it in afterAll; the user, transaction
+// type and reward rule describes take one before each test and restore it in
+// afterEach, and each of their tests seeds through psql the row it edits or
+// deletes, so every test runs alone, in any order and after a failed one.
 //
 // - A rejection whose docs/parity/validation-audit.md row names a BMS field
 //   the page renders is asserted through expectFieldError: the message, the
@@ -22,9 +25,11 @@
 //   DELETE), except a write held at `halt`, whose 500 is asserted instead.
 // - Keys this spec creates (a user ID, a type code) are chosen per run so no
 //   seeded row and no row of an interrupted earlier run holds them.
-import type { Locator, Page, Request, Response } from "@playwright/test";
+import type { APIResponse, Locator, Page, Request, Response, Route } from "@playwright/test";
 
 import {
+  apiPath,
+  assertDigits,
   checkpoint,
   confirmDialog,
   content,
@@ -44,7 +49,9 @@ import {
   pressControl,
   processingDate,
   psql,
+  readJson,
   REWARD_SCREENS,
+  rewardRuleResponseSchema,
   rowEndpoint,
   rowInput,
   seedPendingAuthorization,
@@ -363,8 +370,33 @@ test.describe("sign-on form (F-COSGN00-001)", () => {
 
   test("rejects a wrong password (V-COSGN00C-005, PASSWD)", async ({ page }) => {
     await typeInto(page, userId(page), USERS.user.userId);
-    await submitFrom(page, password(page), "WRONGPWD");
-    await expectFieldError(page, password(page), MESSAGES.WRONG_PASSWORD_TRY_AGAIN);
+    await typeInto(page, password(page), "WRONGPWD");
+    // Sent from Sign on, with the answer held until the cursor is seen off
+    // the password, so only the rejection can move it there.
+    const login = "**/api/auth/login";
+    let release: () => void = () => undefined;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let arrive: () => void = () => undefined;
+    const arrived = new Promise<void>((resolve) => {
+      arrive = resolve;
+    });
+    await page.route(login, async (route) => {
+      arrive();
+      await released;
+      await route.continue();
+    });
+    try {
+      await pressControl(page, control(page, "F-COSGN00-001"));
+      await arrived;
+      await expect(password(page)).not.toBeFocused();
+      release();
+      await expectFieldError(page, password(page), MESSAGES.WRONG_PASSWORD_TRY_AGAIN);
+    } finally {
+      release();
+      await page.unroute(login);
+    }
     await expect(page).toHaveURL(urlPath("/login"));
   });
 
@@ -381,7 +413,7 @@ test.describe("sign-on form (F-COSGN00-001)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// CAVW dashboard lookup and CAUP account update
+// CAVW dashboard lookup and account view, CAUP account update
 // ---------------------------------------------------------------------------
 
 test.describe("account lookup (F-COACTVW-001, F-COACTVW-002, F-COACTUP-001)", () => {
@@ -401,6 +433,105 @@ test.describe("account lookup (F-COACTVW-001, F-COACTVW-002, F-COACTUP-001)", ()
     await enterOn(page, "F-COACTVW-002");
     await expect(page).toHaveURL(urlPath(`/accounts/${FIXTURE_KEYS.account}`));
   });
+});
+
+// The account view keeps ACCTSID on screen with the lookup's label and submit
+// names (F-COACTVW-001), so ENTER there looks up another account in place: a
+// new key opens its view, the key on screen is read again, and a key the
+// edits reject is refused with no read (web/src/pages/accounts/AccountViewPage.tsx).
+test.describe("account view key form (F-COACTVW-001, F-COACTVW-002)", () => {
+  const viewRoute = (key: string): string => `/accounts/${key}`;
+  const accountKey = (page: Page): Locator => input(page, "F-COACTVW-001", 0);
+  // The one value of the Card section, the cross-referenced card number of
+  // the account read, rendered only once its GET has answered.
+  const cardNumber = (page: Page): Locator =>
+    content(page)
+      .locator('[data-slot="card"]')
+      .filter({ has: page.getByRole("heading", { level: 2, name: "Card", exact: true }) })
+      .getByRole("definition");
+
+  /** `GET /accounts/{id}` of F-COACTVW-001 for account `key`. */
+  const accountRead = (key: string): Endpoint => {
+    const { method, path } = rowEndpoint("F-COACTVW-001");
+    return { method, path: path.replace("{id}", key) };
+  };
+
+  /**
+   * Runs `action` and asserts that it sent a GET of account `key` answered
+   * 200. The wait starts before the action, so a read answered earlier does
+   * not satisfy it.
+   */
+  const expectRead = async (page: Page, key: string, action: () => Promise<void>): Promise<void> => {
+    await expectWrite(page, accountRead(key), action, 200);
+  };
+
+  /** Asserts that the view shows account `key`, whose card is `card`. */
+  const expectAccountShown = async (page: Page, key: string, card: string): Promise<void> => {
+    await expect(page).toHaveURL(urlPath(viewRoute(key)));
+    await expect(content(page).getByRole("heading", { level: 2, name: "Account", exact: true })).toBeVisible();
+    await expect(cardNumber(page)).toHaveText(card);
+    await expect(content(page).getByRole("status")).toHaveText(`Account ${key} loaded`);
+    await expect(accountKey(page)).toHaveValue(key);
+  };
+
+  test.beforeEach(async ({ page }) => {
+    await signInWithKeyboard(page, "user");
+    await expectRead(page, FIXTURE_KEYS.account, async () => {
+      await page.goto(viewRoute(FIXTURE_KEYS.account));
+    });
+    await expectAccountShown(page, FIXTURE_KEYS.account, FIXTURE_KEYS.card);
+  });
+
+  test("ENTER with another account number opens that account's view", async ({ page }) => {
+    await expectRead(page, FIXTURE_KEYS.otherAccount, () =>
+      submitFrom(page, accountKey(page), FIXTURE_KEYS.otherAccount),
+    );
+    await expectAccountShown(page, FIXTURE_KEYS.otherAccount, FIXTURE_KEYS.otherCard);
+  });
+
+  test("ENTER on the account number on screen reads the account again", async ({ page }) => {
+    // A reload of the page reads the account too, and gives the document a
+    // new time origin: an unchanged origin proves ENTER sent the read.
+    const loadedAt = await page.evaluate(() => performance.timeOrigin);
+    await tabTo(page, accountKey(page));
+    await expect(accountKey(page)).toHaveValue(FIXTURE_KEYS.account);
+    await expectRead(page, FIXTURE_KEYS.account, () => page.keyboard.press("Enter"));
+    expect(await page.evaluate(() => performance.timeOrigin), "read by ENTER, not by a reload").toBe(loadedAt);
+    await expectAccountShown(page, FIXTURE_KEYS.account, FIXTURE_KEYS.card);
+  });
+
+  for (const { entered, key, vId, message } of [
+    { entered: "a blank account number", key: "", vId: "V-COACTVWC-001", message: MESSAGES.NO_INPUT_RECEIVED },
+    {
+      entered: "an all-zero account number",
+      key: "00000000000",
+      vId: "V-COACTVWC-002",
+      message: MESSAGES.ACCOUNT_FILTER_MUST_BE_NON_ZERO_11_DIGIT,
+    },
+    {
+      entered: "a non-numeric account number",
+      key: "0000000000A",
+      vId: "V-COACTVWC-002",
+      message: MESSAGES.ACCOUNT_FILTER_MUST_BE_NON_ZERO_11_DIGIT,
+    },
+    {
+      entered: "an account number shorter than 11 digits",
+      key: "0000000002",
+      vId: "V-COACTVWC-002",
+      message: MESSAGES.ACCOUNT_FILTER_MUST_BE_NON_ZERO_11_DIGIT,
+    },
+  ]) {
+    // Submitted from the "Look up account" button, so the cursor placement on
+    // ACCTSID is the rejection's own and not focus left in the field.
+    test(`rejects ${entered} with no read and puts the cursor there (${vId}, ACCTSID)`, async ({ page }) => {
+      await expectNoRequest(page, rowEndpoint("F-COACTVW-001"), async () => {
+        await typeInto(page, accountKey(page), key);
+        await enterOn(page, "F-COACTVW-001");
+        await expectFieldError(page, accountKey(page), message);
+      });
+      await expect(page).toHaveURL(urlPath(viewRoute(FIXTURE_KEYS.account)));
+    });
+  }
 });
 
 test.describe("account update (F-COACTUP-002, F-COACTUP-004, F-COACTUP-005, F-COACTUP-006)", () => {
@@ -853,7 +984,6 @@ test.describe("pending authorizations (F-COPAU00-001, F-COPAU00-005, F-COPAU01-0
 // ---------------------------------------------------------------------------
 
 test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001, F-COUSR01-003, F-COUSR02-002, F-COUSR02-003, F-COUSR02-004, F-COUSR02-005, F-COUSR03-002, F-COUSR03-003, F-COUSR03-004, F-COUSR03-005)", () => {
-  test.describe.configure({ mode: "serial" });
   const labels = UNMAPPED_LABELS.userForm;
   const newUserPassword = (page: Page): Locator => content(page).getByLabel(nameMatcher(labels.password));
   /** PUT (F-COUSR02-002, F-COUSR02-004) or DELETE (F-COUSR03-004) of the new user. */
@@ -861,19 +991,33 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
     method,
     path: `/admin/users/${NEW_USER_ID}`,
   });
+  /** The new user's row before the current test, restored after it. */
   let saved: Checkpoint | undefined;
 
-  test.beforeAll(async () => {
+  test.beforeEach(async ({ page }) => {
     saved = await checkpoint([{ table: "users", where: `user_id = ${sqlLiteral(NEW_USER_ID)}` }]);
+    await signInWithKeyboard(page, "admin");
   });
 
-  test.afterAll(async () => {
+  test.afterEach(async () => {
     await saved?.restore();
   });
 
-  test.beforeEach(async ({ page }) => {
-    await signInWithKeyboard(page, "admin");
-  });
+  // The new user as "adds the user" stores it (Edith Tester, type U), for the
+  // update and delete tests: written through psql, with USER0001's password
+  // hash, so each of them runs alone. The test's checkpoint removes it.
+  async function seedNewUser(): Promise<void> {
+    await psql(
+      `INSERT INTO users (user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type)
+       SELECT ${sqlLiteral(NEW_USER_ID)}, 'Edith', 'Tester', u.password_hash, 'U'
+         FROM users u
+        WHERE u.user_id = ${sqlLiteral(USERS.user.userId)}`,
+    );
+    expect(
+      await psql(`SELECT count(*) FROM users WHERE user_id = ${sqlLiteral(NEW_USER_ID)}`),
+      `the new user ${NEW_USER_ID} is seeded`,
+    ).toBe("1");
+  }
 
   // The list started at the new user (F-COUSR00-001), whose row is first.
   async function listFromNewUser(page: Page): Promise<Locator> {
@@ -927,6 +1071,7 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
   });
 
   test("update answers an unchanged save, then saves a new last name", async ({ page }) => {
+    await seedNewUser();
     await openEdit(page);
     // V-COUSR02C-010: a message-only 200 that rejects nothing and writes nothing.
     await enterOn(page, "F-COUSR02-004");
@@ -938,6 +1083,7 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
   });
 
   test("update: Change password, checked with Space, needs a password (V-COUSR02C-007, PASSWD)", async ({ page }) => {
+    await seedNewUser();
     await openEdit(page);
     const changePassword = content(page).getByRole("checkbox", { name: labels.changePassword, exact: true });
     await expect(newUserPassword(page)).toBeDisabled();
@@ -956,6 +1102,7 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
 
   test("update: Reset clears the fields, Save and exit returns to the list without a PUT for them, Cancel returns to the list, Save and exit saves valid input and returns", async ({ page }) => {
     const exitTarget = urlPath(mapControl("F-COUSR02-002").target ?? "/admin/users");
+    await seedNewUser();
     await openEdit(page);
     await typeInto(page, textbox(page, labels.firstName), "Changed");
     await enterOn(page, "F-COUSR02-003");
@@ -979,6 +1126,7 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
   test("delete: the dialog traps focus, Escape and Cancel keep the user, Confirm deletes it", async ({ page }) => {
     const deleteButton = async (): Promise<Locator> =>
       (await listFromNewUser(page)).getByRole("button", { name: mapControl("F-COUSR00-006").name, exact: true });
+    await seedNewUser();
     await pressControl(page, await deleteButton());
     await expectDialogTrapsFocus(page, confirmDialog(page), userEndpoint("DELETE"));
     for (const cancelId of ["F-COUSR03-002", "F-COUSR03-003", "F-COUSR03-005"]) {
@@ -998,7 +1146,6 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
 // ---------------------------------------------------------------------------
 
 test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F-COTRTUP-006, F-COTRTUP-007, F-COTRTUP-012, F-COTRTUP-014, F-COTRTUP-015, F-COTRTLI-001, F-COTRTLI-006, F-COTRTLI-007, F-COTRTLI-008, F-COTRTLI-009)", () => {
-  test.describe.configure({ mode: "serial" });
   const typeCode = (page: Page): Locator => input(page, "F-COTRTUP-001", 0);
   const description = (scope: Page | Locator): Locator => textbox(scope, UNMAPPED_LABELS.tranType.description);
   const storedDescription = (): Promise<string> =>
@@ -1008,25 +1155,37 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
     method,
     path: `/admin/transaction-types/${newTypeCode}`,
   });
+  /** The new type's rows before the current test, restored after it. */
   let saved: Checkpoint | undefined;
   /** The type this describe creates and deletes, chosen by freeTypeCode. */
   let newTypeCode = "";
 
   test.beforeAll(async () => {
     newTypeCode = await freeTypeCode();
+  });
+
+  test.beforeEach(async ({ page }) => {
     saved = await checkpoint([
       { table: "transaction_types", where: `tr_type = ${sqlLiteral(newTypeCode)}` },
       { table: "transaction_categories", where: `trc_type_code = ${sqlLiteral(newTypeCode)}` },
     ]);
+    await signInWithKeyboard(page, "admin");
   });
 
-  test.afterAll(async () => {
+  test.afterEach(async () => {
     await saved?.restore();
   });
 
-  test.beforeEach(async ({ page }) => {
-    await signInWithKeyboard(page, "admin");
-  });
+  // The new type as "adds the type, then the edit rejects and saves
+  // descriptions" leaves it, for the delete test: written through psql, so
+  // that test runs alone. The test's checkpoint removes it.
+  async function seedNewType(text: string): Promise<void> {
+    await psql(
+      `INSERT INTO transaction_types (tr_type, tr_description)
+       VALUES (${sqlLiteral(newTypeCode)}, ${sqlLiteral(text)})`,
+    );
+    expect(await storedDescription(), `the new type ${newTypeCode} is seeded`).toBe(text);
+  }
 
   async function addNewType(page: Page, text: string): Promise<void> {
     await page.goto(mapControl("F-COTRTUP-001").route);
@@ -1079,6 +1238,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
   });
 
   test("edit: the Delete dialog traps focus, Cancel keeps it, Cancel leaves for key entry, Confirm removes it", async ({ page }) => {
+    await seedNewType("E2E TEST TYPE TWO");
     await page.goto(`/admin/transaction-types/${newTypeCode}/edit`);
     await enterOn(page, "F-COTRTUP-006");
     await expectDialogTrapsFocus(page, confirmDialog(page), typeEndpoint("DELETE"));
@@ -1142,38 +1302,47 @@ test.describe("rewards account lookup", () => {
 });
 
 test.describe("reward rule form", () => {
-  test.describe.configure({ mode: "serial" });
   const labels = UNMAPPED_LABELS.rewardRule;
   const screens = REWARD_SCREENS;
   const ruleEndpoint = (method: "POST" | "PUT" | "DELETE", ruleId?: string): Endpoint => ({
     method,
     path: ruleId === undefined ? "/admin/reward-rules" : `/admin/reward-rules/${ruleId}`,
   });
+  /** Every reward rule before the current test, restored after it. */
   let saved: Checkpoint | undefined;
   let today = "";
-  /** The rule "creates a valid rule" stored, edited and soft-deleted after it. */
-  let createdRuleId: string | undefined;
 
   test.beforeAll(async () => {
-    saved = await checkpoint([{ table: "reward_rules", where: "TRUE" }]);
     // The processing clock's UTC day: the created rule starts no later than
     // the instant its soft delete stamps as active_to.
     today = await processingDate();
   });
 
-  test.afterAll(async () => {
-    await saved?.restore();
-  });
-
   test.beforeEach(async ({ page }) => {
+    saved = await checkpoint([{ table: "reward_rules", where: "TRUE" }]);
     await signInWithKeyboard(page, "admin");
   });
 
-  function createdRule(): string {
-    if (createdRuleId === undefined) {
-      throw new Error("no rule was created by this spec");
-    }
-    return createdRuleId;
+  test.afterEach(async () => {
+    await saved?.restore();
+  });
+
+  // The rule "creates a valid rule" stores (the rule-test pair at 2.5000 from
+  // midnight UTC of `today`, no amount bounds, no end), for the edit and soft
+  // delete tests: written through psql, so each of them runs alone. Returns
+  // its rule_id; the test's checkpoint removes it. The insert sits in a CTE so
+  // psql prints the new key alone, without the INSERT tag.
+  async function seedRule(): Promise<string> {
+    const ruleId = await psql(
+      `WITH inserted AS (
+         INSERT INTO reward_rules (transaction_type_cd, transaction_category_cd, reward_rate, active_from)
+         VALUES (${sqlLiteral(FIXTURE_KEYS.ruleTestTypeCode)}, ${sqlLiteral(FIXTURE_KEYS.ruleTestCategoryCode)}::integer,
+                 2.5000, ${sqlLiteral(`${today}T00:00:00Z`)}::timestamptz)
+         RETURNING rule_id
+       )
+       SELECT rule_id FROM inserted`,
+    );
+    return assertDigits(ruleId);
   }
 
   // Types the rule-test pair and `rule` into the new-rule form; Enter in the
@@ -1209,29 +1378,60 @@ test.describe("reward rule form", () => {
   });
 
   test("creates a valid rule", async ({ page }) => {
-    const created = await expectWrite(page, ruleEndpoint("POST"), () =>
-      enterRule(page, { rate: "2.5000", min: "", max: "", from: today, to: "" }),
-    );
-    const body: unknown = await created.json();
-    const ruleId =
-      typeof body === "object" && body !== null && "rule_id" in body && typeof body.rule_id === "string"
-        ? body.rule_id
-        : undefined;
+    // The 201 body is read from the copy route.fetch() keeps on the Node side
+    // until the context closes, never from the browser's: Playwright asks
+    // Chromium for that copy only when it is read, and once the form has
+    // navigated to the rule list Chromium may hold it no longer ("No data
+    // found for resource"). The route passes every other method on.
+    const write = ruleEndpoint("POST");
+    const writeUrl = urlPath(apiPath(write.path));
+    let resolveFetched: (response: APIResponse) => void = () => undefined;
+    let rejectFetched: (error: Error) => void = () => undefined;
+    const fetched = new Promise<APIResponse>((resolve, reject) => {
+      resolveFetched = resolve;
+      rejectFetched = reject;
+    });
+    const fetchWrite = async (route: Route): Promise<void> => {
+      if (route.request().method() !== write.method) {
+        await route.fallback();
+        return;
+      }
+      let response: APIResponse;
+      try {
+        response = await route.fetch();
+      } catch (error) {
+        rejectFetched(new Error(`${write.method} ${write.path} got no response`, { cause: error }));
+        await route.abort();
+        return;
+      }
+      resolveFetched(response);
+      await route.fulfill({ response });
+    };
+    await page.route(writeUrl, fetchWrite);
+    let created: APIResponse;
+    try {
+      [created] = await Promise.all([
+        fetched,
+        expectWrite(page, write, () => enterRule(page, { rate: "2.5000", min: "", max: "", from: today, to: "" })),
+      ]);
+    } finally {
+      await page.unroute(writeUrl, fetchWrite);
+    }
+    const ruleId = (await readJson(created, rewardRuleResponseSchema)).rule_id;
     expect(ruleId, "the 201 body carries the new rule_id").toMatch(/^[0-9]+$/);
-    createdRuleId = ruleId;
     await expect(page).toHaveURL(urlPath(screens.ruleList.route));
     expect(
       await psql(
         `SELECT concat_ws('|', transaction_type_cd, lpad(transaction_category_cd::text, 4, '0'), reward_rate,
                           coalesce(min_transaction_amount::text, '-'), coalesce(max_transaction_amount::text, '-'),
                           to_char(active_from AT TIME ZONE 'UTC', 'YYYY-MM-DD'), coalesce(active_to::text, '-'))
-           FROM reward_rules WHERE rule_id = ${sqlLiteral(createdRule())}::bigint`,
+           FROM reward_rules WHERE rule_id = ${sqlLiteral(ruleId)}::bigint`,
       ),
     ).toBe(`${FIXTURE_KEYS.ruleTestTypeCode}|${FIXTURE_KEYS.ruleTestCategoryCode}|2.5000|-|-|${today}|-`);
   });
 
   test("edits the rule's rate", async ({ page }) => {
-    const ruleId = createdRule();
+    const ruleId = await seedRule();
     await page.goto(`/admin/reward-rules/${ruleId}/edit`);
     const rate = textbox(page, labels.rate);
     await expect(rate).toHaveValue("2.5000");
@@ -1242,7 +1442,7 @@ test.describe("reward rule form", () => {
   });
 
   test("soft-deletes the rule from the list; the dialog traps focus first", async ({ page }) => {
-    const ruleId = createdRule();
+    const ruleId = await seedRule();
     await page.goto(screens.ruleList.route);
     const row = content(page)
       .getByRole("table", { name: screens.ruleList.caption, exact: true })
