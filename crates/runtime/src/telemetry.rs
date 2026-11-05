@@ -222,7 +222,11 @@ fn is_context_span(metadata: &Metadata<'_>) -> bool {
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
     /// The filter directives do not follow the `EnvFilter` grammar.
-    #[error("invalid log filter: {0}")]
+    ///
+    /// [`init`] reads the directives from `RUST_LOG`, their only source in the
+    /// binaries, so the text names that variable: `invalid RUST_LOG: ` and the
+    /// parser's reason.
+    #[error("invalid {variable}: {0}", variable = keys::RUST_LOG)]
     Filter(#[from] ParseError),
     /// A global default subscriber is already installed.
     #[error("failed to install the tracing subscriber: {0}")]
@@ -812,7 +816,8 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
-        BATCH_BYTES, QueuedWriter, TelemetryError, subscriber_with_queue, subscriber_with_writer,
+        BATCH_BYTES, QueuedWriter, TelemetryError, keys, subscriber_with_queue,
+        subscriber_with_writer,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1057,7 +1062,8 @@ mod tests {
                 matches!(err, TelemetryError::Filter(_)),
                 "{directives:?}: {err:?}"
             );
-            assert!(err.to_string().starts_with("invalid log filter: "), "{err}");
+            let prefix = format!("invalid {}: ", keys::RUST_LOG);
+            assert!(err.to_string().starts_with(&prefix), "{err}");
         }
     }
 

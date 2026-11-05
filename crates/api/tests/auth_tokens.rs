@@ -37,7 +37,6 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use carddemo_api::auth::{Claims, JwtKeys, UserType};
-use carddemo_api::error::ApiError;
 use carddemo_domain::messages;
 use carddemo_runtime::config::Settings;
 use carddemo_testkit::block_on;
@@ -70,6 +69,15 @@ const ACCOUNT_PATH: &str = "/accounts/00000000001";
 
 /// The CU00 list and CU01 add route, behind the admin gate.
 const ADMIN_USERS: &str = "/admin/users";
+
+/// The `code` of a 401 for a request without a valid bearer token: none, a
+/// value that is no `HS256` token signed with the API's secret, or one whose
+/// expiry has passed.
+const UNAUTHENTICATED: &str = "UNAUTHENTICATED";
+
+/// The `code` of a 403 for a valid token that is not an admin's, on
+/// `/admin/**`.
+const FORBIDDEN: &str = "FORBIDDEN";
 
 /// Every key of the sign-on answer, the members of `LoginResponse`.
 const LOGIN_KEYS: [&str; 5] = ["expires_at", "landing", "token", "user_id", "usr_type"];
@@ -194,16 +202,23 @@ async fn login_answer_carries_the_token(
     token.to_owned()
 }
 
-/// Every request without a valid token is 401 [`ApiError::unauthenticated`]
-/// on a user function. Each forged token is first shown to fail the API's own
-/// keys for the defect it stands for, so its 401 is that defect's. The login
-/// token `user`, sent with the scheme in either case, is the 200 control.
+/// Every request without a valid token is 401 [`UNAUTHENTICATED`]
+/// `Authentication required` on a user function. Each forged token is first
+/// shown to fail the API's own keys for the defect it stands for, so its 401
+/// is that defect's. The login token `user`, sent with the scheme in either
+/// case, is the 200 control.
 async fn invalid_tokens_are_401(app: &TestApp, keys: &JwtKeys, secret: &str, user: &str) {
-    let refused = ApiError::unauthenticated();
+    let unauthorized = StatusCode::UNAUTHORIZED;
     let required = messages::AUTHENTICATION_REQUIRED;
 
     let missing = app.get(ACCOUNT_PATH, None).await;
-    assert_refused(&missing, &refused, required, "no Authorization header");
+    assert_refused(
+        &missing,
+        unauthorized,
+        UNAUTHENTICATED,
+        required,
+        "no Authorization header",
+    );
 
     for (case, authorization) in [
         ("a non-Bearer scheme", "Basic dXNlcjpwYXNz"),
@@ -215,7 +230,7 @@ async fn invalid_tokens_are_401(app: &TestApp, keys: &JwtKeys, secret: &str, use
             &[(AUTHORIZATION.as_str(), authorization)],
         )
         .await;
-        assert_refused(&resp, &refused, required, case);
+        assert_refused(&resp, unauthorized, UNAUTHENTICATED, required, case);
     }
 
     for (case, forged, defect) in forged_tokens(secret, keys.ttl_secs(), user) {
@@ -224,7 +239,7 @@ async fn invalid_tokens_are_401(app: &TestApp, keys: &JwtKeys, secret: &str, use
             .expect_err("the API's keys reject the forged token");
         assert_eq!(rejection.kind(), &defect, "{case}: the defect of the token");
         let resp = app.get(ACCOUNT_PATH, Some(&forged)).await;
-        assert_refused(&resp, &refused, required, case);
+        assert_refused(&resp, unauthorized, UNAUTHENTICATED, required, case);
     }
 
     let (status, _, raw) = app.get(ACCOUNT_PATH, Some(user)).await;
@@ -286,18 +301,25 @@ fn forged_tokens(secret: &str, ttl: u64, user: &str) -> [(&'static str, String, 
     ]
 }
 
-/// A `U` token is 403 [`ApiError::forbidden`] on `/admin/**` whatever else the
-/// request names as the actor: an admin in the query string, admin role
-/// headers, or an admin `sub` and type `A` in the add body, which stores
-/// nothing. Role headers do not demote an admin token either. Without a token
-/// the admin route is 401, and the `U` token reaches a user function.
+/// A `U` token is 403 [`FORBIDDEN`] `Admin access required` on `/admin/**`
+/// whatever else the request names as the actor: an admin in the query
+/// string, admin role headers, or an admin `sub` and type `A` in the add body,
+/// which stores nothing. Role headers do not demote an admin token either.
+/// Without a token the admin route is 401 [`UNAUTHENTICATED`], and the `U`
+/// token reaches a user function.
 async fn the_token_alone_names_the_actor(app: &TestApp, user: &str) {
-    let refused = ApiError::forbidden();
+    let forbidden = StatusCode::FORBIDDEN;
     let admin_only = messages::ADMIN_ACCESS_REQUIRED;
 
     let query = format!("{ADMIN_USERS}?usr_type=A&user_id={ADMIN_USER}");
     let resp = app.get(&query, Some(user)).await;
-    assert_refused(&resp, &refused, admin_only, "a U token with an admin query");
+    assert_refused(
+        &resp,
+        forbidden,
+        FORBIDDEN,
+        admin_only,
+        "a U token with an admin query",
+    );
 
     let bearer = format!("Bearer {user}");
     let spoofed = [
@@ -307,7 +329,13 @@ async fn the_token_alone_names_the_actor(app: &TestApp, user: &str) {
         ("X-Role", "admin"),
     ];
     let resp = get_with_headers(app, ADMIN_USERS, &spoofed).await;
-    assert_refused(&resp, &refused, admin_only, "a U token with admin headers");
+    assert_refused(
+        &resp,
+        forbidden,
+        FORBIDDEN,
+        admin_only,
+        "a U token with admin headers",
+    );
 
     let add = json!({
         "first_name": "ACTOR",
@@ -320,7 +348,8 @@ async fn the_token_alone_names_the_actor(app: &TestApp, user: &str) {
     let resp = app.post(ADMIN_USERS, Some(user), &add).await;
     assert_refused(
         &resp,
-        &refused,
+        forbidden,
+        FORBIDDEN,
         admin_only,
         "a U token adding with admin claims",
     );
@@ -328,12 +357,11 @@ async fn the_token_alone_names_the_actor(app: &TestApp, user: &str) {
     assert!(rows.is_empty(), "the refused add stored a user: {rows:?}");
 
     let resp = app.get(ADMIN_USERS, None).await;
-    let unauthenticated = ApiError::unauthenticated();
-    let required = messages::AUTHENTICATION_REQUIRED;
     assert_refused(
         &resp,
-        &unauthenticated,
-        required,
+        StatusCode::UNAUTHORIZED,
+        UNAUTHENTICATED,
+        messages::AUTHENTICATION_REQUIRED,
         "no token on /admin/users",
     );
 
@@ -366,18 +394,17 @@ async fn the_token_alone_names_the_actor(app: &TestApp, user: &str) {
     assert_eq!(rows, vec![vec![Some(ACTOR_OVERRIDE_ADD.to_owned())]]);
 }
 
-/// Asserts that `resp` is the error answer `expected` of the 401/403 mapping,
-/// with the catalogue text `message` and no fields.
-///
-/// The `code` is the one the mapping itself publishes, which must be a
-/// non-empty string; the test names no code value of its own.
-fn assert_refused(resp: &Resp, expected: &ApiError, message: &str, case: &str) {
-    let body = expected.body();
-    assert!(!body.code.is_empty(), "{case}: the mapping's code is empty");
-    assert_eq!(body.message, message, "{case}: the mapping's message");
-    assert!(body.fields.is_empty(), "{case}: the mapping names fields");
-    assert_eq!(resp.0, expected.status(), "{case}: {}", resp.2);
-    assert_error(resp, expected.status(), &body.code, message, &[]);
+/// Asserts that `resp`, the answer to the request `case` describes, is the
+/// refusal `status` with the wire `code`, the catalogue text `message` and no
+/// fields.
+fn assert_refused(resp: &Resp, status: StatusCode, code: &str, message: &str, case: &str) {
+    let (actual_status, body, raw) = resp;
+    assert_eq!(
+        (*actual_status, body["code"].as_str()),
+        (status, Some(code)),
+        "{case}: the status and `code` of the refusal: {raw}"
+    );
+    assert_error(resp, status, code, message, &[]);
 }
 
 /// Sends `GET path` with exactly the `(name, value)` pairs of `headers` and

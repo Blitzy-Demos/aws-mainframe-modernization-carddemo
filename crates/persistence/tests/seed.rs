@@ -94,6 +94,21 @@ const DEADLOCKS: &str =
 /// How long a session may take to reach a lock wait, or to disconnect.
 const SESSION_DEADLINE: Duration = Duration::from_secs(30);
 
+/// How long a contending seed run may take to finish once the holder it
+/// waits for has ended. An `--if-empty` run queued behind another one waits
+/// out that run's whole load, about a second on an idle host.
+const RUN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The server `statement_timeout` of every contending session, so a statement
+/// that never gets its lock or never ends is cancelled instead of outliving
+/// its test. The longest statement a passing race makes is the `LOCK TABLE`
+/// of a seed run, which waits from its arrival, within [`SESSION_DEADLINE`],
+/// until the holder and any run ahead of it have ended, within
+/// [`RUN_DEADLINE`] more. The timeout is their sum, so it never cuts short a
+/// wait the races prove, and `lock_timeout` would add nothing, because a
+/// statement's lock wait counts towards its `statement_timeout`.
+const CONTENDER_STATEMENT_TIMEOUT: Duration = SESSION_DEADLINE.saturating_add(RUN_DEADLINE);
+
 /// The pause between two reads of `pg_stat_activity`.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -875,13 +890,15 @@ fn source_errors_surface_only_where_the_load_reaches_them() {
 
 /// A pool of up to three sessions named [`CONTENDERS`] on the stack's
 /// database: one for the unit of work that holds or inserts an account row,
-/// and one for each of up to two seed runs.
+/// and one for each of up to two seed runs. Every session runs under
+/// [`CONTENDER_STATEMENT_TIMEOUT`].
 fn contender_pool(stack: &TestStack) -> PgPool {
     let options = stack
         .database_url()
         .parse::<PgConnectOptions>()
         .unwrap_or_else(|err| panic!("the stack's database URL does not parse: {err}"))
-        .application_name(CONTENDERS);
+        .application_name(CONTENDERS)
+        .options([("statement_timeout", CONTENDER_STATEMENT_TIMEOUT.as_millis())]);
     block_on(
         PgPoolOptions::new()
             .max_connections(3)
@@ -907,6 +924,29 @@ async fn wait_for_count(stack: &TestStack, sql: &str, count: usize, what: &str) 
         );
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// The outcome of the seed run on the thread `handle`, once it has finished.
+/// The pause between two looks blocks only the calling thread, as in
+/// [`wait_for_count`].
+///
+/// # Panics
+///
+/// When the thread does not finish within [`RUN_DEADLINE`] of
+/// `holder_ended`, the instant the holder it waited for ended, with `what`
+/// named, or with the thread's own panic.
+fn join_within<T>(handle: thread::JoinHandle<T>, holder_ended: Instant, what: &str) -> T {
+    let until = holder_ended + RUN_DEADLINE;
+    while !handle.is_finished() {
+        assert!(
+            Instant::now() < until,
+            "{what} did not finish within {RUN_DEADLINE:?} of the holder's end"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// The deadlocks the server has counted in the test database, as text.
@@ -986,7 +1026,8 @@ async fn add_and_accrue(uow: &mut UnitOfWork, xref: &CardXref) -> (TranId, Rewar
 /// of `contenders`: a holder takes `FOR KEY SHARE` on the account of `xref`, a
 /// refresh starts on a thread of its own and must wait for a lock, the holder
 /// then makes the CT02 add with [`add_and_accrue`] while the refresh still
-/// waits, and commits. Returns the refresh's outcome.
+/// waits, and commits. Returns the refresh's outcome, which must arrive
+/// within [`RUN_DEADLINE`] of the commit.
 ///
 /// The holder lives inside this one future, so a failed assertion drops its
 /// unit of work inside the test runtime, which rolls it back, rather than
@@ -1029,9 +1070,7 @@ async fn race_refresh_with_holder(
         panic!("the refresh must wait until the holder ends, but it ended first: {ended:?}");
     }
     holder.commit().await.expect("the holder commits");
-    refresh
-        .join()
-        .unwrap_or_else(|_| panic!("the refresh thread panicked"))
+    join_within(refresh, Instant::now(), "the refresh")
 }
 
 /// Inserts the account [`HOLDER_ACCOUNT`] on `holder`. Until the holder's
@@ -1057,7 +1096,8 @@ async fn insert_holder_account(holder: &mut PgConnection) {
 /// sessions of `contenders`: a holder inserts [`HOLDER_ACCOUNT`] and keeps
 /// its unit of work open, `runs` `--if-empty` seeds start on threads of their
 /// own and must all wait for a lock, then the holder commits or, unless
-/// `commit`, rolls back. Returns the outcome of each run, in start order.
+/// `commit`, rolls back. Returns the outcome of each run, in start order,
+/// each of which must arrive within [`RUN_DEADLINE`] of the holder's end.
 ///
 /// The holder lives inside this one future, as in
 /// [`race_refresh_with_holder`], so a failed assertion rolls it back inside
@@ -1091,12 +1131,11 @@ async fn race_if_empty_with_holder(
     } else {
         holder.rollback().await.expect("the holder rolls back");
     }
+    let holder_ended = Instant::now();
     seeds
         .into_iter()
-        .map(|seed| {
-            seed.join()
-                .unwrap_or_else(|_| panic!("an --if-empty run's thread panicked"))
-        })
+        .enumerate()
+        .map(|(run, seed)| join_within(seed, holder_ended, &format!("--if-empty run {run}")))
         .collect()
 }
 

@@ -10,12 +10,20 @@
 //   field, which is marked invalid;
 // - a server error is toasted, set on the field its `fields[]` names and puts
 //   the cursor there, as `MOVE -1 TO <field>L` does;
-// - Reset (PF4) clears the screen without a request.
+// - Reset (PF4) clears the screen without a request;
+// - one submit sends one POST, a double click included, and while it runs the
+//   form is busy and its buttons inert, Add user keeping the focus.
 //
 // The network is the stubbed global the API client looks up on every request.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryRouter, RouterProvider } from "react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -157,6 +165,19 @@ function sentRequests(): Request[] {
 
 function addUserButton(): HTMLElement {
   return screen.getByRole("button", { name: "Add user" });
+}
+
+function resetButton(): HTMLElement {
+  return screen.getByRole("button", { name: "Reset" });
+}
+
+// The form the Add user button submits; it has no accessible name.
+function addUserForm(): HTMLFormElement {
+  const form = addUserButton().closest("form");
+  if (form === null) {
+    throw new Error("Add user is outside a form");
+  }
+  return form;
 }
 
 beforeEach(() => {
@@ -404,5 +425,86 @@ describe("UserAddPage (CU01, COUSR01)", () => {
     });
     expect(fieldErrorOf(inputOf("first_name"))).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // Two clicks before the page re-renders: the second POST of the same user
+  // would be answered V-COUSR01C-006 and, as the last write, shown instead of
+  // the add that succeeded.
+  it("sends one POST for a double click on Add user and shows only its success", async () => {
+    fetchMock.mockImplementation(async () =>
+      Response.json(
+        {
+          code: "DUPLICATE",
+          message: "User ID already exist...",
+          fields: [{ field: "USERID", message: "User ID already exist..." }],
+        } satisfies ErrorBody,
+        { status: 409 },
+      ),
+    );
+    fetchMock.mockImplementationOnce(async () =>
+      Response.json(ADDED_REPLY, { status: 201 }),
+    );
+    const user = renderPage();
+    await fill(user, NEW_USER);
+
+    fireEvent.click(addUserButton());
+    fireEvent.click(addUserButton());
+
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith(ADDED_MESSAGE);
+    });
+    await waitFor(() => {
+      expect(inputOf("user_id").value).toBe("");
+    });
+    expect(sentRequests()).toHaveLength(1);
+    expect(toast.success).toHaveBeenCalledTimes(1);
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(inputOf("user_id").getAttribute("aria-invalid")).toBe("false");
+  });
+
+  it("keeps Add user focused, the form busy and every button inert while the add runs", async () => {
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchMock.mockImplementation(async () => {
+      await held;
+      return Response.json(ADDED_REPLY, { status: 201 });
+    });
+    const user = renderPage();
+    await fill(user, NEW_USER);
+
+    await user.click(addUserButton());
+    await waitFor(() => {
+      expect(addUserButton().getAttribute("aria-disabled")).toBe("true");
+    });
+    // Inert but not disabled: a disabled button would hand focus to the body.
+    expect(addUserButton().hasAttribute("disabled")).toBe(false);
+    expect(document.activeElement).toBe(addUserButton());
+    expect(addUserForm().getAttribute("aria-busy")).toBe("true");
+    expect(resetButton().getAttribute("aria-disabled")).toBe("true");
+    expect(resetButton().hasAttribute("disabled")).toBe(false);
+
+    // Enter on the focused Add user, a second click and Reset all do nothing.
+    await user.keyboard("{Enter}");
+    await user.click(addUserButton());
+    await user.click(resetButton());
+    for (const { name } of FIELDS) {
+      expect(inputOf(name).value).toBe(NEW_USER[name]);
+    }
+    expect(sentRequests()).toHaveLength(1);
+
+    release();
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith(ADDED_MESSAGE);
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(inputOf("first_name"));
+    });
+    expect(addUserButton().getAttribute("aria-disabled")).toBe("false");
+    expect(resetButton().getAttribute("aria-disabled")).toBe("false");
+    expect(addUserForm().getAttribute("aria-busy")).toBe("false");
+    expect(sentRequests()).toHaveLength(1);
+    expect(toast.success).toHaveBeenCalledTimes(1);
   });
 });

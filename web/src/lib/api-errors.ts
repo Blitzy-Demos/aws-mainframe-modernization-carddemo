@@ -20,28 +20,55 @@
 // - A 401 that ended the session (ApiError.endedSession) is shown by the
 //   guard that sends the user to the sign-on page, and may also be shown by a
 //   caller still awaiting that answer. Its toast carries one fixed id, so
-//   Sonner updates the shown toast instead of adding a second one. Every other
-//   error is a plain `toast.error(message)`.
+//   Sonner updates the shown toast instead of adding a second one.
+// - A request past the client's deadline shows the client's own text, 'No
+//   answer from the server within 30 seconds' (RequestTimeoutError).
+// - A request that got no usable answer (noUsableAnswer) leaves a write's
+//   outcome unknown: the server may still carry it out, and sending it again
+//   may repeat it. A caller whose request may write passes an
+//   `unknownOutcome` note, which the toast shows under the message and keeps
+//   on screen until the user dismisses it:
+//
+//     onError: (e) => applyApiError(e, form, bmsFieldMap, { unknownOutcome }),
+//
+//   A 4xx or 5xx error body is the server's answer, so its text is shown
+//   alone, as a plain `toast.error(message)` like every other error.
 //
 // Every text is shown exactly as the server sent it, never trimmed, rewritten
 // or prefixed: it is byte-identical to the audited COBOL message, and the
 // trailing padding some of them carry collapses in HTML. The error `code` and
-// the HTTP status are never shown. Every function is synchronous and uses no
-// React hook, so TanStack Query callbacks and handleSubmit handlers call them
-// directly.
+// the HTTP status are never shown, nor any detail of a failed request beyond
+// the deadline text. Every function is synchronous and uses no React hook, so
+// TanStack Query callbacks and handleSubmit handlers call them directly.
 import { toast } from "sonner";
 import type { FieldValues, Path, UseFormReturn } from "react-hook-form";
 
-import { ApiError, UNEXPECTED_ERROR_BODY } from "@/api/client";
+import {
+  ApiError,
+  RequestTimeoutError,
+  UNEXPECTED_ERROR_BODY,
+} from "@/api/client";
 
 /**
  * The text shown when a failure carries no usable server message: no answer
- * arrived (a network failure, an abort, the client's deadline), the answer had
- * no error body, or its message was blank. It is the server's own text for a
- * 500 without an audited COBOL message (crates/domain/src/messages.rs), which
- * the API client also uses for an unusable body.
+ * arrived (a network failure, an abort), the answer had no error body, or its
+ * message was blank. It is the server's own text for a 500 without an audited
+ * COBOL message (crates/domain/src/messages.rs), which the API client also
+ * uses for an unusable body. A request past the client's deadline shows the
+ * RequestTimeoutError text instead.
  */
 export const UNEXPECTED_ERROR: string = UNEXPECTED_ERROR_BODY.message;
+
+/** How showApiError and applyApiError display a failure. */
+export type ApiErrorOptions = {
+  /**
+   * For a caller whose request may write: the note shown under the message
+   * when the request got no usable answer (noUsableAnswer), so whether the
+   * server carried the write out is unknown. Its toast stays until the user
+   * dismisses it. Absent or blank, nothing is added.
+   */
+  unknownOutcome?: string;
+};
 
 /**
  * The form field each BMS field name of an error's `fields[]` belongs to,
@@ -83,19 +110,51 @@ function hasText(message: unknown): message is string {
 const SESSION_ENDED_TOAST_ID = "session-ended";
 
 /**
+ * Whether a failed request got no usable answer from the server: none
+ * arrived in time or at all (a RequestTimeoutError, a network failure), or a
+ * success status came with a body that could not be read (a JSON parse
+ * error) or was absent (an ApiError with a 2xx status). Whether a write it
+ * carried was applied is then unknown. An ApiError with a 4xx or 5xx status
+ * is the server's answer and does not count.
+ */
+export function noUsableAnswer(error: unknown): boolean {
+  if (!(error instanceof ApiError)) {
+    return true;
+  }
+  return error.status >= 200 && error.status < 300;
+}
+
+// The text a failure is shown with; see showApiError.
+function messageOf(error: unknown): string {
+  if (error instanceof ApiError) {
+    return hasText(error.body.message) ? error.body.message : UNEXPECTED_ERROR;
+  }
+  if (error instanceof RequestTimeoutError) {
+    return error.message;
+  }
+  return UNEXPECTED_ERROR;
+}
+
+/**
  * Shows a failed request's message with `toast.error`: the server's message
- * for an ApiError, otherwise UNEXPECTED_ERROR. The error of a 401 that ended
- * the session is toasted under one fixed id, so it is shown once however many
+ * for an ApiError, the client's deadline text for a RequestTimeoutError, and
+ * otherwise UNEXPECTED_ERROR. With `options.unknownOutcome`, a failure without
+ * a usable answer (noUsableAnswer) shows that note under the message, and its
+ * toast stays until the user dismisses it. The error of a 401 that ended the
+ * session is toasted under one fixed id, so it is shown once however many
  * callers show it.
  */
-export function showApiError(error: unknown): ShownApiError {
+export function showApiError(
+  error: unknown,
+  options: ApiErrorOptions = {},
+): ShownApiError {
   const apiError = error instanceof ApiError ? error : null;
-  const message =
-    apiError !== null && hasText(apiError.body.message)
-      ? apiError.body.message
-      : UNEXPECTED_ERROR;
+  const message = messageOf(error);
+  const { unknownOutcome } = options;
   if (apiError?.endedSession === true) {
     toast.error(message, { id: SESSION_ENDED_TOAST_ID });
+  } else if (hasText(unknownOutcome) && noUsableAnswer(error)) {
+    toast.error(message, { description: unknownOutcome, duration: Infinity });
   } else {
     toast.error(message);
   }
@@ -133,14 +192,16 @@ function focusField<T extends FieldValues>(
  * whose cursor the program does not move.
  *
  * The form only needs `setError` and `setFocus`, so a form whose resolver
- * transforms its values passes as well.
+ * transforms its values passes as well. `options` reach the toast as for
+ * showApiError.
  */
 export function applyApiError<T extends FieldValues, F extends string>(
   error: unknown,
   form: Pick<UseFormReturn<T>, "setError" | "setFocus">,
   bmsFieldMap: BmsFieldMap<F, T>,
+  options: ApiErrorOptions = {},
 ): AppliedApiError<T> {
-  const shown = showApiError(error);
+  const shown = showApiError(error, options);
   const applied: Path<T>[] = [];
   if (error instanceof ApiError) {
     const entries = Array.isArray(error.body.fields) ? error.body.fields : [];

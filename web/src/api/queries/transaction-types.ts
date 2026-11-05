@@ -19,6 +19,8 @@
  *   code, `useTranTypeCreateMutation`.
  * - Failures reach the caller as the client's `ApiError`, unchanged; the COBOL
  *   texts of a success (`message`, and `info` on an inline update) are data.
+ *   A write that fails without a usable answer, or with a 5xx, may still have
+ *   been stored (`mayHaveWritten`), so the types on screen are read again.
  * - A type code in the path of /admin/transaction-types/{id} travels as its
  *   key segment (lib/key-segment.ts), so the codes `.` and `..`, which
  *   MNTTRDB2 can store and a URL would drop, still address their type. The
@@ -31,7 +33,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 
-import { api, unwrap } from "@/api/client";
+import { ApiError, api, unwrap } from "@/api/client";
 import type { components, paths } from "@/api/schema";
 import { encodeKeySegment } from "@/lib/key-segment";
 
@@ -98,14 +100,37 @@ export type TranTypeDeleteVariables = {
 const ALL = ["admin-transaction-types"] as const;
 
 /**
- * Query keys. Every write invalidates `all`: the add and the update read the
- * lists on screen again, while the delete leaves that read to its caller.
+ * Query keys. Every write invalidates `all` once it succeeds, and once it
+ * fails in a way that may follow a stored write (`mayHaveWritten`). Each such
+ * invalidation reads the lists on screen again, the edit page's read of its
+ * type included, except a successful delete's, which leaves that read to its
+ * caller.
  */
 export const tranTypeKeys = {
   all: ALL,
   lists: () => [...ALL, "list"] as const,
   list: (params: TranTypeListParams) => [...ALL, "list", params] as const,
 };
+
+/**
+ * Whether a failed write may have been stored all the same: no usable answer
+ * arrived (the client's deadline, a network failure, a success body that
+ * could not be read, or a 2xx without one), or the answer is a 5xx, which the
+ * Vite proxy also sends when the API's connection ends after its commit.
+ * Every 4xx refuses the write before anything is stored: an edit (400), no
+ * valid session (401), no admin (403), no type with the code (404), a
+ * duplicate code or a referencing category (409).
+ *
+ * Each write hook's onError then invalidates `all` without returning the
+ * reads: TanStack Query awaits that callback before the caller's onError, so
+ * the error shown would otherwise wait for the reads.
+ */
+function mayHaveWritten(error: Error): boolean {
+  if (!(error instanceof ApiError)) {
+    return true;
+  }
+  return (error.status >= 200 && error.status < 300) || error.status >= 500;
+}
 
 /**
  * One page of transaction types in ascending code order, with `next_key` and
@@ -126,7 +151,10 @@ export function useTranTypes(params: TranTypeListParams = {}) {
   });
 }
 
-/** Adds a type (CTTU); the server answers 201 with the commit text. */
+/**
+ * Adds a type (CTTU); the server answers 201 with the commit text. A failure
+ * that may follow the insert (`mayHaveWritten`) reads the lists again.
+ */
 export function useTranTypeCreateMutation() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -134,13 +162,21 @@ export function useTranTypeCreateMutation() {
       unwrap(await api.POST("/admin/transaction-types", { body })),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: tranTypeKeys.all }),
+    onError: (error) => {
+      if (mayHaveWritten(error)) {
+        void queryClient.invalidateQueries({ queryKey: tranTypeKeys.all });
+      }
+    },
   });
 }
 
 /**
  * Updates a type's description. The query string carries `origin=list` only
  * when `origin` is given, because the server picks the program's edits and
- * texts by its presence (one endpoint serves CTLI and CTTU).
+ * texts by its presence (one endpoint serves CTLI and CTTU). A failure that
+ * may follow the update (`mayHaveWritten`) reads the type and the lists
+ * again; the CTTU form keeps what the user typed when the type read back is
+ * unchanged.
  */
 export function useTranTypeUpdateMutation() {
   const queryClient = useQueryClient();
@@ -161,6 +197,11 @@ export function useTranTypeUpdateMutation() {
       ),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: tranTypeKeys.all }),
+    onError: (error) => {
+      if (mayHaveWritten(error)) {
+        void queryClient.invalidateQueries({ queryKey: tranTypeKeys.all });
+      }
+    },
   });
 }
 
@@ -174,6 +215,8 @@ export function useTranTypeUpdateMutation() {
  * caller reads the page it shows next. The CTLI list returns to its first
  * page and the CTTU form leaves for its key entry, so a page the screen is
  * about to discard is never requested, and a list shown later is read anew.
+ * A failure that may follow the delete (`mayHaveWritten`) leaves the screen
+ * where it is, so the page and the type it shows are read again at once.
  */
 export function useTranTypeDeleteMutation() {
   const queryClient = useQueryClient();
@@ -195,5 +238,10 @@ export function useTranTypeDeleteMutation() {
         queryKey: tranTypeKeys.all,
         refetchType: "none",
       }),
+    onError: (error) => {
+      if (mayHaveWritten(error)) {
+        void queryClient.invalidateQueries({ queryKey: tranTypeKeys.all });
+      }
+    },
   });
 }

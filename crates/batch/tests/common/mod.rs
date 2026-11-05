@@ -200,12 +200,16 @@ impl Harness {
     /// Runs `batch <args>` to completion and returns its exit status and output.
     ///
     /// The child runs in the repository root, so the JCL-relative defaults such as
-    /// `posttran --input app/data/ASCII/dailytran.txt` resolve. Its environment is the test
-    /// process's, with `CARDDEMO_DATABASE_URL` naming the test database, `CARDDEMO_BATCH_DIR`
-    /// and `CARDDEMO_STATEMENT_DIR` the harness directories, and `CARDDEMO_FIXTURE_DIR` the
-    /// ASCII fixture corpus. `clock` becomes `CARDDEMO_CLOCK_OVERRIDE`, an RFC 3339 instant
-    /// that pins every time-dependent output; `None` removes the variable, so the child reads
-    /// the system clock.
+    /// `posttran --input app/data/ASCII/dailytran.txt` resolve. Every setting the binary
+    /// reads, [`keys::ALL`], is removed from its environment, so an ambient value cannot change
+    /// or break a run: a `RUST_LOG` of `warn` or `off` cannot drop the INFO events the tests
+    /// assert on, and an invalid `CARDDEMO_*` value, such as a non-numeric
+    /// `CARDDEMO_JWT_TTL_SECS`, cannot fail its start-up. It gets `CARDDEMO_DATABASE_URL`
+    /// naming the test database, `CARDDEMO_BATCH_DIR` and `CARDDEMO_STATEMENT_DIR` the harness
+    /// directories, `CARDDEMO_FIXTURE_DIR` the ASCII fixture corpus and `RUST_LOG` `info`, and
+    /// the defaults otherwise. `clock` becomes `CARDDEMO_CLOCK_OVERRIDE`, an RFC 3339 instant
+    /// that pins every time-dependent output; with `None` the variable stays removed, so the
+    /// child reads the system clock. The test process's own environment is never changed.
     ///
     /// The child reads an empty stdin. Its stdout and stderr are each read on a thread of their
     /// own while it runs, so a child that fills one pipe never stalls. It must exit within the
@@ -226,6 +230,9 @@ impl Harness {
     pub fn run(&self, args: &[&str], clock: Option<&str>) -> Output {
         let program = env!("CARGO_BIN_EXE_batch");
         let mut command = Command::new(program);
+        for key in keys::ALL {
+            command.env_remove(key);
+        }
         command
             .args(args)
             .current_dir(fixtures::repo_root())
@@ -233,13 +240,12 @@ impl Harness {
             .env(keys::BATCH_DIR, &self.batch_dir)
             .env(keys::STATEMENT_DIR, &self.statement_dir)
             .env(keys::FIXTURE_DIR, fixtures::ascii_dir())
+            .env(keys::RUST_LOG, "info")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(instant) = clock {
             command.env(keys::CLOCK_OVERRIDE, instant);
-        } else {
-            command.env_remove(keys::CLOCK_OVERRIDE);
         }
         let started = Instant::now();
         let mut child = command

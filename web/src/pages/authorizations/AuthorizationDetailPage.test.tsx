@@ -6,7 +6,9 @@
 // status the page keeps mounted from its first render: the read in flight,
 // then the authorization's identity, its transaction ID, without its amount
 // or card number. The skeleton shown meanwhile is hidden from assistive
-// technology. A failed read is toasted and announces nothing there.
+// technology. A failed read announces nothing there: one with a message is
+// toasted and kept as the message line, and the 404 without one (COPAUS1C's
+// no-message, no-authorization screen, E-49) shows the header and Back alone.
 //
 // The network is the global the API client looks up on every request, stubbed
 // per test; every answer is typed with the OpenAPI schema, so drift in the
@@ -32,7 +34,6 @@ import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
-import { UNEXPECTED_ERROR } from "@/lib/api-errors";
 
 import AuthorizationDetailPage from "./AuthorizationDetailPage";
 
@@ -278,44 +279,104 @@ const NEWEST_ROUTE = `/authorizations/${NEWEST.auth_id}?account_id=${ACCOUNT_1}`
 /** V-COPAUS1C-006's text for IMS status `AO` (E-44). */
 const DETAIL_READ_FAILED = " System error while reading Auth Details: Code:AO";
 
+/** The API's 404 text for a path no route serves (crates/domain/src/messages.rs ROUTE_NOT_FOUND). */
+const ROUTE_NOT_FOUND = "Resource not found";
+
 /**
- * The failed reads of the record: V-COPAUS1C-005, an ID no detail holds (a
- * purged authorization, say), a 404 without a message that the page toasts
- * as UNEXPECTED_ERROR, and V-COPAUS1C-006, a failed detail read, 500.
+ * The failed reads of the record, each with the text the page toasts and
+ * keeps as its message line, or `null` when it shows none:
+ *
+ * - V-COPAUS1C-005, an ID no detail holds (a purged authorization, say): a
+ *   404 whose message is blank, empty or spaces. COPAUS1C sets no message and
+ *   shows no authorization (E-49), so nothing is toasted or shown.
+ * - A 404 that carries a text, such as the API's answer to a path no route
+ *   serves, shown as every other message is.
+ * - V-COPAUS1C-006, a failed detail read, 500.
  */
-const READ_FAILURES: ReadonlyArray<{ status: number; body: ErrorBody; toasted: string }> = [
+const READ_FAILURES: ReadonlyArray<{
+  answer: string;
+  status: number;
+  body: ErrorBody;
+  shown: string | null;
+}> = [
   {
+    answer: "404 without a message",
     status: 404,
     body: { code: "NOT_FOUND", message: "", fields: [{ field: CARDNUM, message: "" }] },
-    toasted: UNEXPECTED_ERROR,
+    shown: null,
   },
   {
+    answer: "404 whose message is spaces",
+    status: 404,
+    body: { code: "NOT_FOUND", message: "   ", fields: [{ field: CARDNUM, message: "   " }] },
+    shown: null,
+  },
+  {
+    answer: "404 with a message",
+    status: 404,
+    body: { code: "NOT_FOUND", message: ROUTE_NOT_FOUND },
+    shown: ROUTE_NOT_FOUND,
+  },
+  {
+    answer: "500 with a message",
     status: 500,
     body: {
       code: "UNEXPECTED",
       message: DETAIL_READ_FAILED,
       fields: [{ field: CARDNUM, message: DETAIL_READ_FAILED }],
     },
-    toasted: DETAIL_READ_FAILED,
+    shown: DETAIL_READ_FAILED,
   },
 ];
 
 /**
- * The screen once a read of NEWEST failed, the first read or a read again
- * alike: one toast, its text kept as the message line outside any card,
- * nothing announced, no record, PF5 or PF8, and Back to the account's summary.
+ * The text the page shows outside its header, its read status and the
+ * toasts, leaf element by leaf element: the message line, or a record's
+ * fields. The skeleton's blocks hold none.
  */
-async function expectFailedRead(toasted: string): Promise<void> {
-  await waitFor(() => {
-    expect(toastError).toHaveBeenCalledWith(toasted);
-  });
-  await waitFor(() => {
-    expect(messageLines(toasted)).toHaveLength(1);
-  });
+function pageText(): string[] {
+  const header = document.querySelector("header");
+  return screen
+    .queryAllByText(
+      (_content, element) =>
+        element !== null &&
+        element.children.length === 0 &&
+        element.textContent !== "" &&
+        header?.contains(element) !== true &&
+        element.closest("[role='status']") === null &&
+        element.closest("[data-sonner-toaster]") === null,
+    )
+    .map((element) => element.textContent ?? "");
+}
+
+/**
+ * The screen once a read of NEWEST failed, the first read or a read again
+ * alike: nothing announced, no record, PF5 or PF8, and Back to the account's
+ * summary. A failure with a message is toasted once and its text kept as the
+ * message line, the only text outside the header. The 404 without one
+ * (`shown` null) is neither toasted nor shown: the header and Back alone, as
+ * for a rejected key.
+ */
+async function expectFailedRead(shown: string | null): Promise<void> {
+  if (shown === null) {
+    await waitFor(() => {
+      expect(queryClient.getQueryState(authorizationKeys.detail(NEWEST.auth_id))).toMatchObject({
+        status: "error",
+        fetchStatus: "idle",
+      });
+    });
+  } else {
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledWith(shown);
+    });
+    await waitFor(() => {
+      expect(messageLines(shown)).toHaveLength(1);
+    });
+  }
   await afterAnnounceDelay();
   expect(readStatus().textContent).toBe("");
-  expect(toastError).toHaveBeenCalledTimes(1);
-  expect(messageLines(toasted)[0]?.closest("[data-slot='card']")).toBeNull();
+  expect(toastError).toHaveBeenCalledTimes(shown === null ? 0 : 1);
+  expect(pageText()).toEqual(shown === null ? [] : [shown]);
   expect(screen.queryByRole("heading", { level: 2, name: "Authorization" })).toBeNull();
   expect(document.querySelector("[data-slot='card']")).toBeNull();
   expect(screen.queryByText(NEWEST.pa_transaction_id)).toBeNull();
@@ -440,17 +501,17 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read status", () => {
     expect(toastError).not.toHaveBeenCalled();
   });
 
-  // V-COPAUS1C-005 and V-COPAUS1C-006 on the first read: the toast and the
-  // message line carry the failure, no record is shown and the status
-  // announces nothing.
+  // V-COPAUS1C-005 and V-COPAUS1C-006 on the first read: no record is shown
+  // and the status announces nothing. A failure with a message is carried by
+  // the toast and the message line; the 404 without one shows neither (E-49).
   it.each(READ_FAILURES)(
-    "toasts a $status answer and leaves the status empty",
-    async ({ status, body, toasted }) => {
+    "shows a $answer as COPAUS1C does and leaves the status empty",
+    async ({ status, body, shown }) => {
       answer = (request) =>
         isDetailRead(request, NEWEST.auth_id) ? jsonResponse(status, body) : readStore(request);
       renderAt(NEWEST_ROUTE);
 
-      await expectFailedRead(toasted);
+      await expectFailedRead(shown);
       expect(sent()).toEqual([`GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`]);
     },
   );
@@ -558,6 +619,9 @@ const MARKED_NEWEST: AuthDetailResponse = {
   next_id: null,
 };
 
+/** V-COPAUS1C-011's text for IMS status `AO`: the detail replace failed, so the mark rolled back (E-44). */
+const FRAUD_TAGGING_FAILED = " System error while FRAUD Tagging, ROLLBACK||AO";
+
 describe("AuthorizationDetailPage (CPVD, COPAU01) PF5 fraud mark", () => {
   // F-COPAU01-005 and F-COPAU01-006: Next stays offered while a mark is sent,
   // so PF8 can open the next authorization before the PUT answers. The
@@ -615,6 +679,123 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) PF5 fraud mark", () => {
     ]);
     expect(toastError).not.toHaveBeenCalled();
   });
+
+  /**
+   * NEWEST shown, its mark confirmed with the PUT held, and the confirm opened
+   * again from the fraud button, which stays enabled while the mark is sent:
+   * the mark's confirm, with both buttons disabled. `sendMark` answers the PUT.
+   */
+  async function reopenConfirmDuringMark(): Promise<{
+    user: UserEvent;
+    trigger: HTMLElement;
+    reopened: HTMLElement;
+    sendMark: (response: Response) => void;
+  }> {
+    const held = holdResponse();
+    answer = (request) =>
+      isFraudToggle(request, NEWEST.auth_id) ? held.reply : readStore(request);
+    const { user } = renderAt(NEWEST_ROUTE);
+    await waitFor(() => {
+      expect(readStatus().textContent).toBe(NEWEST_LOADED);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Mark fraud" }));
+    await user.click(await screen.findByRole("button", { name: "Confirm" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    const trigger = screen.getByRole("button", { name: "Mark fraud" });
+    expect(trigger.hasAttribute("disabled")).toBe(false);
+    await user.click(trigger);
+    const reopened = await screen.findByRole("alertdialog", {
+      name: "Mark this authorization as fraud?",
+    });
+    expect(within(reopened).getByRole("button", { name: "Confirm" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+    expect(within(reopened).getByRole("button", { name: "Cancel" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+    return { user, trigger, reopened, sendMark: held.send };
+  }
+
+  // F-COPAU01-003 to F-COPAU01-005, E-60: a confirm offers the PF5 its record
+  // names. The mark landing turns the record `F`, so the confirm opened
+  // again meanwhile closes rather than offer Confirm, which would send the
+  // toggle that removes the mark; focus returns to the fraud button, now
+  // Remove fraud, whose own confirm offers the removal.
+  it("closes a confirm opened again while the mark is sent once the mark lands", async () => {
+    const toastSuccess = vi.spyOn(toast, "success");
+    const { user, trigger, sendMark } = await reopenConfirmDuringMark();
+
+    sendMark(jsonResponse(200, { detail: MARKED_NEWEST, message: MARKED_TEXT }));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Remove fraud" })).toBe(trigger);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(trigger);
+    });
+    await waitFor(() => {
+      expect(toastSuccess).toHaveBeenCalledWith(MARKED_TEXT);
+    });
+    await waitFor(() => {
+      expect(queryClient.isMutating()).toBe(0);
+    });
+
+    await user.click(trigger);
+    const removal = await screen.findByRole("alertdialog", { name: "Remove the fraud mark?" });
+    expect(
+      within(removal).getByText(
+        `The fraud mark of the authorization of transaction ${NEWEST.pa_transaction_id} is removed.`,
+      ),
+    ).not.toBeNull();
+    expect(within(removal).getByRole("button", { name: "Confirm" }).hasAttribute("disabled")).toBe(
+      false,
+    );
+    expect(sent()).toEqual([
+      `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+      `PUT ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+    ]);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  // V-COPAUS1C-011: a failed mark leaves the record unmarked, so the confirm
+  // opened again meanwhile still offers the mark, and its Confirm is enabled
+  // once the PUT has answered.
+  it("keeps a confirm opened again while the mark is sent once the mark fails", async () => {
+    const { trigger, reopened, sendMark } = await reopenConfirmDuringMark();
+
+    sendMark(
+      jsonResponse(500, {
+        code: "UNEXPECTED",
+        message: FRAUD_TAGGING_FAILED,
+        fields: [{ field: CARDNUM, message: FRAUD_TAGGING_FAILED }],
+      }),
+    );
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledWith(FRAUD_TAGGING_FAILED);
+    });
+    const confirm = within(reopened).getByRole("button", { name: "Confirm" });
+    await waitFor(() => {
+      expect(confirm.hasAttribute("disabled")).toBe(false);
+    });
+    expect(screen.getByRole("alertdialog", { name: "Mark this authorization as fraud?" })).toBe(
+      reopened,
+    );
+    expect(
+      within(reopened).getByText(
+        `The authorization of transaction ${NEWEST.pa_transaction_id} is reported as fraud.`,
+      ),
+    ).not.toBeNull();
+    expect(trigger.textContent).toBe("Mark fraud");
+    expect(sent()).toEqual([
+      `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+      `PUT ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
+    ]);
+    expect(toastError).toHaveBeenCalledTimes(1);
+  });
 });
 
 /** PF8's summary read one row on from NEWEST once no authorization follows it. */
@@ -629,12 +810,13 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read again after a record was 
   // E-59: PF8 at a record whose follower is gone finds no row and reads the
   // record again. When that read fails, the record purged meanwhile (404) or
   // its read failing (500), the record read earlier is withheld exactly as
-  // on a failed first read. Returning to the route reads the key again: the
+  // on a failed first read, with no toast or message line for the 404
+  // without a message. Returning to the route reads the key again: the
   // skeleton stands in while that read is in flight, the failure is neither
   // toasted again nor shown, and a successful answer brings the record back.
   it.each(READ_FAILURES)(
-    "withholds the record when its read again answers $status, until a read succeeds",
-    async ({ status, body, toasted }) => {
+    "withholds the record when its read again answers a $answer, until a read succeeds",
+    async ({ status, body, shown }) => {
       let failing = false;
       answer = (request) => {
         if (isNextLookup(request)) {
@@ -652,7 +834,7 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read again after a record was 
 
       failing = true;
       await user.click(screen.getByRole("button", { name: "Next" }));
-      await expectFailedRead(toasted);
+      await expectFailedRead(shown);
       expect(router.state.location.pathname).toBe(`/authorizations/${NEWEST.auth_id}`);
 
       const held = holdResponse();
@@ -670,7 +852,7 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read again after a record was 
       expect(document.querySelector("[data-slot='card']")?.getAttribute("aria-hidden")).toBe(
         "true",
       );
-      expect(messageLines(toasted)).toEqual([]);
+      expect(pageText()).toEqual([]);
       expect(screen.queryByText(NEWEST.pa_transaction_id)).toBeNull();
       expect(screen.queryByRole("button", { name: "Mark fraud" })).toBeNull();
       expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
@@ -682,8 +864,8 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read again after a record was 
       expect(screen.getByText(NEWEST.pa_transaction_id)).not.toBeNull();
       expect(screen.getByRole("button", { name: "Mark fraud" })).not.toBeNull();
       expect(screen.getByRole("button", { name: "Next" })).not.toBeNull();
-      expect(messageLines(toasted)).toEqual([]);
-      expect(toastError).toHaveBeenCalledTimes(1);
+      expect(pageText()).not.toContain(shown);
+      expect(toastError).toHaveBeenCalledTimes(shown === null ? 0 : 1);
       expect(sent()).toEqual([
         `GET ${DETAIL_PATH_PREFIX}${NEWEST.auth_id}`,
         `GET ${SUMMARY_PATH}?account_id=${ACCOUNT_1}&start_key=${NEWEST.auth_id}&direction=forward&page_size=1`,
@@ -739,15 +921,16 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read again after a record was 
 
   // F-COPAU01-003, F-COPAU01-005: the confirm belongs to the record it was
   // opened on. PF8 finding no row reads the record again; that read failing
-  // (a purge's 404) withholds the record, and the confirm closes with it, so
-  // no Confirm is offered for it and no PUT is sent.
+  // (a purge's 404, without a message, so with no toast) withholds the
+  // record, and the confirm closes with it, so no Confirm is offered for it
+  // and no PUT is sent.
   it("closes an open fraud confirm when a read again withholds its record", async () => {
     const { router, sendLookup } = await openConfirmDuringNext(true);
 
     act(() => {
       sendLookup();
     });
-    await expectFailedRead(READ_FAILURES[0].toasted);
+    await expectFailedRead(READ_FAILURES[0].shown);
     await waitFor(() => {
       expect(screen.queryByRole("alertdialog")).toBeNull();
     });

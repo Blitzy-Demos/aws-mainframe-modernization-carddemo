@@ -110,6 +110,20 @@ pub enum PersistenceError {
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
+    /// The connection URL was refused before any connection was attempted:
+    /// it does not parse as a `postgres://` URL, or its query holds what sqlx
+    /// would log or quote, a parameter it does not read or an `sslmode` value
+    /// it does not know (see [`pool`]).
+    ///
+    /// The URL every process passes is `CARDDEMO_DATABASE_URL`, so the text
+    /// names that variable, then `reason`, and quotes no part of the URL,
+    /// which carries the password.
+    #[error("invalid CARDDEMO_DATABASE_URL: {reason}")]
+    InvalidDatabaseUrl {
+        /// Why the URL was refused.
+        reason: String,
+    },
+
     /// Applying the embedded migrations failed.
     #[error("database migration failed: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),

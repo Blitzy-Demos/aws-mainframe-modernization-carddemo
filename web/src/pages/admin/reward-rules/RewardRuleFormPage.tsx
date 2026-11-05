@@ -182,24 +182,44 @@ function RewardRuleForm({
     mode: "onSubmit",
   });
 
+  // One save per form: a second click or Enter before the busy state
+  // re-renders would send the rule again. A saved rule keeps the guard set,
+  // since the form stays on screen until the list route has loaded and a
+  // second save there would create the rule twice; the form leaves with the
+  // route. Only a rejection releases it, for the corrected entry.
+  const inFlight = useRef(false);
+
   // The rule as stored is the only success answer: it carries no message, so
   // no success toast is shown and the list itself shows the change.
   const onValid = (values: RewardRuleFormValues): void => {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
     mutation.mutate(values, {
       onSuccess: () => {
         void navigate(LIST_ROUTE);
       },
       onError: (error) => {
+        inFlight.current = false;
         applyApiError(error, form, rewardRuleBmsFieldMap);
       },
     });
   };
+
+  // aria-disabled rather than disabled: a focused button that becomes
+  // disabled loses focus to the document, which would strand a keyboard user
+  // after Save, a rejection that names no field included; the guards keep the
+  // inert buttons from acting. A saved rule stays busy until the form leaves.
+  const busy = mutation.isPending || mutation.isSuccess;
+  const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
 
   return (
     <Card>
       <form
         noValidate
         aria-label={label}
+        aria-busy={busy}
         className="flex flex-col gap-6"
         onSubmit={form.handleSubmit(onValid)}
       >
@@ -252,13 +272,20 @@ function RewardRuleForm({
           </FieldGroup>
         </CardContent>
         <CardFooter className="flex-wrap gap-2">
-          <Button type="submit" disabled={mutation.isPending}>
+          <Button type="submit" aria-disabled={busy} className={busyClass}>
             Save
           </Button>
           <Button
             type="button"
             variant="outline"
-            onClick={() => form.reset(initialValues)}
+            aria-disabled={busy}
+            className={busyClass}
+            onClick={() => {
+              if (busy) {
+                return;
+              }
+              form.reset(initialValues);
+            }}
           >
             Reset
           </Button>

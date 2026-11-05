@@ -6,9 +6,38 @@ import { defineConfig } from "vitest/config";
 
 // Upstream of the dev server's /api proxy, the browser's only route to the API.
 // The default equals CARDDEMO_API_PROXY_TARGET in .env.example; the Compose
-// `app` profile sets http://api:8080.
-const apiProxyTarget =
-  process.env.CARDDEMO_API_PROXY_TARGET ?? "http://127.0.0.1:8080";
+// `app` profile sets http://api:8080. A set value must be an absolute http or
+// https URL, or loading this config fails naming the variable, as the Rust
+// binaries refuse an unusable setting at start; the proxy would otherwise
+// crash or hang on the first /api request. The errors never echo the value,
+// since a URL can carry credentials. The proxy receives the URL standard's
+// canonical form of the value (http:127.0.0.1:8080 becomes
+// http://127.0.0.1:8080/), not the value as written: the proxy parses its
+// target with Node's legacy URL parser, which reads such a value without its
+// host and so would send every /api request to port 80 of localhost.
+const apiProxyTargetOf = (value: string | undefined): string => {
+  if (value === undefined) {
+    return "http://127.0.0.1:8080";
+  }
+  const target = value.trim();
+  if (target === "") {
+    throw new Error("CARDDEMO_API_PROXY_TARGET is set but blank");
+  }
+  const url = URL.canParse(target) ? new URL(target) : undefined;
+  if (
+    url === undefined ||
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.hostname === ""
+  ) {
+    throw new Error(
+      "invalid value for CARDDEMO_API_PROXY_TARGET: expected an absolute " +
+        "http:// or https:// URL, for example http://127.0.0.1:8080",
+    );
+  }
+  return url.href;
+};
+
+const apiProxyTarget = apiProxyTargetOf(process.env.CARDDEMO_API_PROXY_TARGET);
 
 // Vendor chunks, which aim to keep each chunk under Vite's 500 kB warning;
 // pages are split further by route-level React.lazy. The warning-free

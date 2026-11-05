@@ -206,6 +206,13 @@ const CREATED = 201;
 const CONFIRM_PROMPT = "You are about to add this transaction. Please confirm.";
 
 /**
+ * The note under the error of a confirmed add that got no usable answer: the
+ * server may have added it, and adding it again would enter it twice.
+ */
+const ADD_OUTCOME_UNKNOWN =
+  "The transaction may have been added. Check the transaction list before adding it again.";
+
+/**
  * Whether a PF5 check was answered with an edit COTRN02C makes after the key
  * fields: an error naming fields, none of them ACTIDIN or CARDNIN. Only then
  * did COPY-LAST-TRAN-DATA get past VALIDATE-INPUT-KEY-FIELDS and copy the
@@ -402,7 +409,9 @@ export default function TransactionAddPage(): JSX.Element {
           }
         },
         onError: (error) => {
-          applyApiError(error, form, transactionAddBmsFieldMap);
+          applyApiError(error, form, transactionAddBmsFieldMap, {
+            unknownOutcome: ADD_OUTCOME_UNKNOWN,
+          });
         },
       },
     );

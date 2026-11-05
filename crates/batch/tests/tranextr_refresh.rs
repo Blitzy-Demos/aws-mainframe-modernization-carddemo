@@ -20,13 +20,17 @@
 
 pub mod common;
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::ops::Range;
+use std::os::unix::process::CommandExt;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -152,6 +156,11 @@ const POLL: Duration = Duration::from_millis(20);
 /// How long the output of a child that has ended is waited for: 10 seconds. Its pipes close
 /// as it exits, so the wait is long only when a process that inherited them holds them.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the shell of [`stopping_a_process_also_kills_the_descendants_holding_its_stdout`]
+/// may take to write the pid of its background `sleep`, and that `sleep` to be gone once the
+/// shell is stopped: 10 seconds, a wide margin over a start and a `SIGKILL` on a loaded host.
+const DESCENDANT_BOUND: Duration = Duration::from_secs(10);
 
 #[test]
 fn master_edit_reaches_report_only_after_tranextr() {
@@ -440,6 +449,10 @@ impl ApiServer {
     /// point it elsewhere. It gets `CARDDEMO_DATABASE_URL`, `CARDDEMO_HTTP_ADDR`
     /// [`API_LISTEN`] and `RUST_LOG` `info`, at which the handler spans are written, and the
     /// defaults otherwise, the system clock included.
+    ///
+    /// The server is one process that starts no other, so it stays in the test's process
+    /// group ([`Group::Inherited`]): killing it alone ends all of it, and the Ctrl-C of an
+    /// interrupted run still reaches it.
     fn start(database_url: &str) -> Self {
         let mut command = Command::new(api_binary());
         command.current_dir(fixtures::repo_root());
@@ -450,7 +463,7 @@ impl ApiServer {
             .env(keys::DATABASE_URL, database_url)
             .env(keys::HTTP_ADDR, API_LISTEN)
             .env(keys::RUST_LOG, "info");
-        let mut process = Process::spawn("api server", &mut command);
+        let mut process = Process::spawn("api server", &mut command, Group::Inherited);
         let addr = process.wait_for(
             &format!("{API_LISTENING:?} event"),
             API_START_TIMEOUT,
@@ -602,6 +615,9 @@ fn listening_addr(line: &str) -> Option<SocketAddr> {
 /// directory before it runs tests, so the nested build does not wait for the outer one. It
 /// must end within [`API_BUILD_TIMEOUT`].
 ///
+/// Cargo leads a process group of its own ([`Group::Own`]), which its `rustc` and linker
+/// processes join, so a build stopped on a timeout or a panic ends with all of them.
+///
 /// The executable is the one the build's `compiler-artifact` message names for the `api`
 /// bin target.
 fn api_binary() -> PathBuf {
@@ -626,7 +642,7 @@ fn api_binary() -> PathBuf {
         .arg("--target-dir")
         .arg(target_dir)
         .current_dir(&root);
-    let mut build = Process::spawn("cargo build of the api binary", &mut command);
+    let mut build = Process::spawn("cargo build of the api binary", &mut command, Group::Own);
     let status = build.wait_exit(API_BUILD_TIMEOUT);
     if !status.success() {
         build.fail(&format!("exited with {status}"));
@@ -729,12 +745,22 @@ fn response(bytes: &[u8]) -> Result<(u16, String), String> {
 
 /// A child process of the test, its stdout read line by line and its stderr to the end,
 /// each on a thread of its own, so the child never blocks on a full pipe. The stdout lines
-/// received so far are kept for checks and failure messages. Dropping it kills and reaps a
-/// child that is still running.
+/// received so far are kept for checks and failure messages.
+///
+/// The child is stopped once, by [`Process::end`]: a `SIGKILL` to its process group when it
+/// leads one ([`Group::Own`]), then one to the child, then the reap. Dropping a `Process`
+/// stops a child that has not been stopped yet. The group ID equals the child's pid, and an
+/// unreaped child keeps its pid even after it has exited, so no other process or group can
+/// hold that ID while the child is unreaped. The child is therefore never reaped before its
+/// group is signalled: [`Process::wait_exit`] sees an exit in `/proc` without reaping it,
+/// and only [`kill_and_reap`] reaps, after the signals. A group ID a reap may have freed is
+/// never signalled.
 struct Process {
     /// What the child is, in messages.
     label: &'static str,
     child: Child,
+    /// Whether the child leads a process group of its own.
+    group: Group,
     /// When the child was started.
     started: Instant,
     /// The stdout lines from the reader thread, then the error that ended it, if any.
@@ -743,16 +769,53 @@ struct Process {
     stdout: Vec<String>,
     /// The whole of stderr, or the error that ended its reading.
     stderr: Receiver<io::Result<Vec<u8>>>,
+    /// How the stop of the child went, once [`Process::end`] has run: the reaped status, or
+    /// what failed.
+    ended: Option<Result<ExitStatus, String>>,
+}
+
+/// Whether the child of a [`Process`] leads a process group of its own.
+///
+/// A group lets one signal reach the processes the child starts, which outlive a child killed
+/// alone and keep its inherited pipes open. Its cost: a Ctrl-C sends `SIGINT` to the
+/// terminal's foreground process group, the test's, which ends the test without running any
+/// `Drop`, and misses a child in a group of its own, which then runs on until it ends by
+/// itself.
+#[derive(Clone, Copy)]
+enum Group {
+    /// The child leads a new process group (`process_group(0)`), and its group is killed with
+    /// it. For the `cargo build`, whose `rustc` and linker processes would outlive a Cargo
+    /// killed alone; an interrupted run leaves the build to end by itself.
+    Own,
+    /// The child stays in the test's process group, still gets the Ctrl-C of an interrupted
+    /// run, and is killed alone. For the API server, a single process that starts no other.
+    Inherited,
+}
+
+impl Group {
+    /// How a child stopped by [`kill_and_reap`] in this group mode ended, given the `status`
+    /// it was reaped with.
+    fn stopped(self, status: ExitStatus) -> String {
+        match self {
+            Self::Own => {
+                format!("its process group was sent SIGKILL, and it was reaped with {status}")
+            }
+            Self::Inherited => format!("it was sent SIGKILL and reaped with {status}"),
+        }
+    }
 }
 
 impl Process {
-    /// Starts `command`, named `label` in messages, with an empty stdin and both outputs
-    /// piped to their reader threads.
-    fn spawn(label: &'static str, command: &mut Command) -> Self {
+    /// Starts `command`, named `label` in messages, in its own process group when `group` is
+    /// [`Group::Own`], with an empty stdin and both outputs piped to their reader threads.
+    fn spawn(label: &'static str, command: &mut Command, group: Group) -> Self {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Group::Own = group {
+            command.process_group(0);
+        }
         let started = Instant::now();
         let mut child = command.spawn().unwrap_or_else(|error| {
             panic!(
@@ -769,14 +832,17 @@ impl Process {
             Ok((lines, stderr)) => Self {
                 label,
                 child,
+                group,
                 started,
                 lines,
                 stdout: Vec::new(),
                 stderr,
+                ended: None,
             },
             Err(error) => {
                 let pid = child.id();
-                let (Ok(ended) | Err(ended)) = kill_and_reap(&mut child);
+                let ended = kill_and_reap(&mut child, group)
+                    .map_or_else(|problem| problem, |status| group.stopped(status));
                 panic!("cannot read the output of the {label} (pid {pid}): {error}; {ended}")
             }
         }
@@ -817,18 +883,23 @@ impl Process {
     }
 
     /// Waits for the child to exit within `bound` of its start, checking every [`POLL`],
-    /// then for the end of its stdout, and returns its exit status.
+    /// then for the end of its stdout, then stops it ([`Process::end`]), and returns its
+    /// exit status.
+    ///
+    /// The exit is seen without a reap ([`Process::exited`]), so a process of the child's
+    /// group that still holds the stdout [`DRAIN_GRACE`] later, or runs on without it, is
+    /// killed with the group while the unreaped child still reserves the group ID.
     fn wait_exit(&mut self, bound: Duration) -> ExitStatus {
-        let status = loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if self.started.elapsed() >= bound => {
+        loop {
+            match self.exited() {
+                Ok(true) => break,
+                Ok(false) if self.started.elapsed() >= bound => {
                     self.fail(&format!("did not exit within {bound:?}"));
                 }
-                Ok(None) => thread::sleep(POLL),
+                Ok(false) => thread::sleep(POLL),
                 Err(error) => self.fail(&format!("could not be checked for an exit: {error}")),
             }
-        };
+        }
         let until = Instant::now() + DRAIN_GRACE;
         loop {
             match self
@@ -836,19 +907,42 @@ impl Process {
                 .recv_timeout(until.saturating_duration_since(Instant::now()))
             {
                 Ok(Ok(line)) => self.stdout.push(line),
-                Ok(Err(error)) => self.fail(&format!(
-                    "exited with {status}, but its stdout could not be read: {error}"
-                )),
+                Ok(Err(error)) => {
+                    self.fail(&format!(
+                        "exited, but its stdout could not be read: {error}"
+                    ));
+                }
                 Err(RecvTimeoutError::Timeout) => self.fail(&format!(
-                    "exited with {status}, but its stdout was still open {DRAIN_GRACE:?} later"
+                    "exited, but its stdout was still open {DRAIN_GRACE:?} later"
                 )),
-                Err(RecvTimeoutError::Disconnected) => return status,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+        match self.end() {
+            Ok(status) => status,
+            Err(_) => self.fail("exited, but could not be stopped"),
         }
     }
 
-    /// Stops the child, collects what it wrote within [`DRAIN_GRACE`], and panics with
-    /// `problem`, the pid, how the child ended, its stderr and its stdout.
+    /// Whether the child has exited, seen without reaping it: an exited child that is not
+    /// reaped is a zombie, state `Z` in its `/proc/<pid>/stat` (Linux). A stopped child has
+    /// exited.
+    fn exited(&self) -> io::Result<bool> {
+        if self.ended.is_some() {
+            return Ok(true);
+        }
+        let pid = self.child.id();
+        match proc_stat(pid)? {
+            Some(stat) => Ok(stat.state == 'Z'),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("the unreaped child {pid} has no /proc entry"),
+            )),
+        }
+    }
+
+    /// Stops the child ([`Process::stop`]), collects what it wrote within [`DRAIN_GRACE`],
+    /// and panics with `problem`, the pid, how the child ended, its stderr and its stdout.
     fn fail(&mut self, problem: &str) -> ! {
         let (Ok(ended) | Err(ended)) = self.stop();
         let until = Instant::now() + DRAIN_GRACE;
@@ -879,22 +973,33 @@ impl Process {
         )
     }
 
-    /// Kills and reaps the child unless it has already exited, and says how it ended: `Err`
-    /// when the kill or the reap failed.
+    /// Stops the child ([`Process::end`]) and says how it ended: `Err` when a signal or the
+    /// reap failed.
     fn stop(&mut self) -> Result<String, String> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => Ok(format!("it had exited with {status}")),
-            Ok(None) | Err(_) => kill_and_reap(&mut self.child),
-        }
+        let group = self.group;
+        self.end().map(|status| group.stopped(status))
+    }
+
+    /// Stops the child with [`kill_and_reap`] on the first call, whether it is still running
+    /// or has exited, which ends the processes left in its group too, and returns the reaped
+    /// status or what failed. A later call returns the same without a signal: once the child
+    /// is reaped, its group ID may be freed and taken by another process.
+    fn end(&mut self) -> Result<ExitStatus, String> {
+        self.ended
+            .get_or_insert_with(|| kill_and_reap(&mut self.child, self.group))
+            .clone()
     }
 }
 
 impl Drop for Process {
-    /// Kills and reaps a child that is still running, so no process outlives the test,
-    /// whether it passed or panicked. A failed kill or reap is reported on stderr; it
-    /// changes no outcome.
+    /// Stops a child that has not been stopped yet ([`Process::stop`]), with its process
+    /// group when it leads one, so none of its processes outlives the test, whether it passed
+    /// or panicked; a process that has left the group (`setsid`, `setpgid`) is out of reach.
+    /// A failed stop is reported on stderr; it changes no outcome.
     fn drop(&mut self) {
-        if let Err(problem) = self.stop() {
+        if self.ended.is_none()
+            && let Err(problem) = self.stop()
+        {
             eprintln!(
                 "cannot stop the {} (pid {}): {problem}",
                 self.label,
@@ -904,14 +1009,187 @@ impl Drop for Process {
     }
 }
 
-/// Kills `child` with `SIGKILL` and waits for it, so it leaves no zombie. `Ok` describes the
-/// reaped status; `Err` names the step that failed.
-fn kill_and_reap(child: &mut Child) -> Result<String, String> {
+/// Kills `child` with `SIGKILL`, after its whole process group when it leads one
+/// ([`Group::Own`]), and waits for it, so it leaves no zombie. `Ok` is the reaped status;
+/// `Err` names the step that failed.
+///
+/// `child` must not have been reaped: an unreaped child, running or exited, keeps its pid,
+/// so neither that pid nor the group ID equal to it can name another process while the
+/// signals are sent. The child is also killed on its own, so a group signal that failed
+/// cannot leave it running and the reap waiting for it. A `SIGKILL` to a child that has
+/// already exited changes nothing about it: it is reaped with the status it exited with.
+fn kill_and_reap(child: &mut Child, group: Group) -> Result<ExitStatus, String> {
+    let grouped = match group {
+        Group::Own => Some(kill_group(child.id())),
+        Group::Inherited => None,
+    };
     let killed = child.kill();
-    match (killed, child.wait()) {
-        (Ok(()), Ok(status)) => Ok(format!("it was killed and reaped with {status}")),
-        (killed, reaped) => Err(format!("kill returned {killed:?}, reap {reaped:?}")),
+    match (grouped, killed, child.wait()) {
+        (None | Some(Ok(())), Ok(()), Ok(status)) => Ok(status),
+        (grouped, killed, reaped) => {
+            let grouped = grouped.map_or_else(String::new, |grouped| {
+                format!("the kill of its process group returned {grouped:?}, ")
+            });
+            Err(format!(
+                "{grouped}kill returned {killed:?}, reap {reaped:?}"
+            ))
+        }
     }
+}
+
+/// Sends `SIGKILL` to every process of the process group `group` with the `kill` utility,
+/// `kill -s KILL -- -<group>`. The standard library signals only a child of its own, and a
+/// direct `kill(2)` call needs code the workspace lints forbid. `Err` describes a `kill`
+/// that could not be run or failed.
+fn kill_group(group: u32) -> Result<(), String> {
+    let target = format!("-{group}");
+    let output = Command::new("kill")
+        .args(["-s", "KILL", "--", &target])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot run kill: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "kill -s KILL -- {target} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ))
+    }
+}
+
+/// The fields of a `/proc/<pid>/stat` line (Linux) that [`Process::exited`] and the tests
+/// read.
+#[derive(Debug)]
+struct ProcStat {
+    /// The state, field 3: `Z` for a zombie, an exited process that is not reaped yet.
+    state: char,
+    /// The start time in clock ticks after boot, field 22, which tells the process from a
+    /// later one given the same pid.
+    start: u64,
+}
+
+/// The [`ProcStat`] of the process `pid`; `None` when it has no `/proc` entry, as a reaped
+/// process has not.
+fn proc_stat(pid: u32) -> io::Result<Option<ProcStat>> {
+    let path = format!("/proc/{pid}/stat");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // The command name, field 2, is in parentheses and may hold any byte, `)` and spaces
+    // included, so the fields are counted after the last `)`, from field 3.
+    let fields: Vec<&[u8]> = bytes
+        .iter()
+        .rposition(|&byte| byte == b')')
+        .map(|end| {
+            bytes[end + 1..]
+                .split(u8::is_ascii_whitespace)
+                .filter(|field| !field.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| std::str::from_utf8(field).ok())
+    };
+    let state = text(0).and_then(|state| {
+        let mut chars = state.chars();
+        chars.next().filter(|_| chars.next().is_none())
+    });
+    let start = text(19).and_then(|start| start.parse().ok());
+    match (state, start) {
+        (Some(state), Some(start)) => Ok(Some(ProcStat { state, start })),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{path} is not a stat line: {}",
+                String::from_utf8_lossy(&bytes)
+            ),
+        )),
+    }
+}
+
+/// A [`Group::Own`] shell whose background `sleep` holds the inherited stdout is stopped
+/// together with that `sleep`, on both ways [`Process::wait_exit`] fails: the shell runs past
+/// its bound, or it exits while the `sleep` keeps the stdout open past [`DRAIN_GRACE`], so it
+/// is stopped after its exit. Each time the stop ends the `sleep`, and the stdout reader
+/// disconnects within [`DRAIN_GRACE`]; a stop that killed the shell alone would leave the
+/// `sleep` holding the pipe for ten minutes. It needs `sh`, `sleep`, `kill` and `/proc`, and
+/// neither Docker nor a build.
+#[test]
+fn stopping_a_process_also_kills_the_descendants_holding_its_stdout() {
+    // The script, the bound given to `wait_exit`, and the problem its failure names. The
+    // shell that exits gets a bound far beyond the time it takes to exit.
+    let running = Duration::from_secs(2);
+    let exiting = Duration::from_secs(60);
+    let cases = [
+        (
+            "sleep 600 & echo $!; wait",
+            running,
+            format!("did not exit within {running:?}"),
+        ),
+        (
+            "sleep 600 & echo $!",
+            exiting,
+            format!("but its stdout was still open {DRAIN_GRACE:?} later"),
+        ),
+    ];
+    for (script, bound, problem) in cases {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        let mut shell = Process::spawn("shell", &mut command, Group::Own);
+        let sleep: u32 = shell.wait_for("pid of its sleep", DESCENDANT_BOUND, |line| {
+            line.parse().ok()
+        });
+        let before = match proc_stat(sleep) {
+            Ok(Some(stat)) if stat.state != 'Z' => stat,
+            other => panic!("the sleep {sleep} of {script:?} is not running: {other:?}"),
+        };
+
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| shell.wait_exit(bound)));
+        let message = match &outcome {
+            Ok(status) => panic!("wait_exit returned {status} for {script:?} instead of failing"),
+            Err(payload) => panic_text(payload.as_ref()),
+        };
+        assert!(
+            message.contains(&problem),
+            "the failure of {script:?} does not name {problem:?}: {message}"
+        );
+        assert!(
+            !message.contains("after the stop"),
+            "the stop of {script:?} left the stderr open: {message}"
+        );
+        assert!(
+            matches!(shell.lines.try_recv(), Err(TryRecvError::Disconnected)),
+            "the stop of {script:?} left the stdout open {DRAIN_GRACE:?} later: {message}"
+        );
+
+        let until = Instant::now() + DESCENDANT_BOUND;
+        loop {
+            match proc_stat(sleep) {
+                Ok(None) => break,
+                Ok(Some(stat)) if stat.state == 'Z' || stat.start != before.start => break,
+                last if Instant::now() >= until => panic!(
+                    "the sleep {sleep} of {script:?} still runs {DESCENDANT_BOUND:?} after the \
+                     stop: {last:?}"
+                ),
+                _ => thread::sleep(POLL),
+            }
+        }
+    }
+}
+
+/// The text of a panic payload: the message of a formatted `panic!`, or its literal.
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<a panic payload that is not text>")
 }
 
 /// Reads `pipe`, the stdout of the child `label`, line by line on a new thread, which sends

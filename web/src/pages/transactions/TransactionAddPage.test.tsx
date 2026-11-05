@@ -12,6 +12,9 @@
 // - "Cancel" and Escape (CONFIRM N) send nothing and keep the entry;
 // - a server error is toasted, set on the field its `fields[]` names and puts
 //   the cursor there, as `MOVE -1 TO ACTIDINL` does;
+// - a confirmed add without an answer before the client's deadline is sent
+//   once and toasted with the deadline text and a note that it may have been
+//   added, keeping the entry;
 // - "Copy last transaction" (PF5) reads the highest-keyed transaction, copies
 //   its data fields with the screen edit of the amount, and keeps the keys;
 // - the keyboard locks while a PF5 copy or a confirmed add runs: the inputs
@@ -27,6 +30,7 @@ import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
+import { RequestTimeoutError } from "@/api/client";
 import type { components, paths } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -598,6 +602,35 @@ describe("TransactionAddPage (CT02, COTRN02)", () => {
       expect(toast.success).not.toHaveBeenCalled();
     },
   );
+
+  // The client gives up at its deadline while the server may still add the
+  // transaction, so the toast says the add may have happened and the request
+  // is not sent again.
+  it("sends an unanswered add once and toasts the deadline with its unknown outcome", async () => {
+    answers.set("POST /api/transactions", () => {
+      throw new RequestTimeoutError();
+    });
+    const user = renderPage();
+
+    const dialog = await openConfirmation(user);
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(
+        "No answer from the server within 30 seconds",
+        {
+          description:
+            "The transaction may have been added. Check the transaction list before adding it again.",
+          duration: Infinity,
+        },
+      );
+    });
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(sent.map((request) => request.method)).toEqual(["POST"]);
+    expect(await requestsOf("POST")[0]?.clone().json()).toEqual(EXPECTED_ADD_BODY);
+    expectEntry(VALID_ENTRY);
+    expect(toast.success).not.toHaveBeenCalled();
+  });
 
   it(
     "copies the last transaction into the data fields and keeps the keys (F-COTRN02-006)",

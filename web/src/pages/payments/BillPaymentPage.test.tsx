@@ -13,6 +13,9 @@
 // - a blank account ID never reaches the network (V-COBIL00C-001);
 // - a server refusal, of the review or of the payment, is toasted, set on
 //   ACTIDIN and puts the cursor there, as `MOVE -1 TO ACTIDINL` does;
+// - a confirmed payment without an answer before the client's deadline is
+//   sent once and toasted with the deadline text and a note that it may have
+//   been made;
 // - an answer to the review or to the payment, or a failed balance reload,
 //   that arrives after the entry was replaced is still toasted but neither
 //   blanks nor marks the newer entry;
@@ -35,6 +38,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
+import { RequestTimeoutError } from "@/api/client";
 import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -613,6 +617,40 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
       expect(toast.success).not.toHaveBeenCalled();
     },
   );
+
+  // The client gives up at its deadline while the server may still make the
+  // payment: the toast says the payment may have been made, the request is
+  // not sent again, and the balance on file is read again.
+  it("sends an unanswered payment once and toasts the deadline with its unknown outcome", async () => {
+    // The payment's fetch rejects as at the deadline. The handler only marks
+    // the rejection handled until the stub awaits it.
+    const deadline = Promise.reject(new RequestTimeoutError());
+    deadline.catch(() => undefined);
+    stubs.pay = deadline;
+    const user = renderPage();
+
+    const dialog = await review(user);
+    await findBalanceCard();
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(
+        "No answer from the server within 30 seconds",
+        {
+          description:
+            "The payment may have been made. Check the account balance before paying again.",
+          duration: Infinity,
+        },
+      );
+    });
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(await bodiesOf(requestsOf("POST"))).toEqual([REVIEW_BODY, PAY_BODY]);
+    await waitFor(() => {
+      expect(requestsOf("GET").map(pathnameOf)).toEqual([ACCOUNT_PATH, ACCOUNT_PATH]);
+    });
+    expect(accountInput().value).toBe(ACCOUNT_ID);
+    expect(toast.success).not.toHaveBeenCalled();
+  });
 
   // The entry typed while the review or the confirmed payment is still running.
   const NEWER_ACCOUNT = "00000000002";

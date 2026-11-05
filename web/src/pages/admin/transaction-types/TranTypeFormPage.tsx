@@ -57,6 +57,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   applyApiError,
+  noUsableAnswer,
   showApiError,
   showMessage,
   showSuccess,
@@ -84,6 +85,15 @@ function editRoute(typeCode: string): string {
 /** `TRTYPCDI` `X(2)` and `TRTYDSCI` `X(50)` of COTRTUP. */
 const TYPE_CODE_LENGTH = 2;
 const DESCRIPTION_LENGTH = 50;
+
+// The notes under the error of a write that got no usable answer: the server
+// may have carried it out, so the user checks before sending it again.
+const ADD_OUTCOME_UNKNOWN =
+  "The type may have been added. Look it up before adding it again.";
+const UPDATE_OUTCOME_UNKNOWN =
+  "The description may have been saved. Check the type before saving it again.";
+const DELETE_OUTCOME_UNKNOWN =
+  "The type may have been deleted. Check the list before deleting it again.";
 
 const EMPTY_VALUES: TranTypeFormValues = { type_code: "", description: "" };
 
@@ -292,9 +302,27 @@ function TranTypeAddForm(): JSX.Element {
     setPhase("add");
   }
 
+  // One request at a time, a Look up or the Add: a second click or Enter
+  // before the busy state re-renders would read the key again or post the
+  // type twice, the second answered 409 for the type the first one added.
+  // The ref closes that gap. The Look up keeps its own state, since the
+  // form's isSubmitting ends with whichever submit finishes first.
+  const inFlight = useRef(false);
+  const [lookingUp, setLookingUp] = useState(false);
+
   const onSubmit = form.handleSubmit(async (values) => {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
     if (phase === "entry") {
-      await lookUp(values.type_code);
+      setLookingUp(true);
+      try {
+        await lookUp(values.type_code);
+      } finally {
+        inFlight.current = false;
+        setLookingUp(false);
+      }
       return;
     }
     createMutation.mutate(
@@ -305,11 +333,24 @@ function TranTypeAddForm(): JSX.Element {
           toKeyEntry();
         },
         onError: (error) => {
-          applyApiError(error, form, tranTypeUpsertBmsFieldMap);
+          applyApiError(error, form, tranTypeUpsertBmsFieldMap, {
+            unknownOutcome: ADD_OUTCOME_UNKNOWN,
+          });
+        },
+        // Runs after either outcome; a page that has left has no guard to
+        // release.
+        onSettled: () => {
+          inFlight.current = false;
         },
       },
     );
   });
+
+  // aria-disabled rather than disabled: a focused button that becomes
+  // disabled loses focus to the document, which would strand a keyboard user
+  // after Look up or Add; the guards keep the inert buttons from acting.
+  const busy = lookingUp || createMutation.isPending;
+  const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
 
   const adding = phase === "add";
   return (
@@ -319,6 +360,7 @@ function TranTypeAddForm(): JSX.Element {
         <form
           className="flex flex-col gap-6"
           aria-labelledby={titleId}
+          aria-busy={busy}
           noValidate
           onSubmit={onSubmit}
         >
@@ -348,20 +390,30 @@ function TranTypeAddForm(): JSX.Element {
           <CardFooter className="flex flex-wrap gap-2">
             {adding ? (
               <>
-                <Button type="submit" disabled={createMutation.isPending}>
+                <Button
+                  type="submit"
+                  aria-disabled={busy}
+                  className={busyClass}
+                >
                   Add
                 </Button>
                 <Button
                   type="button"
                   variant="outline"
-                  disabled={createMutation.isPending}
-                  onClick={toKeyEntry}
+                  aria-disabled={busy}
+                  className={busyClass}
+                  onClick={() => {
+                    if (busy) {
+                      return;
+                    }
+                    toKeyEntry();
+                  }}
                 >
                   Cancel
                 </Button>
               </>
             ) : (
-              <Button type="submit" disabled={form.formState.isSubmitting}>
+              <Button type="submit" aria-disabled={busy} className={busyClass}>
                 Look up
               </Button>
             )}
@@ -408,8 +460,13 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
   // page then leaves for the key entry. A read of the type that still fails
   // while the delete runs or after it succeeded finds the type gone: that
   // answer is the delete's outcome, not an error of this page, so it is not
-  // shown. Each other failure of the read is shown once.
+  // shown. A delete that got no usable answer may have been applied as well,
+  // and the read it repeats then answers 404: that is the delete's outcome
+  // too, which the delete's own toast already says may have happened, so it
+  // is taken as shown. Each other failure of the read is shown once.
   const deleting = deleteMutation.isPending || deleteMutation.isSuccess;
+  const deleteOutcomeUnknown =
+    deleteMutation.isError && noUsableAnswer(deleteMutation.error);
   const shownError = useRef<unknown>(null);
   useEffect(() => {
     if (
@@ -420,14 +477,24 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
       return;
     }
     shownError.current = query.error;
-    showApiError(query.error);
-  }, [deleting, query.error]);
+    const typeGone =
+      query.error instanceof ApiError && query.error.status === 404;
+    if (!(deleteOutcomeUnknown && typeGone)) {
+      showApiError(query.error);
+    }
+  }, [deleting, deleteOutcomeUnknown, query.error]);
+
+  // One write at a time: a second click or Enter before the busy state
+  // re-renders would send the PUT again, and Enter in the description would
+  // send one while a confirmed delete runs. The ref closes the first gap.
+  const inFlight = useRef(false);
 
   const onSubmit = form.handleSubmit((values) => {
-    if (record === undefined) {
+    if (record === undefined || deleting || inFlight.current) {
       return;
     }
     const fetched = record;
+    inFlight.current = true;
     updateMutation.mutate(
       { typeCode: fetched.type_code, body: toTranTypeUpdateRequest(values) },
       {
@@ -449,7 +516,14 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
           }
         },
         onError: (error) => {
-          applyApiError(error, form, tranTypeUpsertBmsFieldMap);
+          applyApiError(error, form, tranTypeUpsertBmsFieldMap, {
+            unknownOutcome: UPDATE_OUTCOME_UNKNOWN,
+          });
+        },
+        // Runs after either outcome; a page that has left has no guard to
+        // release.
+        onSettled: () => {
+          inFlight.current = false;
         },
       },
     );
@@ -467,13 +541,20 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
           navigate(KEY_ENTRY_ROUTE);
         },
         onError: (error) => {
-          applyApiError(error, form, tranTypeUpsertBmsFieldMap);
+          applyApiError(error, form, tranTypeUpsertBmsFieldMap, {
+            unknownOutcome: DELETE_OUTCOME_UNKNOWN,
+          });
         },
       },
     );
   }
 
+  // aria-disabled rather than disabled: a focused button that becomes
+  // disabled loses focus to the document, which would strand a keyboard user
+  // after Save or a confirmed Delete; the guards keep the inert buttons from
+  // acting.
   const busy = updateMutation.isPending || deleting;
+  const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
   // BLITZY [A11Y]: the destructive Button keeps its built-in focus ring,
   // ring-destructive/20, a pale halo below the WCAG AA 3:1 non-text minimum
   // against the red button. Kept as the shadcn token set defines it; flagged
@@ -485,7 +566,7 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
         <form
           className="flex flex-col gap-6"
           aria-labelledby={titleId}
-          aria-busy={query.isPending}
+          aria-busy={busy || query.isPending}
           noValidate
           onSubmit={onSubmit}
         >
@@ -514,14 +595,24 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
           <CardFooter className="flex flex-wrap gap-2">
             {record === undefined ? null : (
               <>
-                <Button type="submit" disabled={busy}>
+                <Button
+                  type="submit"
+                  aria-disabled={busy}
+                  className={busyClass}
+                >
                   Save
                 </Button>
                 <Button
                   type="button"
                   variant="destructive"
-                  disabled={busy}
-                  onClick={() => setConfirmingDelete(true)}
+                  aria-disabled={busy}
+                  className={busyClass}
+                  onClick={() => {
+                    if (busy) {
+                      return;
+                    }
+                    setConfirmingDelete(true);
+                  }}
                 >
                   Delete
                 </Button>
@@ -530,8 +621,14 @@ function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
             <Button
               type="button"
               variant="outline"
-              disabled={busy}
-              onClick={() => navigate(KEY_ENTRY_ROUTE)}
+              aria-disabled={busy}
+              className={busyClass}
+              onClick={() => {
+                if (busy) {
+                  return;
+                }
+                navigate(KEY_ENTRY_ROUTE);
+              }}
             >
               Cancel
             </Button>

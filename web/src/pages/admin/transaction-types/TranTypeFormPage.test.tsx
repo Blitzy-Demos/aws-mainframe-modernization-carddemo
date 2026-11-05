@@ -11,13 +11,25 @@
 //   DELETE with `origin=form` (F-COTRTUP-007); "Cancel" leaves for the key
 //   entry (F-COTRTUP-014).
 // - "Back" links to the list on both routes (F-COTRTUP-005).
+// - One press sends one request, a double click included; while it runs the
+//   form is busy and every button inert, the pressed one keeping the focus.
 //
 // Input the schema refuses is never sent, and a refused write's `fields` mark
-// their form fields, toast the message and focus the first field. The network
+// their form fields, toast the message and focus the first field. A write
+// without an answer before the client's deadline is sent once, toasted with
+// the deadline text and a note that it may have been carried out, and the
+// type is read again. The network
 // is a stubbed global answering as the API does over a one-type master (row 1
 // of app/data/ASCII/trantype.txt). Every success and failure text is the
 // stub's own, and the schema's texts come from the schema module.
-import { render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent, {
   PointerEventsCheckLevel,
 } from "@testing-library/user-event";
@@ -26,6 +38,8 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { RequestTimeoutError } from "@/api/client";
+import { tranTypeKeys } from "@/api/queries/transaction-types";
 import type { components } from "@/api/schema";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
@@ -70,6 +84,9 @@ const STUB_DELETED = "Stub: type deleted";
 const STUB_REJECTED = "Stub: write rejected";
 const STUB_FIELD_REJECTED = "Stub: field rejected";
 
+/** The client's text for a request past its deadline (api/client.ts). */
+const DEADLINE_TEXT = "No answer from the server within 30 seconds";
+
 /** One request the page sent, as the stub received it. */
 type SentRequest = {
   method: string;
@@ -83,6 +100,15 @@ let stored: TranTypeResponse[];
 let sent: SentRequest[];
 /** When set, every POST, PUT and DELETE is answered with this failure. */
 let writeFailure: { status: number; body: ErrorBody } | undefined;
+/** When set, every request is answered only once this promise settles. */
+let gate: Promise<void> | undefined;
+/**
+ * When set, every POST, PUT and DELETE gets no answer before the client's
+ * deadline: "unapplied" leaves the master as it was, as while the server
+ * still waits on a lock; "applied" stores the write first, as when only its
+ * answer is lost.
+ */
+let unanswered: "unapplied" | "applied" | undefined;
 
 function answer(body: unknown, status: number): Response {
   return Response.json(body, { status });
@@ -111,6 +137,9 @@ async function serve(request: Request): Promise<Response> {
   const hasBody = method === "POST" || method === "PUT";
   const body: unknown = hasBody ? await request.clone().json() : undefined;
   sent.push(hasBody ? { method, url, body } : { method, url });
+  if (gate !== undefined) {
+    await gate;
+  }
 
   if (method === "GET" && url.pathname === LIST_PATH) {
     const code = url.searchParams.get("type_code");
@@ -125,6 +154,9 @@ async function serve(request: Request): Promise<Response> {
   }
   if (writeFailure !== undefined) {
     return answer(writeFailure.body, writeFailure.status);
+  }
+  if (unanswered === "unapplied") {
+    throw new RequestTimeoutError();
   }
   if (method === "POST" && url.pathname === LIST_PATH) {
     const created: TranTypeCreateRequest = await request.clone().json();
@@ -176,7 +208,13 @@ async function serve(request: Request): Promise<Response> {
   );
 }
 
-const fetchMock = vi.fn(async (input: Request) => serve(input));
+const fetchMock = vi.fn(async (input: Request) => {
+  const response = await serve(input);
+  if (unanswered === "applied" && input.method !== "GET") {
+    throw new RequestTimeoutError();
+  }
+  return response;
+});
 
 /** The POST, PUT and DELETE requests sent so far. */
 function writes(): SentRequest[] {
@@ -195,10 +233,21 @@ function rejectWritesOn(field: TranTypeUpsertField): void {
   };
 }
 
+/** Holds every request sent from now on until the returned release runs. */
+function holdRequests(): () => void {
+  let release = (): void => undefined;
+  gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return release;
+}
+
 beforeEach(() => {
   stored = [{ ...PURCHASE }];
   sent = [];
   writeFailure = undefined;
+  gate = undefined;
+  unanswered = undefined;
   fetchMock.mockClear();
   vi.stubGlobal("fetch", fetchMock);
   vi.spyOn(toast, "success");
@@ -251,7 +300,7 @@ function renderAt(path: string) {
   const user = userEvent.setup({
     pointerEventsCheck: PointerEventsCheckLevel.Never,
   });
-  return { router, user };
+  return { router, user, queryClient };
 }
 
 function inputLabelled(label: string): HTMLInputElement {
@@ -282,6 +331,21 @@ async function lookUpNewCode(user: User, entry: string): Promise<void> {
   await screen.findByRole("button", { name: "Add" });
 }
 
+/**
+ * Waits until no read is running, then lets the task pass on which TanStack
+ * Query hands the last answer to the page, so its effects have seen it.
+ */
+async function readsSettled(queryClient: QueryClient): Promise<void> {
+  await waitFor(() => {
+    expect(queryClient.isFetching()).toBe(0);
+  });
+  await act(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
 /** Waits until the edit route shows the type on file for update. */
 async function waitForPrefill(description: string): Promise<void> {
   await waitFor(() => {
@@ -289,6 +353,35 @@ async function waitForPrefill(description: string): Promise<void> {
     expect(input.value).toBe(description);
     expect(input.disabled).toBe(false);
   });
+}
+
+function buttonNamed(name: string): HTMLElement {
+  return screen.getByRole("button", { name });
+}
+
+function maintenanceForm(): HTMLElement {
+  return screen.getByRole("form", { name: "Transaction type" });
+}
+
+/**
+ * The form while its request runs: busy, `submit` and every button in
+ * `siblings` inert but not disabled, so `submit` keeps the focus.
+ */
+function expectBusy(submit: string, siblings: readonly string[]): void {
+  expect(maintenanceForm().getAttribute("aria-busy")).toBe("true");
+  for (const name of [submit, ...siblings]) {
+    expect(buttonNamed(name).getAttribute("aria-disabled")).toBe("true");
+    expect(buttonNamed(name).hasAttribute("disabled")).toBe(false);
+  }
+  expect(document.activeElement).toBe(buttonNamed(submit));
+}
+
+/** Every button in `names` live again, and the form no longer busy. */
+function expectIdle(names: readonly string[]): void {
+  expect(maintenanceForm().getAttribute("aria-busy")).toBe("false");
+  for (const name of names) {
+    expect(buttonNamed(name).getAttribute("aria-disabled")).toBe("false");
+  }
 }
 
 describe("key entry and add (/admin/transaction-types/new)", () => {
@@ -513,6 +606,44 @@ describe("update and delete (/admin/transaction-types/:code/edit)", () => {
     expect(writes().map((request) => request.method)).toEqual(["PUT"]);
   });
 
+  // The server may still store the description after the client gave up, so
+  // the toast says so, the PUT is not sent again, and the type is read again.
+  // The master still holds the old row, so the form keeps what was typed.
+  it("toasts a PUT past the deadline as possibly saved, sends it once and reads the type again", async () => {
+    unanswered = "unapplied";
+    const { user, queryClient } = renderAt(EDIT_ROUTE_01);
+    await waitForPrefill(PURCHASE.description);
+    const description = inputLabelled("Description");
+    await user.clear(description);
+    await user.type(description, CHANGED_DESCRIPTION);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(DEADLINE_TEXT, {
+        description:
+          "The description may have been saved. Check the type before saving it again.",
+        duration: Infinity,
+      });
+    });
+    await waitFor(() => {
+      expect(sent.map((request) => request.method)).toEqual([
+        "GET",
+        "PUT",
+        "GET",
+      ]);
+    });
+    await readsSettled(queryClient);
+    const reread = sent[2];
+    expect(reread.url.pathname).toBe(LIST_PATH);
+    expect(reread.url.searchParams.get("type_code")).toBe(PURCHASE.type_code);
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(inputLabelled("Description").value).toBe(CHANGED_DESCRIPTION);
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled,
+    ).toBe(false);
+  });
+
   // F4 is carried as the COTRTUPC delete (E-23, F-COTRTUP-006, -007, -012):
   // the Delete button only asks for confirmation, the dialog's Cancel sends
   // nothing, and its Confirm sends the one DELETE with origin=form. This
@@ -559,6 +690,47 @@ describe("update and delete (/admin/transaction-types/:code/edit)", () => {
     );
   });
 
+  // The delete is stored but its answer lost: the toast says the type may
+  // have been deleted, and the type read again answers 404, the delete's own
+  // outcome, which is not toasted as an error of the page.
+  it("toasts a DELETE whose answer is lost as possibly done and shows nothing for the 404 read after it", async () => {
+    unanswered = "applied";
+    const { router, user, queryClient } = renderAt(EDIT_ROUTE_01);
+    await waitForPrefill(PURCHASE.description);
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+    const confirming = await screen.findByRole("alertdialog", {
+      name: "Delete transaction type",
+    });
+    await user.click(
+      within(confirming).getByRole("button", { name: "Confirm" }),
+    );
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(DEADLINE_TEXT, {
+        description:
+          "The type may have been deleted. Check the list before deleting it again.",
+        duration: Infinity,
+      });
+    });
+    await waitFor(() => {
+      expect(sent.map((request) => request.method)).toEqual([
+        "GET",
+        "DELETE",
+        "GET",
+      ]);
+    });
+    await readsSettled(queryClient);
+    expect(
+      queryClient.getQueryState(
+        tranTypeKeys.list({ type_code: PURCHASE.type_code }),
+      )?.status,
+    ).toBe("error");
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(writes()).toHaveLength(1);
+    expect(router.state.location.pathname).toBe(EDIT_ROUTE_01);
+  });
+
   it("Cancel leaves for the empty key entry without a request (F12)", async () => {
     const { router, user } = renderAt(EDIT_ROUTE_01);
     await waitForPrefill(PURCHASE.description);
@@ -603,3 +775,190 @@ it.each([KEY_ENTRY_ROUTE, EDIT_ROUTE_01])(
     expect(writes()).toEqual([]);
   },
 );
+
+describe("one request at a time, the submit keeping the focus", () => {
+  // Two clicks before the page re-renders send one request: the second Add
+  // of the same code would otherwise be answered 409 for the type the first
+  // one added.
+  it.each([
+    {
+      control: "Look up",
+      path: KEY_ENTRY_ROUTE,
+      prepare: async (user: User) => {
+        await user.type(inputLabelled("Type code"), NEW_CODE);
+      },
+      settled: async () => {
+        await screen.findByRole("button", { name: "Add" });
+      },
+      requests: () => sent.filter((request) => request.method === "GET"),
+      success: undefined,
+    },
+    {
+      control: "Add",
+      path: KEY_ENTRY_ROUTE,
+      prepare: async (user: User) => {
+        await lookUpNewCode(user, NEW_CODE);
+        await user.type(inputLabelled("Description"), NEW_DESCRIPTION);
+      },
+      settled: async () => {
+        await screen.findByRole("button", { name: "Look up" });
+      },
+      requests: writes,
+      success: STUB_ADDED,
+    },
+    {
+      control: "Save",
+      path: EDIT_ROUTE_01,
+      prepare: async (user: User) => {
+        await waitForPrefill(PURCHASE.description);
+        await user.clear(inputLabelled("Description"));
+        await user.type(inputLabelled("Description"), CHANGED_DESCRIPTION);
+      },
+      settled: async () => {
+        await waitFor(() => {
+          expect(buttonNamed("Save").getAttribute("aria-disabled")).toBe(
+            "false",
+          );
+        });
+      },
+      requests: writes,
+      success: STUB_UPDATED,
+    },
+  ])(
+    "sends one request for a double click on $control",
+    async ({ control, path, prepare, settled, requests, success }) => {
+      const { user } = renderAt(path);
+      await prepare(user);
+      const before = requests().length;
+
+      fireEvent.click(buttonNamed(control));
+      fireEvent.click(buttonNamed(control));
+
+      await settled();
+      if (success !== undefined) {
+        await waitFor(() => {
+          expect(toast.success).toHaveBeenCalledWith(success);
+        });
+        expect(toast.success).toHaveBeenCalledTimes(1);
+      }
+      expect(requests()).toHaveLength(before + 1);
+      expect(toast.error).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps Look up focused and inert while the key is read", async () => {
+    const { user } = renderAt(KEY_ENTRY_ROUTE);
+    await user.type(inputLabelled("Type code"), NEW_CODE);
+    const release = holdRequests();
+
+    await user.click(buttonNamed("Look up"));
+    await waitFor(() => {
+      expect(buttonNamed("Look up").getAttribute("aria-disabled")).toBe("true");
+    });
+    expectBusy("Look up", []);
+    await user.keyboard("{Enter}");
+    await user.click(buttonNamed("Look up"));
+    expect(sent).toHaveLength(1);
+
+    release();
+    await screen.findByRole("button", { name: "Add" });
+    expectIdle(["Add", "Cancel"]);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("keeps Add focused and Cancel inert while the add runs", async () => {
+    const { user } = renderAt(KEY_ENTRY_ROUTE);
+    await lookUpNewCode(user, NEW_CODE);
+    await user.type(inputLabelled("Description"), NEW_DESCRIPTION);
+    const release = holdRequests();
+
+    await user.click(buttonNamed("Add"));
+    await waitFor(() => {
+      expect(buttonNamed("Add").getAttribute("aria-disabled")).toBe("true");
+    });
+    expectBusy("Add", ["Cancel"]);
+    // Cancel leaves the add as it is, and a second Add sends nothing.
+    await user.click(buttonNamed("Cancel"));
+    await user.click(buttonNamed("Add"));
+    expect(inputLabelled("Description").value).toBe(NEW_DESCRIPTION);
+    expect(inputLabelled("Type code").value).toBe(NEW_CODE);
+    expect(writes()).toHaveLength(1);
+
+    release();
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith(STUB_ADDED);
+    });
+    await screen.findByRole("button", { name: "Look up" });
+    expectIdle(["Look up"]);
+    expect(writes()).toHaveLength(1);
+  });
+
+  it("keeps Save focused, and Delete and Cancel inert, while the update runs and after it", async () => {
+    const { router, user } = renderAt(EDIT_ROUTE_01);
+    await waitForPrefill(PURCHASE.description);
+    const description = inputLabelled("Description");
+    await user.clear(description);
+    await user.type(description, CHANGED_DESCRIPTION);
+    const release = holdRequests();
+
+    await user.click(buttonNamed("Save"));
+    await waitFor(() => {
+      expect(buttonNamed("Save").getAttribute("aria-disabled")).toBe("true");
+    });
+    expectBusy("Save", ["Delete", "Cancel"]);
+    // Delete asks nothing, Cancel stays, and Save again sends nothing.
+    await user.click(buttonNamed("Delete"));
+    await user.click(buttonNamed("Cancel"));
+    await user.click(buttonNamed("Save"));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(router.state.location.pathname).toBe(EDIT_ROUTE_01);
+    expect(writes()).toHaveLength(1);
+
+    release();
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith(STUB_UPDATED);
+    });
+    await waitFor(() => {
+      expectIdle(["Save", "Delete", "Cancel"]);
+    });
+    expect(document.activeElement).toBe(buttonNamed("Save"));
+    expect(writes().map((request) => request.method)).toEqual(["PUT"]);
+  });
+
+  // Enter in a field submits through an aria-disabled Save, so the update
+  // itself refuses to run beside a confirmed delete.
+  it("sends no PUT for Enter in the description while a confirmed delete runs", async () => {
+    const { router, user } = renderAt(EDIT_ROUTE_01);
+    await waitForPrefill(PURCHASE.description);
+    const release = holdRequests();
+
+    await user.click(buttonNamed("Delete"));
+    const confirming = await screen.findByRole("alertdialog", {
+      name: "Delete transaction type",
+    });
+    await user.click(
+      within(confirming).getByRole("button", { name: "Confirm" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    await waitFor(() => {
+      expect(buttonNamed("Delete").getAttribute("aria-disabled")).toBe("true");
+    });
+    expect(maintenanceForm().getAttribute("aria-busy")).toBe("true");
+    expect(document.activeElement).toBe(buttonNamed("Delete"));
+    for (const name of ["Save", "Cancel"]) {
+      expect(buttonNamed(name).getAttribute("aria-disabled")).toBe("true");
+    }
+
+    await user.type(inputLabelled("Description"), " more{Enter}");
+    expect(writes().map((request) => request.method)).toEqual(["DELETE"]);
+
+    release();
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe(KEY_ENTRY_ROUTE);
+    });
+    expect(toast.success).toHaveBeenCalledWith(STUB_DELETED);
+    expect(writes().map((request) => request.method)).toEqual(["DELETE"]);
+  });
+});

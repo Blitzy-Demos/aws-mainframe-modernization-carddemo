@@ -6,10 +6,11 @@
 //! `ADMIN001`, so it crosses the extractors, the bearer token, the status
 //! mapping and the `{code, message, fields}` body the SPA receives.
 //!
-//! - The seeded first page, before any write: the ten `DUSRSECJ` users in
+//! - The seeded first page, before any write: the `DUSRSECJ` users in
 //!   `SEC-USR-ID` order with their names and types, right-trimmed, compared
-//!   with the `SYSUT1` rows read from the JCL itself and with the
-//!   `cu00_user_list__first_page` snapshot.
+//!   with the users the reviewed parity count row decodes with the reviewed
+//!   `CSUSR01Y` layout, one screen of the reviewed `COUSR00C` page size, and
+//!   with the `cu00_user_list__first_page` snapshot.
 //! - The page-boundary texts `COUSR00C` shows without its error flag, each in
 //!   `message` of a 200 page (E-54): PF8 without a next page, PF7 on the
 //!   first page, the end and the start of the file, and a start key with no
@@ -17,7 +18,8 @@
 //! - Paging over fifteen users, five of them added through
 //!   `POST /admin/users`: forward pages followed by `next_key` concatenate to
 //!   every user once, in order, and backward pages from `prev_key` give back
-//!   the previous page, at the default 10 rows and at 5.
+//!   the previous page, at the default screen size the reviewed `COUSR00C`
+//!   row records and at 5.
 //! - The `USRIDIN` answers: a start key the REST query can carry but a 3270
 //!   field cannot (E-49), and the browse failures of `STARTBR`, `READNEXT`
 //!   and `READPREV`, injected through SQL.
@@ -39,8 +41,6 @@
 pub mod common;
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::ops::Range;
 
 use carddemo_api::dto::admin_users::UserListField;
 use carddemo_audit::{
@@ -52,7 +52,7 @@ use carddemo_testkit::fixtures;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-use common::{Resp, TestApp};
+use common::{Resp, SeededUser, TestApp};
 
 /// The program whose audit rows this file proves.
 const PROGRAM: &str = "COUSR00C";
@@ -64,35 +64,14 @@ const ADMIN_USERS: &str = "/admin/users";
 /// `USRIDINL`, so the cursor stays on the search field.
 const USRIDIN: &str = UserListField::UsrIdIn.as_str();
 
-/// The rows of one `COUSR0A` screen, `USER-REC OCCURS 10 TIMES`
-/// [app/cbl/COUSR00C.cbl:L56-64]: the default `page_size`.
-const SCREEN_ROWS: usize = 10;
+/// The parity row of `PROCESS-PAGE-FORWARD`, whose `page_size=` is the rows
+/// of one `COUSR0A` screen: the default `page_size`.
+const SCREEN_ROW: &str = "P-COUSR00C-003";
 
-/// The users `DUSRSECJ` loads: its ten `SYSUT1` rows
-/// [app/jcl/DUSRSECJ.jcl:L35-44].
-const SEEDED_USERS: usize = 10;
-
-/// The JCL statement that opens the `DUSRSECJ` in-stream user rows.
-const SYSUT1_DD: &str = "//SYSUT1";
-
-/// The delimiter that ends an in-stream data set.
-const INSTREAM_END: &str = "/*";
-
-/// `SEC-USR-ID PIC X(08)` within a `SEC-USER-DATA` record
-/// [app/cpy/CSUSR01Y.cpy:L18].
-const SEC_USR_ID: Range<usize> = 0..8;
-
-/// `SEC-USR-FNAME PIC X(20)` [app/cpy/CSUSR01Y.cpy:L19].
-const SEC_USR_FNAME: Range<usize> = 8..28;
-
-/// `SEC-USR-LNAME PIC X(20)` [app/cpy/CSUSR01Y.cpy:L20].
-const SEC_USR_LNAME: Range<usize> = 28..48;
-
-/// `SEC-USR-PWD PIC X(08)` [app/cpy/CSUSR01Y.cpy:L21].
-const SEC_USR_PWD: Range<usize> = 48..56;
-
-/// `SEC-USR-TYPE PIC X(01)` [app/cpy/CSUSR01Y.cpy:L22].
-const SEC_USR_TYPE: Range<usize> = 56..57;
+/// The count row of the `DUSRSECJ` `SYSUT1` users the seed loads
+/// [app/jcl/DUSRSECJ.jcl:L35-44], whose cited records, decoded with the
+/// reviewed `CSUSR01Y` layout, give the seeded users every page expects.
+const SEEDED_USERS_ROW: &str = "P-CSUSR01Y-007";
 
 /// The users added through `POST /admin/users`, as (user ID, first name,
 /// last name, type): two sort between the seeded administrators and regular
@@ -325,72 +304,14 @@ fn assert_published(spec: &Value, key: &AidKey, endpoint: &Endpoint) {
     }
 }
 
-/// One `SYSUT1` row of `DUSRSECJ`: a `SEC-USER-DATA` record, each field
-/// right-trimmed.
-struct SeedUser {
-    user_id: String,
-    first_name: String,
-    last_name: String,
-    password: String,
-    usr_type: String,
-}
-
-impl SeedUser {
-    /// The record of the in-stream line `line`, field by field.
-    fn parse(line: &str) -> Self {
-        Self {
-            user_id: field(line, SEC_USR_ID),
-            first_name: field(line, SEC_USR_FNAME),
-            last_name: field(line, SEC_USR_LNAME),
-            password: field(line, SEC_USR_PWD),
-            usr_type: field(line, SEC_USR_TYPE),
-        }
-    }
-
-    /// The list row `COUSR00C` `POPULATE-USER-DATA` fills for this user.
-    fn item(&self) -> Value {
-        item(
-            &self.user_id,
-            &self.first_name,
-            &self.last_name,
-            &self.usr_type,
-        )
-    }
-}
-
-/// The text of `range` in the record `line`, right-trimmed; the part of the
-/// range past the end of a short line is spaces.
-fn field(line: &str, range: Range<usize>) -> String {
-    let end = range.end.min(line.len());
-    line.get(range.start..end)
-        .unwrap_or_default()
-        .trim_end()
-        .to_owned()
-}
-
-/// The `DUSRSECJ` users, in file order, read from the JCL the seed reads.
-///
-/// # Panics
-///
-/// Panics if the JCL cannot be read or does not hold the ten user rows.
-fn seeded_users() -> Vec<SeedUser> {
-    let path = fixtures::dusrsecj_jcl();
-    let jcl = fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("{} cannot be read: {error}", path.display()));
-    let users: Vec<SeedUser> = jcl
-        .lines()
-        .skip_while(|line| !line.starts_with(SYSUT1_DD))
-        .skip(1)
-        .take_while(|line| !line.starts_with(INSTREAM_END))
-        .map(SeedUser::parse)
-        .collect();
-    assert_eq!(
-        users.len(),
-        SEEDED_USERS,
-        "{} holds {SEEDED_USERS} SYSUT1 user rows",
-        path.display()
-    );
-    users
+/// The list row `COUSR00C` `POPULATE-USER-DATA` fills for the seeded `user`.
+fn seeded_item(user: &SeededUser) -> Value {
+    item(
+        &user.user_id,
+        &user.first_name,
+        &user.last_name,
+        &user.usr_type,
+    )
 }
 
 /// One `UserSummary` as the list returns it.
@@ -620,6 +541,28 @@ impl<'a> Cu00<'a> {
             assert_reviewed(&self.parity, id);
         }
     }
+
+    /// The rows of one `COUSR0A` screen, the default `page_size`: the
+    /// `page_size=` of [`SCREEN_ROW`], once it is a reviewed `COUSR00C` row.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the row, if it has not passed review or records no
+    /// `page_size=` row count.
+    fn screen_rows(&self) -> usize {
+        assert_reviewed(&self.parity, SCREEN_ROW);
+        let (table, row) = self
+            .parity
+            .find_row(SCREEN_ROW)
+            .unwrap_or_else(|| panic!("the audit defines no {SCREEN_ROW} row"));
+        let rows = key_values(cell(table, row, SCREEN_ROW, "Expected result"))
+            .into_iter()
+            .find(|pair| pair.key == "page_size")
+            .unwrap_or_else(|| panic!("{SCREEN_ROW} gives no page_size= result"))
+            .value;
+        rows.parse()
+            .unwrap_or_else(|_| panic!("{SCREEN_ROW} records no row count: {rows:?}"))
+    }
 }
 
 /// The `message` of a rejection whose path sets no message (E-49).
@@ -651,15 +594,15 @@ fn first_id(rows: &[Value]) -> &str {
 
 /// The seeded list before any write, then fifteen users, five of them added
 /// through `POST /admin/users`, paged forward and backward at the default
-/// 10 rows and at 5. One container serves the whole sequence, because each
-/// step builds on the users the one before left.
+/// screen size and at 5. One container serves the whole sequence, because
+/// each step builds on the users the one before left.
 #[test]
 fn cu00_pages_the_user_file_in_key_order() {
     let app = TestApp::start();
     carddemo_testkit::block_on(async {
         let cu00 = Cu00::new(&app).await;
-        let seeded = seeded_users();
-        let seeded_items = in_key_order(seeded.iter().map(SeedUser::item).collect());
+        let seeded = common::seeded_users(&cu00.parity, SEEDED_USERS_ROW);
+        let seeded_items = in_key_order(seeded.iter().map(seeded_item).collect());
         let first_page = seeded_first_page(&cu00, &seeded_items).await;
         seeded_boundaries(&cu00, &seeded_items, &first_page).await;
         no_row_selector(&cu00, &first_page).await;
@@ -709,7 +652,11 @@ async fn seeded_first_page(cu00: &Cu00<'_>, seeded: &[Value]) -> Value {
         "V-COUSR00C-005",
         messages::YOU_HAVE_REACHED_THE_BOTTOM_OF_THE_PAGE,
     );
-    assert_eq!(seeded.len(), SCREEN_ROWS, "the seed fills one screen");
+    assert_eq!(
+        seeded.len(),
+        cu00.screen_rows(),
+        "{SEEDED_USERS_ROW}: the seed fills one {SCREEN_ROW} screen"
+    );
     let expected = expected_page(seeded, None, Some(first_id(seeded)), Some(bottom));
     let page = cu00.expect_page("", &expected).await;
     insta::assert_yaml_snapshot!("first_page", page);
@@ -968,20 +915,20 @@ async fn return_to_prev_screen(cu00: &Cu00<'_>) {
 
 /// Adds [`ADDED_USERS`] through `POST /admin/users`, with the password the
 /// seed stores, and returns every user's list row in key order.
-async fn add_users(cu00: &Cu00<'_>, seeded: &[SeedUser]) -> Vec<Value> {
+async fn add_users(cu00: &Cu00<'_>, seeded: &[SeededUser]) -> Vec<Value> {
     let password = seeded.first().map_or_else(
         || panic!("the seed holds no user"),
         |user| user.password.as_str(),
     );
-    let mut users: Vec<Value> = seeded.iter().map(SeedUser::item).collect();
+    let mut users: Vec<Value> = seeded.iter().map(seeded_item).collect();
     for user in ADDED_USERS {
         users.push(cu00.add(user, password).await);
     }
     in_key_order(users)
 }
 
-/// Pages of `page_size` rows (the default 10 when `None`) over every user
-/// `users` holds, in key order — P-COUSR00C-003, P-COUSR00C-007,
+/// Pages of `page_size` rows (the default screen size when `None`) over
+/// every user `users` holds, in key order — P-COUSR00C-003, P-COUSR00C-007,
 /// P-COUSR00C-008, P-COUSR00C-009, P-COUSR00C-011; V-COUSR00C-005,
 /// V-COUSR00C-007, V-COUSR00C-008.
 ///
@@ -1015,7 +962,9 @@ async fn pages_both_ways(cu00: &Cu00<'_>, users: &[Value], page_size: Option<usi
     let size = page_size
         .map(|rows| format!("page_size={rows}"))
         .unwrap_or_default();
-    let pages: Vec<&[Value]> = users.chunks(page_size.unwrap_or(SCREEN_ROWS)).collect();
+    let pages: Vec<&[Value]> = users
+        .chunks(page_size.unwrap_or_else(|| cu00.screen_rows()))
+        .collect();
     assert!(
         pages.len() > 1,
         "{} users fill more than one page",
@@ -1068,9 +1017,10 @@ async fn start_key_positions(cu00: &Cu00<'_>, users: &[Value]) {
         "V-COUSR00C-005",
         messages::YOU_HAVE_REACHED_THE_BOTTOM_OF_THE_PAGE,
     );
+    let screen_rows = cu00.screen_rows();
     let following = at_or_after(users, "USER0001");
-    let shown = &following[..following.len().min(SCREEN_ROWS)];
-    let next_key = following.get(SCREEN_ROWS).map(id_of);
+    let shown = &following[..following.len().min(screen_rows)];
+    let next_key = following.get(screen_rows).map(id_of);
     let message = next_key.is_none().then_some(bottom);
     let expected = expected_page(shown, next_key, Some(first_id(shown)), message);
     assert_eq!(first_id(shown), "USER0001", "the page starts at USER0001");

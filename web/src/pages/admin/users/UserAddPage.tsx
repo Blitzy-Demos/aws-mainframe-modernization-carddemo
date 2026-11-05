@@ -19,7 +19,7 @@
 // come from the server and land on the field its `fields[]` names. Every value is sent
 // exactly as typed, case kept and never trimmed or padded: COUSR01C stores the user ID
 // and the password as entered (E-20).
-import { useEffect, type JSX } from "react";
+import { useEffect, useRef, type JSX } from "react";
 import { Link } from "react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm, type Control } from "react-hook-form";
@@ -139,7 +139,16 @@ export default function UserAddPage(): JSX.Element {
     form.setFocus(INITIAL_FIELD);
   }
 
+  // One add at a time: a second click or Enter before the busy state re-renders
+  // would send the same user again, and its 'User ID already exist...' would
+  // replace the success of the add that wrote it. The ref closes that gap.
+  const inFlight = useRef(false);
+
   function onSubmit(values: UserAddFormValues): void {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
     mutation.mutate(values, {
       // WRITE-USER-SEC-FILE NORMAL: 'User <id> has been added ...' in green on a
       // cleared screen.
@@ -150,13 +159,24 @@ export default function UserAddPage(): JSX.Element {
       onError: (error) => {
         applyApiError(error, form, userAddBmsFieldMap);
       },
+      // Runs after either outcome; a page that has left has no guard to
+      // release.
+      onSettled: () => {
+        inFlight.current = false;
+      },
     });
   }
+
+  // aria-disabled rather than disabled: a focused button that becomes
+  // disabled loses focus to the document, which would strand a keyboard user
+  // after Add user; the guards keep the inert buttons from acting.
+  const busy = mutation.isPending;
+  const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
 
   return (
     <div className="flex flex-col gap-6">
       <PageHeader />
-      <form noValidate onSubmit={form.handleSubmit(onSubmit)}>
+      <form noValidate aria-busy={busy} onSubmit={form.handleSubmit(onSubmit)}>
         <Card>
           <CardContent>
             {/* Two columns at lg pair the inputs as the map lays them out: names on
@@ -210,10 +230,21 @@ export default function UserAddPage(): JSX.Element {
             </FieldGroup>
           </CardContent>
           <CardFooter className="flex-wrap gap-2">
-            <Button type="submit" disabled={mutation.isPending}>
+            <Button type="submit" aria-disabled={busy} className={busyClass}>
               Add user
             </Button>
-            <Button type="button" variant="outline" onClick={clearForm}>
+            <Button
+              type="button"
+              variant="outline"
+              aria-disabled={busy}
+              className={busyClass}
+              onClick={() => {
+                if (busy) {
+                  return;
+                }
+                clearForm();
+              }}
+            >
               Reset
             </Button>
             <Button variant="ghost" asChild>

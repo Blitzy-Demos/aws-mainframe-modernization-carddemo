@@ -10,17 +10,21 @@
 // password" is checked, and a checked password is required. A checked password
 // goes out as typed, case kept (E-20).
 //
+// One save sends one PUT, a double click included, and while it runs the form
+// is busy and its four buttons inert, Save keeping the focus after it too.
+//
 // The network is the stubbed global the API client looks up on every request;
 // it answers GET from the DUSRSECJ seed row of USER0001 and PUT with each
 // test's answer.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
   createMemoryRouter,
   RouterProvider,
   type RouteObject,
 } from "react-router";
+import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { userKeys } from "@/api/queries/admin-users";
@@ -94,7 +98,7 @@ let stored: UserSummary;
 // The path the stub answers GET and PUT on: USER0001's unless a test opens
 // another user.
 let apiUserPath: string;
-let answerPut: (body: unknown) => Response;
+let answerPut: (body: unknown) => Response | Promise<Response>;
 let queryClient: QueryClient;
 
 function puts(): Sent[] {
@@ -163,6 +167,7 @@ beforeEach(() => {
 afterEach(() => {
   queryClient.clear();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 function renderAt(path: string) {
@@ -241,6 +246,22 @@ async function replaceText(
 ): Promise<void> {
   await user.clear(input);
   await user.paste(text);
+}
+
+function button(name: string): HTMLElement {
+  return screen.getByRole("button", { name });
+}
+
+// The buttons beside Save: PF3, PF4 and PF12.
+const SAVE_SIBLINGS = ["Save and exit", "Reset", "Cancel"] as const;
+
+// The form Save submits; it has no accessible name.
+function editForm(): HTMLFormElement {
+  const form = button("Save").closest("form");
+  if (form === null) {
+    throw new Error("Save is outside a form");
+  }
+  return form;
 }
 
 describe("UserEditPage (CU02, COUSR02C)", () => {
@@ -516,5 +537,94 @@ describe("UserEditPage (CU02, COUSR02C)", () => {
       usr_type: "U",
     } satisfies UserUpdateRequest);
     expect(textbox("First Name").getAttribute("aria-invalid")).toBe("false");
+  });
+
+  // Two clicks before the page re-renders: the second PUT of the same values
+  // would find them stored and answer V-COUSR02C-010, which, as the last
+  // write, would be shown instead of the update that succeeded.
+  it("sends one PUT for a double click on Save and shows only its success", async () => {
+    const { user } = renderAt(EDIT_PATH);
+    await loadedForm();
+    answerPut = () => {
+      answerPut = () =>
+        Response.json({
+          user: stored,
+          message: PLEASE_MODIFY,
+        } satisfies UserMessageResponse);
+      return updated({ ...USER0001, first_name: "LARRY" });
+    };
+    await replaceText(user, textbox("First Name"), "LARRY");
+    const toastSuccess = vi.spyOn(toast, "success");
+    const toastError = vi.spyOn(toast, "error");
+
+    fireEvent.click(button("Save"));
+    fireEvent.click(button("Save"));
+
+    await waitFor(() => {
+      expect(toastSuccess).toHaveBeenCalledWith(UPDATED);
+    });
+    await waitFor(() => {
+      expect(button("Save").getAttribute("aria-disabled")).toBe("false");
+    });
+    // The one PUT took the first answer, so the unchanged-save prompt the
+    // stub keeps for a second one was never sent back.
+    expect(puts()).toHaveLength(1);
+    expect(toastSuccess).toHaveBeenCalledTimes(1);
+    expect(toastError).not.toHaveBeenCalled();
+    expect(textbox("First Name").value).toBe("LARRY");
+  });
+
+  it("keeps Save focused, the form busy and every button inert while the save runs and after it", async () => {
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { user, router } = renderAt(EDIT_PATH);
+    await loadedForm();
+    // The PUT is answered only once the test releases it.
+    answerPut = async () => {
+      await held;
+      return updated({ ...USER0001, first_name: "LARRY" });
+    };
+    await replaceText(user, textbox("First Name"), "LARRY");
+
+    await user.click(button("Save"));
+    await waitFor(() => {
+      expect(button("Save").getAttribute("aria-disabled")).toBe("true");
+    });
+    // Inert but not disabled: a disabled button would hand focus to the body.
+    expect(button("Save").hasAttribute("disabled")).toBe(false);
+    expect(document.activeElement).toBe(button("Save"));
+    expect(editForm().getAttribute("aria-busy")).toBe("true");
+    for (const name of SAVE_SIBLINGS) {
+      expect(button(name).getAttribute("aria-disabled")).toBe("true");
+      expect(button(name).hasAttribute("disabled")).toBe(false);
+    }
+
+    // Enter on the focused Save, each other button and Save again do nothing:
+    // no second PUT, no exit to the list, no cleared field.
+    await user.keyboard("{Enter}");
+    for (const name of SAVE_SIBLINGS) {
+      await user.click(button(name));
+    }
+    await user.click(button("Save"));
+    expect(router.state.location.pathname).toBe(EDIT_PATH);
+    expect(textbox("First Name").value).toBe("LARRY");
+    expect(puts()).toHaveLength(1);
+
+    release();
+    expect((await toastShowing(UPDATED)).getAttribute("data-type")).toBe(
+      "success",
+    );
+    await waitFor(() => {
+      expect(button("Save").getAttribute("aria-disabled")).toBe("false");
+    });
+    for (const name of SAVE_SIBLINGS) {
+      expect(button(name).getAttribute("aria-disabled")).toBe("false");
+    }
+    expect(editForm().getAttribute("aria-busy")).toBe("false");
+    expect(document.activeElement).toBe(button("Save"));
+    expect(router.state.location.pathname).toBe(EDIT_PATH);
+    expect(puts()).toHaveLength(1);
   });
 });

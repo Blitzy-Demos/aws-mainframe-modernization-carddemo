@@ -28,7 +28,7 @@ import {
 import { Link, useParams } from "react-router";
 import { Controller, useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, LoaderCircle } from "lucide-react";
 
 import {
   useAccount,
@@ -47,7 +47,12 @@ import {
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { applyApiError, showApiError, showSuccess } from "@/lib/api-errors";
+import {
+  applyApiError,
+  showApiError,
+  showMessage,
+  showSuccess,
+} from "@/lib/api-errors";
 import {
   accountKeyError,
   accountUpdateBmsFieldMap,
@@ -137,6 +142,8 @@ type TextFieldProps = {
   numeric?: boolean;
   /** A field COACTUPC protects once the details are shown. */
   readOnly?: boolean;
+  /** Placement of the field in its section's grid. */
+  className?: string;
 };
 
 /**
@@ -150,6 +157,7 @@ function TextField({
   maxLength,
   numeric = false,
   readOnly = false,
+  className,
 }: TextFieldProps): JSX.Element {
   const id = `acup-${name}`;
   const errorId = `${id}-error`;
@@ -158,7 +166,7 @@ function TextField({
       control={control}
       name={name}
       render={({ field, fieldState }) => (
-        <Field data-invalid={fieldState.invalid}>
+        <Field data-invalid={fieldState.invalid} className={className}>
           <FieldLabel htmlFor={id}>{label}</FieldLabel>
           <Input
             {...field}
@@ -170,7 +178,7 @@ function TextField({
             aria-describedby={fieldState.invalid ? errorId : undefined}
             autoComplete="off"
             spellCheck={false}
-            className={readOnly ? "bg-muted" : undefined}
+            className={readOnly ? "bg-muted dark:bg-muted" : undefined}
           />
           <FieldError id={errorId} errors={[fieldState.error]} />
         </Field>
@@ -196,9 +204,7 @@ type PartsFieldProps = {
 function PartsField({ control, legend, parts }: PartsFieldProps): JSX.Element {
   return (
     <FieldSet className="gap-3">
-      <FieldLegend variant="label" className="mb-0">
-        {legend}
-      </FieldLegend>
+      <FieldLegend variant="label">{legend}</FieldLegend>
       <div className="grid grid-cols-3 gap-2">
         {parts.map((part) => (
           <TextField
@@ -255,7 +261,13 @@ const SSN_PARTS: readonly [Part, Part, Part] = [
   { name: "cust_ssn_3", label: "Last 4", maxLength: 4 },
 ];
 
-/** A titled group of the form, one column up to `lg` and two from there. */
+/**
+ * A titled group of the form, one column up to `lg` and two from there. The
+ * children fill the rows in order, so the reading order is the visual order
+ * at both widths. Each row pairs two fields of one shape, two single fields or
+ * two three-part values, so the inputs of a row line up; a lone field ends its
+ * row.
+ */
 function FormSection({
   legend,
   children,
@@ -360,7 +372,14 @@ function AccountEditForm({
       const response = await mutation.mutateAsync(
         toAccountUpdateRequest(values),
       );
-      showSuccess(response.message);
+      // Values equal to the fetched record write nothing and answer 'No
+      // change detected with respect to values fetched.' (V-COACTUPC-010), a
+      // prompt rather than a success; the record then keeps the token sent.
+      if (response.account.version === values.version) {
+        showMessage(response.message);
+      } else {
+        showSuccess(response.message);
+      }
       reset(toFormValues(response.account));
     } catch (error) {
       // Shown by the failure effect, or at once when the form has left.
@@ -397,11 +416,14 @@ function AccountEditForm({
   // aria-disabled rather than disabled: a focused button that becomes
   // disabled loses focus to the document, which would strand a keyboard user
   // after Save or Cancel; the guard above keeps the inert buttons from acting.
+  // While a request runs the form is aria-busy and the button that sent it
+  // shows a spinner, as on sign-on, so the wait is seen and announced.
   const busy = mutation.isPending || reading;
   const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
 
   return (
     <form
+      aria-busy={busy}
       noValidate
       onSubmit={form.handleSubmit(onSave)}
       className="flex flex-col gap-6"
@@ -421,21 +443,11 @@ function AccountEditForm({
           label="Active Y/N"
           maxLength={1}
         />
-        <PartsField
-          control={control}
-          legend="Opened"
-          parts={dateParts("acct_open_year", "acct_open_mon", "acct_open_day")}
-        />
         <TextField
           control={control}
           name="acct_credit_limit"
           label="Credit Limit"
           maxLength={15}
-        />
-        <PartsField
-          control={control}
-          legend="Expiry"
-          parts={dateParts("acct_exp_year", "acct_exp_mon", "acct_exp_day")}
         />
         <TextField
           control={control}
@@ -443,25 +455,10 @@ function AccountEditForm({
           label="Cash credit Limit"
           maxLength={15}
         />
-        <PartsField
-          control={control}
-          legend="Reissue"
-          parts={dateParts(
-            "acct_reissue_year",
-            "acct_reissue_mon",
-            "acct_reissue_day",
-          )}
-        />
         <TextField
           control={control}
           name="acct_curr_bal"
           label="Current Balance"
-          maxLength={15}
-        />
-        <TextField
-          control={control}
-          name="acct_curr_cyc_credit"
-          label="Current Cycle Credit"
           maxLength={15}
         />
         <TextField
@@ -472,9 +469,34 @@ function AccountEditForm({
         />
         <TextField
           control={control}
+          name="acct_curr_cyc_credit"
+          label="Current Cycle Credit"
+          maxLength={15}
+        />
+        <TextField
+          control={control}
           name="acct_curr_cyc_debit"
           label="Current Cycle Debit"
           maxLength={15}
+        />
+        <PartsField
+          control={control}
+          legend="Opened"
+          parts={dateParts("acct_open_year", "acct_open_mon", "acct_open_day")}
+        />
+        <PartsField
+          control={control}
+          legend="Expiry"
+          parts={dateParts("acct_exp_year", "acct_exp_mon", "acct_exp_day")}
+        />
+        <PartsField
+          control={control}
+          legend="Reissue"
+          parts={dateParts(
+            "acct_reissue_year",
+            "acct_reissue_mon",
+            "acct_reissue_day",
+          )}
         />
       </FormSection>
 
@@ -487,18 +509,18 @@ function AccountEditForm({
           numeric
           readOnly
         />
-        <PartsField control={control} legend="SSN" parts={SSN_PARTS} />
-        <PartsField
-          control={control}
-          legend="Date of birth"
-          parts={dateParts("cust_dob_year", "cust_dob_mon", "cust_dob_day")}
-        />
         <TextField
           control={control}
           name="cust_fico_credit_score"
           label="FICO Score"
           maxLength={3}
           numeric
+        />
+        <PartsField control={control} legend="SSN" parts={SSN_PARTS} />
+        <PartsField
+          control={control}
+          legend="Date of birth"
+          parts={dateParts("cust_dob_year", "cust_dob_mon", "cust_dob_day")}
         />
         <TextField
           control={control}
@@ -523,12 +545,7 @@ function AccountEditForm({
           name="cust_addr_line_1"
           label="Address line 1"
           maxLength={50}
-        />
-        <TextField
-          control={control}
-          name="cust_addr_state_cd"
-          label="State"
-          maxLength={2}
+          className="lg:col-start-1"
         />
         <TextField
           control={control}
@@ -538,16 +555,22 @@ function AccountEditForm({
         />
         <TextField
           control={control}
+          name="cust_addr_line_3"
+          label="City"
+          maxLength={50}
+        />
+        <TextField
+          control={control}
+          name="cust_addr_state_cd"
+          label="State"
+          maxLength={2}
+        />
+        <TextField
+          control={control}
           name="cust_addr_zip"
           label="Zip"
           maxLength={5}
           numeric
-        />
-        <TextField
-          control={control}
-          name="cust_addr_line_3"
-          label="City"
-          maxLength={50}
         />
         <TextField
           control={control}
@@ -568,12 +591,6 @@ function AccountEditForm({
             "cust_phone_num_1c",
           )}
         />
-        <TextField
-          control={control}
-          name="cust_govt_issued_id"
-          label="Government Issued Id Ref"
-          maxLength={20}
-        />
         <PartsField
           control={control}
           legend="Phone 2"
@@ -582,6 +599,12 @@ function AccountEditForm({
             "cust_phone_num_2b",
             "cust_phone_num_2c",
           )}
+        />
+        <TextField
+          control={control}
+          name="cust_govt_issued_id"
+          label="Government Issued Id Ref"
+          maxLength={20}
         />
         <TextField
           control={control}
@@ -600,6 +623,12 @@ function AccountEditForm({
 
       <div className="flex flex-wrap gap-2">
         <Button type="submit" aria-disabled={busy} className={busyClass}>
+          {mutation.isPending ? (
+            <LoaderCircle
+              aria-hidden="true"
+              className="motion-safe:animate-spin"
+            />
+          ) : null}
           Save
         </Button>
         <Button
@@ -611,6 +640,12 @@ function AccountEditForm({
             void onCancel();
           }}
         >
+          {reading ? (
+            <LoaderCircle
+              aria-hidden="true"
+              className="motion-safe:animate-spin"
+            />
+          ) : null}
           Cancel
         </Button>
       </div>

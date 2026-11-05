@@ -172,6 +172,8 @@ At start-up every binary reads all the settings through the shared reader, so it
 - `mq` continues with `clock` (`CARDDEMO_CLOCK_OVERRIDE`), `database` and `serve` (the broker connection and the consumers). An invalid clock override prints `mq: clock: invalid clock override: …`.
 - `batch` parses its arguments before it reads any setting: `--help` and `--version` print plain text on standard output and exit 0, and a usage error exits with status 2. It then installs telemetry, reads the settings and checks `CARDDEMO_CLOCK_OVERRIDE`. A failure there, or a failed database connection when the job starts, is one standard error line, `SETUP FAILURE: <error>`, and exit status 16.
 
+The Vite dev server likewise refuses an unusable `CARDDEMO_API_PROXY_TARGET` at start (section 7.2).
+
 ### 3.2 Overrides in the Compose `app` profile
 
 The defaults above serve processes started on the host. The `app` profile of `docker-compose.yml` replaces these values with Compose service names, and leaves every other `CARDDEMO_*` setting at its default:
@@ -243,7 +245,9 @@ docker compose down
 docker compose down -v
 ```
 
-Success: `docker compose ps` lists nothing after `down`. `down -v` also deletes the `postgres-data` and `rabbitmq-data` volumes, so the next start needs section 5 again. Once the `app` profile has run (section 8), name it as well, `docker compose --profile app down -v`, or its build volumes stay behind.
+Success: in host-toolchain mode `docker compose ps` lists nothing after `down`. `down -v` also deletes the `postgres-data` and `rabbitmq-data` volumes, so the next start needs section 5 again.
+
+These three commands act only on `postgres` and `rabbitmq`. Once the `app` profile has run (section 8), name it in each of them, for example `docker compose --profile app down -v`, as section 8.3 does. Without it, `api`, `mq` and `web` keep running, and `mq` restarts again and again without its broker. `down` then cannot remove the project network, which they still use, and `down -v` leaves the `cargo-target`, `cargo-registry` and `web-node-modules` volumes behind.
 
 ## 5. Database
 
@@ -378,6 +382,8 @@ pnpm --dir web dev
 ```
 
 Success: Vite prints `Local: http://localhost:5173/`. It exits at once if port 5173 is taken (`strictPort`).
+
+Vite reads `CARDDEMO_API_PROXY_TARGET` when it loads `web/vite.config.ts`, as `pnpm --dir web build` and `pnpm --dir web test` also do; unset, it gives the default `http://127.0.0.1:8080`. A blank value, or one that is not an absolute `http://` or `https://` URL, stops the command at start with `failed to load config` and an error that names the variable but not the value.
 
 ### 7.3 Sign on
 
@@ -781,7 +787,7 @@ Record each check, the command that ran it and its result in `docs/parity/signof
 - **Settings not exported.** The binaries read only the environment, never `.env` itself. Load the settings into every new shell (section 3.1).
 - **Busy ports.** 5432, 5672, 15672, 8080 and 5173 must be free. Host mode and Compose mode use the same ports, so stop one mode before starting the other. Vite exits at once rather than move to another port.
 - **No `guest` user.** The definitions file replaces RabbitMQ's default `guest` user and `/` vhost; connect as `carddemo`.
-- **Changing `infra/rabbitmq/definitions.json`.** The broker imports the file at every boot, so `docker compose restart rabbitmq` applies added or changed users, permissions and queues. The import never deletes anything: removing a queue or user needs a fresh broker data volume, which `docker compose down -v` gives at the cost of the database as well (repeat section 5).
+- **Changing `infra/rabbitmq/definitions.json`.** The broker imports the file at every boot, so `docker compose restart rabbitmq` applies added or changed users, permissions and queues. The import never deletes anything: removing a queue or user needs a fresh broker data volume, which `docker compose down -v` gives at the cost of the database as well (repeat section 5). Once the `app` profile has run, use `docker compose --profile app down -v` instead, which also removes the build volumes (repeat section 8.2).
 - **`seed` without `--if-empty` is a refresh.** It clears every reward accrual, balance and rule and reloads the fixtures, but keeps the transaction master. To regenerate the seed accruals, run `tranbkp` and then `posttran`.
 - **`posttran` needs an empty live master.** Run on a master that holds transactions, it abends with exit 16. Run `tranbkp` first.
 - **Empty live master online.** After a fresh seed or a `tranbkp`, "Add transaction" and "Bill payment" refuse to write, as the COBOL does, until `posttran` or `combtran` fills the master.
@@ -794,4 +800,4 @@ Record each check, the command that ran it and its result in `docs/parity/signof
 - **Changing `RUSTFLAGS` rebuilds everything.** Keep it identical across `build`, `test`, `clippy` and `llvm-cov`, for example exported once as in section 11.2.
 - **Lockfiles.** Never run `cargo update` or a `pnpm install` without `--frozen-lockfile`; the gates build with `--locked` against the committed `Cargo.lock` and `web/pnpm-lock.yaml`.
 - **Disk space.** `target/` grows to several GB, and `cargo llvm-cov` builds a second tree in `target/llvm-cov-target`; remove that directory after a coverage run, or run `cargo clean` to free everything.
-- **Compose volumes.** `docker compose down -v` without `--profile app` leaves the `cargo-target`, `cargo-registry` and `web-node-modules` volumes behind; use `docker compose --profile app down -v` to remove them too.
+- **Compose teardown after the `app` profile.** Without `--profile app`, `docker compose stop`, `down` and `down -v` act only on `postgres` and `rabbitmq`. `api`, `mq` and `web` keep running and keep ports 8080 and 5173, and `mq` restarts again and again without its broker. `down` cannot remove the project network, which they still use, and `down -v` leaves the `cargo-target`, `cargo-registry` and `web-node-modules` volumes behind. Once the profile has run, always name it: `docker compose --profile app down` or `docker compose --profile app down -v` (section 8.3).

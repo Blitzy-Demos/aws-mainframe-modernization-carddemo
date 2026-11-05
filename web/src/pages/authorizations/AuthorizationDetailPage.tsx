@@ -18,6 +18,7 @@ import { useEffect, useRef, useState, type JSX } from "react";
 import { Link, useNavigate, useParams, useSearchParams, type To } from "react-router";
 import { ArrowLeft, ChevronRight } from "lucide-react";
 
+import { ApiError } from "@/api/client";
 import {
   useAuthorizationDetail,
   useAuthorizationSummary,
@@ -334,6 +335,19 @@ function readKeyOf(authId: string): string {
   return authDetailKeySchema.safeParse({ auth_id: authId }).success ? authId : "";
 }
 
+/**
+ * COPAUS1C READ-AUTH-RECORD — V-COPAUS1C-004, V-COPAUS1C-005, E-49: whether a
+ * failed read is the 404 with a blank message, no summary for the account or
+ * no detail with the key. The COBOL sets AUTHS-EOF with no message and sends
+ * the map with no authorization, so the screen is the one a rejected key
+ * gets (V-COPAUS1C-001): its header and Back alone, with no toast, no message
+ * line and nothing announced. A 404 that carries a text, like every other
+ * failure, is shown.
+ */
+function isNoMessageNotFound(error: Error): boolean {
+  return error instanceof ApiError && error.status === 404 && error.body.message.trim() === "";
+}
+
 // ---------------------------------------------------------------------------
 // Navigation
 // ---------------------------------------------------------------------------
@@ -444,9 +458,11 @@ const FRAUD_ACTIONS: Readonly<
 };
 
 /**
- * The dialog's action and transaction ID stay set while it closes, so its
- * text does not change mid-animation. `authId` is the route key of the record
- * it was opened on, the only one its Confirm may toggle.
+ * The confirm of one PF5. `authId` is the route key of the record it was
+ * opened on, the only one its Confirm may toggle, and `action` the PF5 that
+ * record's fraud flag named then (F-COPAU01-003, F-COPAU01-004), the only one
+ * its Confirm may send. The action and transaction ID stay set while it
+ * closes, so its text does not change mid-animation.
  */
 type FraudDialog = Readonly<{ open: boolean; action: FraudAction; authId: string; tranId: string }>;
 
@@ -479,21 +495,35 @@ export default function AuthorizationDetailPage(): JSX.Element {
   const fraudToggle = useFraudToggleMutation();
   const openNext = useNextAuthorization(detail, query.refetch);
   const [dialog, setDialog] = useState<FraudDialog>(CLOSED_DIALOG);
+  // PF5 by the fraud flag of the record shown (P-COPAUS1C-006).
+  const fraudAction: FraudAction = detail?.pa_auth_fraud === FRAUD_CONFIRMED ? "remove" : "mark";
 
-  // The dialog confirms the PF5 of the record it was opened on. Once that
-  // record is no longer shown, withheld after a failed read or left for
-  // another route key, it closes rather than offer Confirm for it.
-  const dialogOpen = dialog.open && detail !== undefined && dialog.authId === readKey;
+  // The dialog confirms the PF5 of the record it was opened on, while that
+  // record still names that PF5. Once the record is no longer shown, withheld
+  // after a failed read or left for another route key, or its flag names the
+  // other PF5, it closes rather than offer Confirm for it: a mark sent before
+  // the dialog was opened again lands as `F`, and the toggle Confirm sends
+  // would then remove it (F-COPAU01-003 to F-COPAU01-005, E-60). A mark that
+  // fails leaves the flag, and so the dialog, as they were.
+  const dialogOpen =
+    dialog.open &&
+    detail !== undefined &&
+    dialog.authId === readKey &&
+    dialog.action === fraudAction;
   if (dialog.open && !dialogOpen) {
     setDialog({ ...dialog, open: false });
   }
 
-  // A failed read is toasted once per error, the repeated effects of
-  // StrictMode included. The toasted text also stays on the screen as the
-  // 3270 message line did, the same for a first read and a read again, until
-  // the key is read again; the Back link stays to leave the screen. A failure
-  // a read again already supersedes, such as the cached one a return to the
-  // route reads again, is neither toasted again nor shown.
+  // A failed read is handled once per error, the repeated effects of
+  // StrictMode included, the same for a first read and a read again; the
+  // Back link stays to leave the screen. Two cases:
+  // - The 404 with a blank message (isNoMessageNotFound) sets no message
+  //   (E-49): nothing is toasted or shown, and the screen keeps its header
+  //   and Back alone, as for a rejected key.
+  // - Any other failure is toasted, and the toasted text stays on the screen
+  //   as the 3270 message line did, until the key is read again.
+  // A failure a read again already supersedes, such as the cached one a
+  // return to the route reads again, is neither toasted again nor shown.
   const failed = query.isError && query.fetchStatus === "idle" ? query.error : null;
   const toastedFor = useRef<Error | null>(null);
   const [shown, setShown] = useState<ShownError | null>(null);
@@ -502,15 +532,19 @@ export default function AuthorizationDetailPage(): JSX.Element {
       return;
     }
     toastedFor.current = failed;
+    if (isNoMessageNotFound(failed)) {
+      return;
+    }
     setShown({ error: failed, message: showApiError(failed).message });
   }, [failed]);
   const errorLine =
     failed !== null && shown !== null && shown.error === failed ? shown.message : null;
 
   // The read's progress for assistive technology, the reads of PF8 Next and
-  // of a PF5 result included. A failed read announces nothing here, as its
-  // toast and the message line carry it. The status is emptied on every
-  // change of the text and on every completed read, then filled after
+  // of a PF5 result included. A failed read announces nothing here: its
+  // toast and the message line carry it, and the 404 with a blank message
+  // has no message to carry. The status is emptied on every change of the
+  // text and on every completed read, then filled after
   // STATUS_ANNOUNCE_DELAY_MS, as DataTable does.
   const statusText =
     readKey !== "" && query.isFetching
@@ -540,7 +574,6 @@ export default function AuthorizationDetailPage(): JSX.Element {
 
   // The account of the record, then the one the summary's View link passed.
   const accountId = detail?.account_id ?? searchParams.get("account_id") ?? "";
-  const fraudAction: FraudAction = detail?.pa_auth_fraud === FRAUD_CONFIRMED ? "remove" : "mark";
   const dialogText = FRAUD_ACTIONS[dialog.action];
 
   // The PUT names the key of the record shown when Confirm is pressed, fixed

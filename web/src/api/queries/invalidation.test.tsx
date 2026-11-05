@@ -5,8 +5,9 @@
 // an observer nothing is read again, so the only request sent is the write.
 //
 // Covered: the card update (CCUP), the user add, update and delete (CU01 to
-// CU03), the fraud mark (CPVD PF5), the transaction add (CT02) and the bill
-// payment (CB00).
+// CU03), the fraud mark (CPVD PF5), the transaction add (CT02), the bill
+// payment (CB00), and the transaction type add, update and delete (CTTU,
+// CTLI).
 import {
   QueryClient,
   QueryClientProvider,
@@ -30,6 +31,12 @@ import { authorizationKeys, useFraudToggleMutation } from "./authorizations";
 import { cardKeys, useCardUpdateMutation } from "./cards";
 import { usePaymentMutation } from "./payments";
 import { rewardKeys } from "./rewards";
+import {
+  tranTypeKeys,
+  useTranTypeCreateMutation,
+  useTranTypeDeleteMutation,
+  useTranTypeUpdateMutation,
+} from "./transaction-types";
 import { transactionKeys, useTransactionAddMutation } from "./transactions";
 
 type Schemas = components["schemas"];
@@ -789,6 +796,205 @@ describe("usePaymentMutation (CB00)", () => {
 
       expect(invalidated(SEEDED)).toEqual(stale);
       expect(sent).toEqual(["POST /api/payments"]);
+    },
+  );
+});
+
+describe("transaction type administration (CTTU, CTLI)", () => {
+  // The CTLI list and the CTTU edit page's read of type 01. Every write marks
+  // all of them stale or none.
+  const LISTS = [tranTypeKeys.list({}), tranTypeKeys.list({ type_code: "01" })];
+
+  // Row 1 of app/data/ASCII/trantype.txt, and a code the fixture lacks.
+  const PURCHASE: Schemas["TranTypeResponse"] = {
+    type_code: "01",
+    description: "Purchase",
+  };
+  const NEW_TYPE: Schemas["TranTypeResponse"] = {
+    type_code: "08",
+    description: "Test type",
+  };
+
+  const NOT_ON_FILE = refusal(
+    "NOT_FOUND",
+    "No record found for this key in database",
+  );
+
+  const WRITES: readonly {
+    write: string;
+    request: string;
+    /** The status of the write's success. */
+    status: number;
+    answer: Schemas["TranTypeMessageResponse"];
+    /** The 4xx answers that refuse the write before anything is stored. */
+    refusals: readonly { outcome: string; reply: Reply }[];
+    /** Renders the hook; the call returned sends the write. */
+    start: () => () => Promise<unknown>;
+  }[] = [
+    {
+      write: "the add (CTTU F5)",
+      request: "POST /api/admin/transaction-types",
+      status: 201,
+      answer: {
+        message: "Changes committed to database",
+        transaction_type: NEW_TYPE,
+      },
+      refusals: [
+        {
+          outcome: "a failed edit (400)",
+          reply: { status: 400, body: refusal("INVALID", "") },
+        },
+        {
+          outcome: "a code on file (409)",
+          reply: { status: 409, body: refusal("DUPLICATE", "") },
+        },
+      ],
+      start: () => {
+        const { result } = renderHook(() => useTranTypeCreateMutation(), {
+          wrapper,
+        });
+        return () => result.current.mutateAsync(NEW_TYPE);
+      },
+    },
+    {
+      write: "the update (CTTU F5, CTLI U)",
+      request: `PUT /api/admin/transaction-types/${PURCHASE.type_code}`,
+      status: 200,
+      answer: {
+        message: "Changes committed to database",
+        transaction_type: { ...PURCHASE, description: "Retail purchase" },
+      },
+      refusals: [
+        {
+          outcome: "a failed edit (400)",
+          reply: { status: 400, body: refusal("INVALID", "") },
+        },
+        {
+          outcome: "a code not on file (404, V-COTRTUPC-004)",
+          reply: { status: 404, body: NOT_ON_FILE },
+        },
+      ],
+      start: () => {
+        const { result } = renderHook(() => useTranTypeUpdateMutation(), {
+          wrapper,
+        });
+        return () =>
+          result.current.mutateAsync({
+            typeCode: PURCHASE.type_code,
+            body: { description: "Retail purchase" },
+          });
+      },
+    },
+    {
+      write: "the delete (CTTU F4)",
+      request: `DELETE /api/admin/transaction-types/${PURCHASE.type_code}`,
+      status: 200,
+      answer: { message: "Delete successful.", transaction_type: PURCHASE },
+      refusals: [
+        {
+          outcome: "a code not on file (404)",
+          reply: { status: 404, body: NOT_ON_FILE },
+        },
+        {
+          outcome: "categories still referencing the type (409)",
+          reply: {
+            status: 409,
+            body: refusal(
+              "CONFLICT",
+              "Please delete associated child records first:",
+            ),
+          },
+        },
+      ],
+      start: () => {
+        const { result } = renderHook(() => useTranTypeDeleteMutation(), {
+          wrapper,
+        });
+        return () =>
+          result.current.mutateAsync({
+            typeCode: PURCHASE.type_code,
+            origin: "form",
+          });
+      },
+    },
+  ];
+
+  // The failures after which the write may have been stored: the server's
+  // own 500, which the client cannot tell from the proxy's after a commit,
+  // the proxy's, a success whose body was cut off, and no answer at all.
+  function uncertain(status: number): { outcome: string; reply: Reply }[] {
+    return [
+      {
+        outcome: "the server's 500",
+        reply: { status: 500, body: refusal("UNEXPECTED", "Unexpected error") },
+      },
+      {
+        outcome: "the proxy's empty 500",
+        reply: {
+          status: 500,
+          text: "",
+          headers: { "Content-Type": "text/plain" },
+        },
+      },
+      {
+        outcome: `a ${status} with a truncated body`,
+        reply: {
+          status,
+          text: '{"message":',
+          headers: { "Content-Type": "application/json" },
+        },
+      },
+      { outcome: "a network failure", reply: "network failure" },
+      { outcome: "the client's deadline", reply: "deadline" },
+    ];
+  }
+
+  type Case = Omit<(typeof WRITES)[number], "status" | "answer" | "refusals"> & {
+    outcome: string;
+    reply: Reply;
+    stale: readonly QueryKey[];
+    effect: string;
+  };
+
+  const CASES: readonly Case[] = WRITES.flatMap(
+    ({ status, answer, refusals, ...write }): Case[] => [
+      {
+        ...write,
+        outcome: `the success (${status})`,
+        reply: { status, body: answer },
+        stale: LISTS,
+        effect: "every list stale",
+      },
+      ...refusals.map(
+        (refused): Case => ({
+          ...write,
+          ...refused,
+          stale: [],
+          effect: "nothing stale",
+        }),
+      ),
+      ...uncertain(status).map(
+        (failure): Case => ({
+          ...write,
+          ...failure,
+          stale: LISTS,
+          effect: "every list stale",
+        }),
+      ),
+    ],
+  );
+
+  it.each(CASES)(
+    "after $outcome, $write marks $effect",
+    async ({ request, start, reply: answer, stale }) => {
+      seed(LISTS);
+      reply = answer;
+      const send = start();
+
+      expect(await settle(send)).toBe(resolvesOn(answer));
+
+      expect(invalidated(LISTS)).toEqual(stale);
+      expect(sent).toEqual([request]);
     },
   );
 });

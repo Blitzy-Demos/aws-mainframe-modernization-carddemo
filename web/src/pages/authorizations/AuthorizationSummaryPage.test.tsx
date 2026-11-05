@@ -165,6 +165,35 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// COPAUS0C sends every screen with the cursor on ACCTID, `MOVE -1 TO ACCTIDL
+// OF COPAU0AI` [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L188, L196]:
+// the empty first entry, which reads nothing, and an entry with an account in
+// the URL, whose summary is read with the cursor left on the field.
+describe("CPVS on arrival", () => {
+  it.each([
+    { arrival: "the empty first entry", account: null },
+    { arrival: "an account in the URL", account: ACCOUNT_1 },
+  ])("puts the cursor on ACCTID for $arrival", async ({ account }) => {
+    const fetchMock = stubApi(200, summaryOk);
+    renderPage(account === null ? "/authorizations" : `/authorizations?account_id=${account}`);
+
+    expect(document.activeElement).toBe(accountField());
+
+    if (account === null) {
+      expect(fetchMock).not.toHaveBeenCalled();
+    } else {
+      expect(
+        (await screen.findByRole("heading", { name: `Account ${account}` })).tagName,
+      ).toBe("H2");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(new URL(firstRequest(fetchMock).url).searchParams.get("account_id")).toBe(account);
+      expect(document.activeElement).toBe(accountField());
+    }
+    expect(accountField().getAttribute("aria-invalid")).toBe("false");
+    expect(toastError).not.toHaveBeenCalled();
+  });
+});
+
 describe("CPVS ENTER with an account ID that passes the edits", () => {
   it.each([
     { how: "Enter in the field", key: "{Enter}", click: false },

@@ -9,10 +9,15 @@
 //!   history, both 200; an account key that names no account, or is no
 //!   account key at all, is 404 `Account not found`; a request without a
 //!   bearer token is 401. A `U` token suffices: these are user functions.
-//! - Three CT02 adds under the seeded retail rule (`01`/`0001`, rate 1.0000)
-//!   accrue `ceil(amount × 1.0000)` points each, and the history pages them
-//!   newest first by `start_key` and `page_size`, every accrual stamped with
-//!   the pinned processing clock.
+//! - Six CT02 adds under the seeded retail rule (`01`/`0001`, rate 1.0000),
+//!   alternating between two accounts in one database, accrue
+//!   `ceil(amount × 1.0000)` points each. Each account's balance is the sum
+//!   of its own points, and its history pages only its own accruals newest
+//!   first by `start_key` and `page_size`, every accrual stamped with the
+//!   pinned processing clock. A `start_key` naming the other account's
+//!   accrual gives an empty page, and a third existing account that earned
+//!   nothing still has the zero balance and an empty history after the
+//!   other two have earned.
 //! - Points and row identities are decimal digit strings, never JSON numbers,
 //!   so a stored balance of `9007199254740993`, above the 2^53 − 1 a browser
 //!   holds exactly, arrives as those exact digits (AAP 0.5.3.1).
@@ -38,14 +43,23 @@ const CLOCK: &str = "2022-07-01T12:00:00Z";
 /// The `code` of a 401 for a request without a valid bearer token.
 const UNAUTHENTICATED: &str = "UNAUTHENTICATED";
 
-/// Account 1 of the fixture [app/data/ASCII/acctdata.txt:L1], with card
-/// `9680294154603697` [app/data/ASCII/cardxref.txt:L49]: the account the CT02
-/// adds post to.
-const ACCRUING_ACCOUNT: &str = "00000000001";
+/// Account 1 of the fixture, active [app/data/ASCII/acctdata.txt:L1], with
+/// card `9680294154603697` [app/data/ASCII/cardxref.txt:L49]: one of the two
+/// accounts the CT02 adds post to.
+const ACCOUNT_1: &str = "00000000001";
 
-/// Account 2 of the fixture [app/data/ASCII/acctdata.txt:L2], which never
+/// Account 2 of the fixture, active [app/data/ASCII/acctdata.txt:L2], with
+/// card `0923877193247330` [app/data/ASCII/cardxref.txt:L3]: the other
+/// account the CT02 adds post to.
+const ACCOUNT_2: &str = "00000000002";
+
+/// Account 4 of the fixture, active [app/data/ASCII/acctdata.txt:L4], with
+/// card `2988091353094312` [app/data/ASCII/cardxref.txt:L13], which never
 /// accrues here.
-const QUIET_ACCOUNT: &str = "00000000002";
+const QUIET_ACCOUNT: &str = "00000000004";
+
+/// The `reward_balances` row of [`QUIET_ACCOUNT`], which must not exist.
+const QUIET_BALANCE_ROW: &str = "SELECT account_id::text FROM reward_balances WHERE account_id = 4";
 
 /// Account 3 of the fixture [app/data/ASCII/acctdata.txt:L3], given the large
 /// stored balance.
@@ -78,28 +92,36 @@ const LIVE_ROW: &str = "INSERT INTO transaction_master \
       1, 'Base merchant', 'Base city', '12345', \
       '9680294154603697', '2022-06-01 00:00:00.000000', '2022-06-01 00:00:00.000000')";
 
-/// The three CT02 purchases on [`ACCRUING_ACCOUNT`], in posting order: the
-/// `TRNAMT` text in the `COTRN02C` amount form `-99999999.99` (sign, eight
-/// digits, point, two digits) and the points `ceil(amount × 1.0000)` it earns
-/// under the retail rule. The cent rounds up to a whole point, and 99.50 to
-/// 100.
+/// The six CT02 purchases in posting order, alternating between
+/// [`ACCOUNT_1`] and [`ACCOUNT_2`], so each account's accruals interleave
+/// with the other's: the account, the `TRNAMT` text in the `COTRN02C` amount
+/// form `-99999999.99` (sign, eight digits, point, two digits) and the points
+/// `ceil(amount × 1.0000)` it earns under the retail rule. The cent rounds up
+/// to a whole point, 99.50 to 100, 20.25 to 21 and 33.10 to 34.
 // No audit ID is cited here: these purchases pass every edit, so citing one
 // would count as coverage of an error path this file never sends.
-const PURCHASES: [(&str, &str); 3] = [
-    ("+00000010.00", "10"),
-    ("+00000000.01", "1"),
-    ("+00000099.50", "100"),
+const PURCHASES: [(&str, &str, &str); 6] = [
+    (ACCOUNT_1, "+00000010.00", "10"),
+    (ACCOUNT_2, "+00000005.00", "5"),
+    (ACCOUNT_1, "+00000000.01", "1"),
+    (ACCOUNT_2, "+00000020.25", "21"),
+    (ACCOUNT_1, "+00000099.50", "100"),
+    (ACCOUNT_2, "+00000033.10", "34"),
 ];
 
-/// The sum of the [`PURCHASES`] points.
-const PURCHASED_POINTS: &str = "111";
+/// Each accruing account with the sum of its [`PURCHASES`] points, which it
+/// has earned and has available.
+const ACCRUING_ACCOUNTS: [(&str, &str); 2] = [(ACCOUNT_1, "111"), (ACCOUNT_2, "60")];
 
-/// The accruals of account 1 newest first, with the TRAN-ID of the
-/// transaction each one credits: the rows the history must show.
-const ACCOUNT_1_ACCRUALS: &str = "SELECT a.accrual_id::text, a.transaction_id::text, \
-            a.points_earned::text, m.tran_id \
+/// The accruals on a page of the paged history reads.
+const PAGE_ROWS: usize = 2;
+
+/// Every accrual newest first, with the 11-digit key of the account it
+/// credits, as the routes take it, and the TRAN-ID of the transaction it
+/// credits.
+const ACCRUALS: &str = "SELECT lpad(a.account_id::text, 11, '0'), a.accrual_id::text, \
+            a.transaction_id::text, a.points_earned::text, m.tran_id \
      FROM reward_accruals a JOIN transaction_master m USING (transaction_id) \
-     WHERE a.account_id = 1 \
      ORDER BY a.created_at DESC, a.accrual_id DESC";
 
 /// 2^53 + 1: the smallest points value a JSON number turns into another
@@ -125,6 +147,7 @@ const ACCRUAL_KEYS: [&str; 6] = [
 /// One accrual as the database holds it, in the text the history sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredAccrual {
+    account_id: String,
     accrual_id: String,
     transaction_id: String,
     points_earned: String,
@@ -192,12 +215,18 @@ fn text<'a>(value: &'a Value, key: &str, raw: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no string `{key}` in {value}: {raw}"))
 }
 
-/// Asserts that `resp` is a 200 history page holding exactly `expected`, in
-/// that order, with `next_key` as given and `prev_key` `null`, as the history
-/// pages forward only, and no `message`.
-fn assert_history_page(resp: &Resp, expected: &[StoredAccrual], next_key: Option<&str>) {
+/// Asserts that `resp` is a 200 history page of `account` holding exactly
+/// `expected`, accruals of `account`, in that order, with `next_key` as given
+/// and `prev_key` `null`, as the history pages forward only, and no
+/// `message`.
+fn assert_history_page(
+    resp: &Resp,
+    account: &str,
+    expected: &[StoredAccrual],
+    next_key: Option<&str>,
+) {
     let (status, body, raw) = resp;
-    assert_eq!(*status, StatusCode::OK, "history page: {raw}");
+    assert_eq!(*status, StatusCode::OK, "history page of {account}: {raw}");
     let Value::Object(page) = body else {
         panic!("the history page is not an object: {raw}");
     };
@@ -221,17 +250,25 @@ fn assert_history_page(resp: &Resp, expected: &[StoredAccrual], next_key: Option
     let items = page["items"]
         .as_array()
         .unwrap_or_else(|| panic!("`items` of the page is not an array: {raw}"));
-    assert_eq!(items.len(), expected.len(), "accruals on the page: {raw}");
+    assert_eq!(
+        items.len(),
+        expected.len(),
+        "accruals on the page of {account}: {raw}"
+    );
     for (item, stored) in items.iter().zip(expected) {
-        assert_accrual(item, stored, raw);
+        assert_accrual(item, account, stored, raw);
     }
 }
 
-/// Asserts that the history `item` is the accrual `stored` of
-/// [`ACCRUING_ACCOUNT`] under the retail rule: every identity and the points
-/// as their decimal strings, and `created_at` an RFC 3339 instant equal to
-/// [`CLOCK`].
-fn assert_accrual(item: &Value, stored: &StoredAccrual, raw: &str) {
+/// Asserts that the history `item` is the accrual `stored` of `account` under
+/// the retail rule: every identity and the points as their decimal strings,
+/// and `created_at` an RFC 3339 instant equal to [`CLOCK`].
+fn assert_accrual(item: &Value, account: &str, stored: &StoredAccrual, raw: &str) {
+    assert_eq!(
+        stored.account_id, account,
+        "the expected accrual of TRAN-ID {} credits {account}",
+        stored.tran_id
+    );
     let Value::Object(members) = item else {
         panic!("a history item is not an object but {item}: {raw}");
     };
@@ -249,7 +286,7 @@ fn assert_accrual(item: &Value, stored: &StoredAccrual, raw: &str) {
         Value::Object(strings),
         json!({
             "accrual_id": stored.accrual_id,
-            "account_id": ACCRUING_ACCOUNT,
+            "account_id": account,
             "transaction_id": stored.transaction_id,
             "rule_id": RETAIL_RULE_ID,
             "points_earned": stored.points_earned,
@@ -275,11 +312,11 @@ fn pinned_clock() -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-/// The CT02 body of a confirmed retail purchase of `amount` on
-/// [`ACCRUING_ACCOUNT`]: type `01`, category `0001`, dated on the clock's day.
-fn purchase(amount: &str) -> Value {
+/// The CT02 body of a confirmed retail purchase of `amount` on `account`:
+/// type `01`, category `0001`, dated on the clock's day.
+fn purchase(account: &str, amount: &str) -> Value {
     json!({
-        "account_id": ACCRUING_ACCOUNT,
+        "account_id": account,
         "tran_type_cd": "01",
         "tran_cat_cd": "0001",
         "tran_source": "POS TERM",
@@ -295,27 +332,31 @@ fn purchase(amount: &str) -> Value {
     })
 }
 
-/// Adds the purchase of `amount` through `POST /transactions` and returns
-/// its TRAN-ID, asserting the 201 and the `COTRN02C` success text.
-async fn post_purchase(app: &TestApp, token: &str, amount: &str) -> String {
+/// Adds the purchase of `amount` on `account` through `POST /transactions`
+/// and returns its TRAN-ID, asserting the 201 and the `COTRN02C` success
+/// text.
+async fn post_purchase(app: &TestApp, token: &str, account: &str, amount: &str) -> String {
     let (status, body, raw) = app
-        .post("/transactions", Some(token), &purchase(amount))
+        .post("/transactions", Some(token), &purchase(account, amount))
         .await;
-    assert_eq!(status, StatusCode::CREATED, "CT02 add of {amount}: {raw}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "CT02 add of {amount} on {account}: {raw}"
+    );
     let tran_id = text(&body["transaction"], "tran_id", &raw).to_owned();
     assert_eq!(
         body["message"].as_str(),
         Some(messages::transaction_added_message(&tran_id).as_str()),
-        "CT02 message of {amount}: {raw}"
+        "CT02 message of {amount} on {account}: {raw}"
     );
     tran_id
 }
 
-/// The accruals of account 1 newest first, as [`ACCOUNT_1_ACCRUALS`] reads
-/// them.
+/// Every accrual newest first, as [`ACCRUALS`] reads them.
 async fn stored_accruals(app: &TestApp) -> Vec<StoredAccrual> {
     app.stack()
-        .fetch_text_rows(ACCOUNT_1_ACCRUALS)
+        .fetch_text_rows(ACCRUALS)
         .await
         .into_iter()
         .map(|row| {
@@ -326,13 +367,82 @@ async fn stored_accruals(app: &TestApp) -> Vec<StoredAccrual> {
                     .unwrap_or_else(|| panic!("column {index} of an accrual row is null: {row:?}"))
             };
             StoredAccrual {
-                accrual_id: column(0),
-                transaction_id: column(1),
-                points_earned: column(2),
-                tran_id: column(3),
+                account_id: column(0),
+                accrual_id: column(1),
+                transaction_id: column(2),
+                points_earned: column(3),
+                tran_id: column(4),
             }
         })
         .collect()
+}
+
+/// The accruals of `account` among `stored`, in the order of `stored`.
+fn accruals_of(stored: &[StoredAccrual], account: &str) -> Vec<StoredAccrual> {
+    stored
+        .iter()
+        .filter(|accrual| accrual.account_id == account)
+        .cloned()
+        .collect()
+}
+
+/// Reads the whole history of `account` [`PAGE_ROWS`] accruals a page,
+/// starting each page at the previous page's `next_key` until it is `null`,
+/// and asserts that every page is the next slice of `expected`, the stored
+/// accruals of `account` newest first, and that the pages together hold
+/// exactly those accruals.
+async fn assert_paged_history(
+    app: &TestApp,
+    token: &str,
+    account: &str,
+    expected: &[StoredAccrual],
+) {
+    let mut shown: Vec<String> = Vec::new();
+    let mut start_key: Option<String> = None;
+    loop {
+        let query = match &start_key {
+            None => format!("page_size={PAGE_ROWS}"),
+            Some(key) => format!("start_key={key}&page_size={PAGE_ROWS}"),
+        };
+        let page = app.get(&history_path(account, &query), Some(token)).await;
+        let from = shown.len().min(expected.len());
+        let to = (from + PAGE_ROWS).min(expected.len());
+        let next_key = expected.get(to).map(|accrual| accrual.accrual_id.as_str());
+        assert_history_page(&page, account, &expected[from..to], next_key);
+        let (_, body, raw) = &page;
+        for item in body["items"].as_array().into_iter().flatten() {
+            shown.push(text(item, "accrual_id", raw).to_owned());
+        }
+        match body["next_key"].as_str() {
+            Some(key) => start_key = Some(key.to_owned()),
+            None => break,
+        }
+    }
+    let stored_ids: Vec<&str> = expected
+        .iter()
+        .map(|accrual| accrual.accrual_id.as_str())
+        .collect();
+    assert_eq!(
+        shown, stored_ids,
+        "the pages of {account} together hold exactly its accruals, newest first"
+    );
+}
+
+/// Asserts that [`QUIET_ACCOUNT`] has no `reward_balances` row and answers
+/// the zero balance and an empty history page, both 200; `when` names the
+/// state of the database in the messages.
+async fn assert_quiet(app: &TestApp, token: &str, when: &str) {
+    assert!(
+        app.stack()
+            .fetch_text_rows(QUIET_BALANCE_ROW)
+            .await
+            .is_empty(),
+        "{QUIET_ACCOUNT} has no reward balance row {when}"
+    );
+    let balance = app.get(&balance_path(QUIET_ACCOUNT), Some(token)).await;
+    assert_balance(&balance, QUIET_ACCOUNT, "0", "0", "0");
+    let history = app.get(&history_path(QUIET_ACCOUNT, ""), Some(token)).await;
+    assert_history_page(&history, QUIET_ACCOUNT, &[], None);
 }
 
 /// `raw` without the JSON whitespace (space, tab, line feed, carriage return)
@@ -366,19 +476,7 @@ fn accounts_without_accruals_answer_zero_and_unknown_accounts_or_no_token_are_re
     block_on(async {
         // A `U` token suffices: both routes are user functions.
         let token = app.user_token().await;
-        assert!(
-            app.stack()
-                .fetch_text_rows("SELECT account_id FROM reward_balances WHERE account_id = 2")
-                .await
-                .is_empty(),
-            "account 2 must start without a reward balance row"
-        );
-        let balance = app.get(&balance_path(QUIET_ACCOUNT), Some(&token)).await;
-        assert_balance(&balance, QUIET_ACCOUNT, "0", "0", "0");
-        let history = app
-            .get(&history_path(QUIET_ACCOUNT, ""), Some(&token))
-            .await;
-        assert_history_page(&history, &[], None);
+        assert_quiet(&app, &token, "on a fresh seed").await;
 
         for account in [UNKNOWN_ACCOUNT, MALFORMED_ACCOUNT] {
             assert_account_not_found(&app.get(&balance_path(account), Some(&token)).await);
@@ -391,7 +489,7 @@ fn accounts_without_accruals_answer_zero_and_unknown_accounts_or_no_token_are_re
 }
 
 #[test]
-fn ct02_accruals_make_the_balance_and_a_newest_first_paged_history() {
+fn ct02_accruals_of_two_accounts_make_separate_balances_and_newest_first_paged_histories() {
     let app = TestApp::start_with_clock(CLOCK);
     block_on(async {
         let stack = app.stack();
@@ -406,54 +504,68 @@ fn ct02_accruals_make_the_balance_and_a_newest_first_paged_history() {
         );
         stack.exec_sql(LIVE_ROW).await;
         let token = app.user_token().await;
+        assert_quiet(&app, &token, "before any purchase").await;
         let mut tran_ids = Vec::new();
-        for (amount, _) in PURCHASES {
-            tran_ids.push(post_purchase(&app, &token, amount).await);
+        for (account, amount, _) in PURCHASES {
+            tran_ids.push(post_purchase(&app, &token, account, amount).await);
         }
 
-        // Newest first: the last purchase's accrual leads.
         let stored = stored_accruals(&app).await;
-        let posted: Vec<(String, String)> = tran_ids
+        let mut histories = Vec::new();
+        for (account, points) in ACCRUING_ACCOUNTS {
+            // Newest first: the account's last purchase's accrual leads.
+            let own = accruals_of(&stored, account);
+            let posted: Vec<(String, String)> = tran_ids
+                .iter()
+                .zip(PURCHASES)
+                .filter(|(_, (to, _, _))| *to == account)
+                .rev()
+                .map(|(tran_id, (_, _, earned))| (tran_id.clone(), earned.to_owned()))
+                .collect();
+            let accrued: Vec<(String, String)> = own
+                .iter()
+                .map(|accrual| (accrual.tran_id.clone(), accrual.points_earned.clone()))
+                .collect();
+            assert_eq!(
+                accrued, posted,
+                "the accruals of {account} newest first, as (TRAN-ID, points)"
+            );
+            let balance = app.get(&balance_path(account), Some(&token)).await;
+            assert_balance(&balance, account, points, "0", points);
+            histories.push((account, own));
+        }
+        let mut split_ids: Vec<&str> = histories
             .iter()
-            .zip(PURCHASES)
-            .rev()
-            .map(|(tran_id, (_, points))| (tran_id.clone(), points.to_owned()))
+            .flat_map(|(_, own)| own.iter().map(|accrual| accrual.accrual_id.as_str()))
             .collect();
-        let accrued: Vec<(String, String)> = stored
+        let mut all_ids: Vec<&str> = stored
             .iter()
-            .map(|accrual| (accrual.tran_id.clone(), accrual.points_earned.clone()))
+            .map(|accrual| accrual.accrual_id.as_str())
             .collect();
+        split_ids.sort_unstable();
+        all_ids.sort_unstable();
         assert_eq!(
-            accrued, posted,
-            "the accruals of account 1 newest first, as (TRAN-ID, points)"
+            split_ids, all_ids,
+            "every accrual credits exactly one of the two accruing accounts"
         );
 
-        let balance = app.get(&balance_path(ACCRUING_ACCOUNT), Some(&token)).await;
-        assert_balance(
-            &balance,
-            ACCRUING_ACCOUNT,
-            PURCHASED_POINTS,
-            "0",
-            PURCHASED_POINTS,
-        );
+        for (account, own) in &histories {
+            assert_paged_history(&app, &token, account, own).await;
+            // Without `page_size`, one page of up to 10 holds all three of the
+            // account's accruals.
+            let whole = app.get(&history_path(account, ""), Some(&token)).await;
+            assert_history_page(&whole, account, own, None);
+        }
+        for ((account, _), (_, other_own)) in histories.iter().zip(histories.iter().rev()) {
+            // The other account's newest accrual, newer than accruals of this
+            // account, starts no page of this account: the page is empty.
+            let foreign = &other_own[0].accrual_id;
+            let query = format!("start_key={foreign}");
+            let page = app.get(&history_path(account, &query), Some(&token)).await;
+            assert_history_page(&page, account, &[], None);
+        }
 
-        let first = app
-            .get(&history_path(ACCRUING_ACCOUNT, "page_size=2"), Some(&token))
-            .await;
-        assert_history_page(&first, &stored[..2], Some(&stored[2].accrual_id));
-        let next_key = text(&first.1, "next_key", &first.2);
-        let second_path = history_path(
-            ACCRUING_ACCOUNT,
-            &format!("start_key={next_key}&page_size=2"),
-        );
-        let second = app.get(&second_path, Some(&token)).await;
-        assert_history_page(&second, &stored[2..], None);
-
-        // Without `page_size`, one page of up to 10 holds all three.
-        let whole = app
-            .get(&history_path(ACCRUING_ACCOUNT, ""), Some(&token))
-            .await;
-        assert_history_page(&whole, &stored, None);
+        assert_quiet(&app, &token, "after the other accounts have earned").await;
     });
 }
 

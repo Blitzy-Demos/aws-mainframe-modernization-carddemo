@@ -10,7 +10,12 @@
 //!   handler span `update_account`, inside which sqlx writes a `sqlx::query`
 //!   statement event, as enabled by `sqlx::query=debug`;
 //! - a batch `job` span with its reject and halt events;
-//! - an MQ `message` span.
+//! - two MQ `message` spans, told apart by their `flow`: a CP00 request rejected
+//!   after its reply was not confirmed, with `error_record` `none` and the
+//!   `CCPAUERY` location `M004`, because CP00 has no error queue; and a CDRD
+//!   request rejected after its `MQ-ERR-DISPLAY` error record could not be
+//!   published either, with `error_record` `logged`, `location` `none` and the
+//!   `MQ-ERR-DISPLAY` error event inside it.
 //!
 //! Every event line has a string `level`, a string `target` and a `fields`
 //! object. An application event also has a `fields.message`; a dependency's
@@ -47,6 +52,13 @@ const START_EVENT: &str = "telemetry json output test start";
 const CAUP_EVENT: &str = "account update committed";
 const REJECT_EVENT: &str = "daily transaction rejected";
 const HALT_EVENT: &str = "posting halted by the reward engine";
+/// The message of the event the CDRD and CDRA consumer logs when an
+/// `MQ-ERR-DISPLAY` record could not be published to the error queue: the
+/// record's COBOL data name, not a catalog message. The stand-in event carries
+/// the consumer's identifying and failure fields and leaves out its
+/// `mq_err_display` record text, whose COBOL text the binaries take from
+/// `carddemo-domain`'s message catalog.
+const MQ_ERR_DISPLAY_EVENT: &str = "MQ-ERR-DISPLAY";
 const DEBUG_EVENT: &str = "debug event must be filtered out";
 
 /// The API's request span, from its `TraceLayer`.
@@ -69,13 +81,29 @@ const SQLX_STATEMENT: &str =
 const ACCOUNT_ID: &str = "00000000001";
 /// `TRAN-ID` of record 1 of `app/data/ASCII/dailytran.txt`.
 const TRAN_ID: &str = "0000000000683580";
-/// A CP00 reply `message_id`: 48 lowercase hexadecimal characters.
-const MESSAGE_ID: &str = "17f0c2a9b3d4e5f600001a2b00000001c0ffee00deadbeef";
-const CORRELATION_ID: &str = "cp00-correlation-0001";
+
+const CP00_FLOW: &str = "CP00";
+const CDRD_FLOW: &str = "CDRD";
+
+/// The `message_id` of the CP00 request, which its message span records: a
+/// 24-byte MQ `MSGID` as 48 lowercase hexadecimal characters.
+const CP00_MESSAGE_ID: &str = "17f0c2a9b3d4e5f600001a2b00000001c0ffee00deadbeef";
+const CP00_CORRELATION_ID: &str = "cp00-correlation-0001";
+
+/// The `message_id` of the CDRD request, which its message span records and
+/// its reply, had it been confirmed, would have echoed.
+const CDRD_MESSAGE_ID: &str = "cdrd-msg-0001";
+const CDRD_CORRELATION_ID: &str = "cdrd-corr-0001";
 
 /// The `CCPAUERY` `ERR-LOCATION` `COPAUA0C` sets when the reply put fails
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L768].
 const REPLY_PUT_FAILED: &str = "M004";
+/// The message span's `location` on a path without a `CCPAUERY` location, as
+/// every CDRD and CDRA request has.
+const NO_LOCATION: &str = "none";
+/// Why the publish of the CDRD error record failed: the `Display` text of a
+/// mandatory publish the broker returned as unroutable.
+const ERROR_PUT_FAILURE: &str = "returned unroutable";
 
 /// In-memory stand-in for standard output, shared by the JSON formatter and the
 /// span exporter.
@@ -181,21 +209,54 @@ fn emit_batch_job() {
     });
 }
 
-/// Messaging family: a CP00 message span whose outcome, error record and
-/// `CCPAUERY` location are recorded after the reply was not confirmed.
-fn emit_mq_message() {
-    let message = tracing::info_span!(
+/// The message span the consumer opens for a request of `flow`, with the
+/// request's IDs and the fields it records once it has settled the request.
+fn message_span(flow: &str, message_id: &str, correlation_id: &str) -> tracing::Span {
+    tracing::info_span!(
         MESSAGE_SPAN,
-        flow = "CP00",
-        message_id = MESSAGE_ID,
-        correlation_id = CORRELATION_ID,
+        flow,
+        message_id,
+        correlation_id,
         outcome = tracing::field::Empty,
         error_record = tracing::field::Empty,
         location = tracing::field::Empty,
-    );
+    )
+}
+
+/// Messaging family, CP00: the message span of a request whose reply was not
+/// confirmed. The flow has logged its `CCPAUERY` record at location `M004`, and
+/// CP00 has no error queue, so the request is rejected with `error_record`
+/// `none` and that location.
+fn emit_cp00_message() {
+    let message = message_span(CP00_FLOW, CP00_MESSAGE_ID, CP00_CORRELATION_ID);
     message.record("outcome", "rejected");
-    message.record("error_record", "logged");
+    message.record("error_record", "none");
     message.record("location", REPLY_PUT_FAILED);
+}
+
+/// Messaging family, CDRD: the message span of a request whose reply was not
+/// confirmed and whose `MQ-ERR-DISPLAY` record the error queue did not accept.
+/// Inside the span the consumer logs the `MQ-ERR-DISPLAY` error event, then
+/// rejects the request with `error_record` `logged` and no `CCPAUERY`
+/// location. The stand-in event carries the consumer's identifying fields
+/// (`flow`, `message_id`, `correlation_id`) and its `failure`, and leaves out
+/// the consumer's `mq_err_display` record text, whose COBOL text the binaries
+/// take from `carddemo-domain`'s message catalog: this crate does not depend
+/// on that catalog, and this test certifies the line's shape, not that text.
+fn emit_cdrd_message() {
+    let message = message_span(CDRD_FLOW, CDRD_MESSAGE_ID, CDRD_CORRELATION_ID);
+    message.in_scope(|| {
+        tracing::error!(
+            flow = CDRD_FLOW,
+            message_id = CDRD_MESSAGE_ID,
+            correlation_id = CDRD_CORRELATION_ID,
+            failure = ERROR_PUT_FAILURE,
+            "{MQ_ERR_DISPLAY_EVENT}"
+        );
+        message.record("error_record", "logged");
+        message.record("outcome", "rejected");
+        message.record("location", NO_LOCATION);
+    });
 }
 
 /// Parses every line of `output`. The output must end with a newline, and every
@@ -239,6 +300,23 @@ fn find_span<'a>(exported: &[&'a Value], name: &str) -> &'a Value {
         .copied()
         .find(|line| line["name"] == name)
         .unwrap_or_else(|| panic!("no span line named {name}: {exported:?}"))
+}
+
+/// The message span line of `flow`: the only span line named [`MESSAGE_SPAN`]
+/// whose `flow` attribute is `flow`.
+fn find_message_span<'a>(exported: &[&'a Value], flow: &str) -> &'a Value {
+    let mut matching = exported
+        .iter()
+        .copied()
+        .filter(|line| line["name"] == MESSAGE_SPAN && attr_str(line, "flow") == Some(flow));
+    let line = matching
+        .next()
+        .unwrap_or_else(|| panic!("no {MESSAGE_SPAN} span line of flow {flow}: {exported:?}"));
+    assert!(
+        matching.next().is_none(),
+        "more than one {MESSAGE_SPAN} span line of flow {flow}: {exported:?}"
+    );
+    line
 }
 
 fn find_event<'a>(events: &[&'a Value], message: &str) -> &'a Value {
@@ -297,15 +375,22 @@ fn assert_attributes(line: &Value, expected: &[(&str, &str)]) {
     }
 }
 
-/// Exactly the four scenario spans, well formed, correctly parented and carrying
-/// their attributes, `Span::record` values included.
+/// Exactly the five scenario spans, well formed, correctly parented and carrying
+/// their attributes, `Span::record` values included. The two message spans share
+/// their name and are told apart by `flow`.
 fn assert_span_lines(exported: &[&Value]) {
     let mut names: Vec<&str> = exported
         .iter()
         .filter_map(|line| line["name"].as_str())
         .collect();
     names.sort_unstable();
-    let mut expected = [REQUEST_SPAN, HANDLER_SPAN, JOB_SPAN, MESSAGE_SPAN];
+    let mut expected = [
+        REQUEST_SPAN,
+        HANDLER_SPAN,
+        JOB_SPAN,
+        MESSAGE_SPAN,
+        MESSAGE_SPAN,
+    ];
     expected.sort_unstable();
     assert_eq!(names, expected, "span lines: {exported:?}");
     for &line in exported {
@@ -315,19 +400,26 @@ fn assert_span_lines(exported: &[&Value]) {
     let request = find_span(exported, REQUEST_SPAN);
     let handler = find_span(exported, HANDLER_SPAN);
     let job = find_span(exported, JOB_SPAN);
-    let message = find_span(exported, MESSAGE_SPAN);
+    let cp00 = find_message_span(exported, CP00_FLOW);
+    let cdrd = find_message_span(exported, CDRD_FLOW);
 
     assert_eq!(handler["parent_span_id"], request["span_id"], "{handler}");
     assert_eq!(handler["trace_id"], request["trace_id"], "{handler}");
-    for root in [request, job, message] {
+    let roots = [request, job, cp00, cdrd];
+    for root in roots {
         assert!(
             root["parent_span_id"].is_null(),
             "root span has a parent: {root}"
         );
     }
-    assert_ne!(job["trace_id"], request["trace_id"], "{job}");
-    assert_ne!(message["trace_id"], request["trace_id"], "{message}");
-    assert_ne!(message["trace_id"], job["trace_id"], "{message}");
+    for (index, first) in roots.iter().enumerate() {
+        for second in &roots[index + 1..] {
+            assert_ne!(
+                first["trace_id"], second["trace_id"],
+                "root spans share a trace: {first} and {second}"
+            );
+        }
+    }
 
     assert_attributes(
         request,
@@ -348,14 +440,25 @@ fn assert_span_lines(exported: &[&Value]) {
     );
     assert_attributes(job, &[("job", "posttran")]);
     assert_attributes(
-        message,
+        cp00,
         &[
-            ("flow", "CP00"),
-            ("message_id", MESSAGE_ID),
-            ("correlation_id", CORRELATION_ID),
+            ("flow", CP00_FLOW),
+            ("message_id", CP00_MESSAGE_ID),
+            ("correlation_id", CP00_CORRELATION_ID),
+            ("outcome", "rejected"),
+            ("error_record", "none"),
+            ("location", REPLY_PUT_FAILED),
+        ],
+    );
+    assert_attributes(
+        cdrd,
+        &[
+            ("flow", CDRD_FLOW),
+            ("message_id", CDRD_MESSAGE_ID),
+            ("correlation_id", CDRD_CORRELATION_ID),
             ("outcome", "rejected"),
             ("error_record", "logged"),
-            ("location", REPLY_PUT_FAILED),
+            ("location", NO_LOCATION),
         ],
     );
 }
@@ -379,14 +482,21 @@ fn joins(line: &Value, span: &Value) -> bool {
 }
 
 /// An event line emitted inside a span carries the `trace_id` and `span_id` of
-/// the span line its `span` names; one emitted outside every span carries
-/// neither key.
+/// the span line its `span` names, a message span by its `flow`; one emitted
+/// outside every span carries neither key.
 fn assert_joins_its_span(line: &Value, exported: &[&Value]) {
     if let Some(span) = line.get("span") {
         let name = span["name"]
             .as_str()
             .unwrap_or_else(|| panic!("event span without a name: {line}"));
-        let owner = find_span(exported, name);
+        let owner = if name == MESSAGE_SPAN {
+            let flow = span["flow"]
+                .as_str()
+                .unwrap_or_else(|| panic!("event message span without a flow: {line}"));
+            find_message_span(exported, flow)
+        } else {
+            find_span(exported, name)
+        };
         assert!(
             joins(line, owner),
             "event line does not carry the IDs of its span line {owner}: {line}"
@@ -476,6 +586,26 @@ fn assert_event_lines(events: &[&Value], exported: &[&Value]) {
     assert_eq!(halt["fields"]["tran_id"], TRAN_ID, "{halt}");
     assert_eq!(halt["span"]["name"], JOB_SPAN, "{halt}");
     assert!(joins(halt, job), "{halt}");
+
+    let display = find_event(events, MQ_ERR_DISPLAY_EVENT);
+    assert_eq!(display["level"], "ERROR", "{display}");
+    assert_eq!(display["target"], APP_TARGET, "{display}");
+    assert_eq!(display["fields"]["flow"], CDRD_FLOW, "{display}");
+    assert_eq!(
+        display["fields"]["message_id"], CDRD_MESSAGE_ID,
+        "{display}"
+    );
+    assert_eq!(
+        display["fields"]["correlation_id"], CDRD_CORRELATION_ID,
+        "{display}"
+    );
+    assert_eq!(display["fields"]["failure"], ERROR_PUT_FAILURE, "{display}");
+    assert_eq!(display["span"]["name"], MESSAGE_SPAN, "{display}");
+    assert_eq!(display["span"]["flow"], CDRD_FLOW, "{display}");
+    assert!(
+        joins(display, find_message_span(exported, CDRD_FLOW)),
+        "{display}"
+    );
 }
 
 #[test]
@@ -487,7 +617,8 @@ fn json_lines_only() {
         tracing::info!("{START_EVENT}");
         emit_api_request();
         emit_batch_job();
-        emit_mq_message();
+        emit_cp00_message();
+        emit_cdrd_message();
         tracing::debug!("{DEBUG_EVENT}");
     });
     guard.shutdown().expect("telemetry shutdown");

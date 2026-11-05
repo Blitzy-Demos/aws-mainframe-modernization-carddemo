@@ -18,13 +18,18 @@
 //! work. When `RewardEngine::accrue` fails, that unit is rolled back whole, the records before
 //! it stay committed, the run stops with exit 8 and the record number and TRAN-ID on stderr,
 //! and `DALYREJS(+1)` is discarded uncataloged. A test-only trigger on `reward_accruals` makes
-//! the accrual of one chosen record fail on the server.
+//! the accrual of one chosen record fail on the server. The halt runs twice, each on a fresh
+//! database: over an empty batch directory, and over a full `DALYREJS` GDG of five generations
+//! with known bytes, where cataloging `(+1)` would scratch the oldest. Both runs leave
+//! `DALYREJS` as it was: the same generations holding the same bytes, and no new generation,
+//! pending temporary file or allocation lock.
 
 pub mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 
 use carddemo_audit::Document;
 use carddemo_codec::{CardXrefLayout, Charset, DailyTranLayout, Layout, pad};
@@ -99,6 +104,14 @@ const XREF_FILE: &str = "cardxref.txt";
 
 /// The reject dataset, `DALYREJS(+1)` [app/jcl/POSTTRAN.jcl:L34-38].
 const DALYREJS: &str = "DALYREJS";
+
+/// The width of a `DALYREJS` record, the CBTRN02C `REJECT-RECORD`: `LRECL=430`
+/// [app/jcl/POSTTRAN.jcl:L34-38].
+const REJECT_RECORD_LEN: usize = 430;
+
+/// The generations of a full `DALYREJS` GDG, oldest first: `LIMIT(5) SCRATCH` keeps the newest
+/// 5 [app/jcl/DALYREJS.jcl:L24-28], so cataloging `(+1)` over them would scratch `G0001V00`.
+const FULL_DALYREJS: [u16; 5] = [1, 2, 3, 4, 5];
 
 /// The page size of the reward history reads: above the 262 posted records, so one page holds
 /// every accrual of an account.
@@ -497,12 +510,37 @@ fn account_state(h: &Harness, account: AccountId) -> Vec<Vec<Option<String>>> {
     rows.filter(|row| row.first() == Some(&key)).collect()
 }
 
+/// Catalogs the generations `numbers` of `DALYREJS` in the batch directory of `h`, as earlier
+/// runs leave them, and returns each file name with the bytes written. Generation `n` holds `n`
+/// records of [`REJECT_RECORD_LEN`] bytes, each its generation's name and record number padded
+/// with spaces and followed by `LF`, so no two generations hold the same bytes or length.
+/// POSTTRAN never reads `DALYREJS`, so the records need not be rejects.
+fn catalog_rejects(h: &Harness, numbers: &[u16]) -> BTreeMap<String, Vec<u8>> {
+    numbers
+        .iter()
+        .map(|&number| {
+            let name = format!("{DALYREJS}.G{number:04}V00");
+            let mut bytes = Vec::new();
+            for record in 1..=number {
+                let mut line = format!("{name} RECORD {record}").into_bytes();
+                line.resize(REJECT_RECORD_LEN, b' ');
+                line.push(b'\n');
+                bytes.extend(line);
+            }
+            let path = h.batch_dir().join(&name);
+            fs::write(&path, &bytes)
+                .unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+            (name, bytes)
+        })
+        .collect()
+}
+
 /// The names of the entries of the batch directory that belong to `DALYREJS`: cataloged
 /// generations, a pending generation's hidden temporary file and the allocation lock.
-fn dalyrejs_entries(h: &Harness) -> Vec<String> {
+fn dalyrejs_entries(h: &Harness) -> BTreeSet<String> {
     let entries = match fs::read_dir(h.batch_dir()) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Vec::new(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return BTreeSet::new(),
         Err(error) => panic!("cannot list {}: {error}", h.batch_dir().display()),
     };
     entries
@@ -517,26 +555,14 @@ fn dalyrejs_entries(h: &Harness) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn posting_accrues_retail_points_per_posted_record() {
-    // P-CBTRN02C-065, P-CBTRN02C-216 and the D.1 rows of REJECT_IDS.
-    let corpus = Corpus::load(&parity());
-    let h = Harness::new();
-
-    let _ = h.run_expect(&["posttran"], Some(TRANREPT_CLOCK), RECORDS_REJECTED);
-
-    let live: BTreeSet<String> = live_tran_ids(&h).into_values().collect();
-    let posted: BTreeSet<String> = corpus.posted.iter().map(|p| p.tran_id.clone()).collect();
-    assert_eq!(
-        live, posted,
-        "the live master holds exactly the audited posted set"
-    );
-    assert_accruals(&h, &corpus.posted, &corpus.accounts);
-}
-
-#[test]
-fn reward_failure_halts_posting_with_exit_8() {
-    // P-CBTRN02C-065, P-CBTRN02C-216 and the D.1 rows of REJECT_IDS.
+/// Runs `batch posttran` over the fixture day on a fresh harness whose `DALYREJS` GDG holds the
+/// generations `prior` ([`catalog_rejects`]), with the accrual of [`HALTING_TRAN_ID`] failing on
+/// the server, and checks the halt: exit 8 with the record number and TRAN-ID on stderr; the
+/// records before the halting one posted with their accruals; the halting record and its
+/// account rolled back; and `DALYREJS` unchanged: the same generations holding the same bytes,
+/// and no other `DALYREJS` entry, so no new generation, pending temporary file or allocation
+/// lock.
+fn assert_reward_halt(prior: &[u16]) {
     let corpus = Corpus::load(&parity());
     let (index, halting) = halting_record(&corpus.posted);
     assert_eq!(
@@ -544,8 +570,19 @@ fn reward_failure_halts_posting_with_exit_8() {
         "the trigger names the halting record"
     );
     let h = Harness::new();
+    let written = catalog_rejects(&h, prior);
+    let names: BTreeSet<String> = written.keys().cloned().collect();
+    let cataloged: Vec<PathBuf> = names.iter().map(|name| h.batch_dir().join(name)).collect();
     let rejects_before = h.generations(DALYREJS);
-    assert!(rejects_before.is_empty(), "{rejects_before:?}");
+    assert_eq!(
+        rejects_before, cataloged,
+        "DALYREJS generations before the run"
+    );
+    assert_eq!(
+        dalyrejs_entries(&h),
+        names,
+        "DALYREJS entries before the run"
+    );
     let before = account_state(&h, halting.account_id);
     let category_key = [RETAIL.0.to_owned(), RETAIL.1.to_string()].map(Some);
     assert!(
@@ -588,11 +625,52 @@ fn reward_failure_halts_posting_with_exit_8() {
     assert_eq!(
         h.generations(DALYREJS),
         rejects_before,
-        "no DALYREJS generation"
+        "no DALYREJS generation added or scratched"
     );
+    for (name, bytes) in &written {
+        let path = h.batch_dir().join(name);
+        let now = fs::read(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        assert!(
+            now == *bytes,
+            "{name} changed: {} bytes written, {} bytes now",
+            bytes.len(),
+            now.len()
+        );
+    }
     assert_eq!(
         dalyrejs_entries(&h),
-        Vec::<String>::new(),
-        "no DALYREJS file remains"
+        names,
+        "no new generation, pending temporary file or allocation lock of DALYREJS remains"
     );
+}
+
+#[test]
+fn posting_accrues_retail_points_per_posted_record() {
+    // P-CBTRN02C-065, P-CBTRN02C-216 and the D.1 rows of REJECT_IDS.
+    let corpus = Corpus::load(&parity());
+    let h = Harness::new();
+
+    let _ = h.run_expect(&["posttran"], Some(TRANREPT_CLOCK), RECORDS_REJECTED);
+
+    let live: BTreeSet<String> = live_tran_ids(&h).into_values().collect();
+    let posted: BTreeSet<String> = corpus.posted.iter().map(|p| p.tran_id.clone()).collect();
+    assert_eq!(
+        live, posted,
+        "the live master holds exactly the audited posted set"
+    );
+    assert_accruals(&h, &corpus.posted, &corpus.accounts);
+}
+
+#[test]
+fn reward_failure_halts_posting_with_exit_8() {
+    // P-CBTRN02C-065, P-CBTRN02C-216 and the D.1 rows of REJECT_IDS, over an empty batch
+    // directory.
+    assert_reward_halt(&[]);
+}
+
+#[test]
+fn reward_halt_leaves_every_cataloged_dalyrejs_generation_unchanged() {
+    // P-CBTRN02C-065, P-CBTRN02C-216 and the D.1 rows of REJECT_IDS, over a full DALYREJS GDG.
+    assert_reward_halt(&FULL_DALYREJS);
 }

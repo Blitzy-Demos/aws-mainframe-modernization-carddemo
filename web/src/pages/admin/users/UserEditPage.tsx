@@ -302,7 +302,16 @@ function UserEditFormCard({
     void navigate(USER_LIST_ROUTE);
   };
 
+  // One save at a time, from Save or Save and exit: a second click or Enter
+  // before the busy state re-renders would send the PUT again, and its answer
+  // would replace the first one's. The ref closes that gap.
+  const inFlight = useRef(false);
+
   function save(values: UserUpdateFormValues, exit: boolean): void {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
     mutation.mutate(toUserUpdateRequest(values), {
       onSuccess: (answer) => {
         if (answer.message === USER_UPDATE_UNCHANGED_MESSAGE) {
@@ -315,7 +324,10 @@ function UserEditFormCard({
       onError: (error) => {
         applyApiError(error, form, userUpdateBmsFieldMap);
       },
+      // Runs after either outcome; a page that has left has no guard to
+      // release.
       onSettled: () => {
+        inFlight.current = false;
         if (exit) {
           exitToList();
         }
@@ -348,11 +360,18 @@ function UserEditFormCard({
     form.setFocus("user_id");
   };
 
+  // aria-disabled rather than disabled: a focused button that becomes
+  // disabled loses focus to the document, which would strand a keyboard user
+  // after Save; the guards keep the inert buttons from acting.
+  const busy = mutation.isPending;
+  const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
+
   return (
     <Card>
       <CardContent>
         <form
           noValidate
+          aria-busy={busy}
           className="flex flex-col gap-6"
           onSubmit={(event) => {
             void submit(event);
@@ -391,23 +410,49 @@ function UserEditFormCard({
             />
           </FieldGroup>
           <div className="flex flex-wrap gap-2">
-            <Button type="submit" disabled={mutation.isPending}>
+            <Button type="submit" aria-disabled={busy} className={busyClass}>
               Save
             </Button>
             <Button
               type="button"
               variant="secondary"
-              disabled={mutation.isPending}
+              aria-disabled={busy}
+              className={busyClass}
               onClick={(event) => {
+                if (busy) {
+                  return;
+                }
                 void submitAndExit(event);
               }}
             >
               Save and exit
             </Button>
-            <Button type="button" variant="outline" onClick={clear}>
+            <Button
+              type="button"
+              variant="outline"
+              aria-disabled={busy}
+              className={busyClass}
+              onClick={() => {
+                if (busy) {
+                  return;
+                }
+                clear();
+              }}
+            >
               Reset
             </Button>
-            <Button type="button" variant="ghost" onClick={exitToList}>
+            <Button
+              type="button"
+              variant="ghost"
+              aria-disabled={busy}
+              className={busyClass}
+              onClick={() => {
+                if (busy) {
+                  return;
+                }
+                exitToList();
+              }}
+            >
               Cancel
             </Button>
           </div>

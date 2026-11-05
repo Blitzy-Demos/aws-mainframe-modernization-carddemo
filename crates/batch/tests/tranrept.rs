@@ -33,7 +33,8 @@ use std::ops::Range;
 use std::str::FromStr;
 
 use carddemo_audit::{
-    CodeSpan, Document, KeyValue, PARITY_COMMON_COLUMNS, Table, code_span, key_values,
+    CodeSpan, Document, KeyValue, PARITY_COMMON_COLUMNS, PARITY_LAYOUT_COLUMNS, Table,
+    cell_code_spans, code_span, key_values,
 };
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
 use carddemo_codec::{Charset, Layout};
@@ -41,8 +42,8 @@ use carddemo_domain::entities::{NewTransaction, Transaction};
 use carddemo_domain::numeric::{Alnum, CardNumber, Money, TranId, TranTypeCode, TransactionRowId};
 use carddemo_domain::rules::transaction_report::ReportRun;
 use common::{
-    Harness, LIVE_MASTER_COLUMNS, TRANREPT_CLOCK, block_on, expected_span, expected_value, parity,
-    parity_cell, parity_row, split_records,
+    Harness, LIVE_MASTER_COLUMNS, TRANREPT_CLOCK, block_on, expected_span, expected_value,
+    fixture_lines, parity, parity_cell, parity_row, split_records,
 };
 use rust_decimal::Decimal;
 
@@ -614,6 +615,7 @@ fn tranrept_defaults_match_audit() {
 }
 
 /// One expected record or line, with the label a mismatch message names it by.
+#[derive(Clone)]
 struct Line {
     label: String,
     text: String,
@@ -1121,6 +1123,39 @@ VALUES ('0000000000000001', '01', 1, 'POS TERM', 'Purchase at Example Store', 10
         '2022-07-07 19:27:53.000000', '2022-07-07-12.00.00.000000');
 ";
 
+/// The fields CBTRN03C reports of one record of [`AROUND_THE_RANGE`], as its `INSERT` writes
+/// them: `TRAN-ID`, `TRAN-TYPE-CD`, `TRAN-CAT-CD` as its `9(04)` digits, `TRAN-SOURCE`,
+/// `TRAN-AMT` and `TRAN-CARD-NUM`.
+struct Reported {
+    tran_id: &'static str,
+    type_cd: &'static str,
+    cat_cd: &'static str,
+    source: &'static str,
+    amount: &'static str,
+    card_num: &'static str,
+}
+
+/// Records 2 and 3 of [`AROUND_THE_RANGE`], processed on the first and on the last day of the
+/// range, in the order of `TRANSACT.DALY(+1)`: one record on each card, the cards ascending.
+const INSIDE: [Reported; 2] = [
+    Reported {
+        tran_id: "0000000000000002",
+        type_cd: "01",
+        cat_cd: "0001",
+        source: "POS TERM",
+        amount: "20.00",
+        card_num: "0500024453765740",
+    },
+    Reported {
+        tran_id: "0000000000000003",
+        type_cd: "01",
+        cat_cd: "0001",
+        source: "POS TERM",
+        amount: "30.00",
+        card_num: "0683586198171516",
+    },
+];
+
 #[test]
 fn a_record_outside_the_dates_never_reaches_the_report_and_would_end_its_loop() {
     let doc = parity();
@@ -1157,6 +1192,17 @@ fn a_record_outside_the_dates_never_reaches_the_report_and_would_end_its_loop() 
         .filter(|id| all.contains(id))
         .collect();
     assert_eq!(details, in_range, "{DATE_FILTER}: the detail lines");
+    // The whole report against the audited CBTRN03C rules applied to the records inside the
+    // range, never against the production report code.
+    let expected = inside_report(&doc);
+    assert_same_lines(
+        &format!(
+            "{DATE_FILTER}: TRANREPT(+1) against the audited report of the records inside the \
+             range, totals included"
+        ),
+        &expected,
+        &report,
+    );
 
     // CBTRN03C itself, fed a record outside the range, writes nothing for it, nor for any record
     // after it, nor the end-of-input totals.
@@ -1174,21 +1220,16 @@ fn a_record_outside_the_dates_never_reaches_the_report_and_would_end_its_loop() 
             records.len()
         );
     };
-    let (inside, inside_totals) = report_run(&h, start, end, &[first_day, last_day]);
-    assert!(
-        inside.iter().all(|lines| !lines.is_empty()) && !inside_totals.is_empty(),
-        "{DATE_FILTER}: two records inside the range are reported and totalled"
-    );
-    assert_eq!(
-        report,
-        [inside.concat(), inside_totals].concat(),
-        "{DATE_FILTER}: TRANREPT(+1) is the report of the records inside the range, totals \
-         included"
-    );
+    // The first record inside the range writes what it writes in the report: the header block
+    // and its detail line (P-CBTRN03C-006).
+    let first_detail: Vec<String> = expected[..=HEADER_BLOCK.len()]
+        .iter()
+        .map(|line| line.text.clone())
+        .collect();
     let (left, left_totals) = report_run(&h, start, end, &[first_day, before, last_day]);
     assert_eq!(
         left,
-        [inside[0].clone(), Vec::new(), Vec::new()],
+        [first_detail, Vec::new(), Vec::new()],
         "{DATE_FILTER}: the record before the range leaves the loop"
     );
     assert_eq!(
@@ -1251,4 +1292,397 @@ fn report_run(
             .unwrap_or_else(|error| panic!("cannot end the lookup unit of work: {error}"));
         (written, totals)
     })
+}
+
+/// The kinds of the four lines of the header block (P-CBTRN03C-475) in the order CBTRN03C
+/// writes them, D.6 report lines 1 to 4 (P-CBTRN03C-016 to P-CBTRN03C-019).
+const HEADER_BLOCK: [&str; 4] = [
+    "REPORT-NAME-HEADER",
+    "BLANK-LINE",
+    "TRANSACTION-HEADER-1",
+    "TRANSACTION-HEADER-2",
+];
+
+/// The card cross-reference fixture behind the `CARDXREF` lookup (P-CBTRN03C-001).
+const XREF_FILE: &str = "cardxref.txt";
+
+/// The `TRANTYPE` processing copy fixture (P-CBTRN03C-001).
+const TRANTYPE_FILE: &str = "trantype.txt";
+
+/// The `TRANCATG` processing copy fixture (P-CBTRN03C-001).
+const TRANCATG_FILE: &str = "trancatg.txt";
+
+/// The section A row of `XREF-CARD-NUM X(16)`, the `CARDXREF` key.
+const XREF_CARD_NUM: &str = "P-CVACT03Y-001";
+
+/// The section A row of `XREF-ACCT-ID 9(11)`, the account ID of a detail line.
+const XREF_ACCT_ID: &str = "P-CVACT03Y-003";
+
+/// The section A row of `TRAN-TYPE X(02)`, the `TRANTYPE` key.
+const TRAN_TYPE: &str = "P-CVTRA03Y-001";
+
+/// The section A row of `TRAN-TYPE-DESC X(50)`.
+const TRAN_TYPE_DESC: &str = "P-CVTRA03Y-002";
+
+/// The section A row of `TRAN-TYPE-CD X(02)`, the first part of the `TRANCATG` key.
+const CAT_TYPE_CD: &str = "P-CVTRA04Y-001";
+
+/// The section A row of `TRAN-CAT-CD 9(04)`, the second part of the `TRANCATG` key.
+const CAT_CD: &str = "P-CVTRA04Y-002";
+
+/// The section A row of `TRAN-CAT-TYPE-DESC X(50)`.
+const CAT_TYPE_DESC: &str = "P-CVTRA04Y-003";
+
+/// The section C row of the `+ZZZ,ZZZ,ZZZ.ZZ` edit of the account and grand totals, the picture
+/// of the page total too (P-CBTRN03C-011).
+const TOTALS_EDIT: &str = "P-CBTRN03C-012";
+
+/// The section C row of the `-ZZZ,ZZZ,ZZZ.ZZ` edit of the detail amount.
+const DETAIL_EDIT: &str = "P-CBTRN03C-014";
+
+/// The width of both edited amount pictures.
+const EDITED_WIDTH: usize = 15;
+
+/// 10^11 cents: an `S9(09)V99` field holds 11 digits, so its magnitude stays below this.
+const S9_09_V99_LIMIT: i64 = 100_000_000_000;
+
+/// The sign symbol that begins an edited amount picture of CVTRA07Y.
+#[derive(Clone, Copy)]
+enum SignSymbol {
+    /// `-ZZZ,ZZZ,ZZZ.ZZ`, `TRAN-REPORT-AMT` [app/cpy/CVTRA07Y.cpy:L30]: `-` when the amount is
+    /// negative, otherwise a space.
+    Minus,
+    /// `+ZZZ,ZZZ,ZZZ.ZZ`, the page, account and grand totals [app/cpy/CVTRA07Y.cpy:L54]
+    /// [app/cpy/CVTRA07Y.cpy:L60] [app/cpy/CVTRA07Y.cpy:L66]: `-` when the amount is negative,
+    /// otherwise `+`.
+    Plus,
+}
+
+impl SignSymbol {
+    /// The picture, as section C writes it.
+    fn picture(self) -> &'static str {
+        match self {
+            Self::Minus => "-ZZZ,ZZZ,ZZZ.ZZ",
+            Self::Plus => "+ZZZ,ZZZ,ZZZ.ZZ",
+        }
+    }
+}
+
+/// A totals line of CVTRA07Y: a label `FILLER`, a `FILLER` of dots (`VALUE ALL '.'`) and the
+/// total edited `+ZZZ,ZZZ,ZZZ.ZZ`.
+struct TotalsLine {
+    /// The record name, which also labels the line in a mismatch message.
+    name: &'static str,
+    /// The `VALUE` of the label `FILLER`.
+    label: &'static str,
+    /// The `PIC X(n)` length of the label `FILLER`.
+    label_width: usize,
+    /// The `PIC X(n)` length of the dot `FILLER`.
+    dots: usize,
+}
+
+/// `REPORT-PAGE-TOTALS` [app/cpy/CVTRA07Y.cpy:L50-54].
+const PAGE_TOTALS: TotalsLine = TotalsLine {
+    name: "REPORT-PAGE-TOTALS",
+    label: "Page Total",
+    label_width: 11,
+    dots: 86,
+};
+
+/// `REPORT-ACCOUNT-TOTALS` [app/cpy/CVTRA07Y.cpy:L56-60].
+const ACCOUNT_TOTALS: TotalsLine = TotalsLine {
+    name: "REPORT-ACCOUNT-TOTALS",
+    label: "Account Total",
+    label_width: 13,
+    dots: 84,
+};
+
+/// `REPORT-GRAND-TOTALS` [app/cpy/CVTRA07Y.cpy:L62-66].
+const GRAND_TOTALS: TotalsLine = TotalsLine {
+    name: "REPORT-GRAND-TOTALS",
+    label: "Grand Total",
+    label_width: 11,
+    dots: 86,
+};
+
+/// `TRANREPT(+1)` for the records [`INSIDE`] the default range, derived from the audited
+/// CBTRN03C rules [app/cbl/CBTRN03C.cbl:L170-206] [app/cbl/CBTRN03C.cbl:L274-374] and the
+/// fixtures alone, never from the production report code:
+///
+/// 1. The first detail writes the header block (P-CBTRN03C-006, P-CBTRN03C-475), which for the
+///    default dates is D.6 lines 1 to 4. The line counter is then 4, and 7 before the second
+///    detail, so `MOD(WS-LINE-COUNTER, 20)` is never 0 and no page break falls in this report.
+/// 2. Each detail line (P-CBTRN03C-007) adds its amount to the page and account totals
+///    (P-CBTRN03C-010).
+/// 3. The second record changes the card, so before its detail come the first card's account
+///    totals line and header 2, the account total reset to 0 (P-CBTRN03C-004, P-CBTRN03C-008,
+///    P-CBTRN03C-012).
+/// 4. At the end of input the last amount is added again (P-CBTRN03C-009, P-CBTRN03C-013), the
+///    page totals line and header 2 are written, the page total is added to the grand total and
+///    reset (P-CBTRN03C-011, P-CBTRN03C-486), and the grand totals line ends the report
+///    (P-CBTRN03C-477). The second card's account total is never written.
+///
+/// Eleven lines: the header block, a detail, the account totals, header 2, a detail, the page
+/// totals, header 2 and the grand totals.
+fn inside_report(doc: &Document) -> Vec<Line> {
+    assert_edits_match_audit(doc);
+    let mut lines = header_block(&Expected::from_audit(doc));
+    let header_2 = lines[HEADER_BLOCK.len() - 1].clone();
+    let [first, second] = &INSIDE;
+    assert!(
+        first.card_num < second.card_num,
+        "the records inside the range must lie on two cards in ascending order, the order of \
+         TRANSACT.DALY(+1)"
+    );
+    let first_amount = cents(first.amount, first.tran_id);
+    let second_amount = cents(second.amount, second.tran_id);
+    let first_account_total = add(0, first_amount);
+    let page_total = add(add(add(0, first_amount), second_amount), second_amount);
+    let grand_total = add(0, page_total);
+    lines.extend([
+        detail_line(doc, first),
+        total_line(&ACCOUNT_TOTALS, first_account_total),
+        header_2.clone(),
+        detail_line(doc, second),
+        total_line(&PAGE_TOTALS, page_total),
+        header_2,
+        total_line(&GRAND_TOTALS, grand_total),
+    ]);
+    lines
+}
+
+/// D.6 lines 1 to 4, the header block CBTRN03C writes for the default dates before the first
+/// detail (P-CBTRN03C-016 to P-CBTRN03C-019), each checked to be the line [`HEADER_BLOCK`]
+/// names.
+fn header_block(audit: &Expected) -> Vec<Line> {
+    let lines = audit
+        .lines
+        .get(..HEADER_BLOCK.len())
+        .unwrap_or_else(|| panic!("the {D6_SUBSECTION} lines hold no whole header block"));
+    for (line, kind) in lines.iter().zip(HEADER_BLOCK) {
+        assert!(
+            line.label.ends_with(&format!(" {kind}")),
+            "{D6_SUBSECTION}: {} is not the {kind} line of the header block",
+            line.label
+        );
+    }
+    lines.to_vec()
+}
+
+/// The `TRANSACTION-DETAIL-REPORT` line of `record` [app/cpy/CVTRA07Y.cpy:L15-31], in the order
+/// of P-CBTRN03C-007, padded to the 133 bytes of `FD-REPTFILE-REC`: `TRAN-ID` X(16), a space,
+/// the card's `XREF-ACCT-ID` X(11), a space, the type code X(02), `-`, the `TRANTYPE`
+/// description X(15), a space, the category code 9(04), `-`, the `TRANCATG` description X(29),
+/// a space, the source X(10), four spaces, the amount edited `-ZZZ,ZZZ,ZZZ.ZZ` (P-CBTRN03C-014)
+/// and two spaces. A `MOVE` to a shorter alphanumeric field keeps the leading bytes.
+fn detail_line(doc: &Document, record: &Reported) -> Line {
+    let &Reported {
+        tran_id,
+        type_cd,
+        cat_cd,
+        source,
+        amount,
+        card_num,
+    } = record;
+    let account_id = lookup(doc, XREF_FILE, &[(XREF_CARD_NUM, card_num)], XREF_ACCT_ID);
+    let type_desc = lookup(doc, TRANTYPE_FILE, &[(TRAN_TYPE, type_cd)], TRAN_TYPE_DESC);
+    let cat_desc = lookup(
+        doc,
+        TRANCATG_FILE,
+        &[(CAT_TYPE_CD, type_cd), (CAT_CD, cat_cd)],
+        CAT_TYPE_DESC,
+    );
+    // The `9(11)` and `9(04)` sources move digit for digit into their `X(11)` and `9(04)`
+    // receivers, which this line builds only from values of exactly those lengths.
+    for (digits, width, what) in [
+        (account_id.as_str(), 11, "XREF-ACCT-ID"),
+        (cat_cd, 4, "TRAN-CAT-CD"),
+    ] {
+        assert!(
+            digits.len() == width && digits.bytes().all(|byte| byte.is_ascii_digit()),
+            "TRAN-ID {tran_id}: {what} {digits:?} is not {width} digits"
+        );
+    }
+    let amount = edited(cents(amount, tran_id), SignSymbol::Minus);
+    let text = format!(
+        "{tran_id:<16.16} {account_id:<11.11} {type_cd:<2.2}-{type_desc:<15.15} \
+         {cat_cd:<4.4}-{cat_desc:<29.29} {source:<10.10}    {amount}  "
+    );
+    Line {
+        label: format!("TRANSACTION-DETAIL-REPORT of TRAN-ID {tran_id}"),
+        text: format!("{text:<REPORT_LRECL$}"),
+    }
+}
+
+/// The totals line `layout` holding `total` cents edited `+ZZZ,ZZZ,ZZZ.ZZ` (P-CBTRN03C-011,
+/// P-CBTRN03C-012), padded to the 133 bytes of `FD-REPTFILE-REC`.
+fn total_line(layout: &TotalsLine, total: i64) -> Line {
+    let width = layout.label_width;
+    let text = format!(
+        "{:<width$}{}{}",
+        layout.label,
+        ".".repeat(layout.dots),
+        edited(total, SignSymbol::Plus)
+    );
+    Line {
+        label: layout.name.to_owned(),
+        text: format!("{text:<REPORT_LRECL$}"),
+    }
+}
+
+/// `cents` edited by the picture of `sign`: the sign symbol, the 9 integer digits in groups of
+/// three, `.` and the 2 decimals. Zero suppression turns each leading zero and each comma before
+/// the first significant digit into a space and stops at the point, so the decimals always show.
+/// Every digit position is `Z`, so a zero amount is 15 spaces (P-CBTRN03C-012).
+///
+/// # Panics
+///
+/// Panics if `cents` does not fit `S9(09)V99`.
+fn edited(cents: i64, sign: SignSymbol) -> String {
+    assert!(
+        (1 - S9_09_V99_LIMIT..S9_09_V99_LIMIT).contains(&cents),
+        "{cents} cents do not fit S9(09)V99"
+    );
+    if cents == 0 {
+        return " ".repeat(EDITED_WIDTH);
+    }
+    let symbol = match (cents < 0, sign) {
+        (true, _) => '-',
+        (false, SignSymbol::Minus) => ' ',
+        (false, SignSymbol::Plus) => '+',
+    };
+    let magnitude = cents.unsigned_abs();
+    let mut integer = String::new();
+    let mut significant = false;
+    for (index, digit) in format!("{:09}", magnitude / 100).chars().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            integer.push(if significant { ',' } else { ' ' });
+        }
+        significant |= digit != '0';
+        integer.push(if significant { digit } else { ' ' });
+    }
+    format!("{symbol}{integer}.{:02}", magnitude % 100)
+}
+
+/// `ADD amount TO total` into an `S9(09)V99` receiver without `ON SIZE ERROR`: the sum keeps
+/// its sign and its 11 low-order digits (P-CBTRN03C-010, P-CBTRN03C-011: `mode=truncate`,
+/// `high_order=truncate`).
+fn add(total: i64, amount: i64) -> i64 {
+    (total + amount) % S9_09_V99_LIMIT
+}
+
+/// The cents of the amount `text` that `source` gives: an optional `-`, one or more digits,
+/// `.` and two digits, for example `-47.88`.
+fn cents(text: &str, source: &str) -> i64 {
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (whole, fraction) = unsigned
+        .split_once('.')
+        .filter(|(whole, fraction)| {
+            !whole.is_empty()
+                && fraction.len() == 2
+                && whole
+                    .bytes()
+                    .chain(fraction.bytes())
+                    .all(|byte| byte.is_ascii_digit())
+        })
+        .unwrap_or_else(|| panic!("{source}: {text:?} is not an amount with two decimals"));
+    let value: i64 = format!("{whole}{fraction}")
+        .parse()
+        .unwrap_or_else(|error| panic!("{source}: amount {text:?}: {error}"));
+    if negative { -value } else { value }
+}
+
+/// Fails unless [`edited`] gives every example of the `format=` of P-CBTRN03C-012
+/// (`+ZZZ,ZZZ,ZZZ.ZZ`) and of P-CBTRN03C-014 (`-ZZZ,ZZZ,ZZZ.ZZ`), written
+/// `<picture>: <amount> -> <edited text> width=15, <amount> -> ...`.
+fn assert_edits_match_audit(doc: &Document) {
+    for (id, sign) in [
+        (TOTALS_EDIT, SignSymbol::Plus),
+        (DETAIL_EDIT, SignSymbol::Minus),
+    ] {
+        let cell = expected_value(doc, id, "format");
+        let (picture, examples) = cell
+            .split_once(": ")
+            .unwrap_or_else(|| panic!("{id}: format= names no picture"));
+        assert_eq!(picture, sign.picture(), "{id}: format= picture");
+        // Each `->` follows an amount, the last word before it, and precedes its edited text.
+        let pieces: Vec<&str> = examples.split(" -> ").collect();
+        let edits = cell_code_spans(examples);
+        assert!(
+            !edits.is_empty() && pieces.len() == edits.len() + 1,
+            "{id}: format= holds no list of `<amount> -> <edited text>` examples"
+        );
+        for (&piece, edit) in pieces.iter().zip(&edits) {
+            let amount = piece.rsplit(' ').next().unwrap_or(piece);
+            assert_eq!(
+                edit.width,
+                Some(EDITED_WIDTH),
+                "{id}: the width= of the edit of {amount}"
+            );
+            assert_eq!(
+                edited(cents(amount, id), sign),
+                unquote(&edit.text, id),
+                "{id}: {amount} edited {picture}"
+            );
+        }
+    }
+}
+
+/// Field `value` of the one record of the ASCII fixture `file` whose fields `keys` hold their
+/// texts, every field a section A row: the keyed read of a CBTRN03C lookup (P-CBTRN03C-004)
+/// from the fixture the seed loads (P-CBTRN03C-001).
+///
+/// # Panics
+///
+/// Panics, naming the file and the keys, unless exactly one record matches, or if a field lies
+/// outside its record or is not UTF-8.
+fn lookup(doc: &Document, file: &str, keys: &[(&str, &str)], value: &str) -> String {
+    let text_at = |record: &[u8], range: &Range<usize>, number: usize| -> String {
+        record
+            .get(range.clone())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map_or_else(
+                || {
+                    panic!(
+                        "{file} record {number}: no text at bytes {} to {}",
+                        range.start + 1,
+                        range.end
+                    )
+                },
+                str::to_owned,
+            )
+    };
+    let key_fields: Vec<(Range<usize>, &str)> = keys
+        .iter()
+        .map(|&(id, text)| (layout_range(doc, id), text))
+        .collect();
+    let value_field = layout_range(doc, value);
+    let found: Vec<String> = fixture_lines(file)
+        .iter()
+        .zip(1_usize..)
+        .filter(|&(record, number)| {
+            key_fields
+                .iter()
+                .all(|(range, text)| text_at(record, range, number) == *text)
+        })
+        .map(|(record, number)| text_at(record, &value_field, number))
+        .collect();
+    match &found[..] {
+        [one] => one.clone(),
+        _ => panic!("{file}: {} records hold {keys:?}, not 1", found.len()),
+    }
+}
+
+/// The bytes section A row `id` gives its field: `Offset` to `Offset + Length`.
+fn layout_range(doc: &Document, id: &str) -> Range<usize> {
+    let [offset, length] = [PARITY_LAYOUT_COLUMNS[0], PARITY_LAYOUT_COLUMNS[1]].map(|column| {
+        let text = parity_cell(doc, id, column);
+        text.parse::<usize>().unwrap_or_else(|error| {
+            panic!("parity audit row {id}: {column} {text:?} is not a count: {error}")
+        })
+    });
+    offset..offset + length
 }

@@ -11,9 +11,13 @@
 #   docker compose --profile app run --rm api cargo run --bin batch -- <subcommand>
 #
 # Teardown, for both modes: with the app profile named, Compose acts on the
-# app-profile services and their volumes as well as on the infrastructure. A
-# plain `docker compose down -v` leaves the cargo-target, cargo-registry and
-# web-node-modules volumes behind.
+# app-profile services and their volumes as well as on the infrastructure.
+# Without it, Compose acts on postgres and rabbitmq only. Once the app profile
+# has run, a plain `docker compose down` leaves api, mq and web running (mq
+# restarts again and again without its broker) and cannot remove the network
+# they still use; a plain `down -v` also leaves the cargo-target,
+# cargo-registry and web-node-modules volumes behind. So always name the
+# profile once it has run.
 # Remove every container and keep the data and build volumes:
 #   docker compose --profile app down
 # Also remove every named volume (postgres-data, rabbitmq-data, cargo-target,
@@ -62,13 +66,27 @@ services:
       - ./infra/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
       - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
       - rabbitmq-data:/var/lib/rabbitmq
+    # Restarted after a non-zero exit, as api and mq are, so a broker that
+    # fails while it boots comes back by itself. It does not apply to
+    # `docker compose stop`.
+    restart: on-failure
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      # As the broker user, as the entrypoint runs the server. The image has no
+      # USER, so the check would run as root, and the CLI's Erlang node writes
+      # /var/lib/rabbitmq/.erlang.cookie when the server has not written it yet:
+      # owned by root and readable by root only, it stops the broker's boot
+      # with eacces.
+      # The CLI's Erlang VM starts one scheduler per host CPU, which costs many
+      # CPU-seconds per check on a large host; one scheduler keeps each check
+      # under a CPU-second. The timeout covers a check on a slow or busy host:
+      # a check cut off by it leaves its VM running, since only the wrapper
+      # script is killed, and the VMs that pile up starve the broker's boot.
+      test: ["CMD", "gosu", "rabbitmq", "env", "RABBITMQ_CTL_ERL_ARGS=+S 1:1", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
       interval: 5s
-      timeout: 10s
+      timeout: 30s
       retries: 20
 
   api:

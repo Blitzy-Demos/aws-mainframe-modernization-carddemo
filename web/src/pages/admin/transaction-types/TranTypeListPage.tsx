@@ -72,6 +72,13 @@ const DESCRIPTION_MAX_LENGTH = 50;
 /** One array for every page without rows, so the table sees one empty result. */
 const NO_ROWS: TranType[] = [];
 
+// The notes under the error of a write that got no usable answer: the server
+// may have carried it out, so the user checks before sending it again.
+const UPDATE_OUTCOME_UNKNOWN =
+  "The description may have been saved. Check the type before saving it again.";
+const DELETE_OUTCOME_UNKNOWN =
+  "The type may have been deleted. Check the list before deleting it again.";
+
 type Direction = NonNullable<TranTypeListParams["direction"]>;
 
 /** The filters of a list request, without its cursor. */
@@ -154,7 +161,16 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
     defaultValues: { description: tranType.description },
   });
 
+  // One update at a time: a second click or Enter before the busy state
+  // re-renders would send the PUT again, and its answer would replace the
+  // first one's. The ref closes that gap.
+  const inFlight = useRef(false);
+
   const onSave = (values: TranTypeInlineEditValues): void => {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
     updateMutation.mutate(
       {
         typeCode: tranType.type_code,
@@ -172,15 +188,29 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
           finishEdit(tranType.type_code);
         },
         onError: (error) => {
-          applyApiError(error, rowForm, tranTypeInlineEditBmsFieldMap);
+          applyApiError(error, rowForm, tranTypeInlineEditBmsFieldMap, {
+            unknownOutcome: UPDATE_OUTCOME_UNKNOWN,
+          });
+        },
+        // Runs after either outcome; a row that has closed has no guard to
+        // release.
+        onSettled: () => {
+          inFlight.current = false;
         },
       },
     );
   };
 
+  // aria-disabled rather than disabled: a focused button that becomes
+  // disabled loses focus to the document, which would strand a keyboard user
+  // after Save; the guard above keeps the inert button from acting.
+  const busy = updateMutation.isPending;
+  const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
+
   return (
     <form
       noValidate
+      aria-busy={busy}
       onSubmit={rowForm.handleSubmit(onSave)}
       className="flex w-80 items-start gap-2"
     >
@@ -210,7 +240,7 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
           </Field>
         )}
       />
-      <Button type="submit" disabled={updateMutation.isPending}>
+      <Button type="submit" aria-disabled={busy} className={busyClass}>
         Save
       </Button>
     </form>
@@ -488,7 +518,7 @@ export default function TranTypeListPage(): JSX.Element {
           setParams(first);
         },
         onError: (error) => {
-          showApiError(error);
+          showApiError(error, { unknownOutcome: DELETE_OUTCOME_UNKNOWN });
         },
       },
     );

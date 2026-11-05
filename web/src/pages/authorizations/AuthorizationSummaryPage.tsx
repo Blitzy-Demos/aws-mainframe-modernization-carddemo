@@ -653,12 +653,16 @@ export default function AuthorizationSummaryPage(): JSX.Element {
             <Field data-invalid={fieldState.invalid}>
               <FieldLabel htmlFor={ACCOUNT_FIELD_ID}>Account ID</FieldLabel>
               <div className="flex flex-col gap-2 md:flex-row">
+                {/* The cursor starts on ACCTID: COPAUS0C sends every screen
+                    with MOVE -1 TO ACCTIDL
+                    [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L188, L196]. */}
                 <Input
                   {...field}
                   id={ACCOUNT_FIELD_ID}
                   maxLength={ACCOUNT_ID_LENGTH}
                   inputMode="numeric"
                   autoComplete="off"
+                  autoFocus
                   aria-invalid={fieldState.invalid}
                   aria-describedby={fieldState.invalid ? ACCOUNT_ERROR_ID : undefined}
                   className="md:max-w-xs"

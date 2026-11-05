@@ -78,6 +78,13 @@ const CONFIRM_YES = "Y";
 /** The status of a completed payment; a 200 only carries a message. */
 const CREATED = 201;
 
+/**
+ * The note under the error of a confirmed payment that got no usable answer:
+ * the server may have made it, and paying again would pay twice.
+ */
+const PAYMENT_OUTCOME_UNKNOWN =
+  "The payment may have been made. Check the account balance before paying again.";
+
 /** `ACTIDINI PIC X(11)` [app/cpy-bms/COBIL00.CPY:L60]. */
 const ACCOUNT_ID_LENGTH = 11;
 const ACCOUNT_FIELD = "account_id";
@@ -336,10 +343,11 @@ export default function BillPaymentPage(): JSX.Element {
           }
         },
         onError: (error) => {
+          const options = { unknownOutcome: PAYMENT_OUTCOME_UNKNOWN };
           if (ownsEntry()) {
-            applyApiError(error, form, billPaymentBmsFieldMap);
+            applyApiError(error, form, billPaymentBmsFieldMap, options);
           } else {
-            showApiError(error);
+            showApiError(error, options);
           }
         },
       },

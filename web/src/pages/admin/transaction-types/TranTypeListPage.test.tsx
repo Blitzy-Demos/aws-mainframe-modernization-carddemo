@@ -2,15 +2,26 @@
 // each control the function map names (F-COTRTLI-001, -006, -007, -008,
 // -009) sends its request for valid input, sends nothing for input the
 // schema module rejects, and shows a server rejection through lib/api-errors
-// (toast, field error, focus). The API is stubbed at the global the client
-// sends through; every body is typed against the generated OpenAPI schemas.
+// (toast, field error, focus). The inline update sends one PUT per Save, a
+// double click included, and keeps its Save focused while the PUT runs. An
+// inline update without an answer before the client's deadline is sent once,
+// toasted with a note that it may have been saved, and the list is read
+// again. The API is stubbed at the global the client sends through; every
+// body is typed against the generated OpenAPI schemas.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { RequestTimeoutError } from "@/api/client";
 import type { components } from "@/api/schema";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
@@ -358,6 +369,106 @@ describe("TranTypeListPage inline update (F-COTRTLI-006, F-COTRTLI-007)", () => 
     expect(requests("PUT")).toHaveLength(1);
     // The inline update names no BMS field, so only the toast carries the text.
     expect(within(rowForm()).queryByRole("alert")).toBeNull();
+  });
+
+  // Two clicks before the row re-renders send one PUT, and its answer is
+  // the one shown.
+  it("sends one PUT for a double click on the row's Save", async () => {
+    const successSpy = vi.spyOn(toast, "success");
+    const errorSpy = vi.spyOn(toast, "error");
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    const save = within(rowForm()).getByRole("button", { name: "Save" });
+    fireEvent.click(save);
+    fireEvent.click(save);
+
+    await waitFor(() => {
+      expect(successSpy).toHaveBeenCalledWith(UPDATE_ANSWER.message);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    });
+    expect(requests("PUT")).toHaveLength(1);
+    expect(successSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps the row's Save focused and its form busy while the update runs, then returns focus to Edit", async () => {
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    respond = async (request) => {
+      if (request.method === "PUT") {
+        await held;
+      }
+      return defaultRespond(request);
+    };
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    const save = within(rowForm()).getByRole("button", { name: "Save" });
+    await user.click(save);
+    await waitFor(() => {
+      expect(save.getAttribute("aria-disabled")).toBe("true");
+    });
+    // Inert but not disabled: a disabled button would hand focus to the body.
+    expect(save.hasAttribute("disabled")).toBe(false);
+    expect(document.activeElement).toBe(save);
+    expect(rowForm().getAttribute("aria-busy")).toBe("true");
+    await user.keyboard("{Enter}");
+    await user.click(save);
+    expect(requests("PUT")).toHaveLength(1);
+
+    release();
+    await waitFor(() => {
+      expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    });
+    // The saved row closes with its Save, and focus lands on its Edit.
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        rowButton("Edit", PURCHASE.type_code),
+      );
+    });
+    expect(requests("PUT")).toHaveLength(1);
+  });
+
+  // The server may still store the description after the client gave up, so
+  // the toast says so, the PUT is not sent again, the row stays open with
+  // what was typed, and the list is read again.
+  it("toasts an update past the deadline as possibly saved, sends it once and reads the list again", async () => {
+    const errorSpy = vi.spyOn(toast, "error");
+    respond = async (request) => {
+      if (request.method === "PUT") {
+        throw new RequestTimeoutError();
+      }
+      return defaultRespond(request);
+    };
+    const { user } = await renderLoadedPage();
+    const reads = requests("GET").length;
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    await user.clear(rowDescription());
+    await user.type(rowDescription(), "Retail purchase");
+    await user.click(within(rowForm()).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(errorSpy).toHaveBeenCalledWith(
+        "No answer from the server within 30 seconds",
+        {
+          description:
+            "The description may have been saved. Check the type before saving it again.",
+          duration: Infinity,
+        },
+      );
+    });
+    await waitFor(() => {
+      expect(requests("GET")).toHaveLength(reads + 1);
+    });
+    expect(requests("PUT")).toHaveLength(1);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(rowDescription()).toHaveProperty("value", "Retail purchase");
   });
 });
 

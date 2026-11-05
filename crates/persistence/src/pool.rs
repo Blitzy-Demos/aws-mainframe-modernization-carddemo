@@ -15,12 +15,18 @@
 //! URL carries the password, so nothing here logs or displays it, and the
 //! [`Debug`] form of a [`Db`] shows only the pool's size and options.
 //!
+//! A URL refused before any connection attempt, one that does not parse or
+//! one refused as below, is a [`PersistenceError::InvalidDatabaseUrl`]: its
+//! text names `CARDDEMO_DATABASE_URL`, the variable every process passes the
+//! URL in, and the reason, never any part of the URL.
+//!
 //! sqlx logs every query parameter of the URL that it does not read, at
 //! `WARN` and with the parameter's value, and that value can be a credential:
-//! libpq's `sslpassword`, or a misspelt `password`. [`connect`] and
+//! libpq's `sslpassword`, or a misspelt `password`. Its parse error for an
+//! `sslmode` value it does not know quotes that value. [`connect`] and
 //! [`connect_with_statement_timeout`] therefore refuse a URL whose query holds
-//! such a parameter before sqlx parses it, naming the parameter but never its
-//! value.
+//! such a parameter or value before sqlx parses it, naming the parameter but
+//! never its value.
 //!
 //! [`connect`] and [`connect_with_statement_timeout`] open the first connection
 //! directly, in one attempt sqlx does not retry, beside the pool's own first
@@ -82,6 +88,20 @@ const OPTION_PREFIX: &str = "options[";
 /// The end of an `options[NAME]` parameter. sqlx ignores a parameter that has
 /// the prefix but not this end, so such a parameter is refused as well.
 const OPTION_SUFFIX: char = ']';
+
+/// The two names sqlx 0.8.6 reads the SSL mode under.
+const SSL_MODE_PARAMETERS: [&str; 2] = ["sslmode", "ssl-mode"];
+
+/// The SSL modes sqlx 0.8.6 knows, matched after ASCII lower-casing. Its
+/// error for any other value quotes the value.
+const SSL_MODES: [&str; 6] = [
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+];
 
 /// The connection pool of one process.
 ///
@@ -168,18 +188,19 @@ impl Db {
 ///
 /// # Errors
 ///
-/// [`PersistenceError::Sqlx`] when `url` does not parse as a connection URL,
-/// or when the first connection cannot be opened or authenticated: the error
-/// of that attempt, [`sqlx::Error::Io`] for a refused or unreachable server
-/// for example, or [`sqlx::Error::PoolTimedOut`] when the server does not
-/// answer within the acquire timeout. A query parameter sqlx does not read is
-/// refused first, as a [`sqlx::Error::Configuration`] that names the parameter
-/// but not its value (nor any of its text when it has no `=`), because sqlx
-/// would log that value.
+/// - [`PersistenceError::InvalidDatabaseUrl`] when `url` does not parse as a
+///   connection URL, with sqlx's reason, `relative URL without a base` or
+///   `invalid port number` for example. A query parameter sqlx does not read,
+///   or an `sslmode` value it does not know, is refused first, naming the
+///   parameter but not its value (nor any of its text when it has no `=`),
+///   because sqlx would log or quote that value.
+/// - [`PersistenceError::Sqlx`] when the first connection cannot be opened or
+///   authenticated: the error of that attempt, [`sqlx::Error::Io`] for a
+///   refused or unreachable server for example, or
+///   [`sqlx::Error::PoolTimedOut`] when the server does not answer within the
+///   acquire timeout.
 pub async fn connect(url: &str) -> Result<Db, PersistenceError> {
-    check_query_parameters(url)?;
-    // The parse `PgPoolOptions::connect` would make of `url`.
-    let pool = open_pool(url.parse::<PgConnectOptions>()?).await?;
+    let pool = open_pool(parse_url(url)?).await?;
     // The URL is left out of the event: it carries the password.
     tracing::debug!(max_connections = MAX_CONNECTIONS, "database pool connected");
     Ok(Db::from_pool(pool))
@@ -199,8 +220,8 @@ pub async fn connect(url: &str) -> Result<Db, PersistenceError> {
 ///
 /// # Errors
 ///
-/// Every error [`connect`] returns, the refusal of a query parameter sqlx
-/// does not read included, checked before sqlx parses `url`. The first
+/// Every error [`connect`] returns, the refusal of a query parameter or an
+/// `sslmode` value included, checked before sqlx parses `url`. The first
 /// connection is opened directly as [`connect`] opens it, so a server that
 /// refuses it or turns it away reports its cause at once here too, and one
 /// that never answers fails at the pool's acquire timeout.
@@ -208,11 +229,8 @@ pub async fn connect_with_statement_timeout(
     url: &str,
     statement_timeout: Duration,
 ) -> Result<Db, PersistenceError> {
-    check_query_parameters(url)?;
     let timeout_ms = statement_timeout.as_millis().max(1);
-    let options = url
-        .parse::<PgConnectOptions>()?
-        .options([("statement_timeout", timeout_ms)]);
+    let options = parse_url(url)?.options([("statement_timeout", timeout_ms)]);
     let pool = open_pool(options).await?;
     // The URL is left out of the event: it carries the password.
     tracing::debug!(
@@ -309,18 +327,52 @@ where
     .await
 }
 
+/// Parses `url` into the options sqlx connects with, once
+/// [`check_query_parameters`] has refused what sqlx would log or quote.
+///
+/// The reason of a parse failure is sqlx's: a URL syntax, UTF-8, number or IP
+/// address error, none of which quotes the URL. It is taken from inside
+/// sqlx's configuration error, without that error's `error with
+/// configuration: ` prefix.
+///
+/// # Errors
+///
+/// [`PersistenceError::InvalidDatabaseUrl`] when [`check_query_parameters`]
+/// refuses `url` or sqlx cannot parse it.
+fn parse_url(url: &str) -> Result<PgConnectOptions, PersistenceError> {
+    check_query_parameters(url)?;
+    // The parse `PgPoolOptions::connect` would make of `url`.
+    url.parse::<PgConnectOptions>()
+        .map_err(|error| PersistenceError::InvalidDatabaseUrl {
+            reason: match error {
+                sqlx::Error::Configuration(source) => source.to_string(),
+                other => other.to_string(),
+            },
+        })
+}
+
 /// Refuses `url` when its query holds a parameter sqlx does not read, which
-/// sqlx would log at `WARN` together with its value.
+/// sqlx would log at `WARN` together with its value, or an `sslmode` (or
+/// `ssl-mode`) value sqlx does not know, which its parse error would quote.
 ///
 /// The error names the parameter by its decoded name. A parameter without `=`
 /// is a name alone, and that text may itself be a credential, so it is named
-/// only by its position in the query.
+/// only by its position in the query. An `sslmode` without `=` has the empty
+/// value, as sqlx reads it, and is refused as unknown.
 fn check_query_parameters(url: &str) -> Result<(), PersistenceError> {
-    for (position, (name, has_value)) in query_parameters(url).iter().enumerate() {
-        if is_recognized(name) {
-            continue;
-        }
-        let message = if *has_value {
+    for (position, (name, value)) in query_parameters(url).iter().enumerate() {
+        let reason = if is_recognized(name) {
+            if !SSL_MODE_PARAMETERS.contains(&name.as_str())
+                || is_ssl_mode(value.as_deref().unwrap_or_default())
+            {
+                continue;
+            }
+            format!(
+                "unsupported value of connection URL query parameter {name:?} (value withheld); \
+                 expected one of {}",
+                SSL_MODES.join(", ")
+            )
+        } else if value.is_some() {
             format!("unsupported connection URL query parameter {name:?} (value withheld)")
         } else {
             format!(
@@ -328,11 +380,14 @@ fn check_query_parameters(url: &str) -> Result<(), PersistenceError> {
                 position + 1
             )
         };
-        return Err(PersistenceError::Sqlx(sqlx::Error::Configuration(
-            message.into(),
-        )));
+        return Err(PersistenceError::InvalidDatabaseUrl { reason });
     }
     Ok(())
+}
+
+/// Whether sqlx reads `value`, decoded, as an SSL mode.
+fn is_ssl_mode(value: &str) -> bool {
+    SSL_MODES.contains(&value.to_ascii_lowercase().as_str())
 }
 
 /// Whether sqlx reads the query parameter `name`.
@@ -344,12 +399,12 @@ fn is_recognized(name: &str) -> bool {
 }
 
 /// The query parameters of `url` as sqlx sees them, in order: each decoded
-/// name, with whether a `=` follows it.
+/// name, with its decoded value when a `=` follows it.
 ///
-/// This takes the names exactly as sqlx's parser does, `url` 2.5 then the
-/// `form_urlencoded` pairs of the query, so that no parameter reaches sqlx
-/// under a name this check did not see.
-fn query_parameters(url: &str) -> Vec<(String, bool)> {
+/// This takes the names and values exactly as sqlx's parser does, `url` 2.5
+/// then the `form_urlencoded` pairs of the query, so that no parameter reaches
+/// sqlx under a name or with a value this check did not see.
+fn query_parameters(url: &str) -> Vec<(String, Option<String>)> {
     // C0 controls and spaces at either end are trimmed, and tabs and line
     // breaks are dropped wherever they stand.
     let url: String = url
@@ -368,8 +423,8 @@ fn query_parameters(url: &str) -> Vec<(String, bool)> {
         .split('&')
         .filter(|segment| !segment.is_empty())
         .map(|segment| match segment.split_once('=') {
-            Some((name, _)) => (decode_component(name), true),
-            None => (decode_component(segment), false),
+            Some((name, value)) => (decode_component(name), Some(decode_component(value))),
+            None => (decode_component(segment), None),
         })
         .collect()
 }
@@ -429,6 +484,11 @@ mod tests {
 
     /// A stand-in for a credential written into a connection URL.
     const SECRET: &str = "not-a-real-secret";
+
+    /// The start of the text of every URL refused before a connection
+    /// attempt. The `mq` start-up test checks that the binary's report names
+    /// the settings' key for the URL the same way.
+    const INVALID_URL: &str = "invalid CARDDEMO_DATABASE_URL: ";
 
     /// How long a refused first connection may take to be reported: well
     /// under the pool's 30-second acquire timeout, which sqlx's retries of a
@@ -502,11 +562,18 @@ mod tests {
         (result, capture.fields())
     }
 
-    /// The message of the configuration error `url` is refused with.
+    /// The reason `url` is refused with, checked to follow the name of
+    /// `CARDDEMO_DATABASE_URL` in the error's text.
     fn refusal(url: &str) -> String {
         match check_query_parameters(url) {
-            Err(PersistenceError::Sqlx(sqlx::Error::Configuration(message))) => message.to_string(),
-            Err(other) => panic!("{url:?}: expected a configuration error, got {other}"),
+            Err(error @ PersistenceError::InvalidDatabaseUrl { .. }) => {
+                let text = error.to_string();
+                match text.strip_prefix(INVALID_URL) {
+                    Some(reason) => reason.to_owned(),
+                    None => panic!("{url:?}: the error does not name the variable: {text}"),
+                }
+            }
+            Err(other) => panic!("{url:?}: expected an invalid URL error, got {other}"),
             Ok(()) => panic!("{url:?}: accepted"),
         }
     }
@@ -525,8 +592,9 @@ mod tests {
              &application_name=carddemo&options=-c%20search_path%3Dpublic",
             "postgres://u:p@h/db?options[search_path]=public",
             "postgres://u:p@h/db?options%5Bsearch_path%5D=public",
-            // sqlx matches the decoded name.
+            // sqlx matches the decoded name, and the SSL mode in any case.
             "postgres://u:p@h/db?ssl%6Dode=disable",
+            "postgres://u:p@h/db?sslmode=Verify-Full&ssl-mode=REQUIRE&sslmode=%61llow",
             // The URL parser drops tabs and line breaks inside the name.
             "postgres://u:p@h/db?ssl\tmo\r\nde=disable",
             // A name without `=` that sqlx reads gets an empty value.
@@ -542,6 +610,9 @@ mod tests {
         for url in cases {
             if let Err(err) = check_query_parameters(url) {
                 panic!("{url:?} refused: {err}");
+            }
+            if let Err(err) = url.parse::<PgConnectOptions>() {
+                panic!("{url:?} does not parse in sqlx: {err}");
             }
         }
     }
@@ -597,11 +668,32 @@ mod tests {
                 "postgres://u:p@h/db?sslmode=disable&&not-a-real-secret%3Dx#y",
                 r#"unsupported connection URL query parameter 2 without "=" (text withheld)"#,
             ),
+            // sqlx's error for an SSL mode it does not know quotes the value.
+            (
+                "postgres://u:p@h/db?sslmode=not-a-real-secret",
+                r#"unsupported value of connection URL query parameter "sslmode" (value withheld); expected one of disable, allow, prefer, require, verify-ca, verify-full"#,
+            ),
+            (
+                "postgres://u:p@h/db?sslmode=disable&ssl-mode=not-a-real-secret",
+                r#"unsupported value of connection URL query parameter "ssl-mode" (value withheld); expected one of disable, allow, prefer, require, verify-ca, verify-full"#,
+            ),
+            (
+                "postgres://u:p@h/db?ssl%6Dode=dis+able",
+                r#"unsupported value of connection URL query parameter "sslmode" (value withheld); expected one of disable, allow, prefer, require, verify-ca, verify-full"#,
+            ),
+            (
+                "postgres://u:p@h/db?sslmode",
+                r#"unsupported value of connection URL query parameter "sslmode" (value withheld); expected one of disable, allow, prefer, require, verify-ca, verify-full"#,
+            ),
         ];
         for (url, expected) in cases {
             let message = refusal(url);
             assert_eq!(message, expected, "{url:?}");
             assert!(!message.contains(SECRET), "{url:?}: {message}");
+            if expected.starts_with("unsupported value") {
+                // sqlx refuses the value as well; the check only withholds it.
+                assert!(url.parse::<PgConnectOptions>().is_err(), "{url:?}");
+            }
         }
     }
 
@@ -628,7 +720,7 @@ mod tests {
                 assert!(
                     matches!(
                         poll,
-                        Poll::Ready(Err(PersistenceError::Sqlx(sqlx::Error::Configuration(_))))
+                        Poll::Ready(Err(PersistenceError::InvalidDatabaseUrl { .. }))
                     ),
                     "{url:?}: {poll:?}"
                 );
@@ -636,6 +728,57 @@ mod tests {
                     !fields.iter().any(|field| field.contains(SECRET)),
                     "{url:?}: {fields:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_url_sqlx_cannot_parse_names_the_variable_and_the_reason_but_not_the_url() {
+        let cases = [
+            ("notaurl".to_owned(), "relative URL without a base"),
+            (
+                format!("postgres://carddemo:{SECRET}@127.0.0.1:notaport/carddemo"),
+                "invalid port number",
+            ),
+            (
+                format!("postgres://carddemo:{SECRET}@[::1/carddemo"),
+                "invalid IPv6 address",
+            ),
+            (
+                format!("postgres://carddemo:%FF{SECRET}@127.0.0.1/carddemo"),
+                "invalid utf-8 sequence of 1 bytes from index 0",
+            ),
+            (
+                format!("postgres://carddemo:carddemo@127.0.0.1/carddemo?port={SECRET}"),
+                "invalid digit found in string",
+            ),
+            (
+                format!("postgres://carddemo:carddemo@127.0.0.1/carddemo?hostaddr={SECRET}"),
+                "invalid IP address syntax",
+            ),
+        ];
+        for (url, reason) in &cases {
+            let openers = [
+                poll_once(connect(url)),
+                poll_once(connect_with_statement_timeout(url, Duration::from_secs(25))),
+            ];
+            for poll in openers {
+                let Poll::Ready(Err(error)) = poll else {
+                    panic!("{url:?}: expected an immediate refusal, got {poll:?}");
+                };
+                assert!(
+                    matches!(error, PersistenceError::InvalidDatabaseUrl { .. }),
+                    "{url:?}: {error:?}"
+                );
+                let text = error.to_string();
+                assert_eq!(text, format!("{INVALID_URL}{reason}"), "{url:?}");
+                for withheld in [SECRET, url.as_str()] {
+                    assert!(!text.contains(withheld), "{url:?}: {text}");
+                    assert!(
+                        !format!("{error:?}").contains(withheld),
+                        "{url:?}: {error:?}"
+                    );
+                }
             }
         }
     }

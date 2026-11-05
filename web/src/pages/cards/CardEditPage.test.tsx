@@ -5,7 +5,9 @@
 // edits reject are marked without a read; and a field or key error the
 // server answers is toasted, marked on its control and given focus, as
 // `MOVE -1 TO <field>L` places the cursor. A save and PF12 Cancel's re-read
-// run one at a time, and the pressed button keeps focus while they run.
+// run one at a time, and the pressed button keeps focus while they run. A 409
+// redisplays the card as re-read, with the message on Name on card and the
+// cursor there, and the next Save sends the re-read card's token.
 //
 // The network is the global the API client looks up on every request,
 // stubbed to answer as the API does for card 0500024453765740 of account
@@ -542,6 +544,11 @@ describe("CardEditPage", () => {
     expect(save.hasAttribute("disabled")).toBe(false);
     expect(cancel.hasAttribute("disabled")).toBe(false);
     expect(document.activeElement).toBe(cancel);
+    // The form is busy and the pressed Cancel spins, its name unchanged.
+    expect(save.closest("form")?.getAttribute("aria-busy")).toBe("true");
+    expect(cancel.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(save.querySelector("svg")).toBeNull();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBe(cancel);
     await user.click(save);
     await user.click(input("Name on card"));
     await user.keyboard("{Enter}");
@@ -559,6 +566,8 @@ describe("CardEditPage", () => {
       expect(save.getAttribute("aria-disabled")).toBe("false");
     });
     expect(cancel.getAttribute("aria-disabled")).toBe("false");
+    expect(save.closest("form")?.getAttribute("aria-busy")).toBe("false");
+    expect(cancel.querySelector("svg")).toBeNull();
     await settle();
 
     await enter(user, "Name on card", "Aniya Vonn");
@@ -672,6 +681,11 @@ describe("CardEditPage", () => {
     expect(cancel.getAttribute("aria-disabled")).toBe("true");
     expect(cancel.hasAttribute("disabled")).toBe(false);
     expect(document.activeElement).toBe(save);
+    // The form is busy and the pressed Save spins, its name unchanged.
+    expect(save.closest("form")?.getAttribute("aria-busy")).toBe("true");
+    expect(save.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(cancel.querySelector("svg")).toBeNull();
+    expect(screen.getByRole("button", { name: "Save" })).toBe(save);
 
     write.release();
     await waitFor(() => {
@@ -682,5 +696,119 @@ describe("CardEditPage", () => {
     });
     expect(cancel.getAttribute("aria-disabled")).toBe("false");
     expect(document.activeElement).toBe(save);
+    expect(save.closest("form")?.getAttribute("aria-busy")).toBe("false");
+    expect(save.querySelector("svg")).toBeNull();
+  });
+
+  /**
+   * The card as another user rewrote it while the entry was being made: a
+   * new name, status and expiry, and so a new version token.
+   */
+  const CHANGED_ELSEWHERE: CardResponse = {
+    ...CARD,
+    card_embossed_name: "Aniya Smith",
+    card_expiraion_date: "2025-07-09",
+    card_active_status: "N",
+    version: "a1b2c3d4e5f60718",
+  };
+
+  /** COCRDUPC 9300-CHECK-CHANGE-IN-REC's text (V-COCRDUPC-019). */
+  const RECORD_CHANGED = "Record changed by some one else. Please review";
+
+  /** COCRDUPC 1200-EDIT-MAP-INPUTS's no-change text (V-COCRDUPC-009). */
+  const NO_CHANGE = "No change detected with respect to values fetched.";
+
+  it("reloads a card changed by someone else, marks Name on card and saves it with the new token", async () => {
+    const toastError = vi.spyOn(toast, "error");
+    const toastSuccess = vi.spyOn(toast, "success");
+    // The stubbed API recompares the token sent with the card stored, as the
+    // server does inside its locked read: a stale token is the 409 at
+    // CRDNAME, where COCRDUPC puts the cursor; the current token with the
+    // stored card's own values writes nothing. The first PUT is held until
+    // the card has changed.
+    const write = hold();
+    answerPut = async (body) => {
+      await write.held;
+      if (body.version !== stored.version) {
+        return errorAnswer(409, {
+          code: "CONFLICT",
+          message: RECORD_CHANGED,
+          fields: [{ field: "CRDNAME", message: RECORD_CHANGED }],
+        });
+      }
+      const answer: CardUpdateResponse = { card: stored, message: NO_CHANGE };
+      return Response.json(answer);
+    };
+    const { user } = await renderLoaded();
+
+    await enter(user, "Name on card", "Aniya Vonn");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(sentPuts()).toHaveLength(1);
+    });
+    // Another user rewrites the card before the PUT is answered, so the
+    // hook's re-read after the 409 returns it.
+    stored = CHANGED_ELSEWHERE;
+    write.release();
+
+    // The form holds the card as re-read, not the entry, with the message on
+    // CRDNAME and the cursor there, as COCRDUPC redisplays the changed card.
+    const expectConflictShown = () => {
+      const name = input("Name on card");
+      expect(name.value).toBe("Aniya Smith");
+      expect(input("Card Active Y/N").value).toBe("N");
+      expect(input("Expiry Month").value).toBe("07");
+      expect(input("Expiry Year").value).toBe("2025");
+      expect(name.getAttribute("aria-invalid")).toBe("true");
+      const error = fieldErrorOf(name);
+      expect(error.getAttribute("role")).toBe("alert");
+      expect(error.textContent).toBe(RECORD_CHANGED);
+      expect(document.activeElement).toBe(name);
+    };
+    await waitFor(expectConflictShown);
+    expect(toastError).toHaveBeenCalledWith(RECORD_CHANGED);
+    // The page hears of the re-read card on a later timer task than the
+    // failed save; the form, the error and the cursor outlast that.
+    await settle();
+    expectConflictShown();
+    const read = `GET ${CARD_PATH}?account_id=${ACCOUNT_ID}`;
+    expect(received).toEqual([read, `PUT ${CARD_PATH}`, read]);
+
+    // Save sends the re-read card with its token, which COCRDUPC finds
+    // unchanged: a prompt rather than a success, and the error is cleared.
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText(NO_CHANGE)).toBeTruthy();
+    expect(toastSuccess).not.toHaveBeenCalled();
+    expect(toastError).toHaveBeenCalledTimes(1);
+    const sent: CardUpdateRequest[] = [
+      {
+        version: CARD.version,
+        account_id: ACCOUNT_ID,
+        embossed_name: "Aniya Vonn",
+        active_status: "Y",
+        expiry_month: "03",
+        expiry_year: "2023",
+      },
+      {
+        version: CHANGED_ELSEWHERE.version,
+        account_id: ACCOUNT_ID,
+        embossed_name: "Aniya Smith",
+        active_status: "N",
+        expiry_month: "07",
+        expiry_year: "2025",
+      },
+    ];
+    expect(putBodies).toEqual(sent);
+    // Each save settles once the hook's re-read of the card has answered.
+    expect(received).toEqual([
+      read,
+      `PUT ${CARD_PATH}`,
+      read,
+      `PUT ${CARD_PATH}`,
+      read,
+    ]);
+    expect(input("Name on card").value).toBe("Aniya Smith");
+    expect(input("Name on card").getAttribute("aria-invalid")).toBe("false");
   });
 });

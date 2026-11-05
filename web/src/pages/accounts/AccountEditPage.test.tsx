@@ -12,7 +12,7 @@
 // The network is the stubbed global the API client looks up on every request,
 // answering by method: GET with the test's records, PUT with its answers.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
@@ -331,6 +331,28 @@ function errorOf(field: HTMLInputElement): string | null {
 }
 
 /**
+ * Waits for the newest toast to show `message` and checks it is the neutral
+ * toast of a 200 that wrote nothing: neither a success nor an error, and no
+ * icon. Sonner keeps its toasts across tests and puts the newest in front, so
+ * an earlier toast with the same text is never the one checked.
+ */
+async function expectPrompt(message: string): Promise<void> {
+  const shown = await waitFor(() => {
+    const front = document.querySelector<HTMLElement>(
+      '[data-sonner-toast][data-front="true"]',
+    );
+    expect(front?.textContent).toBe(message);
+    return front;
+  });
+  if (shown === null) {
+    throw new Error(`"${message}" is not shown in a toast`);
+  }
+  expect(shown.getAttribute("data-type")).not.toBe("success");
+  expect(shown.getAttribute("data-type")).not.toBe("error");
+  expect(shown.querySelector("[data-icon]")).toBeNull();
+}
+
+/**
  * Lets every effect, microtask and zero-delay timer scheduled so far run,
  * among them TanStack Query's notification of the page about new data.
  */
@@ -377,6 +399,81 @@ describe("AccountEditPage (CAUP, COACTUPC)", () => {
       expect(input(name).readOnly).toBe(true);
     }
     expect(input("First Name").readOnly).toBe(false);
+  });
+
+  // 3300-SETUP-SCREEN-ATTRS positions the cursor in screen-location order
+  // [app/cbl/COACTUPC.cbl:L3008]. The page's DOM order is its visual order:
+  // one column below `lg`, and from `lg` rows of two that pair single fields
+  // with single fields and three-part values with three-part values.
+  it.each([
+    {
+      section: "Account",
+      names: [
+        "Account Number",
+        "Active Y/N",
+        "Credit Limit",
+        "Cash credit Limit",
+        "Current Balance",
+        "Account Group",
+        "Current Cycle Credit",
+        "Current Cycle Debit",
+        "Opened Year",
+        "Opened Month",
+        "Opened Day",
+        "Expiry Year",
+        "Expiry Month",
+        "Expiry Day",
+        "Reissue Year",
+        "Reissue Month",
+        "Reissue Day",
+      ],
+    },
+    {
+      section: "Customer Details",
+      names: [
+        "Customer id",
+        "FICO Score",
+        "SSN First 3",
+        "SSN 4th & 5th",
+        "SSN Last 4",
+        "Date of birth Year",
+        "Date of birth Month",
+        "Date of birth Day",
+        "First Name",
+        "Middle Name",
+        "Last Name",
+        "Address line 1",
+        "Address line 2",
+        "City",
+        "State",
+        "Zip",
+        "Country",
+      ],
+    },
+    {
+      section: "Contact and other details",
+      names: [
+        "Phone 1 Area code",
+        "Phone 1 Prefix",
+        "Phone 1 Line number",
+        "Phone 2 Area code",
+        "Phone 2 Prefix",
+        "Phone 2 Line number",
+        "Government Issued Id Ref",
+        "EFT Account Id",
+        "Primary Card Holder Y/N",
+      ],
+    },
+  ])("reads the $section fields in order", async ({ section, names }) => {
+    stubNetwork({ reads: [ACCOUNT] });
+    await renderPage();
+
+    const fields = within(
+      screen.getByRole("group", { name: section }),
+    ).getAllByRole("textbox");
+    expect(fields.map((field) => field.id)).toEqual(
+      names.map((name) => input(name).id),
+    );
   });
 
   // COACTUPC reads the record only once the key edits pass: a route key they
@@ -548,8 +645,10 @@ describe("AccountEditPage (CAUP, COACTUPC)", () => {
 
     await user.click(screen.getByRole("button", { name: "Save" }));
 
-    await screen.findByText(NO_CHANGE_DETECTED);
-    expect(success).toHaveBeenCalledWith(NO_CHANGE_DETECTED);
+    // The record already holds the values sent: nothing is written, and the
+    // answer keeps the token sent, a prompt rather than a success.
+    await expectPrompt(NO_CHANGE_DETECTED);
+    expect(success).not.toHaveBeenCalledWith(NO_CHANGE_DETECTED);
     const puts = await Promise.all(network.sent("PUT").map(contentOf));
     const resent: AccountUpdateRequest = {
       ...UNCHANGED_BODY,
@@ -606,6 +705,10 @@ describe("AccountEditPage (CAUP, COACTUPC)", () => {
     const cancel = screen.getByRole("button", { name: "Cancel" });
     expect(save.getAttribute("aria-disabled")).toBe("true");
     expect(cancel.getAttribute("aria-disabled")).toBe("true");
+    // The form is busy and the pressed Cancel spins, found by its own name.
+    expect(save.closest("form")?.getAttribute("aria-busy")).toBe("true");
+    expect(cancel.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(save.querySelector("svg")).toBeNull();
     await user.click(save);
     await user.click(input("First Name"));
     await user.keyboard("{Enter}");
@@ -621,6 +724,8 @@ describe("AccountEditPage (CAUP, COACTUPC)", () => {
       expect(save.getAttribute("aria-disabled")).toBe("false");
     });
     expect(cancel.getAttribute("aria-disabled")).toBe("false");
+    expect(save.closest("form")?.getAttribute("aria-busy")).toBe("false");
+    expect(cancel.querySelector("svg")).toBeNull();
     // The page hears of the re-read record on a later timer task and resets
     // the form to the same values then, so entries wait for that.
     await settle();
@@ -634,11 +739,11 @@ describe("AccountEditPage (CAUP, COACTUPC)", () => {
     expect(input("First Name").value).toBe(NEW_FIRST_NAME);
     expect(input("Credit Limit").value).toBe("2021.00");
 
-    // The next save echoes the saved record's token.
+    // The next save echoes the saved record's token, which the unchanged
+    // record keeps: a prompt rather than a success.
     await user.click(save);
-    await waitFor(() => {
-      expect(success).toHaveBeenCalledWith(NO_CHANGE_DETECTED);
-    });
+    await expectPrompt(NO_CHANGE_DETECTED);
+    expect(success).not.toHaveBeenCalledWith(NO_CHANGE_DETECTED);
     const savedBody: AccountUpdateRequest = {
       ...UNCHANGED_BODY,
       acct_credit_limit: "2021.00",

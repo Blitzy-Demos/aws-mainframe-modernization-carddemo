@@ -16,7 +16,9 @@
 //! - `more_than_ten_transactions_on_a_card_halts_with_exit_16` fills the 10 transaction slots of
 //!   one card, which still fit the CBSTM03A tables, then adds an 11th, where the COBOL subscripts
 //!   run past the table: the run stops with exit 16 and names the halt escalation (E-33), and the
-//!   statements of the run before are deleted and none written (AAP 0.9.6).
+//!   statements of the run before are deleted and none written (AAP 0.9.6). The COBOL result is
+//!   undefined there, so the stop's message is the replacement's own: the test spells it out,
+//!   with the slots its scenario needs and the table capacities the audit gives.
 //! - `empty_live_master_abends_reading_trnxfile`: an empty transaction file abends.
 //! - `p_ids_are_every_statement_row` and `audit_describes_every_statement_line` read repository
 //!   files only and need no Docker.
@@ -35,12 +37,11 @@ use carddemo_audit::{
 };
 use carddemo_domain::messages::{ABENDING_PROGRAM, ERROR_READING_TRNXFILE, RETURN_CODE};
 use carddemo_domain::numeric::TranId;
-use carddemo_domain::rules::statement::StatementError;
 use carddemo_persistence::Db;
 use carddemo_testkit::fixtures;
 use common::{
     Harness, LIVE_MASTER_COLUMNS, TRANREPT_CLOCK, ct02_add, ct02_input, expected_value,
-    fixture_lines, parity, parity_row, split_records,
+    fixture_lines, parity, parity_cell, parity_row, split_records,
 };
 
 /// Normal end, condition code 0: CBSTM03A 9999-GOBACK sets no `RETURN-CODE` (P-CBSTM03A-1264),
@@ -84,6 +85,16 @@ const POSTTRAN_COUNTS: &str = "P-CBTRN02C-065";
 
 /// COMBTRAN's load into the live master TRANBKP emptied, the README case, with its `exit=`.
 const COMBTRAN_README_LOAD: &str = "P-COMBTRAN-005";
+
+/// The section B row of the CBSTM03A table load, whose copybook field cell gives the `OCCURS`
+/// count of each table and whose expected result states the capacity they make.
+const TABLES_ROW: &str = "P-CBSTM03A-004";
+
+/// The card table, `WS-CARD-TBL` [app/cbl/CBSTM03A.CBL:L226-230].
+const CARD_TABLE: &str = "WS-CARD-TBL";
+
+/// The transaction table of one card, `WS-TRAN-TBL` [app/cbl/CBSTM03A.CBL:L228-230].
+const TRANSACTION_TABLE: &str = "WS-TRAN-TBL";
 
 /// The D.5 capacity confirmation, which the D.5 table is found by.
 const CAPACITY_ROW: &str = "P-CBSTM03A-014";
@@ -149,6 +160,11 @@ fn more_than_ten_transactions_on_a_card_halts_with_exit_16() {
         .first()
         .unwrap_or_else(|| panic!("cardxref.txt holds no record"))
         .card_number;
+    let (card_capacity, per_card) = table_capacities(&doc);
+    assert_eq!(
+        per_card, CARD_TRANSACTION_SLOTS,
+        "{TABLES_ROW}: the boundary run must fill every {TRANSACTION_TABLE} slot of the card"
+    );
 
     let mut tran_id = TranId::zeros();
     for _ in 0..CARD_TRANSACTION_SLOTS {
@@ -170,18 +186,25 @@ fn more_than_ten_transactions_on_a_card_halts_with_exit_16() {
 
     let _ = add_transaction(&db, card, tran_id);
     let output = h.run_expect(&["creastmt"], Some(TRANREPT_CLOCK), ABEND);
-    let halted = StatementError::CapacityExceeded {
-        cards: 1,
-        max_per_card: CARD_TRANSACTION_SLOTS + 1,
-    };
+    // The COBOL result is undefined past the tables (E-33), so the stop's message is the
+    // replacement's own, written out in full. Its counts are this scenario's: the boundary run
+    // found every transaction on the one card, which fills one card slot and needs a transaction
+    // slot for each transaction added. Its capacities are those of the audited tables.
+    let card_slots = 1;
+    let transaction_slots = CARD_TRANSACTION_SLOTS + 1;
     let escalation = expected_value(&doc, HALT_ROW, "escalation");
-    let expected: Vec<String> = halted
-        .to_string()
-        .lines()
-        .map(str::to_owned)
-        .chain([format!("CAPACITY STOP: halt escalation {escalation}")])
-        .collect();
-    assert_eq!(stderr_lines(&output), expected, "capacity stop stderr");
+    assert_eq!(
+        stderr_lines(&output),
+        [
+            format!(
+                "TRNXFILE needs at least {card_slots} card slots and at least {transaction_slots} \
+                 transaction slots for one card; the CBSTM03A tables hold {card_capacity} cards \
+                 and {per_card} transactions per card"
+            ),
+            format!("CAPACITY STOP: halt escalation {escalation}"),
+        ],
+        "capacity stop stderr"
+    );
     // STEP030 deleted the statements of the boundary run, and the stop wrote none.
     assert_no_statement_files(&h);
 }
@@ -486,6 +509,34 @@ fn xref_records() -> Vec<XrefRecord> {
             }
         })
         .collect()
+}
+
+/// The capacities of the CBSTM03A tables, cards and transactions per card: the `OCCURS` counts
+/// the copybook field cell of [`TABLES_ROW`] gives [`CARD_TABLE`] and [`TRANSACTION_TABLE`],
+/// which the row's expected result must state as the capacity of the load.
+fn table_capacities(doc: &Document) -> (usize, usize) {
+    let clauses = parity_cell(doc, TABLES_ROW, PARITY_COMMON_COLUMNS[3]);
+    let occurs = |name: &str| {
+        let count = clauses
+            .split(',')
+            .find_map(|clause| {
+                let words: Vec<&str> = clause.split_whitespace().collect();
+                match words[..] {
+                    [table, "OCCURS", count] if table == name => Some(count),
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|| panic!("{TABLES_ROW}: {clauses:?} gives no {name} OCCURS clause"));
+        expected_number(count, &format!("{TABLES_ROW} {name} OCCURS"))
+    };
+    let (cards, per_card) = (occurs(CARD_TABLE), occurs(TRANSACTION_TABLE));
+    let rule = parity_cell(doc, TABLES_ROW, PARITY_COMMON_COLUMNS[5]);
+    let stated = format!("capacity {cards} cards and {per_card} transactions per card");
+    assert!(
+        rule.contains(&stated),
+        "{TABLES_ROW}: the expected result does not state {stated:?}: {rule}"
+    );
+    (cards, per_card)
 }
 
 /// P-CBSTM03A-1256 gives the input class beyond the CBSTM03A tables the disposition `halt`, and

@@ -81,6 +81,20 @@ const CT01_NOT_FOUND: &str = "P-COTRN01C-004";
 /// The CT02 TRAN-ID allocation on an empty live master: `STARTBR` `NOTFND`, no add (E-27).
 const CT02_EMPTY_FILE: &str = "P-COTRN02C-021";
 
+/// The CT02 TRAN-ID allocation on a live master that holds records.
+const CT02_ALLOCATION: &str = "P-COTRN02C-020";
+
+/// The `tran_id=` rule of [`CT02_ALLOCATION`], which [`audited_successor`] applies.
+const ALLOCATION_RULE: &str = "STARTBR RIDFLD HIGH-VALUES + READPREV (highest TRAN-ID in the \
+                               whole file) + ENDBR, then + 1 zero-padded to 16 digits";
+
+/// The receiving field of the `ADD 1` of [`CT02_ALLOCATION`].
+const ALLOCATION_RECEIVER: &str = "WS-TRAN-ID-N 9(16)";
+
+/// `10^16`, one above the largest value of the `9(16)` receiver: the `ADD` has no
+/// `ON SIZE ERROR`, so a sum that does not fit 16 digits loses its high-order digit.
+const ALLOCATION_MODULUS: u64 = 10_000_000_000_000_000;
+
 /// `TRANSACT.COMBINED(+1)` after POSTTRAN, INTCALC and TRANBKP.
 const COMBINED_CORPUS: &str = "P-COMBTRAN-004";
 
@@ -557,16 +571,47 @@ fn add_colliding_rows(db: &Db, case: &ReproCase, combined: &[String]) -> BTreeSe
         .collect()
 }
 
+/// P-COTRN02C-020: the TRAN-ID `ADD-TRANSACTION` allocates when `highest` is the highest key
+/// of the live master, worked out here from the audited rule and not by the allocation code.
+/// The key moves into the `9(16)` receiver, gains 1 modulo `10^16` and moves back as 16 digits
+/// with leading zeros.
+///
+/// # Panics
+///
+/// Panics, naming the row, if the row states another rule or receiver, or if `highest` is not
+/// 16 digits.
+fn audited_successor(doc: &Document, highest: &str) -> String {
+    let id = CT02_ALLOCATION;
+    assert_eq!(
+        expected_value(doc, id, "tran_id"),
+        ALLOCATION_RULE,
+        "{id}: the allocation rule"
+    );
+    assert_eq!(
+        parity_cell(doc, id, "Copybook field or PIC clause"),
+        ALLOCATION_RECEIVER,
+        "{id}: the receiving field"
+    );
+    assert!(
+        highest.len() == KEY_LEN && highest.bytes().all(|byte| byte.is_ascii_digit()),
+        "{id}: the highest live key {highest:?} is not {KEY_LEN} digits"
+    );
+    let value: u64 = parsed(id, highest);
+    let successor = value
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("{id}: {highest} + 1 overflows"))
+        % ALLOCATION_MODULUS;
+    format!("{successor:0KEY_LEN$}")
+}
+
 /// The CT02 add whose TRAN-ID the allocation gives — P-COTRN02C-020: the highest live key
 /// plus one, the live master holding only the `held` rows at that point. Returns its
 /// TRAN-ID, which no combined record has.
-fn add_fresh_row(db: &Db, held: &BTreeSet<String>, combined: &[String]) -> String {
+fn add_fresh_row(doc: &Document, db: &Db, held: &BTreeSet<String>, combined: &[String]) -> String {
     let highest = held
         .last()
         .unwrap_or_else(|| panic!("the fresh add needs a live row before it (E-27)"));
-    let expected = TranId::move_from(highest)
-        .next()
-        .unwrap_or_else(|error| panic!("{highest} has no successor: {error}"));
+    let expected = audited_successor(doc, highest);
     let input = ct02_input(
         &card_of(&combined[0]),
         FRESH_AMOUNT,
@@ -574,8 +619,9 @@ fn add_fresh_row(db: &Db, held: &BTreeSet<String>, combined: &[String]) -> Strin
     );
     let written = ct02_add(db, input, None, TRANREPT_CLOCK);
     assert_eq!(
-        written, expected,
-        "P-COTRN02C-020: the highest live key plus one"
+        written.to_string(),
+        expected,
+        "{CT02_ALLOCATION}: the highest live key {highest} plus one"
     );
     let fresh = written.trimmed().into_owned();
     assert!(
@@ -647,7 +693,7 @@ fn run_interleaved(doc: &Document, id: &'static str, fresh_add: bool) {
     // (E-27), so the fresh add allocates once they are live.
     let mut ct02_ids = add_colliding_rows(&db, &case, &combined);
     if fresh_add {
-        let fresh = add_fresh_row(&db, &ct02_ids, &combined);
+        let fresh = add_fresh_row(doc, &db, &ct02_ids, &combined);
         ct02_ids.insert(fresh);
     }
     let ct02_before = live_rows_of(&h, &ct02_ids);

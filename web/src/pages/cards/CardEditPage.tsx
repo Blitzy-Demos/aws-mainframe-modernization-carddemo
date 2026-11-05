@@ -17,7 +17,7 @@
 //   (F-COCRDUP-004).
 // - Every message is the server's, shown through lib/api-errors.ts.
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, LoaderCircle } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import {
   Controller,
@@ -165,7 +165,7 @@ function KeyField({
         spellCheck={false}
         aria-invalid={invalid}
         aria-describedby={invalid ? errorId : undefined}
-        className="bg-muted"
+        className="bg-muted dark:bg-muted"
       />
       <FieldError id={errorId}>{message}</FieldError>
     </Field>
@@ -409,6 +409,8 @@ export default function CardEditPage(): JSX.Element {
   // aria-disabled rather than disabled: a focused button that becomes
   // disabled loses focus to the document, which would strand a keyboard user
   // after Save or Cancel; the guard above keeps the inert buttons from acting.
+  // While a request runs the form is aria-busy and the button that sent it
+  // shows a spinner, as on sign-on, so the wait is seen and announced.
   const busy = mutation.isPending || reading;
   const busyClass = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
 
@@ -429,6 +431,7 @@ export default function CardEditPage(): JSX.Element {
   if (holdsCard) {
     editor = (
       <form
+        aria-busy={busy}
         noValidate
         onSubmit={form.handleSubmit(saveCard)}
         className="flex flex-col gap-6"
@@ -476,6 +479,12 @@ export default function CardEditPage(): JSX.Element {
           </CardContent>
           <CardFooter className="flex-wrap gap-2">
             <Button type="submit" aria-disabled={busy} className={busyClass}>
+              {mutation.isPending ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="motion-safe:animate-spin"
+                />
+              ) : null}
               Save
             </Button>
             <Button
@@ -487,6 +496,12 @@ export default function CardEditPage(): JSX.Element {
                 void cancelEdits();
               }}
             >
+              {reading ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="motion-safe:animate-spin"
+                />
+              ) : null}
               Cancel
             </Button>
           </CardFooter>

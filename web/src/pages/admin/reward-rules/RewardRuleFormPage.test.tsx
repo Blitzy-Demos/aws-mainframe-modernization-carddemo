@@ -2,13 +2,26 @@
 // input is sent as the RewardRuleRequest body of `POST /admin/reward-rules`,
 // input the schema rejects is never sent, and a server 400 lands on its field
 // with a toast and the cursor. In edit mode, the `PUT /admin/reward-rules/{id}`
-// body keeps each stored window instant whose date was left unchanged. The page
+// body keeps each stored window instant whose date was left unchanged. In both
+// modes one Save sends one request, a double click included; Save keeps the
+// focus while it runs and after a rejection that names no field; and a saved
+// rule leaves the form inert until the list route has loaded. The page
 // runs with the real API client, query hooks and error helper; only the network
 // is stubbed, through the global the client looks up on every request.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
-import { createMemoryRouter, RouterProvider } from "react-router";
+import {
+  createMemoryRouter,
+  RouterProvider,
+  type NonIndexRouteObject,
+} from "react-router";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -85,8 +98,14 @@ afterEach(() => {
 
 // The page alone at its own routes, beside a marker list route, opened at
 // `initialEntry`, with a fresh query cache and router per test so no state
-// carries over between cases.
-function renderPage(initialEntry: string = NEW_ROUTE): void {
+// carries over between cases. `list` replaces the marker route's element, for
+// a list that loads lazily as the page's chunk does.
+function renderPage(
+  initialEntry: string = NEW_ROUTE,
+  list: Pick<NonIndexRouteObject, "element" | "lazy"> = {
+    element: <div>{LIST_MARKER}</div>,
+  },
+): ReturnType<typeof createMemoryRouter> {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -102,7 +121,7 @@ function renderPage(initialEntry: string = NEW_ROUTE): void {
         element: <RewardRuleFormPage />,
         handle: { crumb: "Edit rule" } satisfies RouteHandle,
       },
-      { path: LIST_ROUTE, element: <div>{LIST_MARKER}</div> },
+      { path: LIST_ROUTE, ...list },
     ],
     { initialEntries: [initialEntry] },
   );
@@ -111,6 +130,20 @@ function renderPage(initialEntry: string = NEW_ROUTE): void {
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
+  return router;
+}
+
+// A promise the test settles when it chooses, to hold an answer or a load.
+function hold(): { held: Promise<void>; release: () => void } {
+  let release = (): void => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { held, release };
+}
+
+function button(name: string): HTMLElement {
+  return screen.getByRole("button", { name });
 }
 
 function textbox(label: string): HTMLElement {
@@ -238,6 +271,73 @@ describe("RewardRuleFormPage (new rule)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(LIST_MARKER)).toBeNull();
     expect(screen.getByRole("form", { name: "New reward rule" })).toBeTruthy();
+  });
+
+  // Two clicks before the page re-renders: a second POST would create the
+  // rule twice.
+  it("sends one POST for a double click on Save", async () => {
+    fetchMock.mockImplementation(async () =>
+      Response.json(TIMED_RULE, { status: 201 }),
+    );
+    const user = userEvent.setup();
+    renderPage();
+    await fillForm(user, VALID_INPUT);
+
+    fireEvent.click(button("Save"));
+    fireEvent.click(button("Save"));
+
+    expect(await screen.findByText(LIST_MARKER)).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // applyApiError places no field for such an answer and leaves the focus
+  // where it is: on Save, which stayed focusable while the request ran.
+  it("keeps Save focused through a rejection that names no field", async () => {
+    const message = "Stub: a rejection naming no field";
+    const answer = hold();
+    fetchMock.mockImplementation(async () => {
+      await answer.held;
+      return Response.json(
+        { code: "INVALID", message } satisfies ErrorBody,
+        { status: 400 },
+      );
+    });
+    const toastError = vi.spyOn(toast, "error");
+    const user = userEvent.setup();
+    renderPage();
+    await fillForm(user, VALID_INPUT);
+    const form = screen.getByRole("form", { name: "New reward rule" });
+
+    await save(user);
+    await waitFor(() => {
+      expect(button("Save").getAttribute("aria-disabled")).toBe("true");
+    });
+    // Inert but not disabled: a disabled button would hand focus to the body.
+    expect(button("Save").hasAttribute("disabled")).toBe(false);
+    expect(document.activeElement).toBe(button("Save"));
+    expect(form.getAttribute("aria-busy")).toBe("true");
+    expect(button("Reset").getAttribute("aria-disabled")).toBe("true");
+    // Reset keeps the entry, and Save again sends nothing.
+    await user.click(button("Reset"));
+    await save(user);
+    expect(inputValue("Reward rate")).toBe(VALID_INPUT.reward_rate);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    answer.release();
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledWith(message);
+    });
+    await waitFor(() => {
+      expect(button("Save").getAttribute("aria-disabled")).toBe("false");
+    });
+    expect(document.activeElement).toBe(button("Save"));
+    expect(button("Reset").getAttribute("aria-disabled")).toBe("false");
+    expect(form.getAttribute("aria-busy")).toBe("false");
+    expect(toastError).toHaveBeenCalledTimes(1);
+    for (const [, label] of FIELDS) {
+      expect(textbox(label).getAttribute("aria-invalid")).toBe("false");
+    }
+    expect(screen.queryByText(LIST_MARKER)).toBeNull();
   });
 });
 
@@ -389,4 +489,71 @@ describe("RewardRuleFormPage (edit rule)", () => {
     const body: RewardRuleRequest = await request.clone().json();
     expect(body).toStrictEqual(sent);
   });
+});
+
+// The list page is a lazy chunk: the router keeps the form on screen until it
+// has loaded, so a saved rule must leave the form inert meanwhile.
+describe("RewardRuleFormPage (saved, before the list loads)", () => {
+  it.each([
+    {
+      mode: "new",
+      path: NEW_ROUTE,
+      method: "POST",
+      enter: async (user: UserEvent) => {
+        await fillForm(user, VALID_INPUT);
+      },
+    },
+    {
+      mode: "edit",
+      path: `${LIST_ROUTE}/${TIMED_RULE.rule_id}/edit`,
+      method: "PUT",
+      enter: async (user: UserEvent) => {
+        await screen.findByRole("form", {
+          name: `Edit reward rule ${TIMED_RULE.rule_id}`,
+        });
+        await user.clear(textbox("Reward rate"));
+        await user.type(textbox("Reward rate"), "1.5000");
+      },
+    },
+  ])(
+    "keeps Save and Reset inert after the $method succeeds ($mode)",
+    async ({ path, method, enter }) => {
+      stubRuleApi(TIMED_RULE);
+      const list = hold();
+      const user = userEvent.setup();
+      const router = renderPage(path, {
+        lazy: async () => {
+          await list.held;
+          return { element: <div>{LIST_MARKER}</div> };
+        },
+      });
+      await enter(user);
+      const entered = inputValue("Reward rate");
+
+      await save(user);
+      await waitFor(() => {
+        expect(router.state.navigation.state).toBe("loading");
+      });
+      onlyRequest(method);
+      expect(button("Save").getAttribute("aria-disabled")).toBe("true");
+      expect(button("Reset").getAttribute("aria-disabled")).toBe("true");
+      expect(screen.getByRole("form").getAttribute("aria-busy")).toBe("true");
+      expect(document.activeElement).toBe(button("Save"));
+
+      // Enter on Save, Enter in a field, Reset and Save again: no second
+      // write, and the entry stays as saved.
+      await user.keyboard("{Enter}");
+      await user.click(textbox("Reward rate"));
+      await user.keyboard("{Enter}");
+      await user.click(button("Reset"));
+      await save(user);
+      expect(inputValue("Reward rate")).toBe(entered);
+      onlyRequest(method);
+      expect(screen.queryByText(LIST_MARKER)).toBeNull();
+
+      list.release();
+      expect(await screen.findByText(LIST_MARKER)).toBeTruthy();
+      onlyRequest(method);
+    },
+  );
 });

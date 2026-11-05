@@ -5,7 +5,8 @@
 //! Docker: every case fails before the broker is reached. The database URL of
 //! every case points at a loopback port nothing listens on and carries
 //! [`SECRET`] as its password, so a case that reached the database would be
-//! refused, and none may write the password.
+//! refused, and none may write the password. A case that sets a malformed URL
+//! of its own instead may write no part of that URL either.
 //!
 //! The binary must exit with status 1, write exactly one line on standard
 //! error, `mq: <stage>: <error>`, keep standard output JSON-only with the
@@ -31,14 +32,23 @@ enum Cause {
     Exact(&'static str),
     /// Text that holds this fragment.
     Holding(&'static str),
+    /// Text that holds `invalid <variable>: `, the variable named by its key,
+    /// followed by text that holds `reason`.
+    Invalid {
+        /// The key of the variable the text names.
+        variable: &'static str,
+        /// A fragment of the reason after the variable.
+        reason: &'static str,
+    },
 }
 
 /// One failing start of `mq`.
-struct Case {
+struct Case<'a> {
     /// The stage the failure is reported at.
     stage: &'static str,
-    /// The variable the case sets, with its value, beside the database URL.
-    variable: Option<(&'static str, &'static str)>,
+    /// The variable the case sets, with its value: beside the database URL,
+    /// or in its place when the variable is `CARDDEMO_DATABASE_URL`.
+    variable: Option<(&'static str, &'a str)>,
     /// What the standard error line reads after its stage prefix.
     cause: Cause,
     /// The message of the JSON event that reports the failure on standard
@@ -59,6 +69,9 @@ fn refused_port() -> u16 {
 
 #[test]
 fn each_start_up_failure_is_one_stderr_line_beside_json_stdout() {
+    let bad_port = format!("postgres://carddemo:{SECRET}@127.0.0.1:notaport/carddemo");
+    let bad_ssl_mode =
+        format!("postgres://carddemo:carddemo@127.0.0.1:1/carddemo?sslmode={SECRET}");
     let cases = [
         Case {
             stage: "configuration",
@@ -69,7 +82,10 @@ fn each_start_up_failure_is_one_stderr_line_beside_json_stdout() {
         Case {
             stage: "telemetry",
             variable: Some((keys::RUST_LOG, "job=loud")),
-            cause: Cause::Holding("invalid log filter: "),
+            cause: Cause::Invalid {
+                variable: keys::RUST_LOG,
+                reason: "error parsing level filter: ",
+            },
             event: "mq start-up failed",
         },
         Case {
@@ -96,6 +112,33 @@ fn each_start_up_failure_is_one_stderr_line_beside_json_stdout() {
             cause: Cause::Holding("Connection refused"),
             event: "mq stopped",
         },
+        Case {
+            stage: "database",
+            variable: Some((keys::DATABASE_URL, "notaurl")),
+            cause: Cause::Invalid {
+                variable: keys::DATABASE_URL,
+                reason: "relative URL without a base",
+            },
+            event: "mq stopped",
+        },
+        Case {
+            stage: "database",
+            variable: Some((keys::DATABASE_URL, &bad_port)),
+            cause: Cause::Invalid {
+                variable: keys::DATABASE_URL,
+                reason: "invalid port number",
+            },
+            event: "mq stopped",
+        },
+        Case {
+            stage: "database",
+            variable: Some((keys::DATABASE_URL, &bad_ssl_mode)),
+            cause: Cause::Invalid {
+                variable: keys::DATABASE_URL,
+                reason: r#"query parameter "sslmode" (value withheld)"#,
+            },
+            event: "mq stopped",
+        },
     ];
     for case in &cases {
         check(case);
@@ -104,13 +147,16 @@ fn each_start_up_failure_is_one_stderr_line_beside_json_stdout() {
 
 /// Runs `mq` as `case` sets it up and checks its exit status, its one
 /// standard error line, its JSON standard output and that neither stream
-/// holds the database URL or its password.
-fn check(case: &Case) {
+/// holds the database URL it was given or its password.
+fn check(case: &Case<'_>) {
     let program = env!("CARGO_BIN_EXE_mq");
-    let database_url = format!(
-        "postgres://carddemo:{SECRET}@127.0.0.1:{}/carddemo",
-        refused_port()
-    );
+    let database_url = match case.variable {
+        Some((keys::DATABASE_URL, url)) => url.to_owned(),
+        _ => format!(
+            "postgres://carddemo:{SECRET}@127.0.0.1:{}/carddemo",
+            refused_port()
+        ),
+    };
     let mut command = Command::new(program);
     command.env_clear().env(keys::DATABASE_URL, &database_url);
     // A coverage run (cargo llvm-cov) names each process's profile file in
@@ -147,6 +193,12 @@ fn check(case: &Case) {
     match case.cause {
         Cause::Exact(expected) => assert_eq!(text, expected, "{context}"),
         Cause::Holding(fragment) => assert!(text.contains(fragment), "{context}"),
+        Cause::Invalid { variable, reason } => {
+            let Some((_, rest)) = text.split_once(&format!("invalid {variable}: ")) else {
+                panic!("the error does not name {variable}: {context}");
+            };
+            assert!(rest.contains(reason), "{context}");
+        }
     }
 
     for line in stdout.lines() {
