@@ -46,13 +46,13 @@ type ErrorBody = components["schemas"]["ErrorBody"];
 type TransactionPage =
   paths["/transactions"]["get"]["responses"][200]["content"]["application/json"];
 
-/** A COTRN02 input; CONFIRM has none, the confirmation dialog replaces it. */
+// A COTRN02 input; CONFIRM has none, the confirmation dialog replaces it.
 type InputField = Exclude<TransactionAddField, "CONFIRM">;
 
-/** What to type into each COTRN02 input; the empty string leaves it untouched. */
+// What to type into each COTRN02 input; the empty string leaves it untouched.
 type Entry = Record<InputField, string>;
 
-/** A `TransactionAddRequest` with every member present as text. */
+// A `TransactionAddRequest` with every member present as text.
 type AddBody = { [K in keyof TransactionAddRequest]-?: string };
 
 // The COTRN02 inputs in screen order, with their BMS captions

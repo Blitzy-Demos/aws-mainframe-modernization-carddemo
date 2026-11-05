@@ -54,67 +54,61 @@ type FetchImpl = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-/** `GET /transactions/{id}` under the client's `/api` base path. */
+// `GET /transactions/{id}` under the client's `/api` base path.
 const VIEW_PATH_PREFIX = "/api/transactions/";
 
-/** The list route, the target of F3=Back and F5=Browse Tran. */
+// The list route, the target of F3=Back and F5=Browse Tran.
 const LIST_ROUTE = "/transactions";
 
-/** What the test router shows at the list route. */
+// What the test router shows at the list route.
 const LIST_MARKER = "Transaction list";
 
-/**
- * A static route below /transactions, where the view renders without a key.
- * The application's route table has none (E-61); the static segment outranks
- * `:tranId`, so the page reads no `tranId` there.
- */
+// A static route below /transactions, where the view renders without a key.
+// The application's route table has none (E-61); the static segment outranks
+// `:tranId`, so the page reads no `tranId` there.
 const KEYLESS_ROUTE = "/transactions/lookup";
 
-/** The COTRN01 screen title [app/bms/COTRN01.bms:L75-79]. */
+// The COTRN01 screen title [app/bms/COTRN01.bms:L75-79].
 const TITLE = "View Transaction";
 
-/** The heading of the card that holds the key and the display fields. */
+// The heading of the card that holds the key and the display fields.
 const PANEL_NAME = "Transaction details";
 
-/** The caption of the key the route carries, TRNIDIN's place on the map. */
+// The caption of the key the route carries, TRNIDIN's place on the map.
 const KEY_CAPTION = "Tran ID";
 
-/** The BMS field every COTRN01C error places the cursor on (P-COTRN01C-007). */
+// The BMS field every COTRN01C error places the cursor on (P-COTRN01C-007).
 const TRNIDIN: components["schemas"]["TransactionViewField"] = "TRNIDIN";
 
-/** COTRN01C's blank-key text (V-COTRN01C-001), byte for byte. */
+// COTRN01C's blank-key text (V-COTRN01C-001), byte for byte.
 const TRAN_ID_EMPTY = "Tran ID can NOT be empty...";
 
-/** COTRN01C's NOTFND text (V-COTRN01C-002), byte for byte. */
+// COTRN01C's NOTFND text (V-COTRN01C-002), byte for byte.
 const TRAN_ID_NOT_FOUND = "Transaction ID NOT found...";
 
-/** COTRN01C's text for any other READ failure (V-COTRN01C-003), byte for byte. */
+// COTRN01C's text for any other READ failure (V-COTRN01C-003), byte for byte.
 const UNABLE_TO_LOOKUP = "Unable to lookup Transaction...";
 
-/**
- * zod's text for a key over TRNIDIN's 16 characters, which a 3270 field
- * cannot send and no audit row covers.
- */
+// zod's text for a key over TRNIDIN's 16 characters, which a 3270 field
+// cannot send and no audit row covers.
 const OVER_LENGTH = "String must contain at most 16 character(s)";
 
-/** The live transaction the view reads: the first key CT02 allocates (E-09). */
+// The live transaction the view reads: the first key CT02 allocates (E-09).
 const TRAN_ID = "0000000000000001";
 
-/** The status text while the transaction is read. */
+// The status text while the transaction is read.
 const LOADING = "Loading transaction";
 
-/** The status text once TRAN_ID is read: its identity alone. */
+// The status text once TRAN_ID is read: its identity alone.
 const LOADED = `Transaction ${TRAN_ID} loaded`;
 
-/** Longer than the page's 150 ms announce delay, so a due announcement is shown. */
+// Longer than the page's 150 ms announce delay, so a due announcement is shown.
 const ANNOUNCE_WAIT_MS = 300;
 
-/**
- * Record 1 of app/data/ASCII/dailytran.txt (CVTRA06Y) as the transaction
- * master holds it once posted: `DALYTRAN-AMT` `0000005047G` decoded from its
- * trailing overpunch, the processing timestamp in the CBTRN02C
- * Z-GET-DB2-FORMAT-TIMESTAMP form at the processing clock the tests pin.
- */
+// Record 1 of app/data/ASCII/dailytran.txt (CVTRA06Y) as the transaction
+// master holds it once posted: `DALYTRAN-AMT` `0000005047G` decoded from its
+// trailing overpunch, the processing timestamp in the CBTRN02C
+// Z-GET-DB2-FORMAT-TIMESTAMP form at the processing clock the tests pin.
 const TRANSACTION: TransactionResponse = {
   tran_id: TRAN_ID,
   tran_type_cd: "01",
@@ -131,11 +125,9 @@ const TRANSACTION: TransactionResponse = {
   tran_proc_ts: "2022-07-01-12.00.00.000000",
 };
 
-/**
- * The 13 COTRN01 display fields in map order [app/bms/COTRN01.bms:L100-258]
- * with the values COTRN01C moves into them [app/cbl/COTRN01C.cbl:L176-192],
- * each the API string as sent.
- */
+// The 13 COTRN01 display fields in map order [app/bms/COTRN01.bms:L100-258]
+// with the values COTRN01C moves into them [app/cbl/COTRN01C.cbl:L176-192],
+// each the API string as sent.
 const DISPLAY_FIELDS: readonly (readonly [string, string])[] = [
   ["Transaction ID", TRANSACTION.tran_id],
   ["Card Number", TRANSACTION.tran_card_num],
@@ -152,15 +144,13 @@ const DISPLAY_FIELDS: readonly (readonly [string, string])[] = [
   ["Merchant Zip", TRANSACTION.tran_merchant_zip],
 ];
 
-/**
- * A COTRN01C error as the server answers it: the kind's code, the message,
- * and the one TRNIDIN entry with the same text.
- */
+// A COTRN01C error as the server answers it: the kind's code, the message,
+// and the one TRNIDIN entry with the same text.
 function viewError(code: string, message: string): ViewErrorBody {
   return { code, message, fields: [{ field: TRNIDIN, message }] };
 }
 
-/** The answer to a request no test expects; afterEach reports it. */
+// The answer to a request no test expects; afterEach reports it.
 const UNEXPECTED: ErrorBody = { code: "UNEXPECTED", message: "Unexpected error" };
 
 function jsonResponse(status: number, body: TransactionResponse | ErrorBody): Response {
@@ -176,7 +166,7 @@ let unexpected: string[];
 let queryClient: QueryClient;
 let toastError: MockInstance<typeof toast.error>;
 
-/** The view the live master answers: TRAN_ID is TRANSACTION, nothing else is. */
+// The view the live master answers: TRAN_ID is TRANSACTION, nothing else is.
 function readMaster(request: Request): Response {
   const url = new URL(request.url);
   if (
@@ -190,7 +180,7 @@ function readMaster(request: Request): Response {
   return jsonResponse(500, UNEXPECTED);
 }
 
-/** A response held until the test sends it, so a read stays in flight. */
+// A response held until the test sends it, so a read stays in flight.
 type HeldResponse = { reply: Promise<Response>; send: (response: Response) => void };
 
 function holdResponse(): HeldResponse {
@@ -201,14 +191,14 @@ function holdResponse(): HeldResponse {
   return { reply, send };
 }
 
-/** Every request the page sent, in the order sent. */
+// Every request the page sent, in the order sent.
 function requests(): Request[] {
   return fetchMock.mock.calls.map(([input, init]) =>
     input instanceof Request ? input : new Request(input, init),
   );
 }
 
-/** Asserts that the page sent exactly one request, the read of `tranId`. */
+// Asserts that the page sent exactly one request, the read of `tranId`.
 function expectOneRead(tranId: string): void {
   const [read, ...rest] = requests();
   expect(rest).toEqual([]);
@@ -218,17 +208,17 @@ function expectOneRead(tranId: string): void {
   expect(url.search).toBe("");
 }
 
-/** The card that holds the key and the display fields. */
+// The card that holds the key and the display fields.
 function panel(): Promise<HTMLElement> {
   return screen.findByRole("region", { name: PANEL_NAME });
 }
 
-/** The polite status beside the card that announces the read. */
+// The polite status beside the card that announces the read.
 function readStatus(): HTMLElement {
   return screen.getByRole("status");
 }
 
-/** Waits out the announce delay, so a status still empty announces nothing. */
+// Waits out the announce delay, so a status still empty announces nothing.
 async function afterAnnounceDelay(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => {
@@ -237,12 +227,12 @@ async function afterAnnounceDelay(): Promise<void> {
   });
 }
 
-/** The captions the card shows, in screen order. */
+// The captions the card shows, in screen order.
 function captions(region: HTMLElement): string[] {
   return Array.from(region.querySelectorAll("dt"), (term) => term.textContent ?? "");
 }
 
-/** Each caption with the text of its value, in screen order. */
+// Each caption with the text of its value, in screen order.
 function captionedValues(region: HTMLElement): [string, string][] {
   return Array.from(region.querySelectorAll("dt"), (term) => [
     term.textContent ?? "",
@@ -250,7 +240,7 @@ function captionedValues(region: HTMLElement): [string, string][] {
   ]);
 }
 
-/** The value element of `caption` in the card. */
+// The value element of `caption` in the card.
 function valueOf(region: HTMLElement, caption: string): HTMLElement {
   const term = within(region).getByText(caption, { selector: "dt" });
   const value = term.nextElementSibling;
@@ -260,12 +250,10 @@ function valueOf(region: HTMLElement, caption: string): HTMLElement {
   return value;
 }
 
-/**
- * Renders the page at `path` in a data router nested as the application's
- * route table nests it, which PageHeader's useMatches needs: the list at
- * /transactions, the view at /transactions/:tranId, and the test-only
- * key-less route.
- */
+// Renders the page at `path` in a data router nested as the application's
+// route table nests it, which PageHeader's useMatches needs: the list at
+// /transactions, the view at /transactions/:tranId, and the test-only
+// key-less route.
 function renderAt(path: string): UserEvent {
   queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },

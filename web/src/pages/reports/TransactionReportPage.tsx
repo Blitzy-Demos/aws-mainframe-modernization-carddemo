@@ -64,24 +64,22 @@ import {
 
 type ReportType = ReportRequestFormValues["report_type"];
 
-/** The map's selectors in screen order: MONTHLY, YEARLY, CUSTOM. */
+// The map's selectors in screen order: MONTHLY, YEARLY, CUSTOM.
 const REPORT_TYPES = [
   "monthly",
   "yearly",
   "custom",
 ] as const satisfies readonly ReportType[];
 
-/** The CORPT00 captions of the selectors [app/bms/CORPT00.bms]. */
+// The CORPT00 captions of the selectors [app/bms/CORPT00.bms].
 const REPORT_TYPE_LABELS: Readonly<Record<ReportType, string>> = {
   monthly: "Monthly (Current Month)",
   yearly: "Yearly (Current Year)",
   custom: "Custom (Date Range)",
 };
 
-/**
- * The custom range inputs: SDTYYYY/SDTMM/SDTDD and EDTYYYY/EDTMM/EDTDD, one
- * YYYY-MM-DD text each, as there is no date picker.
- */
+// The custom range inputs: SDTYYYY/SDTMM/SDTDD and EDTYYYY/EDTMM/EDTDD, one
+// YYYY-MM-DD text each, as there is no date picker.
 const DATE_FIELDS = [
   { name: "start_date", label: "Start date" },
   { name: "end_date", label: "End date" },
@@ -90,37 +88,31 @@ const DATE_FIELDS = [
   label: string;
 }[];
 
-/** The OpenAPI maxLength of a date text: X(4), X(2), X(2) and two hyphens. */
+// The OpenAPI maxLength of a date text: X(4), X(2), X(2) and two hyphens.
 const DATE_TEXT_MAX_LENGTH = 10;
 
-/**
- * The format each date text takes, the CSUTLDTC picture of the request: the
- * placeholder, and in parentheses the description, as the maps write their
- * format hints [app/bms/CORPT00.bms:L160] and CT02 shows its dates.
- */
+// The format each date text takes, the CSUTLDTC picture of the request: the
+// placeholder, and in parentheses the description, as the maps write their
+// format hints [app/bms/CORPT00.bms:L160] and CT02 shows its dates.
 const DATE_FORMAT_HINT = "YYYY-MM-DD";
 
-/**
- * CONFIRMI 'Y', the value CORPT00C accepts to submit the report
- * [app/cbl/CORPT00C.cbl:L478-479], sent by the dialog's "Confirm".
- */
+// CONFIRMI 'Y', the value CORPT00C accepts to submit the report
+// [app/cbl/CORPT00C.cbl:L478-479], sent by the dialog's "Confirm".
 const CONFIRM_YES = "Y";
 
-/** The map's confirmation caption, without the CONFIRM field it led into. */
+// The map's confirmation caption, without the CONFIRM field it led into.
 const CONFIRM_PROMPT =
   "The Report will be submitted for printing. Please confirm.";
 
-/**
- * The screen INITIALIZE-ALL-FIELDS leaves [app/cbl/CORPT00C.cbl:L633-646]: no
- * selector entered and the date parts empty. CONFIRM has no form field, since
- * the dialog supplies it.
- */
+// The screen INITIALIZE-ALL-FIELDS leaves [app/cbl/CORPT00C.cbl:L633-646]: no
+// selector entered and the date parts empty. CONFIRM has no form field, since
+// the dialog supplies it.
 const DEFAULT_VALUES: DefaultValues<ReportRequestFormInput> = {
   start_date: "",
   end_date: "",
 };
 
-/** The dialog's description of the request about to run. */
+// The dialog's description of the request about to run.
 function describeRequest(request: ReportRequestFormValues): ReactNode {
   const range =
     request.report_type === "custom"
@@ -137,13 +129,13 @@ function describeRequest(request: ReportRequestFormValues): ReactNode {
   );
 }
 
-/** Which sides of the report box hold record text scrolled out of view. */
+// Which sides of the report box hold record text scrolled out of view.
 interface ReportOverflow {
-  /** A record is wider than the box, so the box scrolls sideways. */
+  // A record is wider than the box, so the box scrolls sideways.
   readonly overflowing: boolean;
-  /** Text lies before the scroll position: the line starts are hidden. */
+  // Text lies before the scroll position: the line starts are hidden.
   readonly start: boolean;
-  /** Text lies past the box's end: the line ends are hidden. */
+  // Text lies past the box's end: the line ends are hidden.
   readonly end: boolean;
 }
 
@@ -153,11 +145,9 @@ const NO_OVERFLOW: ReportOverflow = {
   end: false,
 };
 
-/**
- * Measures the report box. scrollLeft runs negative in a right-to-left box,
- * hence its magnitude, and the one-pixel tolerance absorbs a fractional
- * scroll position at either end.
- */
+// Measures the report box. scrollLeft runs negative in a right-to-left box,
+// hence its magnitude, and the one-pixel tolerance absorbs a fractional
+// scroll position at either end.
 function measureOverflow(box: HTMLElement): ReportOverflow {
   const hidden = box.scrollWidth - box.clientWidth;
   if (hidden <= 0) {
@@ -171,18 +161,18 @@ function measureOverflow(box: HTMLElement): ReportOverflow {
   };
 }
 
-/**
- * The CVTRA07Y records exactly as returned: fixed width, with significant
- * trailing spaces, so they are never trimmed or wrapped. Focusable so the
- * keyboard can scroll the wide lines.
- *
- * A 133-column record at text-sm is about 1117px wide, wider than the report
- * card at a 1280px viewport, which cut off the Amount column. The records
- * therefore take text-xs with tighter tracking (about 878px) and return to
- * text-sm once the enclosing container is 72rem wide. Where a record is still
- * wider than the box, an edge fade marks each side holding hidden text and a
- * hint above the box says it scrolls sideways.
- */
+// The CVTRA07Y records exactly as returned: fixed width, with significant
+// trailing spaces, so they are never trimmed or wrapped. Focusable so the
+// keyboard can scroll the wide lines.
+//
+// A 133-column record is about 1117px wide at text-sm and about 878px at
+// text-xs with tighter tracking. The smallest Tailwind container size that
+// holds the text-sm width is @6xl (72rem, 1152px), so the records take
+// text-xs and tracking-tighter while the report card's content box, the
+// @container on CardContent, is narrower than 72rem, and text-sm with normal
+// tracking from 72rem. Where a record is still wider than the box, an edge
+// fade marks each side holding hidden text and a hint above the box says it
+// scrolls sideways.
 function ReportRecords({ text }: { text: string }): JSX.Element {
   const hintId = useId();
   const boxRef = useRef<HTMLPreElement>(null);

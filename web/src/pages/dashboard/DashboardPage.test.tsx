@@ -38,20 +38,18 @@ type ErrorBody = components["schemas"]["ErrorBody"];
 
 const ACCOUNT_ID = "00000000001";
 
-/** The status region's texts while a lookup reads and once it has answered. */
+// The status region's texts while a lookup reads and once it has answered.
 const ACCOUNT_LOADING = "Loading account";
 const SUMMARY_LOADED = `Account ${ACCOUNT_ID} summary loaded`;
 
-/** V-COACTVWC-003: no cross-reference for the account, 404 at ACCTSID. */
+// V-COACTVWC-003: no cross-reference for the account, 404 at ACCTSID.
 const XREF_NOT_FOUND =
   "Account:99999999999 not found in Cross ref file.  Resp:000000013  Reas:0000";
 
-/**
- * `GET /accounts/00000000001` on the seeded corpus: the account record
- * [app/data/ASCII/acctdata.txt:L1], customer 000000001
- * [app/data/ASCII/custdata.txt:L1] and the account's card from its
- * cross-reference [app/data/ASCII/cardxref.txt:L49].
- */
+// `GET /accounts/00000000001` on the seeded corpus: the account record
+// [app/data/ASCII/acctdata.txt:L1], customer 000000001
+// [app/data/ASCII/custdata.txt:L1] and the account's card from its
+// cross-reference [app/data/ASCII/cardxref.txt:L49].
 const account: AccountResponse = {
   account_id: ACCOUNT_ID,
   acct_active_status: "Y",
@@ -86,11 +84,9 @@ const account: AccountResponse = {
   version: "3f2a9c1e5b7d0846",
 };
 
-/**
- * A posted purchase on the account's card: daily transaction 156
- * [app/data/ASCII/dailytran.txt:L156], stamped by POSTTRAN at the pinned
- * processing clock.
- */
+// A posted purchase on the account's card: daily transaction 156
+// [app/data/ASCII/dailytran.txt:L156], stamped by POSTTRAN at the pinned
+// processing clock.
 const transaction: TransactionResponse = {
   tran_id: "0000000503557384",
   tran_type_cd: "01",
@@ -107,18 +103,16 @@ const transaction: TransactionResponse = {
   tran_proc_ts: "2022-07-01 12:00:00.000000",
 };
 
-/** The five most recent transactions: here the one above, with no paging. */
+// The five most recent transactions: here the one above, with no paging.
 const transactionPage: TransactionPage = {
   items: [transaction],
   next_key: null,
   prev_key: null,
 };
 
-/**
- * A full backward page as the API answers it: the account's five highest
- * TRAN-IDs in ascending key order, the last of them a CB00 payment whose
- * TRAN-ID is the highest on file plus one.
- */
+// A full backward page as the API answers it: the account's five highest
+// TRAN-IDs in ascending key order, the last of them a CB00 payment whose
+// TRAN-ID is the highest on file plus one.
 const ascendingTranIds = [
   "0000000503557384",
   "0000000532120892",
@@ -135,10 +129,8 @@ const fullPage: TransactionPage = {
   prev_key: null,
 };
 
-/**
- * A points total above 2^53 - 1, which a JavaScript number cannot hold
- * exactly: the page must show the API's string digit for digit.
- */
+// A points total above 2^53 - 1, which a JavaScript number cannot hold
+// exactly: the page must show the API's string digit for digit.
 const rewardBalance: RewardBalanceResponse = {
   account_id: ACCOUNT_ID,
   total_points_earned: "9007199254740993",
@@ -146,46 +138,46 @@ const rewardBalance: RewardBalanceResponse = {
   available_points: "9007199254740993",
 };
 
-/** An HTTP status and the JSON body sent with it. */
+// An HTTP status and the JSON body sent with it.
 type Reply<B> = readonly [status: number, body: B];
 
-/** Every body the stubbed routes answer with. */
+// Every body the stubbed routes answer with.
 type StubBody =
   | AccountResponse
   | TransactionPage
   | RewardBalanceResponse
   | ErrorBody;
 
-/** The answer of each API route the dashboard reads. */
+// The answer of each API route the dashboard reads.
 type ApiStubs = {
   account: Reply<AccountResponse | ErrorBody>;
   transactions: Reply<TransactionPage | ErrorBody>;
   rewards: Reply<RewardBalanceResponse | ErrorBody>;
 };
 
-/** Every route answering with its fixture. */
+// Every route answering with its fixture.
 const SUCCESS: ApiStubs = {
   account: [200, account],
   transactions: [200, transactionPage],
   rewards: [200, rewardBalance],
 };
 
-/** The answer to a path no stub serves, which no test expects. */
+// The answer to a path no stub serves, which no test expects.
 const NO_ROUTE: Reply<ErrorBody> = [
   404,
   { code: "NOT_FOUND", message: "Not found" },
 ];
 
-/** The global the API client sends each Request through. */
+// The global the API client sends each Request through.
 type FetchFn = (
   input: RequestInfo | URL,
   init?: RequestInit,
 ) => Promise<Response>;
 
-/** The requests the page sent, in order. */
+// The requests the page sent, in order.
 const requests: Request[] = [];
 
-/** Answers a test holds back, by pathname; each answers one request. */
+// Answers a test holds back, by pathname; each answers one request.
 const heldReplies = new Map<string, Promise<Reply<StubBody>>>();
 
 let fetchMock: Mock<FetchFn>;
@@ -197,7 +189,7 @@ function jsonResponse<B>([status, body]: Reply<B>): Response {
   });
 }
 
-/** The stub answering `pathname`, the client's `/api`-prefixed path. */
+// The stub answering `pathname`, the client's `/api`-prefixed path.
 function replyFor(pathname: string, stubs: ApiStubs): Reply<StubBody> {
   if (/^\/api\/accounts\/[^/]+$/.test(pathname)) {
     return stubs.account;
@@ -211,10 +203,8 @@ function replyFor(pathname: string, stubs: ApiStubs): Reply<StubBody> {
   return NO_ROUTE;
 }
 
-/**
- * Installs the API stub: each request is logged, then answered by a held
- * answer for its path, when a test holds one, or else by route.
- */
+// Installs the API stub: each request is logged, then answered by a held
+// answer for its path, when a test holds one, or else by route.
 function stubApi(stubs: ApiStubs): void {
   fetchMock = vi.fn<FetchFn>(async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init);
@@ -230,10 +220,8 @@ function stubApi(stubs: ApiStubs): void {
   vi.stubGlobal("fetch", fetchMock);
 }
 
-/**
- * Holds the next answer to `pathname` back; the returned function sends
- * `reply` as that answer.
- */
+// Holds the next answer to `pathname` back; the returned function sends
+// `reply` as that answer.
 function holdReply(pathname: string): (reply: Reply<StubBody>) => void {
   let release: (reply: Reply<StubBody>) => void = () => undefined;
   heldReplies.set(
@@ -245,7 +233,7 @@ function holdReply(pathname: string): (reply: Reply<StubBody>) => void {
   return release;
 }
 
-/** The request sent to `pathname`; throws while there is none. */
+// The request sent to `pathname`; throws while there is none.
 function requestTo(pathname: string): Request {
   const sent = requests.find(
     (request) => new URL(request.url).pathname === pathname,
@@ -256,7 +244,7 @@ function requestTo(pathname: string): Request {
   return sent;
 }
 
-/** Renders the page at `/`; returns the query cache it reads through. */
+// Renders the page at `/`; returns the query cache it reads through.
 function renderPage(): QueryClient {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -285,12 +273,12 @@ function renderPage(): QueryClient {
   return queryClient;
 }
 
-/** ACCTSID, by the label F-COACTVW-001 gives it. */
+// ACCTSID, by the label F-COACTVW-001 gives it.
 function accountInput(): HTMLElement {
   return screen.getByLabelText("Account number");
 }
 
-/** The summary card titled `title`, once it is shown. */
+// The summary card titled `title`, once it is shown.
 async function summaryCard(title: string): Promise<HTMLElement> {
   return screen.findByRole("group", { name: title });
 }

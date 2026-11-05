@@ -49,31 +49,29 @@ import {
 type TransactionResponse = components["schemas"]["TransactionResponse"];
 type TransactionPage = components["schemas"]["Page_TransactionResponse"];
 
-/** The page a key asks for: `start_key` and `direction` of `GET /transactions`. */
+// The page a key asks for: `start_key` and `direction` of `GET /transactions`.
 type Cursor = Pick<TransactionListParams, "start_key" | "direction">;
 
-/** The BMS name of the search field, also its element id. */
+// The BMS name of the search field, also its element id.
 const TRNIDIN = "TRNIDIN";
 
-/** `TRNIDINI X(16)` [app/cpy-bms/COTRN00.CPY:L66]. */
+// `TRNIDINI X(16)` [app/cpy-bms/COTRN00.CPY:L66].
 const TRAN_ID_LENGTH = 16;
 
-/** The date part of `TRAN-ORIG-TS X(26)`, `YYYY-MM-DD`. */
+// The date part of `TRAN-ORIG-TS X(26)`, `YYYY-MM-DD`.
 const DATE_LENGTH = 10;
 
-/** Shown in place of the rows of an empty page that carries no text. */
+// Shown in place of the rows of an empty page that carries no text.
 const NO_TRANSACTIONS = "No transactions found";
 
-/** The ten rows of a COTRN00 page, the server's default page size. */
+// The ten rows of a COTRN00 page, the server's default page size.
 const PAGE_ROWS = 10;
 
 const DEFAULT_VALUES: TransactionListFilterValues = { start_key: "" };
 
-/**
- * The query of one key press, absent and empty values left out, so two
- * presses of one request share one query key. `page_size` is never sent: the
- * server's default is the ten rows of COTRN00.
- */
+// The query of one key press, absent and empty values left out, so two
+// presses of one request share one query key. `page_size` is never sent: the
+// server's default is the ten rows of COTRN00.
 function toParams(cursor: Cursor): TransactionListParams {
   const params: TransactionListParams = {};
   if (cursor.start_key !== undefined && cursor.start_key !== "") {
@@ -89,20 +87,18 @@ function sameParams(a: TransactionListParams, b: TransactionListParams): boolean
   return a.start_key === b.start_key && a.direction === b.direction;
 }
 
-/** The text of an empty page: the server's, unless it sent none. */
+// The text of an empty page: the server's, unless it sent none.
 function emptyPageText(message: string | null | undefined): string {
   return typeof message === "string" && message.trim() !== ""
     ? message
     : NO_TRANSACTIONS;
 }
 
-/**
- * An answer with no rows, only its page-boundary text: for PF7 from a page
- * nothing precedes, 'You are already at the top of the page...'
- * (V-COTRN00C-009); for a key no record is at or after any more, the STARTBR
- * NOTFND text 'You are at the top of the page...' (V-COTRN00C-005,
- * V-COTRN00C-010).
- */
+// An answer with no rows, only its page-boundary text: for PF7 from a page
+// nothing precedes, 'You are already at the top of the page...'
+// (V-COTRN00C-009); for a key no record is at or after any more, the STARTBR
+// NOTFND text 'You are at the top of the page...' (V-COTRN00C-005,
+// V-COTRN00C-010).
 function isBoundaryAnswer(page: TransactionPage): boolean {
   return (
     page.items.length === 0 &&
@@ -111,32 +107,28 @@ function isBoundaryAnswer(page: TransactionPage): boolean {
   );
 }
 
-/**
- * What the table showed when the user last pressed a key: the page, the
- * query's answer it was shown for, and whether the key is PF7 or PF8 rather
- * than ENTER.
- */
+// What the table showed when the user last pressed a key: the page, the
+// query's answer it was shown for, and whether the key is PF7 or PF8 rather
+// than ENTER.
 type OnScreen = {
   answer: TransactionPage | undefined;
   page: TransactionPage | undefined;
   press: boolean;
 };
 
-/**
- * The page the table shows for the query's answer `page`.
- *
- * COTRN00C answers PF7 on the first page and PF8 without a next page with
- * SEND-ERASE-NO, so the rows on screen stay and only the message line is
- * written (P-COTRN00C-009, P-COTRN00C-010, P-COTRN00C-018)
- * [app/cbl/COTRN00C.cbl:L247-251] [app/cbl/COTRN00C.cbl:L269-273], and a PF7
- * or PF8 browse whose STARTBR finds no record blanks no row (P-COTRN00C-016).
- * The API answers such a key with a page that has no rows and carries the
- * text (E-54), so that answer to a press keeps the page that was on screen,
- * with its keys, which Previous and Next page from. The empty page of an
- * ENTER, a search that finds nothing or the empty master, stands in the
- * table (E-27). While a new page loads, a page kept stays in place of the
- * empty answer the query holds over it.
- */
+// The page the table shows for the query's answer `page`.
+//
+// COTRN00C answers PF7 on the first page and PF8 without a next page with
+// SEND-ERASE-NO, so the rows on screen stay and only the message line is
+// written (P-COTRN00C-009, P-COTRN00C-010, P-COTRN00C-018)
+// [app/cbl/COTRN00C.cbl:L247-251] [app/cbl/COTRN00C.cbl:L269-273], and a PF7
+// or PF8 browse whose STARTBR finds no record blanks no row (P-COTRN00C-016).
+// The API answers such a key with a page that has no rows and carries the
+// text (E-54), so that answer to a press keeps the page that was on screen,
+// with its keys, which Previous and Next page from. The empty page of an
+// ENTER, a search that finds nothing or the empty master, stands in the
+// table (E-27). While a new page loads, a page kept stays in place of the
+// empty answer the query holds over it.
 function pageShown(
   page: TransactionPage | undefined,
   onScreen: OnScreen,
@@ -151,16 +143,14 @@ function pageShown(
   return onScreen.press && isBoundaryAnswer(page) ? onScreen.page : page;
 }
 
-/**
- * The COTRN00 columns in screen order ('Transaction ID', 'Date',
- * 'Description', 'Amount'), then the row action that replaces the 'Sel'
- * column. Values are shown exactly as the server sent them: the date is the
- * first ten characters of the timestamp text, never parsed, and the amount is
- * the decimal string as received. Each placeholder is its cell's markup
- * around a value as wide as the column's on a first page: the 16-digit
- * TRAN-ID, a `YYYY-MM-DD` date, a description and an amount as wide as the
- * widest the seeded first page shows, and the row action.
- */
+// The COTRN00 columns in screen order ('Transaction ID', 'Date',
+// 'Description', 'Amount'), then the row action that replaces the 'Sel'
+// column. Values are shown exactly as the server sent them: the date is the
+// first ten characters of the timestamp text, never parsed, and the amount is
+// the decimal string as received. Each placeholder is its cell's markup
+// around a value as wide as the column's on a first page: the 16-digit
+// TRAN-ID, a `YYYY-MM-DD` date, a description and an amount as wide as the
+// widest the seeded first page shows, and the row action.
 function transactionColumns(
   idPrefix: string,
 ): DataTableProps<TransactionResponse>["columns"] {

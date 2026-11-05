@@ -53,22 +53,22 @@ type RewardAccrual = RewardHistoryPage["items"][number];
 
 type ErrorBody = components["schemas"]["ErrorBody"];
 
-/** One stubbed answer: its HTTP status and JSON body. */
+// One stubbed answer: its HTTP status and JSON body.
 type Reply = {
   status: number;
   body: RewardBalance | RewardHistoryPage | ErrorBody;
 };
 
-/** The first account of app/data/ASCII/acctdata.txt. */
+// The first account of app/data/ASCII/acctdata.txt.
 const ACCOUNT = "00000000001";
 
-/** An account number the form accepts and the server has no account for. */
+// An account number the form accepts and the server has no account for.
 const UNKNOWN_ACCOUNT = "99999999999";
 
-/** 2^53 + 1, the smallest integer a JavaScript number cannot hold exactly. */
+// 2^53 + 1, the smallest integer a JavaScript number cannot hold exactly.
 const BEYOND_DOUBLE = "9007199254740993";
 
-/** The status region's texts while the balance is read and once it is. */
+// The status region's texts while the balance is read and once it is.
 const BALANCE_LOADING = "Loading reward balance";
 const BALANCE_LOADED = `Reward balance of account ${ACCOUNT} loaded`;
 
@@ -131,7 +131,7 @@ const balanceRereadBody: RewardBalance = {
   available_points: BEYOND_DOUBLE_PLUS_25,
 };
 
-/** The second account of app/data/ASCII/acctdata.txt. */
+// The second account of app/data/ASCII/acctdata.txt.
 const OTHER_ACCOUNT = "00000000002";
 
 const otherBalanceBody: RewardBalance = {
@@ -148,7 +148,7 @@ const OTHER_PAGE: RewardHistoryPage = {
   prev_key: null,
 };
 
-/** An account on file that has earned no reward points. */
+// An account on file that has earned no reward points.
 const ZERO_ACCOUNT = "00000000037";
 
 // The zero balance the server answers for an account on file without
@@ -166,7 +166,7 @@ const EMPTY_PAGE: RewardHistoryPage = {
   prev_key: null,
 };
 
-/** The text the history table shows in place of the rows of an empty history. */
+// The text the history table shows in place of the rows of an empty history.
 const EMPTY_HISTORY = "No reward points have been earned on this account.";
 
 // The server's answer for an account not on file (crates/api/src/error.rs
@@ -271,19 +271,19 @@ const fetchMock = vi.fn(
   },
 );
 
-/** Every request sent so far, in order, as "METHOD path?query". */
+// Every request sent so far, in order, as "METHOD path?query".
 function requestedPaths(): string[] {
   return fetchMock.mock.calls.map(([input, init]) =>
     describeRequest(asRequest(input, init)),
   );
 }
 
-/** The requests sent so far without their query strings. */
+// The requests sent so far without their query strings.
 function requestedPathnames(): string[] {
   return requestedPaths().map((sent) => sent.split("?")[0]);
 }
 
-/** The `start_key` of every history request so far; null for none. */
+// The `start_key` of every history request so far; null for none.
 function historyStartKeys(): Array<string | null> {
   return fetchMock.mock.calls
     .map(([input, init]) => new URL(asRequest(input, init).url))
@@ -337,10 +337,8 @@ function summaryCard(title: string): HTMLElement {
   return screen.getByRole("group", { name: title });
 }
 
-/**
- * The cell texts of the history table's data rows, top to bottom, without
- * the filler rows, hidden from assistive technology, that pad a short page.
- */
+// The cell texts of the history table's data rows, top to bottom, without
+// the filler rows, hidden from assistive technology, that pad a short page.
 function historyRows(): string[][] {
   const table = screen.getByRole("table", { name: "Reward history" });
   return Array.from(
@@ -350,7 +348,7 @@ function historyRows(): string[][] {
   );
 }
 
-/** A page's rows as the table shows them, in the page's column order. */
+// A page's rows as the table shows them, in the page's column order.
 function rowsOf(page: RewardHistoryPage): string[][] {
   return page.items.map((item) => [
     item.accrual_id,
@@ -385,7 +383,7 @@ async function tabTo(user: UserEvent, target: HTMLElement): Promise<void> {
   expect(document.activeElement).toBe(target);
 }
 
-/** A promise and its resolver, so a test decides when an answer arrives. */
+// A promise and its resolver, so a test decides when an answer arrives.
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve: (value: T) => void = () => undefined;
   const promise = new Promise<T>((settle) => {
@@ -497,7 +495,7 @@ function expectBalanceLoading(): void {
   expect(within(section).queryAllByRole("group")).toEqual([]);
 }
 
-/** The history table's column headers, in screen order. */
+// The history table's column headers, in screen order.
 function historyHeaders(): string[] {
   const table = screen.getByRole("table", { name: "Reward history" });
   return within(table)

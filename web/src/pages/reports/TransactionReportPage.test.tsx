@@ -51,19 +51,17 @@ type Fetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-/** The F-CORPT00-001 radio items: the map's MONTHLY, YEARLY and CUSTOM. */
+// The F-CORPT00-001 radio items: the map's MONTHLY, YEARLY and CUSTOM.
 const MONTHLY = "Monthly (Current Month)";
 const YEARLY = "Yearly (Current Year)";
 const CUSTOM = "Custom (Date Range)";
 
-/** The width of every CVTRA07Y report record CBTRN03C writes. */
+// The width of every CVTRA07Y report record CBTRN03C writes.
 const REPORT_WIDTH = 133;
 
-/**
- * The first records of a TRANREPT report for a range, as the server returns
- * them: fixed width, the trailing spaces kept and one record entirely spaces
- * (crates/api/tests/snapshots/cr00_reports__report_lines.snap).
- */
+// The first records of a TRANREPT report for a range, as the server returns
+// them: fixed width, the trailing spaces kept and one record entirely spaces
+// (crates/api/tests/snapshots/cr00_reports__report_lines.snap).
 function reportLines(startDate: string, endDate: string): string[] {
   return [
     "DALYREPT".padEnd(38) +
@@ -76,7 +74,7 @@ function reportLines(startDate: string, endDate: string): string[] {
   ].map((line) => line.padEnd(REPORT_WIDTH));
 }
 
-/** A report answer: WS-REPORT-NAME and the P-CORPT00C-014 text after it. */
+// A report answer: WS-REPORT-NAME and the P-CORPT00C-014 text after it.
 function report(
   reportName: string,
   startDate: string,
@@ -103,7 +101,7 @@ function jsonResponse(
   });
 }
 
-/** The one request the page sent: its method and URL. */
+// The one request the page sent: its method and URL.
 function onlyRequest(): { method: string; url: URL } {
   expect(fetchMock).toHaveBeenCalledTimes(1);
   const [input, init] = fetchMock.mock.calls[0];
@@ -111,7 +109,7 @@ function onlyRequest(): { method: string; url: URL } {
   return { method: request.method, url: new URL(request.url) };
 }
 
-/** The query the one request carried, every parameter included. */
+// The query the one request carried, every parameter included.
 function onlyQuery(): Record<string, string> {
   const { method, url } = onlyRequest();
   expect(method).toBe("GET");
@@ -151,7 +149,7 @@ function textbox(name: string): HTMLInputElement {
   return element;
 }
 
-/** Selects CUSTOM and types both dates, returning the two inputs. */
+// Selects CUSTOM and types both dates, returning the two inputs.
 async function enterCustomRange(
   user: User,
   startDate: string,
@@ -165,19 +163,19 @@ async function enterCustomRange(
   return { start, end };
 }
 
-/** ENTER, then the dialog that stands for CONFIRM. */
+// ENTER, then the dialog that stands for CONFIRM.
 async function runReport(user: User): Promise<HTMLElement> {
   await user.click(screen.getByRole("button", { name: "Run report" }));
   return screen.findByRole("alertdialog", { name: "Confirm the report" });
 }
 
-/** ENTER, then CONFIRM Y through the dialog's "Confirm" (F-CORPT00-002). */
+// ENTER, then CONFIRM Y through the dialog's "Confirm" (F-CORPT00-002).
 async function runAndConfirm(user: User): Promise<void> {
   const dialog = await runReport(user);
   await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
 }
 
-/** The texts of every field error shown. */
+// The texts of every field error shown.
 async function shownFieldErrors(): Promise<(string | null)[]> {
   const alerts = await screen.findAllByRole("alert");
   return alerts.map((alert) => alert.textContent);
@@ -193,13 +191,13 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** An edit the form schema runs itself, with what it marks. */
+// An edit the form schema runs itself, with what it marks.
 interface ClientRejection {
   readonly id: string;
   readonly enter: (user: User) => Promise<unknown>;
-  /** The control that carries `aria-invalid`. */
+  // The control that carries `aria-invalid`.
   readonly invalid: () => HTMLElement;
-  /** Where the cursor lands, the COBOL `MOVE -1 TO <field>L`. */
+  // Where the cursor lands, the COBOL `MOVE -1 TO <field>L`.
   readonly focused: () => HTMLElement;
   readonly message: string;
 }
@@ -225,7 +223,7 @@ const CLIENT_REJECTIONS: readonly ClientRejection[] = [
   },
 ];
 
-/** A server answer to a request every client edit accepts. */
+// A server answer to a request every client edit accepts.
 interface ServerRejection {
   readonly id: string;
   readonly rejected: "Start date" | "End date";
@@ -259,22 +257,22 @@ const SERVER_REJECTIONS: readonly ServerRejection[] = [
   },
 ];
 
-/** The range typed over the sent one while its request is still running. */
+// The range typed over the sent one while its request is still running.
 const NEWER_RANGE = ["2023-03-01", "2023-03-31"] as const;
 
-/** V-CORPT00C-014, on SDTMM [app/cbl/CORPT00C.cbl:L381-406]. */
+// V-CORPT00C-014, on SDTMM [app/cbl/CORPT00C.cbl:L381-406].
 const START_DATE_INVALID = "Start Date - Not a valid date...";
 
-/** An answer that arrives once the entry it was sent for has been replaced. */
+// An answer that arrives once the entry it was sent for has been replaced.
 interface LateAnswer {
   readonly outcome: string;
   readonly sent: readonly [startDate: string, endDate: string];
   readonly status: number;
   readonly body: ReportResponse | ErrorBody;
-  /** The toast that still carries the answer's message. */
+  // The toast that still carries the answer's message.
   readonly toast: "success" | "error";
   readonly message: string;
-  /** The names of the report regions shown afterwards. */
+  // The names of the report regions shown afterwards.
   readonly regions: readonly string[];
 }
 
@@ -303,13 +301,11 @@ const LATE_ANSWERS: readonly LateAnswer[] = [
   },
 ];
 
-/** The hint shown above a record box narrower than its records. */
+// The hint shown above a record box narrower than its records.
 const SCROLL_HINT = "Scroll sideways to see each line in full.";
 
-/**
- * Lays every element out with the given sizes: jsdom performs no layout, so
- * each reports 0. vi.restoreAllMocks puts the real getters back.
- */
+// Lays every element out with the given sizes: jsdom performs no layout, so
+// each reports 0. vi.restoreAllMocks puts the real getters back.
 function stubLayout(
   scrollWidth: number,
   clientWidth: number,
@@ -326,7 +322,7 @@ function stubLayout(
   return { scrollLeft };
 }
 
-/** Runs a confirmed Monthly report and returns the box holding its records. */
+// Runs a confirmed Monthly report and returns the box holding its records.
 async function showMonthlyRecords(): Promise<HTMLPreElement> {
   fetchMock.mockResolvedValueOnce(
     jsonResponse(200, report("Monthly", "2022-07-01", "2022-07-31")),
@@ -342,7 +338,7 @@ async function showMonthlyRecords(): Promise<HTMLPreElement> {
   return box;
 }
 
-/** The sides of the record box an edge fade covers. */
+// The sides of the record box an edge fade covers.
 function fadedSides(box: HTMLElement): string[] {
   return Array.from(box.parentElement?.children ?? [])
     .filter((element) => element.getAttribute("aria-hidden") === "true")
@@ -354,11 +350,9 @@ function fadedSides(box: HTMLElement): string[] {
     });
 }
 
-/**
- * The margin-top utility that applies to a field description where it stands
- * among its field's children: the generated FieldDescription varies it with
- * the `last:` and `nth-last-2:` variants.
- */
+// The margin-top utility that applies to a field description where it stands
+// among its field's children: the generated FieldDescription varies it with
+// the `last:` and `nth-last-2:` variants.
 function positionalMarginTop(description: Element): string | undefined {
   let variant = "";
   if (description.matches(":last-child")) {
@@ -372,7 +366,7 @@ function positionalMarginTop(description: Element): string | undefined {
     .find((utility) => /^-?mt-/.test(utility));
 }
 
-/** Lets the timer task pass on which react-hook-form's setFocus moves focus. */
+// Lets the timer task pass on which react-hook-form's setFocus moves focus.
 async function nextTask(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => {

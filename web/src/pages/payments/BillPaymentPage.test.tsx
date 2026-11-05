@@ -58,20 +58,18 @@ const ACCOUNT_ID = "00000000001";
 const ACCOUNT_PATH = `/api/accounts/${ACCOUNT_ID}`;
 const PAYMENTS_PATH = "/api/payments";
 
-/** The BMS field every COBIL00C refusal below names [app/cpy-bms/COBIL00.CPY]. */
+// The BMS field every COBIL00C refusal below names [app/cpy-bms/COBIL00.CPY].
 const ACTIDIN = "ACTIDIN" satisfies BillPaymentField;
 
-/** The label of ACTIDIN, the title of the CURBAL card and of the dialog. */
+// The label of ACTIDIN, the title of the CURBAL card and of the dialog.
 const ACCOUNT_LABEL = "Account ID";
 const BALANCE_TITLE = "Your current balance is";
 const DIALOG_TITLE = "Confirm the bill payment";
 
-/**
- * `GET /accounts/00000000001` on the seeded corpus: the account record
- * [app/data/ASCII/acctdata.txt:L1], customer 000000001
- * [app/data/ASCII/custdata.txt:L1] and the account's card from its
- * cross-reference [app/data/ASCII/cardxref.txt:L49].
- */
+// `GET /accounts/00000000001` on the seeded corpus: the account record
+// [app/data/ASCII/acctdata.txt:L1], customer 000000001
+// [app/data/ASCII/custdata.txt:L1] and the account's card from its
+// cross-reference [app/data/ASCII/cardxref.txt:L49].
 const account = {
   account_id: ACCOUNT_ID,
   acct_active_status: "Y",
@@ -142,7 +140,7 @@ const TRAN_ID_EXISTS = "Tran ID already exist...";
 const UNABLE_TO_ADD = "Unable to Add Bill pay Transaction...";
 const UNABLE_TO_UPDATE = "Unable to Update Account...";
 
-/** A COBIL00C refusal whose cursor field is ACTIDIN. */
+// A COBIL00C refusal whose cursor field is ACTIDIN.
 function refusal(code: string, message: string): ErrorBody {
   return { code, message, fields: [{ field: ACTIDIN, message }] };
 }
@@ -152,24 +150,20 @@ const PAYMENT_HANDLE = {
   crumb: "Bill Payment",
 } satisfies RouteHandle;
 
-/** An HTTP status and the JSON body sent with it. */
+// An HTTP status and the JSON body sent with it.
 type Reply<B> = readonly [status: number, body: B];
 
-/** The answer of each request the screen can send. */
+// The answer of each request the screen can send.
 type Stubs = {
-  /** `GET /accounts/00000000001`, the balance card. */
+  // `GET /accounts/00000000001`, the balance card.
   account: Reply<AccountResponse | ErrorBody>;
-  /**
-   * `POST /payments` with any confirmation but `Y`: the review, or a promise
-   * of its answer while a test holds it.
-   */
+  // `POST /payments` with any confirmation but `Y`: the review, or a promise
+  // of its answer while a test holds it.
   review:
     | Reply<PaymentResponse | ErrorBody>
     | Promise<Reply<PaymentResponse | ErrorBody>>;
-  /**
-   * `POST /payments` with `confirm: "Y"`: the payment, or a promise of its
-   * answer while a test holds it.
-   */
+  // `POST /payments` with `confirm: "Y"`: the payment, or a promise of its
+  // answer while a test holds it.
   pay:
     | Reply<PaymentResponse | ErrorBody>
     | Promise<Reply<PaymentResponse | ErrorBody>>;
@@ -284,7 +278,7 @@ function findBalanceCard(): Promise<HTMLElement> {
   return screen.findByRole("group", { name: BALANCE_TITLE, hidden: true });
 }
 
-/** The status text of a CURBAL card whose balance may be about to change. */
+// The status text of a CURBAL card whose balance may be about to change.
 const BALANCE_UPDATING = "Updating the current balance";
 
 // The busy cues of the CURBAL card: its wrapper's aria-busy and status text

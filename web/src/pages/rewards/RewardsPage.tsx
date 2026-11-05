@@ -40,7 +40,7 @@ import {
 
 type RewardAccrual = components["schemas"]["RewardAccrualResponse"];
 
-/** The accruals on one history page. */
+// The accruals on one history page.
 const HISTORY_PAGE_SIZE = 10;
 
 // The `accountId` both reward hooks treat as "no account": the query is

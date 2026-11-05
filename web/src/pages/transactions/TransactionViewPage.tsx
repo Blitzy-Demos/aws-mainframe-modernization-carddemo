@@ -47,35 +47,31 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { showApiError } from "@/lib/api-errors";
 import { transactionViewKeySchema } from "@/schemas/transactions";
 
-/** The COTRN01 screen title [app/bms/COTRN01.bms:L75-79]. */
+// The COTRN01 screen title [app/bms/COTRN01.bms:L75-79].
 const TITLE = "View Transaction";
 
-/** The F3=Back and F5=Browse Tran. target, the transaction list. */
+// The F3=Back and F5=Browse Tran. target, the transaction list.
 const LIST_ROUTE = "/transactions";
 
-/**
- * How long the read's status stays empty before it announces the read's
- * progress, DataTable's delay. The cleared status is committed first, so the
- * identical result of a repeated read is still announced as a change.
- */
+// How long the read's status stays empty before it announces the read's
+// progress, DataTable's delay. The cleared status is committed first, so the
+// identical result of a repeated read is still announced as a change.
 const STATUS_ANNOUNCE_DELAY_MS = 150;
 
-/** One display field of the map and the response member it shows. */
+// One display field of the map and the response member it shows.
 type ScreenField = {
-  /** The BMS field name [app/bms/COTRN01.bms:L105-258]. */
+  // The BMS field name [app/bms/COTRN01.bms:L105-258].
   bms: string;
-  /** The map caption, without its colon. */
+  // The map caption, without its colon.
   caption: string;
   field: keyof Transaction;
-  /** Digits that line up from one transaction to the next. */
+  // Digits that line up from one transaction to the next.
   tabular: boolean;
 };
 
-/**
- * The 13 display fields in map order, row by row from line 10 to line 20
- * [app/bms/COTRN01.bms:L100-258], each with the CVTRA05Y member COTRN01C
- * moves into it [app/cbl/COTRN01C.cbl:L178-190].
- */
+// The 13 display fields in map order, row by row from line 10 to line 20
+// [app/bms/COTRN01.bms:L100-258], each with the CVTRA05Y member COTRN01C
+// moves into it [app/cbl/COTRN01C.cbl:L178-190].
 const SCREEN_FIELDS: readonly ScreenField[] = [
   { bms: "TRNID", caption: "Transaction ID", field: "tran_id", tabular: true },
   { bms: "CARDNUM", caption: "Card Number", field: "tran_card_num", tabular: true },
@@ -94,14 +90,12 @@ const SCREEN_FIELDS: readonly ScreenField[] = [
 
 type KeyIssue = { message: string };
 
-/**
- * The COTRN01C PROCESS-ENTER-KEY edit of the route key, through the schema
- * that mirrors it: `null` when the key passes, else its texts. A blank key
- * gets 'Tran ID can NOT be empty...' and is not read
- * [app/cbl/COTRN01C.cbl:L146-152] (V-COTRN01C-001); a key longer than the
- * 16-character TRNIDIN, which the 3270 field cannot send, keeps the schema's
- * length text and is not read either.
- */
+// The COTRN01C PROCESS-ENTER-KEY edit of the route key, through the schema
+// that mirrors it: `null` when the key passes, else its texts. A blank key
+// gets 'Tran ID can NOT be empty...' and is not read
+// [app/cbl/COTRN01C.cbl:L146-152] (V-COTRN01C-001); a key longer than the
+// 16-character TRNIDIN, which the 3270 field cannot send, keeps the schema's
+// length text and is not read either.
 function editKey(tranId: string): KeyIssue[] | null {
   const result = transactionViewKeySchema.safeParse({ tran_id: tranId });
   return result.success
@@ -112,11 +106,11 @@ function editKey(tranId: string): KeyIssue[] | null {
 type DetailItemProps = {
   caption: string;
   children?: ReactNode;
-  /** The key edit texts shown under the value. */
+  // The key edit texts shown under the value.
   errors?: KeyIssue[] | null;
 };
 
-/** One caption and its value. */
+// One caption and its value.
 function DetailItem({ caption, children, errors }: DetailItemProps): JSX.Element {
   return (
     <div className="flex flex-col gap-1">
@@ -132,14 +126,12 @@ function DetailItem({ caption, children, errors }: DetailItemProps): JSX.Element
 }
 
 type TransactionFieldsProps = {
-  /** The transaction as read, or `undefined` while it is being read. */
+  // The transaction as read, or `undefined` while it is being read.
   transaction: Transaction | undefined;
 };
 
-/**
- * The display fields, each the API string as sent: the amount stays the
- * decimal text of `TRAN-AMT S9(09)V99` and is never converted to a number.
- */
+// The display fields, each the API string as sent: the amount stays the
+// decimal text of `TRAN-AMT S9(09)V99` and is never converted to a number.
 function TransactionFields({ transaction }: TransactionFieldsProps): JSX.Element {
   return (
     <dl className="grid gap-x-6 gap-y-4 lg:grid-cols-2">
@@ -160,19 +152,17 @@ function TransactionFields({ transaction }: TransactionFieldsProps): JSX.Element
   );
 }
 
-/** The failure a toast has shown, kept as the screen's message line. */
+// The failure a toast has shown, kept as the screen's message line.
 type ShownError = { error: Error; message: string };
 
 type TransactionPanelProps = {
-  /** The route key, the TRAN-ID as the list sent it. */
+  // The route key, the TRAN-ID as the list sent it.
   tranId: string;
 };
 
-/**
- * The map below its title: the key (TRNIDIN), the dashed rule of line 8
- * [app/bms/COTRN01.bms:L94-99] and the display fields of the transaction
- * read with that key, followed by the status that announces the read.
- */
+// The map below its title: the key (TRNIDIN), the dashed rule of line 8
+// [app/bms/COTRN01.bms:L94-99] and the display fields of the transaction
+// read with that key, followed by the status that announces the read.
 function TransactionPanel({ tranId }: TransactionPanelProps): JSX.Element {
   const keyIssues = useMemo(() => editKey(tranId), [tranId]);
   const keyPasses = keyIssues === null;

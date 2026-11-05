@@ -69,10 +69,10 @@ import {
 
 type TransactionResponse = components["schemas"]["TransactionResponse"];
 
-/** The form field of ACCTSID, the one input of the lookup. */
+// The form field of ACCTSID, the one input of the lookup.
 const ACCOUNT_FIELD = accountViewBmsFieldMap.ACCTSID;
 
-/** ACCTSID `LENGTH=11`, `PICIN='99999999999'` [app/bms/COACTVW.bms:L84-90]. */
+// ACCTSID `LENGTH=11`, `PICIN='99999999999'` [app/bms/COACTVW.bms:L84-90].
 const ACCOUNT_ID_LENGTH = 11;
 
 // The `accountId` the reward and transaction hooks treat as "no account":
@@ -83,26 +83,24 @@ const NO_ACCOUNT = "";
 // sees the same array until the page arrives.
 const NO_TRANSACTIONS: TransactionResponse[] = [];
 
-/** The transactions table's caption, its name, loaded and loading alike. */
+// The transactions table's caption, its name, loaded and loading alike.
 const TRANSACTIONS_CAPTION = "Recent transactions";
 
-/** The map title [app/bms/COMEN01.bms:L79], heading and naming the menu. */
+// The map title [app/bms/COMEN01.bms:L79], heading and naming the menu.
 const MENU_TITLE = "Main Menu";
 
-/** The account submitted for lookup, and which submission it was. */
+// The account submitted for lookup, and which submission it was.
 type Lookup = { accountId: string; count: number };
 
-/**
- * What the page's status region is to announce for a lookup: `text`, and
- * `token`, which changes with each new answer, so the unchanged text of a
- * repeated lookup is announced again.
- */
+// What the page's status region is to announce for a lookup: `text`, and
+// `token`, which changes with each new answer, so the unchanged text of a
+// repeated lookup is announced again.
 type OverviewStatus = { text: string; token: number };
 
-/** The status of no lookup, of a rejected key and of a failed account read. */
+// The status of no lookup, of a rejected key and of a failed account read.
 const NO_STATUS: OverviewStatus = { text: "", token: 0 };
 
-/** The status text while the account or its reward balance is read. */
+// The status text while the account or its reward balance is read.
 const LOADING_TEXT = "Loading account";
 
 // How long the status region stays empty before it announces. The region is
@@ -156,11 +154,9 @@ const transactionColumns: DataTableProps<TransactionResponse>["columns"] = [
   },
 ];
 
-/**
- * Calls `show` once for each failed read, when its request has settled. An
- * error the cache still holds while the query reads again, as on the remount
- * of a repeated lookup, is not shown a second time.
- */
+// Calls `show` once for each failed read, when its request has settled. An
+// error the cache still holds while the query reads again, as on the remount
+// of a repeated lookup, is not shown a second time.
 function useSettledError(
   error: unknown,
   isFetching: boolean,
@@ -176,13 +172,11 @@ function useSettledError(
   }, [error, isFetching, show]);
 }
 
-/**
- * The summary's layout while the account is read, hidden from assistive
- * technology: the page's status region announces the read. The heading row
- * holds bars as high as its text-lg heading (h-7) and its two small buttons
- * (h-8), then come the four summary cards and the transactions table in their
- * own loading states, so nothing below moves when the account arrives.
- */
+// The summary's layout while the account is read, hidden from assistive
+// technology: the page's status region announces the read. The heading row
+// holds bars as high as its text-lg heading (h-7) and its two small buttons
+// (h-8), then come the four summary cards and the transactions table in their
+// own loading states, so nothing below moves when the account arrives.
 function OverviewSkeleton(): JSX.Element {
   return (
     <div aria-hidden="true" className="flex flex-col gap-4">
@@ -217,16 +211,14 @@ function OverviewSkeleton(): JSX.Element {
 type AccountOverviewProps = {
   accountId: string;
   form: UseFormReturn<AccountKeyValues>;
-  /** Receives the lookup's status each time it changes. */
+  // Receives the lookup's status each time it changes.
   onStatus: (status: OverviewStatus) => void;
 };
 
-/**
- * The summary of a submitted account: `GET /accounts/{id}`, then the reward
- * balance and the five most recent transactions of the account found, newest
- * first. It is remounted for every lookup, so it reports the lookup's status
- * to the page, whose status region stays mounted across lookups.
- */
+// The summary of a submitted account: `GET /accounts/{id}`, then the reward
+// balance and the five most recent transactions of the account found, newest
+// first. It is remounted for every lookup, so it reports the lookup's status
+// to the page, whose status region stays mounted across lookups.
 function AccountOverview({
   accountId,
   form,
@@ -366,8 +358,10 @@ function AccountOverview({
         {rewardCard}
       </div>
 
-      {/* The five rows are the whole answer: there is no page before or
-          after them, so both paging keys are null. */}
+      {/* A preview capped at the five most recent transactions: the
+          dashboard deliberately offers no paging, so both paging keys are
+          null. The Transaction List page (/transactions) is the full, paged
+          browse of the transaction file. */}
       {transactions.isError ? null : (
         <DataTable
           columns={transactionColumns}

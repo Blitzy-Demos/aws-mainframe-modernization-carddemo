@@ -67,64 +67,58 @@ import {
 
 type AccountViewField = components["schemas"]["AccountViewField"];
 
-/** The blank screen INITIALIZE-ALL-FIELDS leaves [app/cbl/COBIL00C.cbl:L560-566]. */
+// The blank screen INITIALIZE-ALL-FIELDS leaves [app/cbl/COBIL00C.cbl:L560-566].
 const EMPTY_VALUES: PaymentFormValues = { account_id: "", confirm: "" };
 
-/** The ENTER of the review: CONFIRMI blank, which only asks (V-COBIL00C-008). */
+// The ENTER of the review: CONFIRMI blank, which only asks (V-COBIL00C-008).
 const CONFIRM_BLANK = "";
-/** The dialog's Confirm: CONFIRMI `Y`, which pays [app/cbl/COBIL00C.cbl:L174-177]. */
+// The dialog's Confirm: CONFIRMI `Y`, which pays [app/cbl/COBIL00C.cbl:L174-177].
 const CONFIRM_YES = "Y";
-/** The status of a completed payment; a 200 only carries a message. */
+// The status of a completed payment; a 200 only carries a message.
 const CREATED = 201;
 
-/**
- * The note under the error of a confirmed payment that got no usable answer:
- * the server may have made it, and paying again would pay twice.
- */
+// The note under the error of a confirmed payment that got no usable answer:
+// the server may have made it, and paying again would pay twice.
 const PAYMENT_OUTCOME_UNKNOWN =
   "The payment may have been made. Check the account balance before paying again.";
 
-/** `ACTIDINI PIC X(11)` [app/cpy-bms/COBIL00.CPY:L60]. */
+// `ACTIDINI PIC X(11)` [app/cpy-bms/COBIL00.CPY:L60].
 const ACCOUNT_ID_LENGTH = 11;
 const ACCOUNT_FIELD = "account_id";
 const ACCOUNT_DESCRIPTION_ID = "account_id-description";
 const ACCOUNT_ERROR_ID = "account_id-error";
 
-/**
- * Where a `GET /accounts/{id}` error of the balance card lands: its one BMS
- * field, ACCTSID, is the account ID this screen asks for. Every member of the
- * enum is listed, so a new one fails `tsc`.
- */
+// Where a `GET /accounts/{id}` error of the balance card lands: its one BMS
+// field, ACCTSID, is the account ID this screen asks for. Every member of the
+// enum is listed, so a new one fails `tsc`.
 const previewFieldMap = {
   ACCTSID: ACCOUNT_FIELD,
 } satisfies Record<AccountViewField, keyof PaymentFormValues>;
 
-/** The 200 answer to a review: the account as entered and its CURBAL. */
+// The 200 answer to a review: the account as entered and its CURBAL.
 type Review = { accountId: string; balance: string };
 
-/** The 201 answer: the paid account and its balance after the payment. */
+// The 201 answer: the paid account and its balance after the payment.
 type Paid = { accountId: string; balance: string };
 
 type BalancePreviewProps = {
   accountId: string;
   paid: Paid | null;
-  /** Whether a confirmed payment, with the reloads after it, is running. */
+  // Whether a confirmed payment, with the reloads after it, is running.
   paying: boolean;
   form: UseFormReturn<PaymentFormValues>;
-  /** Whether the form still holds the entry this account was reviewed from. */
+  // Whether the form still holds the entry this account was reviewed from.
   ownsEntry: () => boolean;
 };
 
-/**
- * The CURBAL line of COBIL00, "Your current balance is", for the account
- * under review: `GET /accounts/{id}` through the account cache the dashboard
- * shares. The payment hook reloads that entry once a confirmed payment
- * settles, failures included (E-19), so the card follows the balance on file;
- * after a completed payment it shows the balance the 201 answered with.
- * While the payment runs, and while the account is read again, the balance
- * on file may be about to change, so the card is marked busy: dimmed, a
- * spinner for its icon and a polite status. The 201's balance is final.
- */
+// The CURBAL line of COBIL00, "Your current balance is", for the account
+// under review: `GET /accounts/{id}` through the account cache the dashboard
+// shares. The payment hook reloads that entry once a confirmed payment
+// settles, failures included (E-19), so the card follows the balance on file;
+// after a completed payment it shows the balance the 201 answered with.
+// While the payment runs, and while the account is read again, the balance
+// on file may be about to change, so the card is marked busy: dimmed, a
+// spinner for its icon and a polite status. The 201's balance is final.
 function BalancePreview({
   accountId,
   paid,
@@ -197,7 +191,7 @@ function BalancePreview({
 
 type PaymentSummaryProps = { review: Review };
 
-/** The dialog's question: the BMS confirmation prompt over the reviewed entry. */
+// The dialog's question: the BMS confirmation prompt over the reviewed entry.
 function PaymentSummary({ review }: PaymentSummaryProps): JSX.Element {
   return (
     <div className="flex flex-col gap-3">

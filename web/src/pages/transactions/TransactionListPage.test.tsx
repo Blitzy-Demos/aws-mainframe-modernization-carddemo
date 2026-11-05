@@ -52,28 +52,28 @@ type FetchImpl = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-/** `GET /transactions` under the client's `/api` base path. */
+// `GET /transactions` under the client's `/api` base path.
 const LIST_PATH = "/api/transactions";
 
-/** COTRN00C's TRNIDIN text (V-COTRN00C-004), byte for byte. */
+// COTRN00C's TRNIDIN text (V-COTRN00C-004), byte for byte.
 const TRAN_ID_NOT_NUMERIC = "Tran ID must be Numeric ...";
 
-/** COTRN00C's end-of-master text (V-COTRN00C-007), byte for byte. */
+// COTRN00C's end-of-master text (V-COTRN00C-007), byte for byte.
 const BOTTOM_REACHED = "You have reached the bottom of the page...";
 
-/** PROCESS-PF7-KEY on the first page (V-COTRN00C-009), byte for byte. */
+// PROCESS-PF7-KEY on the first page (V-COTRN00C-009), byte for byte.
 const ALREADY_AT_TOP = "You are already at the top of the page...";
 
-/** STARTBR NOTFND (V-COTRN00C-005, V-COTRN00C-010), byte for byte. */
+// STARTBR NOTFND (V-COTRN00C-005, V-COTRN00C-010), byte for byte.
 const AT_TOP = "You are at the top of the page...";
 
-/** The V-COTRN00C-005 example: a key above every TRAN-ID of the master. */
+// The V-COTRN00C-005 example: a key above every TRAN-ID of the master.
 const NO_MATCH_KEY = "9999999999999999";
 
-/** The V-COTRN00C-004 example: 16 characters, the last not a digit. */
+// The V-COTRN00C-004 example: 16 characters, the last not a digit.
 const NOT_NUMERIC_KEY = "000000000068358X";
 
-/** A 16-digit key the schema accepts, answered by the server alone. */
+// A 16-digit key the schema accepts, answered by the server alone.
 const SERVER_REJECTED_KEY = "0000000000000099";
 
 // Synthetic TRAN-IDs of the stubbed master: `transaction(index)` gives fixture
@@ -84,16 +84,14 @@ const FIRST_KEY = "0000000000000001";
 const LAST_KEY_OF_FIRST_PAGE = "0000000000000010";
 const FIRST_KEY_OF_SECOND_PAGE = "0000000000000011";
 
-/** `TRAN-ORIG-TS X(26)` of every app/data/ASCII/dailytran.txt record. */
+// `TRAN-ORIG-TS X(26)` of every app/data/ASCII/dailytran.txt record.
 const ORIG_TS = "2022-06-10 19:27:53.000000";
 
-/**
- * `TRAN-PROC-TS X(26)` in the CBTRN02C Z-GET-DB2-FORMAT-TIMESTAMP form,
- * `YYYY-MM-DD-HH.MM.SS.mm0000`, at the processing clock the tests pin.
- */
+// `TRAN-PROC-TS X(26)` in the CBTRN02C Z-GET-DB2-FORMAT-TIMESTAMP form,
+// `YYYY-MM-DD-HH.MM.SS.mm0000`, at the processing clock the tests pin.
 const PROC_TS = "2022-07-01-12.00.00.000000";
 
-/** The members that differ between the twelve fixture records used. */
+// The members that differ between the twelve fixture records used.
 type DailyTranContent = Pick<
   TransactionResponse,
   | "tran_type_cd"
@@ -106,11 +104,9 @@ type DailyTranContent = Pick<
   | "tran_card_num"
 >;
 
-/**
- * Records 1 to 12 of app/data/ASCII/dailytran.txt (CVTRA06Y), the amount
- * decoded from its trailing overpunch. All twelve have category `0001` and
- * merchant ID `800000000`.
- */
+// Records 1 to 12 of app/data/ASCII/dailytran.txt (CVTRA06Y), the amount
+// decoded from its trailing overpunch. All twelve have category `0001` and
+// merchant ID `800000000`.
 const DAILY_TRAN: readonly DailyTranContent[] = [
   { tran_type_cd: "01", tran_source: "POS TERM", tran_desc: "Purchase at Abshire-Lowe", tran_amt: "504.77", tran_merchant_name: "Abshire-Lowe", tran_merchant_city: "North Enoshaven", tran_merchant_zip: "72112", tran_card_num: "4859452612877065" },
   { tran_type_cd: "03", tran_source: "OPERATOR", tran_desc: "Return item at Nitzsche, Nicolas and Lowe", tran_amt: "-919.00", tran_merchant_name: "Nitzsche, Nicolas and Lowe", tran_merchant_city: "Fidelshire", tran_merchant_zip: "53378", tran_card_num: "0927987108636232" },
@@ -126,7 +122,7 @@ const DAILY_TRAN: readonly DailyTranContent[] = [
   { tran_type_cd: "01", tran_source: "POS TERM", tran_desc: "Purchase at Wolf, Cruickshank and Bode", tran_amt: "250.22", tran_merchant_name: "Wolf, Cruickshank and Bode", tran_merchant_city: "Fritzchester", tran_merchant_zip: "20195-5156", tran_card_num: "7094142751055551" },
 ];
 
-/** The transaction master record of fixture record `index` (0-based). */
+// The transaction master record of fixture record `index` (0-based).
 function transaction(index: number): TransactionResponse {
   return {
     tran_id: `${index + 1}`.padStart(16, "0"),
@@ -138,19 +134,17 @@ function transaction(index: number): TransactionResponse {
   };
 }
 
-/**
- * The first entry's page, the ten rows of COTRN00 from the lowest key. It is
- * read without a start key, so it offers no backward request, and its last
- * key is the PF8 start key. COTRN00C shows no text with it, so the server
- * omits `message`.
- */
+// The first entry's page, the ten rows of COTRN00 from the lowest key. It is
+// read without a start key, so it offers no backward request, and its last
+// key is the PF8 start key. COTRN00C shows no text with it, so the server
+// omits `message`.
 const FIRST_PAGE: TransactionPage = {
   items: DAILY_TRAN.slice(0, 10).map((_, index) => transaction(index)),
   next_key: LAST_KEY_OF_FIRST_PAGE,
   prev_key: null,
 };
 
-/** PF8 from the first page: the rows left before the end of the master. */
+// PF8 from the first page: the rows left before the end of the master.
 const SECOND_PAGE: TransactionPage = {
   items: [transaction(10), transaction(11)],
   next_key: null,
@@ -158,18 +152,14 @@ const SECOND_PAGE: TransactionPage = {
   message: BOTTOM_REACHED,
 };
 
-/**
- * ENTER from the first key typed in TRNIDIN: the first page's rows, and, as
- * from every typed key, the first key shown as the PF7 start key, since the
- * server cannot tell that no record precedes it.
- */
+// ENTER from the first key typed in TRNIDIN: the first page's rows, and, as
+// from every typed key, the first key shown as the PF7 start key, since the
+// server cannot tell that no record precedes it.
 const TYPED_KEY_PAGE: TransactionPage = { ...FIRST_PAGE, prev_key: FIRST_KEY };
 
-/**
- * PF7 from the first key, which no record precedes: PROCESS-PF7-KEY on the
- * first page reads nothing, and the page from the key stays reachable
- * forward.
- */
+// PF7 from the first key, which no record precedes: PROCESS-PF7-KEY on the
+// first page reads nothing, and the page from the key stays reachable
+// forward.
 const ALREADY_AT_TOP_PAGE: TransactionPage = {
   items: [],
   next_key: FIRST_KEY,
@@ -177,11 +167,9 @@ const ALREADY_AT_TOP_PAGE: TransactionPage = {
   message: ALREADY_AT_TOP,
 };
 
-/**
- * STARTBR NOTFND: no record at or after the start key. ENTER from a key above
- * the highest gets it, and so does PF8 once the records from its key on are
- * gone, as after `batch tranbkp` empties the live master between two reads.
- */
+// STARTBR NOTFND: no record at or after the start key. ENTER from a key above
+// the highest gets it, and so does PF8 once the records from its key on are
+// gone, as after `batch tranbkp` empties the live master between two reads.
 const NOT_FOUND_PAGE: TransactionPage = {
   items: [],
   next_key: null,
@@ -189,14 +177,14 @@ const NOT_FOUND_PAGE: TransactionPage = {
   message: AT_TOP,
 };
 
-/** V-COTRN00C-004's answer: status 400, the cursor on TRNIDIN. */
+// V-COTRN00C-004's answer: status 400, the cursor on TRNIDIN.
 const START_KEY_ERROR: ListErrorBody = {
   code: "INVALID",
   message: TRAN_ID_NOT_NUMERIC,
   fields: [{ field: "TRNIDIN", message: TRAN_ID_NOT_NUMERIC }],
 };
 
-/** The answer to a request no test expects; afterEach reports it. */
+// The answer to a request no test expects; afterEach reports it.
 const UNEXPECTED: ErrorBody = { code: "UNEXPECTED", message: "Unexpected error" };
 
 function jsonResponse(status: number, body: TransactionPage | ErrorBody): Response {
@@ -206,7 +194,7 @@ function jsonResponse(status: number, body: TransactionPage | ErrorBody): Respon
   });
 }
 
-/** A promise and its resolver, so a test decides when an answer arrives. */
+// A promise and its resolver, so a test decides when an answer arrives.
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve: (value: T) => void = () => undefined;
   const promise = new Promise<T>((settle) => {
@@ -225,11 +213,9 @@ let unexpected: string[];
 let queryClient: QueryClient;
 let toastError: MockInstance<typeof toast.error>;
 
-/**
- * The browse the fixture master answers: forward from the start (the first
- * entry) or from the first key gives the first page, forward from its last key
- * the second. Anything else is recorded as unexpected.
- */
+// The browse the fixture master answers: forward from the start (the first
+// entry) or from the first key gives the first page, forward from its last key
+// the second. Anything else is recorded as unexpected.
 function browse(request: Request): Response {
   const url = new URL(request.url);
   const startKey = url.searchParams.get("start_key");
@@ -246,24 +232,22 @@ function browse(request: Request): Response {
   return jsonResponse(500, UNEXPECTED);
 }
 
-/** Every request the page sent, in the order sent. */
+// Every request the page sent, in the order sent.
 function requests(): Request[] {
   return fetchMock.mock.calls.map(([input, init]) =>
     input instanceof Request ? input : new Request(input, init),
   );
 }
 
-/** The requests for `GET /transactions`. */
+// The requests for `GET /transactions`.
 function listRequests(): Request[] {
   return requests().filter(
     (request) => new URL(request.url).pathname === LIST_PATH,
   );
 }
 
-/**
- * The FieldError that describes `input`: the page links an invalid TRNIDIN to
- * its error through `aria-describedby`, inside the field's group.
- */
+// The FieldError that describes `input`: the page links an invalid TRNIDIN to
+// its error through `aria-describedby`, inside the field's group.
 function fieldError(input: HTMLElement): HTMLElement {
   const id = input.getAttribute("aria-describedby");
   const error = id === null ? null : document.getElementById(id);
@@ -275,12 +259,12 @@ function fieldError(input: HTMLElement): HTMLElement {
   return error;
 }
 
-/** Every toast created so far, for toastsSince. */
+// Every toast created so far, for toastsSince.
 function toastHistory(): unknown[] {
   return [...toast.getHistory()];
 }
 
-/** The toasts created with the text `title` since `before`, a toastHistory(). */
+// The toasts created with the text `title` since `before`, a toastHistory().
 function toastsSince(before: readonly unknown[], title: string): number {
   return toast
     .getHistory()
@@ -292,17 +276,15 @@ function toastsSince(before: readonly unknown[], title: string): number {
     ).length;
 }
 
-/** The "View" row actions, in row order. */
+// The "View" row actions, in row order.
 function viewLinks(): HTMLElement[] {
   return within(screen.getByRole("table")).getAllByRole("link", { name: "View" });
 }
 
-/**
- * Renders the page at /transactions in a data router, which PageHeader's
- * useMatches needs, and waits for the first entry: one request without
- * parameters, which lists from the lowest key, as COTRN00C's first entry
- * browses from LOW-VALUES, and whose rows are shown.
- */
+// Renders the page at /transactions in a data router, which PageHeader's
+// useMatches needs, and waits for the first entry: one request without
+// parameters, which lists from the lowest key, as COTRN00C's first entry
+// browses from LOW-VALUES, and whose rows are shown.
 async function renderPage(): Promise<{
   user: UserEvent;
   startKeyInput: HTMLInputElement;

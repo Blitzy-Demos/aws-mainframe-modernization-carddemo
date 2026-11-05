@@ -66,39 +66,37 @@ import {
 
 type TransactionAddField = components["schemas"]["TransactionAddField"];
 
-/** A COTRN02 input field. CONFIRM has none: the confirm dialog replaces it. */
+// A COTRN02 input field. CONFIRM has none: the confirm dialog replaces it.
 type InputField = Exclude<TransactionAddField, "CONFIRM">;
 
-/** One COTRN02 input; its form key is `transactionAddBmsFieldMap[bms]`. */
+// One COTRN02 input; its form key is `transactionAddBmsFieldMap[bms]`.
 type FieldConfig = {
   readonly bms: InputField;
-  /** The BMS caption without its colon. */
+  // The BMS caption without its colon.
   readonly label: string;
-  /** The `PIC X(n)` width of the BMS input [app/cpy-bms/COTRN02.CPY]. */
+  // The `PIC X(n)` width of the BMS input [app/cpy-bms/COTRN02.CPY].
   readonly maxLength: number;
-  /** Digits only: a numeric keypad on touch devices. */
+  // Digits only: a numeric keypad on touch devices.
   readonly inputMode?: "numeric";
   readonly placeholder?: string;
-  /** The hint the map prints beside the input. */
+  // The hint the map prints beside the input.
   readonly description?: string;
 };
 
-/** A group of COTRN02 inputs, in screen order, rendered as one fieldset. */
+// A group of COTRN02 inputs, in screen order, rendered as one fieldset.
 type FieldSetConfig = {
   readonly legend: string;
-  /** Shown under the legend and linked to every input of the group. */
+  // Shown under the legend and linked to every input of the group.
   readonly description?: string;
   readonly fields: readonly [FieldConfig, ...FieldConfig[]];
 };
 
-/** The COTRN02 date hint, the CSUTLDTC format TORIGDT and TPROCDT ask for. */
+// The COTRN02 date hint, the CSUTLDTC format TORIGDT and TPROCDT ask for.
 const DATE_FORMAT = "YYYY-MM-DD";
 
-/**
- * The COTRN02 inputs in screen order [app/bms/COTRN02.bms:L84-266]. The dates
- * are text inputs, as there is no date picker (AAP gap inventory); whether a
- * `YYYY-MM-DD` text is a calendar date stays the server's CSUTLDTC check.
- */
+// The COTRN02 inputs in screen order [app/bms/COTRN02.bms:L84-266]. The dates
+// are text inputs, as there is no date picker (AAP gap inventory); whether a
+// `YYYY-MM-DD` text is a calendar date stays the server's CSUTLDTC check.
 const FIELD_SETS: readonly FieldSetConfig[] = [
   {
     legend: "Account or card",
@@ -154,11 +152,9 @@ const FIELD_SETS: readonly FieldSetConfig[] = [
   },
 ];
 
-/**
- * INITIALIZE-ALL-FIELDS [app/cbl/COTRN02C.cbl:L758-778]: every input SPACES,
- * which a browser field holds as "", CONFIRMI included. A blank confirmation
- * passes the form schema; the dialog's "Confirm" sends `Y` in its place.
- */
+// INITIALIZE-ALL-FIELDS [app/cbl/COTRN02C.cbl:L758-778]: every input SPACES,
+// which a browser field holds as "", CONFIRMI included. A blank confirmation
+// passes the form schema; the dialog's "Confirm" sends `Y` in its place.
 const EMPTY_VALUES: TransactionAddFormValues = {
   account_id: "",
   card_number: "",
@@ -176,51 +172,45 @@ const EMPTY_VALUES: TransactionAddFormValues = {
   confirm: "",
 };
 
-/** The form keys of the two key fields VALIDATE-INPUT-KEY-FIELDS edits. */
+// The form keys of the two key fields VALIDATE-INPUT-KEY-FIELDS edits.
 const KEY_FIELDS = [
   transactionAddBmsFieldMap.ACTIDIN,
   transactionAddBmsFieldMap.CARDNIN,
 ] as const;
 
-/** The BMS names of the key fields, as an error's `fields[]` carries them. */
+// The BMS names of the key fields, as an error's `fields[]` carries them.
 const KEY_BMS_FIELDS: ReadonlySet<string> = new Set<InputField>(["ACTIDIN", "CARDNIN"]);
 
 // ACTIDIN carries the map's IC attribute, and every successful add and every
 // clear moves the cursor back to it (MOVE -1 TO ACTIDINL).
 const INITIAL_FIELD = transactionAddBmsFieldMap.ACTIDIN;
 
-/** CONFIRMI 'Y', the value ADD-TRANSACTION runs on [app/cbl/COTRN02C.cbl:L169-172]. */
+// CONFIRMI 'Y', the value ADD-TRANSACTION runs on [app/cbl/COTRN02C.cbl:L169-172].
 const CONFIRM_YES = "Y";
 
-/**
- * CONFIRMI SPACES: PROCESS-ENTER-KEY runs every edit and, when all pass,
- * answers 'Confirm to add this transaction...' without writing
- * [app/cbl/COTRN02C.cbl:L173-181].
- */
+// CONFIRMI SPACES: PROCESS-ENTER-KEY runs every edit and, when all pass,
+// answers 'Confirm to add this transaction...' without writing
+// [app/cbl/COTRN02C.cbl:L173-181].
 const CONFIRM_BLANK = "";
 
-/** The status of a completed add: the transaction written, its accrual committed. */
+// The status of a completed add: the transaction written, its accrual committed.
 const CREATED = 201;
 
-/** The map's confirmation caption, without the CONFIRM field it led into. */
+// The map's confirmation caption, without the CONFIRM field it led into.
 const CONFIRM_PROMPT = "You are about to add this transaction. Please confirm.";
 
-/**
- * The note under the error of a confirmed add that got no usable answer: the
- * server may have added it, and adding it again would enter it twice.
- */
+// The note under the error of a confirmed add that got no usable answer: the
+// server may have added it, and adding it again would enter it twice.
 const ADD_OUTCOME_UNKNOWN =
   "The transaction may have been added. Check the transaction list before adding it again.";
 
-/**
- * Whether a PF5 check was answered with an edit COTRN02C makes after the key
- * fields: an error naming fields, none of them ACTIDIN or CARDNIN. Only then
- * did COPY-LAST-TRAN-DATA get past VALIDATE-INPUT-KEY-FIELDS and copy the
- * record, since SEND-TRNADD-SCREEN ends the task at the first failing check
- * [app/cbl/COTRN02C.cbl:L471-499] [app/cbl/COTRN02C.cbl:L516-535]. A key
- * rejection, an error without fields or a failed request leaves the screen
- * as it was.
- */
+// Whether a PF5 check was answered with an edit COTRN02C makes after the key
+// fields: an error naming fields, none of them ACTIDIN or CARDNIN. Only then
+// did COPY-LAST-TRAN-DATA get past VALIDATE-INPUT-KEY-FIELDS and copy the
+// record, since SEND-TRNADD-SCREEN ends the task at the first failing check
+// [app/cbl/COTRN02C.cbl:L471-499] [app/cbl/COTRN02C.cbl:L516-535]. A key
+// rejection, an error without fields or a failed request leaves the screen
+// as it was.
 function passedKeyFields(error: unknown): boolean {
   if (!(error instanceof ApiError)) {
     return false;
@@ -229,7 +219,7 @@ function passedKeyFields(error: unknown): boolean {
   return fields.length > 0 && fields.every(({ field }) => !KEY_BMS_FIELDS.has(field));
 }
 
-/** The entries the confirm dialog repeats, as entered. Blank ones are left out. */
+// The entries the confirm dialog repeats, as entered. Blank ones are left out.
 function describeTransaction(values: TransactionAddFormValues): ReactNode {
   const entries = [
     { term: "Account", value: values.account_id },
@@ -256,20 +246,16 @@ function describeTransaction(values: TransactionAddFormValues): ReactNode {
 type TextFieldProps = {
   control: Control<TransactionAddFormValues>;
   config: FieldConfig;
-  /** The id of the group description the input is also described by. */
+  // The id of the group description the input is also described by.
   groupDescriptionId?: string;
-  /**
-   * The keyboard lock of a running PF5 copy or confirmed add: the input keeps
-   * its value, and stays focusable, so the cursor is not lost.
-   */
+  // The keyboard lock of a running PF5 copy or confirmed add: the input keeps
+  // its value, and stays focusable, so the cursor is not lost.
   readOnly: boolean;
 };
 
-/**
- * One COTRN02 input. The Controller's `field`, its `ref` included, goes to the
- * Input, so a client or server error focuses it, as the COBOL `MOVE -1 TO
- * <field>L` places the cursor.
- */
+// One COTRN02 input. The Controller's `field`, its `ref` included, goes to the
+// Input, so a client or server error focuses it, as the COBOL `MOVE -1 TO
+// <field>L` places the cursor.
 function TextField({
   control,
   config,
