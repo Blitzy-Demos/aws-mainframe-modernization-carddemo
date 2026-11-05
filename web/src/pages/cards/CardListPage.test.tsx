@@ -41,18 +41,18 @@ type ErrorBody = components["schemas"]["ErrorBody"];
 type FetchImpl = (input: Request) => Promise<Response>;
 type FetchMock = Mock<FetchImpl>;
 
-/** The first record of app/data/ASCII/cardxref.txt and carddata.txt. */
+// The first record of app/data/ASCII/cardxref.txt and carddata.txt.
 const FIRST_CARD = "0500024453765740";
 const FIRST_ACCOUNT = "00000000050";
 
-/** An 11-digit account no fixture record holds: valid to the schema. */
+// An 11-digit account no fixture record holds: valid to the schema.
 const UNKNOWN_ACCOUNT = "99999999999";
 
-/** COCRDLIC 2210-EDIT-ACCOUNT's text (V-COCRDLIC-001), byte for byte. */
+// COCRDLIC 2210-EDIT-ACCOUNT's text (V-COCRDLIC-001), byte for byte.
 const ACCOUNT_NOT_NUMERIC =
   "ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER";
 
-/** COCRDLIC 2220-EDIT-CARD's text (V-COCRDLIC-002), byte for byte. */
+// COCRDLIC 2220-EDIT-CARD's text (V-COCRDLIC-002), byte for byte.
 const CARD_NOT_NUMERIC = "CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER";
 
 const PAGE: CardPage = {
@@ -86,7 +86,7 @@ function jsonResponse(body: CardPage | ErrorBody, status = 200): Response {
   });
 }
 
-/** A promise and its resolver, so a test decides when an answer arrives. */
+// A promise and its resolver, so a test decides when an answer arrives.
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve: (value: T) => void = () => undefined;
   const promise = new Promise<T>((settle) => {
@@ -95,12 +95,12 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   return { promise, resolve };
 }
 
-/** Every request the page sent, in the order sent. */
+// Every request the page sent, in the order sent.
 function requests(): Request[] {
   return fetchMock.mock.calls.map(([request]) => request);
 }
 
-/** The requests for `GET /cards`, under the client's `/api` base path. */
+// The requests for `GET /cards`, under the client's `/api` base path.
 function cardListRequests(): Request[] {
   return requests().filter(
     (request) => new URL(request.url).pathname === "/api/cards",
@@ -111,10 +111,8 @@ function queryOf(request: Request): URLSearchParams {
   return new URL(request.url).searchParams;
 }
 
-/**
- * The cell texts of the card table's shown body rows, top to bottom, without
- * the filler rows, hidden from assistive technology, that pad a short page.
- */
+// The cell texts of the card table's shown body rows, top to bottom, without
+// the filler rows, hidden from assistive technology, that pad a short page.
 function cardRows(): string[][] {
   const table = screen.getByRole("table", { name: "Credit cards" });
   return Array.from(
@@ -124,10 +122,8 @@ function cardRows(): string[][] {
   );
 }
 
-/**
- * The FieldError that describes `input`: the page links an invalid filter to
- * its error through `aria-describedby`.
- */
+// The FieldError that describes `input`: the page links an invalid filter to
+// its error through `aria-describedby`.
 function fieldError(input: HTMLElement): HTMLElement {
   const id = input.getAttribute("aria-describedby");
   const error = id === null ? null : document.getElementById(id);
@@ -138,11 +134,9 @@ function fieldError(input: HTMLElement): HTMLElement {
   return error;
 }
 
-/**
- * Renders the page at /cards in a data router, which PageHeader's
- * useMatches needs, and waits for the first entry: one unfiltered request,
- * listing every card from the lowest card number, whose row is shown.
- */
+// Renders the page at /cards in a data router, which PageHeader's
+// useMatches needs, and waits for the first entry: one unfiltered request,
+// listing every card from the lowest card number, whose row is shown.
 async function renderPage(): Promise<{
   user: UserEvent;
   accountInput: HTMLInputElement;

@@ -33,7 +33,8 @@
 //!   to its own savepoint, every statement reported done before it stays, and
 //!   the same transaction still commits them (`carddemo_persistence::tx`,
 //!   "Abandoned calls"). A `COMMIT` that cannot complete within its own
-//!   deadline is reported as the lost summary, `I003`.
+//!   deadline is reported as the lost summary, `I003`, though its outcome is
+//!   unknown: the server may still have committed it.
 //!
 //! [`BoundedStore`] puts every port call of a store under the deadline and
 //! logs the cause of each failure other than `NOTFND`. The `CCPAUERY` record

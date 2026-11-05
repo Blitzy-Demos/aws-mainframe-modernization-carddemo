@@ -272,6 +272,9 @@ fn digits_value<const N: usize>(field: &Alnum<N>) -> Option<u16> {
     }
 }
 
+/// COCRDUPC 9000-READ-DATA, 9300-CHECK-CHANGE-IN-REC — P-COCRDUPC-022,
+/// P-COCRDUPC-005
+///
 /// The year `(1:4)`, month `(6:2)` and day `(9:2)` of a
 /// `CARD-EXPIRAION-DATE X(10)`, as `9000-READ-DATA` and
 /// `9300-CHECK-CHANGE-IN-REC` cut them.

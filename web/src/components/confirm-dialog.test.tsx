@@ -101,7 +101,7 @@ function animateDialogExit(): () => void {
   };
 }
 
-/** The dialog content while it is on the page, closing included. */
+// The dialog content while it is on the page, closing included.
 function dialogContent(): HTMLElement | null {
   return document.querySelector<HTMLElement>('[data-slot="alert-dialog-content"]');
 }
@@ -120,13 +120,13 @@ function field(): HTMLElement {
   return screen.getByRole("textbox", { name: "Field" });
 }
 
-/** Opens the dialog from its opener, which then holds the page's focus. */
+// Opens the dialog from its opener, which then holds the page's focus.
 async function openDialog(user: User): Promise<HTMLElement> {
   await user.click(opener());
   return screen.findByRole("alertdialog", { name: TITLE });
 }
 
-/** Lets the timer tasks queued so far run. */
+// Lets the timer tasks queued so far run.
 async function nextTask(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => {

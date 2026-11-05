@@ -30,7 +30,8 @@ const REGENERATE_TYPES = "pnpm --dir web gen:api";
 const INSTALL = "pnpm --dir web install --frozen-lockfile";
 const PREVIEW_MAX_CHARS = 200;
 
-/** Runs openapi-typescript into `outFile`; returns 0 on success, else an exit code. */
+// Runs openapi-typescript into `outFile`; returns 0 on success, else an exit
+// code.
 function regenerate(outFile) {
   // Exactly the `gen:api` arguments with only the output path changed. Any
   // option later added to `gen:api` in package.json must be added here too.
@@ -70,12 +71,10 @@ function regenerate(outFile) {
   return 0;
 }
 
-/**
- * 1-based number of the line holding the first differing byte, or of the line
- * where the shorter buffer ends when one is a prefix of the other.
- * Counting bytes rather than decoded characters keeps the position exact for
- * any difference, including line endings and invalid UTF-8.
- */
+// 1-based number of the line holding the first differing byte, or of the line
+// where the shorter buffer ends when one is a prefix of the other.
+// Counting bytes rather than decoded characters keeps the position exact for
+// any difference, including line endings and invalid UTF-8.
 function firstDifferenceLine(a, b) {
   const limit = Math.min(a.length, b.length);
   let offset = 0;
@@ -91,10 +90,8 @@ function firstDifferenceLine(a, b) {
   return line;
 }
 
-/**
- * The given 1-based line of `buf` with its `\n` terminator, if it has one,
- * quoted so that whitespace, `\r` and a missing final newline stay visible.
- */
+// The given 1-based line of `buf` with its `\n` terminator, if it has one,
+// quoted so that whitespace, `\r` and a missing final newline stay visible.
 function linePreview(buf, line) {
   const lines = buf.toString("utf8").split("\n");
   const isLast = line >= lines.length;
@@ -117,7 +114,8 @@ function reportStale(detail, previewLines) {
   console.error("Then commit both web/openapi/openapi.json and web/src/api/schema.d.ts.");
 }
 
-/** Compares the regenerated types with the committed file; returns the exit code. */
+// Compares the regenerated types with the committed file; returns the exit
+// code.
 function compare(generatedPath, committedPath) {
   if (!fs.existsSync(committedPath)) {
     reportStale(`is missing (it is generated from ${SPEC_REL})`, []);
@@ -137,7 +135,7 @@ function compare(generatedPath, committedPath) {
   return 1;
 }
 
-/** Returns the process exit code; never exits itself, so `finally` always runs. */
+// Returns the process exit code; never exits itself, so `finally` always runs.
 function main() {
   if (!fs.existsSync(CLI)) {
     console.error(`openapi-typescript is not installed: ${CLI} does not exist.`);

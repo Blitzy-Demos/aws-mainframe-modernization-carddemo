@@ -62,12 +62,10 @@ export const authorizationKeys = {
   detail: (authId: string) => [...all, "detail", authId] as const,
 } as const;
 
-/**
- * Whether `query`, under `authorizationKeys.summaries()`, holds a summary page
- * of `accountId`: its key's params name that account. Both sides are the 11
- * zero-padded digits, the only form the summary query is sent with and the one
- * a detail's `account_id` takes.
- */
+// Whether `query`, under `authorizationKeys.summaries()`, holds a summary page
+// of `accountId`: its key's params name that account. Both sides are the 11
+// zero-padded digits, the only form the summary query is sent with and the one
+// a detail's `account_id` takes.
 function isSummaryOf(query: Query, accountId: string): boolean {
   const params = query.queryKey[2];
   return (
@@ -126,12 +124,10 @@ export function useAuthorizationDetail(
   });
 }
 
-/**
- * The identity a key names, as the server's `i64` parse reads it: the decimal
- * text without its optional `+` and its leading zeros, so the route aliases
- * `+0007` and `0007` name the `auth_id` `7` the server answers with. Text in,
- * text out, so no digit of an ID above 2^53 is lost to a conversion.
- */
+// The identity a key names, as the server's `i64` parse reads it: the decimal
+// text without its optional `+` and its leading zeros, so the route aliases
+// `+0007` and `0007` name the `auth_id` `7` the server answers with. Text in,
+// text out, so no digit of an ID above 2^53 is lost to a conversion.
 function authIdentity(authId: string): string {
   return authId.replace(/^\+?0*/, "");
 }

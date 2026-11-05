@@ -24,10 +24,10 @@ import {
   tranTypeUpdateSchema,
 } from "./transaction-types";
 
-/** Every audited COTRTLIC text the schema module can report. */
+// Every audited COTRTLIC text the schema module can report.
 const AUDITED: readonly string[] = Object.values(TRAN_TYPE_LIST_MESSAGES);
 
-/** 50 characters, 51 bytes: the last one straddles the server's 50-byte cut. */
+// 50 characters, 51 bytes: the last one straddles the server's 50-byte cut.
 const SPLIT_AT_BYTE_50 = `${"A".repeat(49)}\u00e9`;
 
 function issuesOf(values: TranTypeListFilterValues): z.ZodIssue[] {
@@ -159,10 +159,10 @@ describe("tranTypeInlineEditSchema", () => {
 });
 
 describe("lengths in code points", () => {
-  /** A character outside the BMP: one code point, two UTF-16 code units. */
+  // A character outside the BMP: one code point, two UTF-16 code units.
   const EMOJI = "\u{1f600}";
 
-  /** The issues of each field for one entry, the other fields valid. */
+  // The issues of each field for one entry, the other fields valid.
   const FIELDS = {
     "list description filter": (value: string) => issuesOf({ description: value }),
     "list type code filter": (value: string) => issuesOf({ type_code: value }),
@@ -177,7 +177,7 @@ describe("lengths in code points", () => {
       updateIssuesOf({ description: value }),
   } satisfies Record<string, (value: string) => z.ZodIssue[]>;
 
-  /** The issues zod's own `check` gives `field` holding `value`. */
+  // The issues zod's own `check` gives `field` holding `value`.
   function zodIssues(field: string, check: z.ZodString, value: string): z.ZodIssue[] {
     const result = z.object({ [field]: check }).safeParse({ [field]: value });
     if (result.success) {
@@ -186,17 +186,17 @@ describe("lengths in code points", () => {
     return result.error.issues;
   }
 
-  /** zod's own issue of `field` under `.max(maximum)`, for an over-length value. */
+  // zod's own issue of `field` under `.max(maximum)`, for an over-length value.
   function maxIssues(field: string, maximum: number): z.ZodIssue[] {
     return zodIssues(field, z.string().max(maximum), "A".repeat(maximum + 1));
   }
 
-  /** zod's own issue of `field` under a failing `.regex`. */
+  // zod's own issue of `field` under a failing `.regex`.
   function regexIssues(field: string): z.ZodIssue[] {
     return zodIssues(field, z.string().regex(/^$/), "A");
   }
 
-  /** The issue of a COBOL edit on `field`, with its audited text. */
+  // The issue of a COBOL edit on `field`, with its audited text.
   function editIssues(field: string, message: string): z.ZodIssue[] {
     return [{ code: z.ZodIssueCode.custom, path: [field], message }];
   }

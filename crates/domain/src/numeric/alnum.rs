@@ -143,10 +143,21 @@ impl<const N: usize> Alnum<N> {
     /// The semantics are the byte semantics of [`Alnum::move_from_bytes`], as
     /// in the COBOL: a multi-byte UTF-8 character that straddles byte `N` is
     /// cut, and a non-ASCII character is stored as its UTF-8 bytes, which
-    /// [`Alnum::as_text`] then reads one byte per character. API request DTOs
-    /// restrict their text to ASCII, where text and bytes agree. Text read back
-    /// from an SQL column is not moved: [`Alnum::from_trimmed`] rebuilds the
-    /// stored bytes from it.
+    /// [`Alnum::as_text`] then reads one byte per character. Text and bytes
+    /// agree only for ASCII text.
+    ///
+    /// Request text is held to ASCII only where its API request DTO checks
+    /// it, which a DTO does for a member whose bytes its rule moves unedited
+    /// or quotes back in its answer. Other members arrive as entered, for the
+    /// audited edit to read: `tran_type_update::map_input` moves the
+    /// `COTRTUPC` type code and description as given, so a non-ASCII
+    /// character there is stored as its UTF-8 bytes.
+    ///
+    /// Text read back from an SQL column is rebuilt with
+    /// [`Alnum::from_trimmed`], with one exception: the `COTRTUPC` no-change
+    /// test, `tran_type_update::unchanged`, moves the stored description with
+    /// this method, so that it and the entered description, which
+    /// `map_input` also moves, compare in the same byte form.
     #[must_use]
     pub fn move_from(src: &str) -> Self {
         Self::move_from_bytes(src.as_bytes())

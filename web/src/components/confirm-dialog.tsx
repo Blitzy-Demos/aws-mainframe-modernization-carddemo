@@ -9,11 +9,12 @@
 // moved it while the dialog closed (an error's field, say). A button that has
 // left the document by then, such as the Delete of a deleted record's row,
 // hands focus to its nearest focusable ancestor still in the document (the
-// data table), never to another record's button. The action only
-// reports the choice through onConfirm, after which Radix closes the dialog
-// through onOpenChange(false); the page then sends its request (with
-// `confirm: "Y"` where the resource carries a confirmation) and shows the
-// outcome through lib/api-errors. Cancel and Escape stand for the COBOL `N`:
+// data table), never to another record's button. The action reports the
+// choice through onConfirm, in which the page starts its request (with
+// `confirm: "Y"` where the resource carries a confirmation); Radix then
+// closes the dialog through onOpenChange(false). The page shows the outcome
+// through lib/api-errors, and a focus move that outcome makes goes through
+// afterClose, described below. Cancel and Escape stand for the COBOL `N`:
 // onOpenChange(false) without onConfirm.
 //
 // While the dialog is on the page, its closing animation included, Radix

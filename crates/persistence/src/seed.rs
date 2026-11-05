@@ -38,12 +38,16 @@
 //!   else changes. The `.PS` backups `TRANEXTR` writes in STEP10 and STEP20
 //!   are not reproduced, because seed jobs are replaced, not parity-tested.
 //!
-//! Each run is one database transaction, committed only at its end. Any
-//! failure drops the transaction, which rolls it back, so the database is left
-//! exactly as it was. A [`SeedMode::Full`] or [`SeedMode::IfEmpty`] run takes
-//! `LOCK TABLE accounts IN EXCLUSIVE MODE` as its first statement and holds it
-//! to its end: plain reads go on, and the run is serialized with every unit
-//! of work that locks or writes an account row and with every other such run.
+//! Each run is one database transaction, committed only at its end. A failure
+//! before the `COMMIT` drops the transaction, which rolls it back, and a
+//! `COMMIT` the server rejects ends it as a rollback, so the database is left
+//! exactly as it was. A `COMMIT` that fails otherwise, its connection lost or
+//! its answer missing, leaves the outcome unknown: the run may have committed,
+//! so the tables must be checked before it is run again. A [`SeedMode::Full`]
+//! or [`SeedMode::IfEmpty`] run takes `LOCK TABLE accounts IN EXCLUSIVE MODE`
+//! as its first statement and holds it to its end: plain reads go on, and the
+//! run is serialized with every unit of work that locks or writes an account
+//! row and with every other such run.
 //!
 //! # Two steps
 //!
@@ -477,7 +481,9 @@ fn read_sources(sources: &SeedSources) -> PreparedSources {
 /// before the commit it is dropped, which rolls it back. A `COMMIT` the server
 /// fails has already rolled it back, and the commit, through the
 /// crate-internal `commit_transaction` of `crate::tx`, sends no `ROLLBACK`
-/// after it. Either way the database is unchanged.
+/// after it. Either way the database is unchanged. A `COMMIT` that fails
+/// without the server's answer, its connection lost, leaves the outcome
+/// unknown: the run may have committed.
 ///
 /// A [`SeedMode::Full`] or [`SeedMode::IfEmpty`] load first locks `accounts`
 /// in `EXCLUSIVE` mode for the rest of the transaction, and only then reads
@@ -648,20 +654,22 @@ async fn lock_accounts(conn: &mut PgConnection) -> Result<(), PersistenceError> 
 /// [`SeedMode::Full`] run a refresh. A load reads it under the lock of
 /// [`lock_accounts`].
 async fn has_accounts(conn: &mut PgConnection) -> Result<bool, PersistenceError> {
-    let has_rows = sqlx::query_scalar!(r#"SELECT EXISTS (SELECT 1 FROM accounts) AS "has_rows!""#)
+    let has_rows = sqlx::query!(r#"SELECT EXISTS (SELECT 1 FROM accounts) AS "has_rows!""#)
         .fetch_one(&mut *conn)
-        .await?;
+        .await
+        .map(|row| row.has_rows)?;
     Ok(has_rows)
 }
 
 /// Whether both Db2 masters are empty, the state `CREADB21` loads into.
 async fn masters_empty(conn: &mut PgConnection) -> Result<bool, PersistenceError> {
-    let empty = sqlx::query_scalar!(
+    let empty = sqlx::query!(
         r#"SELECT NOT EXISTS (SELECT 1 FROM transaction_types)
               AND NOT EXISTS (SELECT 1 FROM transaction_categories) AS "empty!""#
     )
     .fetch_one(&mut *conn)
-    .await?;
+    .await
+    .map(|row| row.empty)?;
     Ok(empty)
 }
 
@@ -675,16 +683,19 @@ async fn masters_empty(conn: &mut PgConnection) -> Result<bool, PersistenceError
 /// the fixtures (AAP 0.3.2, 0.3.6). One `TRUNCATE … RESTART IDENTITY` empties
 /// them and restarts the `rule_id` and `accrual_id` identities at 1, so the
 /// seed rules are generated as rules 1 and 2. The restart is part of the run's
-/// transaction: if the run or its commit fails, it rolls back with the rows,
-/// together with every identity drawn from the restarted sequences, and the
-/// surviving rows keep sequences that continue after them. `setval` would not
-/// roll back, leaving those rows behind sequences that issue their identities
-/// again. The `TRUNCATE` also holds `ACCESS EXCLUSIVE` on the three tables
-/// until the run ends, so a concurrent rule or accrual writer waits instead of
-/// drawing an identity from a restarted sequence. A CT02 or `POSTTRAN` accrual
-/// takes its account row lock first, so during a run it waits at that lock,
-/// before it reaches them. The other tables are the delete and define steps
-/// (STEP05, STEP10) of each load job; none references another.
+/// transaction: if the run fails before its `COMMIT`, or the server rejects
+/// the `COMMIT`, it rolls back with the rows, together with every identity
+/// drawn from the restarted sequences, and the surviving rows keep sequences
+/// that continue after them. A `COMMIT` whose answer is lost, its connection
+/// gone, either committed the restart with the rows or rolled back both.
+/// `setval` would not roll back, leaving those rows behind sequences that
+/// issue their identities again. The `TRUNCATE` also holds `ACCESS EXCLUSIVE`
+/// on the three tables until the run ends, so a concurrent rule or accrual
+/// writer waits instead of drawing an identity from a restarted sequence. A
+/// CT02 or `POSTTRAN` accrual takes its account row lock first, so during a
+/// run it waits at that lock, before it reaches them. The other tables are the
+/// delete and define steps (STEP05, STEP10) of each load job; none references
+/// another.
 async fn clear(conn: &mut PgConnection) -> Result<(), PersistenceError> {
     sqlx::query!("TRUNCATE reward_accruals, reward_balances, reward_rules RESTART IDENTITY")
         .execute(&mut *conn)
@@ -1422,13 +1433,14 @@ fn quoted_literals(line: &str) -> Result<Vec<String>, &'static str> {
 /// `TRAN-CAT-CD` (P-CVTRA04Y-002), which only four digits express. Every
 /// loaded category is four digits, and no carried program changes one.
 async fn tranextr(conn: &mut PgConnection) -> Result<SeedReport, PersistenceError> {
-    let unconvertible = sqlx::query_scalar!(
+    let unconvertible = sqlx::query!(
         r#"SELECT EXISTS (
                SELECT 1 FROM transaction_categories
                 WHERE trc_type_category !~ '^[0-9]{4}$') AS "found!""#
     )
     .fetch_one(&mut *conn)
-    .await?;
+    .await
+    .map(|row| row.found)?;
     if unconvertible {
         return Err(PersistenceError::Corrupt {
             table: "transaction_categories",
@@ -1527,7 +1539,7 @@ fn seed_rules() -> Result<Vec<(RuleId, NewRewardRule)>, PersistenceError> {
 async fn load_reward_rules(conn: &mut PgConnection) -> Result<usize, PersistenceError> {
     let rules = seed_rules()?;
     for (rule_id, rule) in &rules {
-        let generated = sqlx::query_scalar!(
+        let generated = sqlx::query!(
             r#"INSERT INTO reward_rules (
                    transaction_type_cd, transaction_category_cd, reward_rate,
                    min_transaction_amount, max_transaction_amount, active_from, active_to)
@@ -1542,7 +1554,8 @@ async fn load_reward_rules(conn: &mut PgConnection) -> Result<usize, Persistence
             rule.active_to
         )
         .fetch_one(&mut *conn)
-        .await?;
+        .await
+        .map(|row| row.rule_id)?;
         if generated != rule_id.get() {
             return Err(PersistenceError::Corrupt {
                 table: "reward_rules",

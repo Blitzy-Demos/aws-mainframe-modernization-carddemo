@@ -11,7 +11,7 @@ import { z } from "zod";
 
 import { type ReportRequestFormInput, reportRequestSchema } from "./reports";
 
-/** A custom request every client edit accepts: the TRANREPT range, confirmed. */
+// A custom request every client edit accepts: the TRANREPT range, confirmed.
 const CONFIRMED: ReportRequestFormInput = {
   report_type: "custom",
   start_date: "2022-01-01",
@@ -19,7 +19,7 @@ const CONFIRMED: ReportRequestFormInput = {
   confirm: "Y",
 };
 
-/** V-CORPT00C-018 after the quoted `CONFIRMI`. */
+// V-CORPT00C-018 after the quoted `CONFIRMI`.
 const INVALID_CONFIRM_TAIL = '" is not a valid value to confirm...';
 
 type IssueSummary = [field: string, code: string];
@@ -33,12 +33,10 @@ function issueSummaries(values: ReportRequestFormInput): IssueSummary[] {
   return parseIssues(values).map((issue) => [String(issue.path[0]), issue.code]);
 }
 
-/**
- * The issues of a confirmation that fails its own field checks: every one on
- * `confirm` with zod's code, the regex issue among them, and no rule issue.
- * The code lists the over-width issue too for a character of two UTF-16 code
- * units, which `maxLength` counts as two.
- */
+// The issues of a confirmation that fails its own field checks: every one on
+// `confirm` with zod's code, the regex issue among them, and no rule issue.
+// The code lists the over-width issue too for a character of two UTF-16 code
+// units, which `maxLength` counts as two.
 function expectFieldChecksOnly(values: ReportRequestFormInput, codes: string[]) {
   const issues = parseIssues(values);
   expect(issues.map((issue) => [String(issue.path[0]), issue.code])).toEqual(

@@ -74,24 +74,20 @@ import {
 
 const SUFFIX_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-/** `length` random upper-case letters and digits. */
+// `length` random upper-case letters and digits.
 function uniqueSuffix(length: number): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(length)), (byte) =>
     SUFFIX_ALPHABET.charAt(byte % SUFFIX_ALPHABET.length),
   ).join("");
 }
 
-/**
- * The user ID (SEC-USR-ID X(08)) this spec creates and deletes: `E2E` and a
- * per-run suffix, so no seeded user and no user an interrupted run left
- * behind holds it.
- */
+// The user ID (SEC-USR-ID X(08)) this spec creates and deletes: `E2E` and a
+// per-run suffix, so no seeded user and no user an interrupted run left
+// behind holds it.
 const NEW_USER_ID = `E2E${uniqueSuffix(5)}`;
 
-/**
- * The highest type code from 99 down to 10 that no TRANSACTION_TYPE row
- * holds, for the type this spec creates and deletes.
- */
+// The highest type code from 99 down to 10 that no TRANSACTION_TYPE row
+// holds, for the type this spec creates and deletes.
 async function freeTypeCode(): Promise<string> {
   const taken = new Set((await psql("SELECT tr_type FROM transaction_types")).split("\n"));
   for (let code = 99; code >= 10; code -= 1) {
@@ -107,28 +103,28 @@ async function freeTypeCode(): Promise<string> {
 // Keyboard helpers
 // ---------------------------------------------------------------------------
 
-/** The control of map row `id` on the current page. */
+// The control of map row `id` on the current page.
 function control(page: Page, id: string): Locator {
   return controlLocator(page, mapControl(id));
 }
 
-/** The `index`-th input of map row `id`, in the page content. */
+// The `index`-th input of map row `id`, in the page content.
 function input(page: Page, id: string, index: number): Locator {
   return mapInput(content(page), rowInput(id, index));
 }
 
-/** A text input the map does not list, by its accessible name. */
+// A text input the map does not list, by its accessible name.
 function textbox(scope: Page | Locator, label: LabelText): Locator {
   const root = "goto" in scope ? content(scope) : scope;
   return root.getByRole("textbox", { name: nameMatcher(label) });
 }
 
-/** Tabs to the control of map row `id` and presses Enter. */
+// Tabs to the control of map row `id` and presses Enter.
 async function enterOn(page: Page, id: string): Promise<void> {
   await pressControl(page, control(page, id));
 }
 
-/** Types `text` into `field` and presses Enter there, which submits its form. */
+// Types `text` into `field` and presses Enter there, which submits its form.
 async function submitFrom(page: Page, field: Locator, text: string): Promise<void> {
   await typeInto(page, field, text);
   await page.keyboard.press("Enter");
@@ -145,12 +141,10 @@ async function focusOnRadio(page: Page): Promise<boolean> {
   });
 }
 
-/**
- * Checks the radio `target`: Tab into its group, arrow keys to the target,
- * Space to check it (a radio group is a single Tab stop). Each ArrowDown
- * waits until focus has left the radio it was pressed on, so every key moves
- * focus exactly one radio before the next comparison.
- */
+// Checks the radio `target`: Tab into its group, arrow keys to the target,
+// Space to check it (a radio group is a single Tab stop). Each ArrowDown
+// waits until focus has left the radio it was pressed on, so every key moves
+// focus exactly one radio before the next comparison.
 async function chooseRadio(page: Page, target: Locator): Promise<void> {
   await expect(target).toBeVisible();
   for (let presses = 0; presses < 200 && !(await focusOnRadio(page)); presses += 1) {
@@ -181,7 +175,8 @@ async function chooseRadio(page: Page, target: Locator): Promise<void> {
   await expect(target).toBeChecked();
 }
 
-/** Tabs from the open dialog's initial focus to its button `name` and presses Enter. */
+// Tabs from the open dialog's initial focus to its button of map row `id` and
+// presses Enter.
 async function answerDialog(page: Page, id: string): Promise<void> {
   const dialog = confirmDialog(page);
   await expect(dialog).toBeVisible();
@@ -189,11 +184,9 @@ async function answerDialog(page: Page, id: string): Promise<void> {
   await expect(dialog).toBeHidden();
 }
 
-/**
- * Asserts a rejection of `field`: `message` shows, as a toast or as the
- * field's FieldError alert, and the field is aria-invalid and focused, the
- * cursor placement of the COBOL `MOVE -1 TO <field>L` (AAP 0.5.4.3).
- */
+// Asserts a rejection of `field`: `message` shows, as a toast or as the
+// field's FieldError alert, and the field is aria-invalid and focused, the
+// cursor placement of the COBOL `MOVE -1 TO <field>L` (AAP 0.5.4.3).
 async function expectFieldError(page: Page, field: Locator, message: string): Promise<void> {
   const text = shown(message);
   const fieldError = field
@@ -206,13 +199,11 @@ async function expectFieldError(page: Page, field: Locator, message: string): Pr
   await expect(field).toBeFocused();
 }
 
-/**
- * Asserts that the open confirm `dialog` traps focus and that Escape closes
- * it without sending `write`, the request its confirming action sends (AAP
- * 0.5.4.4): Tab, then Shift+Tab, each pressed once more than the dialog has
- * buttons, keep focus inside it, and Escape hides it with no `write` request
- * sent meanwhile.
- */
+// Asserts that the open confirm `dialog` traps focus and that Escape closes
+// it without sending `write`, the request its confirming action sends (AAP
+// 0.5.4.4): Tab, then Shift+Tab, each pressed once more than the dialog has
+// buttons, keep focus inside it, and Escape hides it with no `write` request
+// sent meanwhile.
 async function expectDialogTrapsFocus(page: Page, dialog: Locator, write: Endpoint): Promise<void> {
   await expect(dialog).toBeVisible();
   const sent: string[] = [];
@@ -241,11 +232,9 @@ async function expectDialogTrapsFocus(page: Page, dialog: Locator, write: Endpoi
   }
 }
 
-/**
- * Runs `action`, which sends one `endpoint` request, and returns its
- * response after asserting its `status`, by default the success status AAP
- * 0.3.1 gives a write: 201 for POST, 200 for PUT and DELETE.
- */
+// Runs `action`, which sends one `endpoint` request, and returns its
+// response after asserting its `status`, by default the success status AAP
+// 0.3.1 gives a write: 201 for POST, 200 for PUT and DELETE.
 async function expectWrite(
   page: Page,
   endpoint: Endpoint,
@@ -260,12 +249,10 @@ async function expectWrite(
   return response;
 }
 
-/**
- * Runs `action` and asserts that no `endpoint` request was sent while it ran,
- * as for input a form's schema rejects (AAP 0.5.4.3). `action` ends on the
- * state the page reaches, so a request it would send goes out before the spy
- * is removed.
- */
+// Runs `action` and asserts that no `endpoint` request was sent while it ran,
+// as for input a form's schema rejects (AAP 0.5.4.3). `action` ends on the
+// state the page reaches, so a request it would send goes out before the spy
+// is removed.
 async function expectNoRequest(page: Page, endpoint: Endpoint, action: () => Promise<void>): Promise<void> {
   const sent: string[] = [];
   const spy = (request: Request): void => {
@@ -282,12 +269,12 @@ async function expectNoRequest(page: Page, endpoint: Endpoint, action: () => Pro
   expect(sent, `no ${endpoint.method} ${endpoint.path}`).toEqual([]);
 }
 
-/** The data rows of the page's table that hold `text`. */
+// The data rows of the page's table that hold `text`.
 function rowsWith(page: Page, text: string): Locator {
   return content(page).getByRole("row").filter({ hasText: text });
 }
 
-/** The first data row of the page's table (row 0 is the header). */
+// The first data row of the page's table (row 0 is the header).
 function firstDataRow(page: Page): Locator {
   return content(page).getByRole("row").nth(1);
 }
@@ -450,22 +437,20 @@ test.describe("account view key form (F-COACTVW-001, F-COACTVW-002)", () => {
       .filter({ has: page.getByRole("heading", { level: 2, name: "Card", exact: true }) })
       .getByRole("definition");
 
-  /** `GET /accounts/{id}` of F-COACTVW-001 for account `key`. */
+  // `GET /accounts/{id}` of F-COACTVW-001 for account `key`.
   const accountRead = (key: string): Endpoint => {
     const { method, path } = rowEndpoint("F-COACTVW-001");
     return { method, path: path.replace("{id}", key) };
   };
 
-  /**
-   * Runs `action` and asserts that it sent a GET of account `key` answered
-   * 200. The wait starts before the action, so a read answered earlier does
-   * not satisfy it.
-   */
+  // Runs `action` and asserts that it sent a GET of account `key` answered
+  // 200. The wait starts before the action, so a read answered earlier does
+  // not satisfy it.
   const expectRead = async (page: Page, key: string, action: () => Promise<void>): Promise<void> => {
     await expectWrite(page, accountRead(key), action, 200);
   };
 
-  /** Asserts that the view shows account `key`, whose card is `card`. */
+  // Asserts that the view shows account `key`, whose card is `card`.
   const expectAccountShown = async (page: Page, key: string, card: string): Promise<void> => {
     await expect(page).toHaveURL(urlPath(viewRoute(key)));
     await expect(content(page).getByRole("heading", { level: 2, name: "Account", exact: true })).toBeVisible();
@@ -986,12 +971,12 @@ test.describe("pending authorizations (F-COPAU00-001, F-COPAU00-005, F-COPAU01-0
 test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001, F-COUSR01-003, F-COUSR02-002, F-COUSR02-003, F-COUSR02-004, F-COUSR02-005, F-COUSR03-002, F-COUSR03-003, F-COUSR03-004, F-COUSR03-005)", () => {
   const labels = UNMAPPED_LABELS.userForm;
   const newUserPassword = (page: Page): Locator => content(page).getByLabel(nameMatcher(labels.password));
-  /** PUT (F-COUSR02-002, F-COUSR02-004) or DELETE (F-COUSR03-004) of the new user. */
+  // PUT (F-COUSR02-002, F-COUSR02-004) or DELETE (F-COUSR03-004) of the new user.
   const userEndpoint = (method: "PUT" | "DELETE"): Endpoint => ({
     method,
     path: `/admin/users/${NEW_USER_ID}`,
   });
-  /** The new user's row before the current test, restored after it. */
+  // The new user's row before the current test, restored after it.
   let saved: Checkpoint | undefined;
 
   test.beforeEach(async ({ page }) => {
@@ -1150,14 +1135,15 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
   const description = (scope: Page | Locator): Locator => textbox(scope, UNMAPPED_LABELS.tranType.description);
   const storedDescription = (): Promise<string> =>
     psql(`SELECT coalesce((SELECT tr_description FROM transaction_types WHERE tr_type = ${sqlLiteral(newTypeCode)}), '<none>')`);
-  /** PUT (F-COTRTUP-002, F-COTRTLI-007) or DELETE (F-COTRTUP-007, F-COTRTLI-009) of the new type. */
+  // PUT (F-COTRTUP-002, F-COTRTLI-007) or DELETE (F-COTRTUP-007,
+  // F-COTRTLI-009) of the new type.
   const typeEndpoint = (method: "PUT" | "DELETE"): Endpoint => ({
     method,
     path: `/admin/transaction-types/${newTypeCode}`,
   });
-  /** The new type's rows before the current test, restored after it. */
+  // The new type's rows before the current test, restored after it.
   let saved: Checkpoint | undefined;
-  /** The type this describe creates and deletes, chosen by freeTypeCode. */
+  // The type this describe creates and deletes, chosen by freeTypeCode.
   let newTypeCode = "";
 
   test.beforeAll(async () => {
@@ -1308,7 +1294,7 @@ test.describe("reward rule form", () => {
     method,
     path: ruleId === undefined ? "/admin/reward-rules" : `/admin/reward-rules/${ruleId}`,
   });
-  /** Every reward rule before the current test, restored after it. */
+  // Every reward rule before the current test, restored after it.
   let saved: Checkpoint | undefined;
   let today = "";
 

@@ -61,11 +61,13 @@
 //! - `STEP10` failures, after `TRANSACT.COMBINED(+1)` is cataloged, are setup failures (exit 16)
 //!   too: a combined file that cannot be read or decoded, a unit of work that cannot begin, a
 //!   record that cannot be loaded, and a commit that fails. The cataloged
-//!   `TRANSACT.COMBINED(+1)` stays, and the live master is as the run found it, because the load
-//!   never began or is rolled back whole, so a rerun starts from the same live master. The job
-//!   span holds `posted` 0 and in `rejected` the duplicate records met before the failure, and
-//!   one `warn` event gives the records the uncommitted load inserted, revived and found
-//!   duplicate.
+//!   `TRANSACT.COMBINED(+1)` stays. The live master is as the run found it when the load never
+//!   began or is rolled back whole, as a `COMMIT` the server rejects rolls it back, so a rerun
+//!   starts from the same live master. A `COMMIT` whose answer is lost, its connection gone,
+//!   leaves the outcome unknown: the whole load may have committed, so the live master is
+//!   checked before a rerun. The job span holds `posted` 0 and in `rejected` the duplicate
+//!   records met before the failure, and one `warn` event gives the records the load inserted,
+//!   revived and found duplicate, reported as not committed.
 //! - Two different records with one TRAN-ID in the SORT input stop the job before
 //!   `TRANSACT.COMBINED(+1)` is allocated: an equivalence halt (exit 16, E-38).
 
@@ -916,8 +918,10 @@ impl fmt::Display for EqualKeyHalt<'_> {
 /// read or decoded or the unit of work cannot begin, before any record is loaded; when a record
 /// cannot be loaded, or the file cannot be read again during the load, after which the load is
 /// rolled back; or when the commit fails. Each leaves the cataloged `TRANSACT.COMBINED(+1)` in
-/// place and the live master as the run found it, and leaves `posted` 0 and `rejected` the
-/// duplicate records met before the failure.
+/// place, `posted` 0 and `rejected` the duplicate records met before the failure. Each leaves
+/// the live master as the run found it, a `COMMIT` the server rejects included, except a
+/// `COMMIT` whose answer is lost, its connection gone: the whole load may then have committed,
+/// so the live master is checked before a rerun.
 async fn repro_step(db: &Db, combined: &Generation, counts: &JobCounts) -> ExitStatus {
     let mut tally = ReproTally::default();
     let read = match count_records_async::<TransactionLayout>(combined.path.clone()).await {
@@ -1043,11 +1047,14 @@ fn finish(tally: ReproTally, read: usize, counts: &JobCounts) -> ExitStatus {
     ExitStatus::ReproCondition(condition_code)
 }
 
-/// The end of STEP10 when the load is not committed, a failure the COBOL has no counterpart
-/// for: `counts` holds `posted` 0, since the live master keeps none of the load, and in
-/// `rejected` the duplicate records met before the failure. One `warn` event reports the
-/// records the uncommitted load handled (`inserted`, `revived`, `duplicates` and their sum
-/// `attempted`) beside `posted` 0. Returns `status`, the failure that ended the step.
+/// The end of STEP10 when the load is not known to be committed, a failure the COBOL has no
+/// counterpart for: `counts` holds `posted` 0, since a rolled-back load, a `COMMIT` the server
+/// rejects included, leaves none of its records in the live master, and in `rejected` the
+/// duplicate records met before the failure.
+/// One `warn` event reports the records the load handled (`inserted`, `revived`, `duplicates`
+/// and their sum `attempted`) beside `posted` 0. After a `COMMIT` whose answer is lost, its
+/// connection gone, `posted` 0 is the reported count, not proof: the load may have committed.
+/// Returns `status`, the failure that ended the step.
 fn not_committed(tally: ReproTally, counts: &JobCounts, status: ExitStatus) -> ExitStatus {
     const POSTED: usize = 0;
     tally.set_counts(counts, POSTED);

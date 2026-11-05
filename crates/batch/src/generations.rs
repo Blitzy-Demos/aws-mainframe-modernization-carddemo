@@ -61,11 +61,13 @@
 //!
 //! Record files use the ASCII codec layouts at full copybook width, each record followed by `LF`
 //! ([`PendingGeneration::append_records`]). [`RecordReader`] reads them back frame by frame, each
-//! frame the copybook width of record bytes and then that `LF`, one record at a time, so no job
-//! holds a whole file; its records and errors are those `read_records`, the whole-file decode the
-//! tests hold it to, gives for the same file. Alphanumeric fields copy bytes, so an `LF` or `CR` inside a record is
-//! record data and never a record boundary, and a file that is not a whole number of such frames
-//! does not decode. Print and statement files are
+//! frame the copybook width of record bytes and then that `LF`, and holds one frame at a time: a
+//! job that streams a file through it holds only the records it keeps, such as one batch of
+//! [`RecordReader::next_batch`], never the file itself. Its records and errors are those
+//! `read_records`, the whole-file decode the tests hold it to, gives for the same file.
+//! Alphanumeric fields copy bytes, so an `LF` or `CR` inside a record is record data and never a
+//! record boundary, and a file that is not a whole number of such frames does not decode. Print
+//! and statement files are
 //! fixed-width text lines with `LF` terminators, checked by [`encode_fixed_lines`]: `TRANREPT`
 //! 133 bytes (`LRECL=133` [app/jcl/TRANREPT.jcl:L78]), STMTFILE 80 and HTMLFILE 100
 //! [app/cbl/CBSTM03A.CBL:L44-47]. A line must have exactly that width and hold no `LF` or `CR`,
@@ -87,6 +89,27 @@
 //! name for a generation or its temporary file. A [`WorkFileWriter`] appends through a buffer;
 //! once finished, the [`WorkFile`] reads any part written back through buffered readers, as
 //! often as the step needs. Every failure is a [`GenerationError::Io`] on the work file.
+//! POSTTRAN holds the `DALYTRAN` records it has read and decoded in such a work file until its
+//! main loop reads them back, so it never holds its input whole.
+//!
+//! # Permissions
+//!
+//! The batch outputs hold card numbers, transactions and customer statements, so only the user
+//! that runs the job can read them. Every file this module creates, a generation's temporary
+//! file and so the generation linked to it, a [`write_replacing`] temporary and so the file it
+//! replaces, a sort work file and a lock file, is created owner-only, mode `0600`, by the call
+//! that creates it, never changed afterwards. The process umask can only remove more bits.
+//!
+//! [`create_private_dir`] prepares every directory a job writes into: the catalog directory of
+//! [`Generations::begin_next`], the directory of a [`write_replacing`] file, and
+//! `CARDDEMO_STATEMENT_DIR` for `creastmt`. It creates each missing directory with mode `0700`.
+//! An existing output directory that grants the group or others any permission loses those
+//! bits, with a `warn` event naming it and its previous mode, unless it is shared, writable by
+//! others or sticky as `/tmp` is: that one is refused with [`GenerationError::SharedDirectory`],
+//! and left as it is. When its permissions cannot be changed, it is refused with
+//! [`GenerationError::DirectoryNotRestricted`]. A refused directory receives no file, and the
+//! job ends as the open of its output fails. The directories above an output directory are the
+//! operator's and are never changed.
 //!
 //! # Execution
 //!
@@ -106,9 +129,10 @@
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -142,6 +166,24 @@ const CLOSED: &str = "generation file is already closed";
 /// The name every sort work file is created under, as the hidden temporary file
 /// `.SORTWK.tmp-<pid>-<seq>` of the catalog directory: DFSORT's `SORTWK` work datasets.
 const SORT_WORK: &str = "SORTWK";
+
+/// The mode every file of this module is created with: read and write for its owner only. See
+/// the module's "Permissions" section.
+const FILE_MODE: u32 = 0o600;
+
+/// The mode every output directory is created with: read, write and search for its owner only.
+const DIR_MODE: u32 = 0o700;
+
+/// The permission bits of the group and of other users, which an output directory must not
+/// hold.
+const GROUP_OTHER_BITS: u32 = 0o077;
+
+/// The bits that mark a directory shared with other users: writable by others (`0o002`) or
+/// sticky (`0o1000`), as `/tmp` is. Such a directory is refused, never restricted.
+const SHARED_BITS: u32 = 0o1002;
+
+/// The permission bits of a mode, the file type bits left out.
+const MODE_BITS: u32 = 0o7777;
 
 /// A GDG base that an in-scope job writes. `TCATBALF.BKUP`, also defined by DEFGDGB, has no
 /// variant because no in-scope job writes it.
@@ -290,6 +332,39 @@ pub(crate) enum GenerationError {
         /// The lock file.
         path: PathBuf,
     },
+    /// An output directory is shared with other users: it grants the group or others access and
+    /// is writable by others or sticky, as `/tmp` is. It is never restricted, because other users
+    /// rely on it, and nothing is written into it. See the module's "Permissions" section.
+    #[error(
+        "output directory {} has mode {mode:04o}, which shares it with other users, and is not \
+         used; point the directory setting at a directory of its own, or, if no other user \
+         needs it, restrict it with `chmod 700 {}`",
+        path.display(),
+        path.display()
+    )]
+    SharedDirectory {
+        /// The output directory.
+        path: PathBuf,
+        /// Its permission bits, `0o1777` for a typical `/tmp`.
+        mode: u32,
+    },
+    /// An output directory grants the group or others access and could not be restricted to its
+    /// owner, for example because this process does not own it. Nothing is written into it.
+    #[error(
+        "output directory {} has mode {mode:04o}, which lets other users reach it, and could \
+         not be restricted to its owner: {source}; restrict it with `chmod 700 {}` or point the \
+         directory setting at a directory of its own",
+        path.display(),
+        path.display()
+    )]
+    DirectoryNotRestricted {
+        /// The output directory.
+        path: PathBuf,
+        /// Its permission bits, left as they were.
+        mode: u32,
+        /// The operating-system error of the change.
+        source: io::Error,
+    },
     /// `(0)` was requested while no generation is cataloged.
     #[error("{dataset}(0): no generation is cataloged")]
     NotCataloged {
@@ -366,11 +441,14 @@ impl Generations {
     }
 
     /// Allocates the `(+1)` generation of `dataset`: the newest number + 1, or `G0001V00` for an
-    /// empty GDG. It creates the catalog directory, takes the allocation lock `.<DATASET>.lock`,
-    /// deletes the temporary files that killed jobs left for `dataset` (the module's "Lock files"
+    /// empty GDG. It creates the catalog directory owner-only, or restricts an existing one to its
+    /// owner, with [`create_private_dir`], takes the allocation lock `.<DATASET>.lock`, deletes
+    /// the temporary files that killed jobs left for `dataset` (the module's "Lock files"
     /// section), reads the current generation, and creates the hidden temporary file
     /// `.<DATASET>.G<nnnn>V00.tmp-<pid>-<seq>` that the generation is written to until it is
-    /// cataloged. The returned [`PendingGeneration`] holds the lock; every error releases it.
+    /// cataloged. The lock file and the temporary file, and so the generation, are created
+    /// owner-only (the module's "Permissions" section). The returned [`PendingGeneration`] holds
+    /// the lock; every error releases it.
     ///
     /// The sweep deletes a regular file named exactly `.<DATASET>.G<nnnn>V00.tmp-<pid>-<seq>`
     /// whose `<pid>` is this process, which holds no other pending generation of `dataset` while
@@ -383,13 +461,16 @@ impl Generations {
     /// - [`GenerationError::InUse`] when the allocation lock of `dataset` exists. Nothing is
     ///   created or changed.
     /// - [`GenerationError::Exhausted`] when `G9999V00` is the newest generation.
+    /// - [`GenerationError::SharedDirectory`] and [`GenerationError::DirectoryNotRestricted`]
+    ///   when the catalog directory is open to other users and is not restricted, as
+    ///   [`create_private_dir`] reports them. Nothing is created in it.
     /// - [`GenerationError::Io`] when the directory cannot be read or created, or the lock file or
     ///   the temporary file cannot be created.
     pub(crate) fn begin_next(
         &self,
         dataset: Dataset,
     ) -> Result<PendingGeneration, GenerationError> {
-        fs::create_dir_all(&self.root).map_err(|source| io_error(&self.root, source))?;
+        create_private_dir(&self.root)?;
         let lock = allocation_lock(&self.root, dataset)?;
         sweep_orphaned_temps(&self.root, dataset);
         let number = match self.current(dataset)? {
@@ -437,8 +518,9 @@ impl Generations {
 
     /// Creates a sort work file in the catalog directory, the module's "Sort work files"
     /// section: the hidden temporary file `.SORTWK.tmp-<pid>-<seq>`, created exclusively and
-    /// opened for reading and writing, whose name is unlinked at once. A name that cannot be
-    /// unlinked is logged at `warn` and deleted when the work file is dropped.
+    /// owner-only (the module's "Permissions" section) and opened for reading and writing, whose
+    /// name is unlinked at once. A name that cannot be unlinked is logged at `warn` and deleted
+    /// when the work file is dropped.
     ///
     /// # Errors
     ///
@@ -477,9 +559,9 @@ pub(crate) struct LockFile {
 }
 
 impl LockFile {
-    /// Takes the lock `name` by creating the file `path` exclusively and writing the process id
-    /// to it, so an operator can tell which process holds it. The directory of `path` must
-    /// exist.
+    /// Takes the lock `name` by creating the file `path` exclusively and owner-only (the
+    /// module's "Permissions" section) and writing the process id to it, so an operator can tell
+    /// which process holds it. The directory of `path` must exist.
     ///
     /// # Errors
     ///
@@ -487,7 +569,12 @@ impl LockFile {
     /// over, and the file is left as it is. [`GenerationError::Io`] when the file cannot be
     /// created or written; a file created but not written is deleted again.
     pub(crate) fn acquire(path: PathBuf, name: &'static str) -> Result<Self, GenerationError> {
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(GenerationError::Locked { name, path });
@@ -836,7 +923,7 @@ impl Drop for PendingGeneration {
 /// shorter than `L::LEN` bytes and its `LF`, a byte other than `LF` after a record, or a field
 /// error of the layout.
 ///
-/// Jobs read record files only through [`RecordReader`], which never holds a whole file; this
+/// Jobs read record files only through [`RecordReader`], which holds one frame at a time; this
 /// whole-file form, the codec's own decode of the file, is the reference the tests hold it to.
 #[cfg(test)]
 pub(crate) fn read_records<L: Layout>(path: &Path) -> Result<Vec<L::Record>, GenerationError> {
@@ -844,8 +931,9 @@ pub(crate) fn read_records<L: Layout>(path: &Path) -> Result<Vec<L::Record>, Gen
     Ok(carddemo_codec::layouts::decode_ascii_lf::<L>(&bytes)?)
 }
 
-/// A record file read one record at a time through a buffer: `read_records` streamed, so a
-/// job holds one frame of the file instead of the whole file. COMBTRAN reads its SORTIN
+/// A record file read one record at a time through a buffer: `read_records` streamed, the
+/// reader holding one frame of the file instead of the whole file, and its caller only the
+/// records it keeps, such as one [`RecordReader::next_batch`]. COMBTRAN reads its SORTIN
 /// `TRANSACT.BKUP(0)` and `SYSTRAN(0)` [app/jcl/COMBTRAN.jcl:L23-26] and its `REPRO` input
 /// `TRANSACT.COMBINED(+1)` [app/jcl/COMBTRAN.jcl:L43-44] this way, and TRANREPT its SORTIN
 /// `TRANSACT.BKUP(+1)` [app/jcl/TRANREPT.jcl:L38-39] and the CBTRN03C `TRANFILE`
@@ -1282,12 +1370,18 @@ pub(crate) fn encode_fixed_lines(
 /// Replaces the file `path` with `bytes` as a whole: writes and syncs a hidden temporary sibling
 /// created exclusively under a name of its own, then renames it over `path`, so a reader never
 /// sees a partly written file and concurrent writers of the same path never share a temporary
-/// file; the last rename wins. The parent directory is created first. `creastmt` writes
-/// `STATEMNT.PS`, `STATEMNT.HTML` and `STATEMNT.PS.PDF` this way, because they are cataloged
-/// datasets, not GDGs: each run replaces them.
+/// file; the last rename wins. The parent directory is first created owner-only, or restricted
+/// to its owner, with [`create_private_dir`]; a bare file name, which names no directory, is
+/// written in the current directory, which is left as it is. The temporary file is created
+/// owner-only, so the file that replaces `path` is owner-only whatever mode the previous file
+/// had (the module's "Permissions" section). `creastmt` writes `STATEMNT.PS`, `STATEMNT.HTML`
+/// and `STATEMNT.PS.PDF` this way, because they are cataloged datasets, not GDGs: each run
+/// replaces them.
 ///
 /// # Errors
 ///
+/// [`GenerationError::SharedDirectory`] and [`GenerationError::DirectoryNotRestricted`] when
+/// the parent directory is open to other users and is not restricted; nothing is written.
 /// [`GenerationError::Io`] when `path` names no file, or when the directory or the temporary
 /// file cannot be created, or the file cannot be written, synced or renamed. The temporary file
 /// is then deleted and `path` keeps its previous content.
@@ -1298,8 +1392,11 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), Generatio
             io::Error::new(io::ErrorKind::InvalidInput, "the path names no file"),
         ));
     };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_private_dir(parent)?;
     }
     let (temp_path, file) = create_temp(path, file_name)?;
     let replaced = write_synced(file, &temp_path, bytes)
@@ -1331,10 +1428,10 @@ fn write_synced(mut file: File, path: &Path, bytes: &[u8]) -> Result<(), Generat
         .map_err(|source| io_error(path, source))
 }
 
-/// Creates the hidden temporary sibling of `path`, whose file name is `file_name`, exclusively:
-/// a name that already exists is never opened, truncated or deleted, and the next sequence
-/// number is tried instead. The file is opened for reading as well as writing, so a sort work
-/// file is read back through the handle it was written through.
+/// Creates the hidden temporary sibling of `path`, whose file name is `file_name`, exclusively
+/// and owner-only ([`FILE_MODE`]): a name that already exists is never opened, truncated or
+/// deleted, and the next sequence number is tried instead. The file is opened for reading as
+/// well as writing, so a sort work file is read back through the handle it was written through.
 ///
 /// # Errors
 ///
@@ -1349,6 +1446,7 @@ fn create_temp(path: &Path, file_name: &OsStr) -> Result<(PathBuf, File), Genera
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(FILE_MODE)
             .open(&temp_path)
         {
             Ok(file) => return Ok((temp_path, file)),
@@ -1361,6 +1459,61 @@ fn create_temp(path: &Path, file_name: &OsStr) -> Result<(PathBuf, File), Genera
             Err(source) => return Err(io_error(&temp_path, source)),
         }
     }
+}
+
+/// Makes `dir` an output directory that only its owner can reach, the module's "Permissions"
+/// section: the one helper through which every batch job creates or checks the directory it
+/// writes into.
+///
+/// The missing directories of `dir`, `dir` itself included, are created with mode `0700`.
+/// Then `dir`, which must be a directory, is checked; the directories above it are the
+/// operator's and are left as they are. When `dir` grants the group or others any permission,
+/// a shared directory, one writable by others or sticky as `/tmp` is, is refused and left
+/// unchanged; any other loses its group and other permission bits, so `0755` becomes `0700`,
+/// and one `warn` event names it and its previous mode.
+///
+/// # Errors
+///
+/// - [`GenerationError::Io`] on `dir` when it or a directory above it cannot be created, when
+///   its metadata cannot be read, or when it is not a directory.
+/// - [`GenerationError::SharedDirectory`] when it is shared with other users.
+/// - [`GenerationError::DirectoryNotRestricted`] when its group and other permissions cannot be
+///   removed, for example because this process does not own it.
+pub(crate) fn create_private_dir(dir: &Path) -> Result<(), GenerationError> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(dir)
+        .map_err(|source| io_error(dir, source))?;
+    let metadata = fs::metadata(dir).map_err(|source| io_error(dir, source))?;
+    if !metadata.is_dir() {
+        return Err(io_error(dir, io::Error::from(io::ErrorKind::NotADirectory)));
+    }
+    let mode = metadata.permissions().mode() & MODE_BITS;
+    if mode & GROUP_OTHER_BITS == 0 {
+        return Ok(());
+    }
+    if mode & SHARED_BITS != 0 {
+        return Err(GenerationError::SharedDirectory {
+            path: dir.to_path_buf(),
+            mode,
+        });
+    }
+    let restricted = mode & !GROUP_OTHER_BITS;
+    fs::set_permissions(dir, Permissions::from_mode(restricted)).map_err(|source| {
+        GenerationError::DirectoryNotRestricted {
+            path: dir.to_path_buf(),
+            mode,
+            source,
+        }
+    })?;
+    tracing::warn!(
+        path = %dir.display(),
+        previous_mode = %format!("{mode:04o}"),
+        mode = %format!("{restricted:04o}"),
+        "output directory restricted to its owner"
+    );
+    Ok(())
 }
 
 /// The generations of `dataset` under `root`, oldest first; see [`Generations::list`].
@@ -1626,6 +1779,7 @@ pub(crate) mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process;
     use std::sync::{Arc, Mutex};
@@ -1640,8 +1794,9 @@ pub(crate) mod tests {
 
     use super::{
         Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, LockHolder,
-        RecordReader, blocking, count_records_async, create_temp, encode_fixed_lines, exited_pid,
-        process_running, read_records, remove_temp, write_replacing, write_synced,
+        RecordReader, blocking, count_records_async, create_private_dir, create_temp,
+        encode_fixed_lines, exited_pid, process_running, read_records, remove_temp,
+        write_replacing, write_synced,
     };
 
     /// A test directory under the system temporary directory, removed when the test ends.
@@ -2644,6 +2799,7 @@ pub(crate) mod tests {
         write_replacing(&path, b"second\n").expect("file is replaced");
 
         assert_eq!(fs::read(&path).expect("file is readable"), b"second\n");
+        assert_eq!(dir_mode_of(&dir.path().join("statements")), 0o700);
         let names: Vec<_> = fs::read_dir(dir.path().join("statements"))
             .expect("directory is readable")
             .map(|entry| entry.expect("directory entry is readable").file_name())
@@ -2723,6 +2879,190 @@ pub(crate) mod tests {
             assert!(payloads.contains(&content.as_slice()), "{content:?}");
         }
         assert_eq!(dir.names(), ["STATEMNT.PS"], "no temporary file is left");
+    }
+
+    /// The permission bits of `path`, also used by the statement tests of `crate::jobs`.
+    pub(crate) fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{} has metadata: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// The permission bits of the directory `path` without the set-group-ID bit, which a new
+    /// directory inherits from a parent that holds it, as the system temporary directory may.
+    pub(crate) fn dir_mode_of(path: &Path) -> u32 {
+        mode_of(path) & !0o2000
+    }
+
+    /// Every file the module creates is owner-only from its creation, whatever the umask leaves:
+    /// the lock file, the temporary generation file and the generation linked to it, a sort work
+    /// file, and a `write_replacing` file, also where it replaces a file others could read. The
+    /// catalog directory the allocation creates is owner-only too.
+    #[test]
+    fn every_file_the_module_creates_is_owner_only() {
+        let dir = TestDir::new("file-modes");
+        let generations = Generations::new(dir.path());
+
+        let mut pending = generations
+            .begin_next(Dataset::DalyRejs)
+            .expect("generation allocates");
+        pending
+            .append_records::<SixBytes>(&[*b"REJECT"])
+            .expect("record appends");
+        assert_eq!(dir_mode_of(dir.path()), 0o700, "catalog directory");
+        assert_eq!(
+            mode_of(&dir.path().join(".DALYREJS.lock")),
+            0o600,
+            "allocation lock"
+        );
+        assert_eq!(mode_of(&pending.temp_path), 0o600, "temporary generation");
+        let generation = pending.catalog().expect("generation catalogs");
+        assert_eq!(mode_of(&generation.path), 0o600, "cataloged generation");
+
+        let work = generations.create_work_file().expect("work file creates");
+        let work_mode = work
+            .writer
+            .get_ref()
+            .metadata()
+            .expect("work file has metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(work_mode, 0o600, "sort work file");
+        drop(work);
+
+        let statement = dir.path().join("STATEMNT.PS");
+        write_replacing(&statement, b"first\n").expect("file writes");
+        assert_eq!(mode_of(&statement), 0o600, "new file");
+        fs::set_permissions(&statement, fs::Permissions::from_mode(0o644))
+            .expect("file mode changes");
+        write_replacing(&statement, b"second\n").expect("file is replaced");
+        assert_eq!(mode_of(&statement), 0o600, "file that replaced a 0644 one");
+        assert_eq!(fs::read(&statement).expect("file is readable"), b"second\n");
+        assert_eq!(dir.names(), ["DALYREJS.G0001V00", "STATEMNT.PS"]);
+    }
+
+    /// Every directory the helper creates, from the first missing one to the output directory,
+    /// is owner-only, and an owner-only directory is used as it is.
+    #[test]
+    fn created_directories_are_owner_only_at_every_level() {
+        let dir = TestDir::new("dir-chain");
+        let middle = dir.path().join("batch");
+        let leaf = middle.join("gdg");
+
+        create_private_dir(&leaf).expect("directories create");
+        create_private_dir(&leaf).expect("an owner-only directory is used as it is");
+
+        for created in [dir.path(), middle.as_path(), leaf.as_path()] {
+            assert_eq!(dir_mode_of(created), 0o700, "{}", created.display());
+        }
+    }
+
+    /// An existing output directory that grants the group or others access loses those bits,
+    /// and only those, so its owner bits are never widened, while the directory above it is left
+    /// as it is.
+    #[test]
+    fn an_open_output_directory_is_restricted_to_its_owner() {
+        for (before, after) in [
+            (0o755, 0o700),
+            (0o750, 0o700),
+            (0o705, 0o700),
+            (0o555, 0o500),
+        ] {
+            let dir = TestDir::new(&format!("restrict-{before:o}"));
+            let leaf = dir.path().join("batch");
+            fs::create_dir_all(&leaf).expect("directory creates");
+            for (path, mode) in [(dir.path(), 0o755), (leaf.as_path(), before)] {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                    .expect("directory mode changes");
+            }
+
+            create_private_dir(&leaf).expect("an owned directory is restricted");
+
+            assert_eq!(mode_of(&leaf), after, "{before:o}");
+            assert_eq!(
+                mode_of(dir.path()),
+                0o755,
+                "{before:o}: the parent is the operator's"
+            );
+        }
+    }
+
+    /// A shared output directory, writable by others or sticky, is refused and never changed,
+    /// by the helper and by the two writers that use it, and nothing is created in it. The text
+    /// names the directory, its mode and what the operator can do.
+    #[test]
+    fn a_shared_output_directory_is_refused_and_left_as_it_is() {
+        for mode in [0o777, 0o1777, 0o1755] {
+            let dir = TestDir::new(&format!("shared-{mode:o}"));
+            fs::create_dir_all(dir.path()).expect("directory creates");
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode))
+                .expect("directory mode changes");
+            let generations = Generations::new(dir.path());
+
+            let errors = [
+                create_private_dir(dir.path()).expect_err("a shared directory is refused"),
+                generations
+                    .begin_next(Dataset::DalyRejs)
+                    .expect_err("no generation is allocated in it"),
+                write_replacing(&dir.path().join("STATEMNT.PS"), b"statement\n")
+                    .expect_err("no file is written in it"),
+            ];
+
+            for error in &errors {
+                assert!(
+                    matches!(
+                        error,
+                        GenerationError::SharedDirectory { path, mode: found }
+                            if path == dir.path() && *found == mode
+                    ),
+                    "{mode:o}: {error:?}"
+                );
+            }
+            assert_eq!(
+                errors[0].to_string(),
+                format!(
+                    "output directory {path} has mode {mode:04o}, which shares it with other \
+                     users, and is not used; point the directory setting at a directory of its \
+                     own, or, if no other user needs it, restrict it with `chmod 700 {path}`",
+                    path = dir.path().display()
+                )
+            );
+            assert!(dir.names().is_empty(), "{mode:o}: nothing is created");
+            assert_eq!(mode_of(dir.path()), mode, "{mode:o}: the mode is kept");
+        }
+    }
+
+    /// An open output directory whose permissions cannot be changed is refused: Linux refuses
+    /// every mode change of a `/proc/<pid>` directory, `0555`, whoever asks.
+    #[test]
+    fn an_output_directory_that_cannot_be_restricted_is_refused() {
+        let proc_self = Path::new("/proc/self");
+
+        let error = create_private_dir(proc_self).expect_err("the mode cannot change");
+
+        assert!(
+            matches!(
+                &error,
+                GenerationError::DirectoryNotRestricted { path, mode: 0o555, source }
+                    if path == proc_self && source.kind() == io::ErrorKind::PermissionDenied
+            ),
+            "{error:?}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.starts_with(
+                "output directory /proc/self has mode 0555, which lets other users reach it, \
+                 and could not be restricted to its owner: "
+            ) && text.ends_with(
+                "; restrict it with `chmod 700 /proc/self` or point the directory setting at a \
+                 directory of its own"
+            ),
+            "{text}"
+        );
+        assert_eq!(mode_of(proc_self), 0o555);
     }
 
     /// A shared in-memory sink standing in for standard output, also used by the job-span

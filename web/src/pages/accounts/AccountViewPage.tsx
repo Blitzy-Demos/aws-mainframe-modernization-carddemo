@@ -49,15 +49,13 @@ import {
   type AccountKeyValues,
 } from "@/schemas/accounts";
 
-/**
- * The INFOMSG line of COACTVW. COACTVWC sets WS-PROMPT-FOR-INPUT whenever no
- * other information message is set, and it never sets one, so the map always
- * carries this text [app/cbl/COACTVWC.cbl:L113-114]
- * [app/cbl/COACTVWC.cbl:L528-534].
- */
+// The INFOMSG line of COACTVW. COACTVWC sets WS-PROMPT-FOR-INPUT whenever no
+// other information message is set, and it never sets one, so the map always
+// carries this text [app/cbl/COACTVWC.cbl:L113-114]
+// [app/cbl/COACTVWC.cbl:L528-534].
 const INFO_MESSAGE = "Enter or update id of account to display";
 
-/** ACCTSID `LENGTH=11`, `PICIN='99999999999'` [app/bms/COACTVW.bms:L84-90]. */
+// ACCTSID `LENGTH=11`, `PICIN='99999999999'` [app/bms/COACTVW.bms:L84-90].
 const ACCOUNT_ID_LENGTH = 11;
 
 // How long the read's status stays empty before it announces. The region is
@@ -65,11 +63,9 @@ const ACCOUNT_ID_LENGTH = 11;
 // still announced as a change; the delay is the one DataTable uses.
 const STATUS_ANNOUNCE_DELAY_MS = 150;
 
-/**
- * One caption of the account view, the value it shows from the account read
- * and, for a value of more than one line, the placeholder that stands in for
- * it while the account is read.
- */
+// One caption of the account view, the value it shows from the account read
+// and, for a value of more than one line, the placeholder that stands in for
+// it while the account is read.
 type AccountField = {
   label: string;
   value: (account: Account) => ReactNode;
@@ -77,10 +73,11 @@ type AccountField = {
 };
 
 /**
- * ACSTSSN as 1200-SETUP-SCREEN-VARS builds it: `CUST-SSN(1:3) '-'
- * CUST-SSN(4:2) '-' CUST-SSN(6:4)` [app/cbl/COACTVWC.cbl:L496-504]. This only
- * places the map's separators between the received characters; a value that
- * is not the nine digits of `CUST-SSN 9(09)` is shown as received.
+ * COACTVWC 1200-SETUP-SCREEN-VARS — P-COACTVWC-015: ACSTSSN as the paragraph
+ * builds it: `CUST-SSN(1:3) '-' CUST-SSN(4:2) '-' CUST-SSN(6:4)`
+ * [app/cbl/COACTVWC.cbl:L496-504]. This only places the map's separators
+ * between the received characters; a value that is not the nine digits of
+ * `CUST-SSN 9(09)` is shown as received.
  */
 function ssnText(ssn: string): string {
   return /^[0-9]{9}$/.test(ssn)
@@ -169,11 +166,9 @@ const CARD_FIELDS: readonly AccountField[] = [
   { label: "Card Number", value: (account) => account.card_number },
 ];
 
-/**
- * One list of account fields, each value from the account read or, while it
- * is read (`account` undefined), its placeholder: one text line unless the
- * field names its own.
- */
+// One list of account fields, each value from the account read or, while it
+// is read (`account` undefined), its placeholder: one text line unless the
+// field names its own.
 function AccountFieldList({
   fields,
   account,
@@ -196,7 +191,7 @@ function AccountFieldList({
   );
 }
 
-/** A details card whose title is the section's h2 (PageHeader holds the h1). */
+// A details card whose title is the section's h2 (PageHeader holds the h1).
 function DetailsCard({
   title,
   children,
@@ -216,17 +211,15 @@ function DetailsCard({
   );
 }
 
-/**
- * The COACTVW output fields 1200-SETUP-SCREEN-VARS fills from the account and
- * customer records [app/cbl/COACTVWC.cbl:L473-522], labelled with the map
- * captions without their colons [app/bms/COACTVW.bms:L93-353], plus the
- * cross-referenced card number the API adds.
- *
- * While the account is read (`account` undefined) the same cards, captions
- * and lines hold placeholders, so nothing moves when the record arrives. The
- * details are then hidden from assistive technology: the page's status region
- * announces the read.
- */
+// The COACTVW output fields 1200-SETUP-SCREEN-VARS fills from the account and
+// customer records [app/cbl/COACTVWC.cbl:L473-522], labelled with the map
+// captions without their colons [app/bms/COACTVW.bms:L93-353], plus the
+// cross-referenced card number the API adds.
+//
+// While the account is read (`account` undefined) the same cards, captions
+// and lines hold placeholders, so nothing moves when the record arrives. The
+// details are then hidden from assistive technology: the page's status region
+// announces the read.
 function AccountDetails({
   account,
 }: {

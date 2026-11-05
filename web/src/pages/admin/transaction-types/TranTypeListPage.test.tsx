@@ -154,7 +154,7 @@ function renderPage() {
   return { user: userEvent.setup() };
 }
 
-/** The page after its first list request has answered. */
+// The page after its first list request has answered.
 async function renderLoadedPage() {
   const view = renderPage();
   await screen.findByText(PURCHASE.description);
@@ -185,7 +185,7 @@ function rowForm(): HTMLElement {
   return form;
 }
 
-/** The first issue message the schema gives for `values`. */
+// The first issue message the schema gives for `values`.
 function schemaMessage(
   schema: typeof tranTypeListFilterSchema | typeof tranTypeInlineEditSchema,
   values: Record<string, string>,
@@ -739,20 +739,16 @@ describe("TranTypeListPage first page after a delete (F-COTRTLI-009)", () => {
     SECOND_PAGE_TYPE,
   ];
 
-  /**
-   * A page's text: its start and the deletes made before it was read, so a
-   * page shown from the cache is told apart from a fresh one.
-   */
+  // A page's text: its start and the deletes made before it was read, so a
+  // page shown from the cache is told apart from a fresh one.
   function pageText(startKey: string | null, deletes: number): string {
     return `Stub page from ${startKey ?? "the start"} after ${deletes} deletes`;
   }
 
-  /**
-   * Serves TWO_PAGES less the types deleted, forward from `start_key`. A read
-   * made after a delete answers after a pause, as over a network, so the page
-   * renders the copy it already holds while the read runs. `deleteAnswered`,
-   * when given, holds back the delete until it settles.
-   */
+  // Serves TWO_PAGES less the types deleted, forward from `start_key`. A read
+  // made after a delete answers after a pause, as over a network, so the page
+  // renders the copy it already holds while the read runs. `deleteAnswered`,
+  // when given, holds back the delete until it settles.
   function serveTwoPages(deleteAnswered?: Promise<void>): void {
     let onFile = [...TWO_PAGES];
     let deletes = 0;
@@ -797,10 +793,8 @@ describe("TranTypeListPage first page after a delete (F-COTRTLI-009)", () => {
     await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
   }
 
-  /**
-   * The requests sent after the delete of `typeCode`, each as its method and
-   * the names of its query parameters.
-   */
+  // The requests sent after the delete of `typeCode`, each as its method and
+  // the names of its query parameters.
   function sentAfterDelete(typeCode: string): [string, string[]][] {
     const sent = fetchMock.mock.calls.map(([request]) => request);
     const deleteAt = sent.findIndex((request) => request.method === "DELETE");

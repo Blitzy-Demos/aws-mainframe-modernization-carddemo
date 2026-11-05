@@ -31,7 +31,7 @@ import { isSpacesOrLowValues } from "./primitives";
 type LoginRequest = components["schemas"]["LoginRequest"];
 type LoginField = components["schemas"]["LoginField"];
 
-/** The width of the `USERIDI` and `PASSWDI` map fields, `PIC X(8)`. */
+// The width of the `USERIDI` and `PASSWDI` map fields, `PIC X(8)`.
 const MAP_FIELD_LENGTH = 8;
 
 /** The COSGN00C texts of the edits this schema repeats, byte for byte. */

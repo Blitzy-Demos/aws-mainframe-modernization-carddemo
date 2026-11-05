@@ -1160,8 +1160,8 @@ fn no_message_cells_link_an_escalation_id() {
         ("no-message `none`", Some(no_id)),
         ("no-message", Some(no_id)),
         ("no-message (E-5)", Some(no_id)),
-        ("No input received", Some(neither)),
-        ("`\"No input received\"`", None),
+        ("Synthetic message text", Some(neither)),
+        ("`\"Synthetic message text\"`", None),
         ("no-message (E-24)", None),
     ];
     for (message, problem) in cases {

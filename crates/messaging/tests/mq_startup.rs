@@ -21,8 +21,9 @@ use carddemo_runtime::config::keys;
 /// A stand-in for a credential written into the database URL.
 const SECRET: &str = "not-a-real-mq-secret";
 
-/// How long one failing start may take: well under the 30-second acquire
-/// timeout a refused database used to wait out.
+/// How long one failing start may take: well under the database pool's
+/// 30-second acquire timeout, which no failing start, a refused database
+/// included, may wait out.
 const PROMPT: Duration = Duration::from_secs(10);
 
 /// What the one standard error line of a case must read after its stage

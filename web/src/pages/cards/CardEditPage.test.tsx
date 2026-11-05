@@ -43,13 +43,11 @@ const CARD_NUMBER = "0500024453765740";
 const ACCOUNT_ID = "00000000050";
 const CARD_PATH = `/api/cards/${CARD_NUMBER}`;
 
-/** The COCRDUP title line [app/bms/COCRDUP.bms:L75-78]. */
+// The COCRDUP title line [app/bms/COCRDUP.bms:L75-78].
 const TITLE = "Update Credit Card Details";
 
-/**
- * The card as `GET /cards/{id}` returns it: carddata.txt record 1 (name,
- * expiry, status), with the version token a PUT echoes.
- */
+// The card as `GET /cards/{id}` returns it: carddata.txt record 1 (name,
+// expiry, status), with the version token a PUT echoes.
 const CARD: CardResponse = {
   account_id: ACCOUNT_ID,
   card_number: CARD_NUMBER,
@@ -59,20 +57,20 @@ const CARD: CardResponse = {
   version: "0123456789abcdef",
 };
 
-/** The card once the rename is rewritten, with its new token. */
+// The card once the rename is rewritten, with its new token.
 const UPDATED_CARD: CardResponse = {
   ...CARD,
   card_embossed_name: "Aniya Vonn",
   version: "fedcba9876543210",
 };
 
-/** COCRDSLC's information line for a found card (P-COCRDSLC-010). */
+// COCRDSLC's information line for a found card (P-COCRDSLC-010).
 const FOUND_MESSAGE = "   Displaying requested details";
 
-/** COCRDUPC's text after the rewrite (P-COCRDUPC-007). */
+// COCRDUPC's text after the rewrite (P-COCRDUPC-007).
 const COMMITTED = "Changes committed to database";
 
-/** The labels of the unprotected COCRDUP fields. */
+// The labels of the unprotected COCRDUP fields.
 const LABELS = [
   "Name on card",
   "Card Active Y/N",
@@ -82,18 +80,16 @@ const LABELS = [
 
 type Label = (typeof LABELS)[number];
 
-/** The labels of the protected keys, ACCTSID and CARDSID. */
+// The labels of the protected keys, ACCTSID and CARDSID.
 const KEY_LABELS = ["Account Number", "Card Number"] as const;
 
 type KeyLabel = (typeof KEY_LABELS)[number];
 
-/** The URL the card list's "Edit" action opens for the card. */
+// The URL the card list's "Edit" action opens for the card.
 const EDIT_ENTRY = `/cards/${CARD_NUMBER}/edit?account_id=${ACCOUNT_ID}`;
 
-/**
- * How the stubbed API answers a `PUT /cards/{id}` with `body`; a promise
- * holds the PUT until the test settles it.
- */
+// How the stubbed API answers a `PUT /cards/{id}` with `body`; a promise
+// holds the PUT until the test settles it.
 type PutAnswer = (body: CardUpdateRequest) => Response | Promise<Response>;
 
 // The stubbed API's state, reset before each test: the stored card, a hold
@@ -109,7 +105,7 @@ function errorAnswer(status: number, body: ErrorBody): Response {
   return Response.json(body, { status });
 }
 
-/** A rewrite: UPDATED_CARD is stored and returned with COMMITTED. */
+// A rewrite: UPDATED_CARD is stored and returned with COMMITTED.
 function commitRename(): Response {
   stored = UPDATED_CARD;
   const answer: CardUpdateResponse = { card: stored, message: COMMITTED };
@@ -143,7 +139,7 @@ function sentPuts(): string[] {
   return received.filter((line) => line.startsWith("PUT "));
 }
 
-/** A hold on a stubbed answer: the request waits until `release` is called. */
+// A hold on a stubbed answer: the request waits until `release` is called.
 function hold(): { held: Promise<void>; release: () => void } {
   let release: () => void = () => undefined;
   const held = new Promise<void>((resolve) => {
@@ -152,21 +148,17 @@ function hold(): { held: Promise<void>; release: () => void } {
   return { held, release };
 }
 
-/**
- * Lets every effect, microtask and zero-delay timer scheduled so far run,
- * among them TanStack Query's notification of the page about new data.
- */
+// Lets every effect, microtask and zero-delay timer scheduled so far run,
+// among them TanStack Query's notification of the page about new data.
 async function settle(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
 }
 
-/**
- * The page at its App.tsx route, `/cards/:cardNumber/edit`, under the card
- * list and card view routes its breadcrumb leads back to, entered at `entry`
- * (by default with the card and account keys), beside the app's Toaster.
- */
+// The page at its App.tsx route, `/cards/:cardNumber/edit`, under the card
+// list and card view routes its breadcrumb leads back to, entered at `entry`
+// (by default with the card and account keys), beside the app's Toaster.
 function renderPage(entry: string = EDIT_ENTRY) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -218,7 +210,7 @@ function input(label: Label | KeyLabel): HTMLInputElement {
   return element;
 }
 
-/** The FieldError `control` names in its aria-describedby. */
+// The FieldError `control` names in its aria-describedby.
 function fieldErrorOf(control: HTMLElement): HTMLElement {
   const id = control.getAttribute("aria-describedby");
   const error = id === null ? null : document.getElementById(id);
@@ -228,7 +220,7 @@ function fieldErrorOf(control: HTMLElement): HTMLElement {
   return error;
 }
 
-/** Renders the page and waits until the form holds the fetched card. */
+// Renders the page and waits until the form holds the fetched card.
 async function renderLoaded() {
   const harness = renderPage();
   await screen.findByLabelText("Name on card");
@@ -238,7 +230,7 @@ async function renderLoaded() {
   return harness;
 }
 
-/** Replaces the entry of the field labelled `label` with `value`. */
+// Replaces the entry of the field labelled `label` with `value`.
 async function enter(
   user: ReturnType<typeof userEvent.setup>,
   label: Label,
@@ -700,10 +692,8 @@ describe("CardEditPage", () => {
     expect(save.querySelector("svg")).toBeNull();
   });
 
-  /**
-   * The card as another user rewrote it while the entry was being made: a
-   * new name, status and expiry, and so a new version token.
-   */
+  // The card as another user rewrote it while the entry was being made: a
+  // new name, status and expiry, and so a new version token.
   const CHANGED_ELSEWHERE: CardResponse = {
     ...CARD,
     card_embossed_name: "Aniya Smith",
@@ -712,10 +702,10 @@ describe("CardEditPage", () => {
     version: "a1b2c3d4e5f60718",
   };
 
-  /** COCRDUPC 9300-CHECK-CHANGE-IN-REC's text (V-COCRDUPC-019). */
+  // COCRDUPC 9300-CHECK-CHANGE-IN-REC's text (V-COCRDUPC-019).
   const RECORD_CHANGED = "Record changed by some one else. Please review";
 
-  /** COCRDUPC 1200-EDIT-MAP-INPUTS's no-change text (V-COCRDUPC-009). */
+  // COCRDUPC 1200-EDIT-MAP-INPUTS's no-change text (V-COCRDUPC-009).
   const NO_CHANGE = "No change detected with respect to values fetched.";
 
   it("reloads a card changed by someone else, marks Name on card and saves it with the new token", async () => {

@@ -68,7 +68,7 @@ type UserEditForm = UseFormReturn<
   UserUpdateFormValues
 >;
 
-/** The form members an Input edits; `change_password` is the checkbox. */
+// The form members an Input edits; `change_password` is the checkbox.
 type TextFieldName = Exclude<keyof UserUpdateFormInput, "change_password">;
 
 // The user list, where the user to update is chosen (E-61), and the target

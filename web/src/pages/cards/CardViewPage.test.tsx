@@ -34,20 +34,18 @@ type CardViewResponse = components["schemas"]["CardViewResponse"];
 type CardViewField = components["schemas"]["CardViewField"];
 type ErrorBody = components["schemas"]["ErrorBody"];
 
-/** The COCRDSL screen title [app/bms/COCRDSL.bms:L75-78]. */
+// The COCRDSL screen title [app/bms/COCRDSL.bms:L75-78].
 const TITLE = "View Credit Card Detail";
 
 const CARD_NUMBER = "0500024453765740";
 const ACCOUNT_ID = "00000000050";
 
-/** The route of the first card with its own account as the account key. */
+// The route of the first card with its own account as the account key.
 const VALID_ENTRY = `/cards/${CARD_NUMBER}?account_id=${ACCOUNT_ID}`;
 
-/**
- * The first card master record [app/data/ASCII/carddata.txt:L1]: CARD-NUM,
- * CARD-ACCT-ID, CARD-EMBOSSED-NAME, CARD-EXPIRAION-DATE and
- * CARD-ACTIVE-STATUS, with a version token of the pattern the API declares.
- */
+// The first card master record [app/data/ASCII/carddata.txt:L1]: CARD-NUM,
+// CARD-ACCT-ID, CARD-EMBOSSED-NAME, CARD-EXPIRAION-DATE and
+// CARD-ACTIVE-STATUS, with a version token of the pattern the API declares.
 const CARD: CardResponse = {
   card_number: CARD_NUMBER,
   account_id: ACCOUNT_ID,
@@ -57,41 +55,35 @@ const CARD: CardResponse = {
   version: "5d0c3e9a71f2b846",
 };
 
-/**
- * The answer of a found card: WS-INFO-MSG once FOUND-CARDS-FOR-ACCOUNT is set,
- * with its three leading spaces (P-COCRDSLC-010).
- */
+// The answer of a found card: WS-INFO-MSG once FOUND-CARDS-FOR-ACCOUNT is set,
+// with its three leading spaces (P-COCRDSLC-010).
 const FOUND: CardViewResponse = {
   ...CARD,
   message: "   Displaying requested details",
 };
 
-/**
- * 9100-GETCARD-BYACCTCARD on NOTFND (V-COCRDSLC-006), byte for byte. The
- * validation audit maps it to 404 (kind NotFound), so the stub answers 404.
- */
+// 9100-GETCARD-BYACCTCARD on NOTFND (V-COCRDSLC-006), byte for byte. The
+// validation audit maps it to 404 (kind NotFound), so the stub answers 404.
 const NOT_FOUND = "Did not find cards for this search condition";
 
 type Network = (request: Request) => Promise<Response>;
 
-/** Stubs the network with `answer` and returns the stub, to read what was sent. */
+// Stubs the network with `answer` and returns the stub, to read what was sent.
 function stubNetwork(answer: (request: Request) => Response) {
   const network = vi.fn<Network>(async (request) => answer(request));
   vi.stubGlobal("fetch", network);
   return network;
 }
 
-/** The requests the page handed to the network, in the order sent. */
+// The requests the page handed to the network, in the order sent.
 function sent(network: ReturnType<typeof stubNetwork>): Request[] {
   return network.mock.calls.map(([request]) => request);
 }
 
-/**
- * Renders the page at `entry` under a data router (PageHeader reads the
- * matched routes' handles), with a fresh query cache that never retries, so a
- * failed read reaches the page on its first answer. The card list and card
- * edit routes are placeholders the page can navigate to.
- */
+// Renders the page at `entry` under a data router (PageHeader reads the
+// matched routes' handles), with a fresh query cache that never retries, so a
+// failed read reaches the page on its first answer. The card list and card
+// edit routes are placeholders the page can navigate to.
 function renderPage(entry: string) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -127,12 +119,12 @@ function renderPage(entry: string) {
   return router;
 }
 
-/** The card region, named by its "Card details" heading. */
+// The card region, named by its "Card details" heading.
 function cardRegion(): HTMLElement {
   return screen.getByRole("region", { name: "Card details" });
 }
 
-/** The value cell that follows the caption `label` in the card region. */
+// The value cell that follows the caption `label` in the card region.
 function valueOf(label: string): HTMLElement {
   const caption = within(cardRegion()).getByText(label, { selector: "dt" });
   const value = caption.nextElementSibling;
@@ -142,10 +134,8 @@ function valueOf(label: string): HTMLElement {
   return value;
 }
 
-/**
- * Lets every effect, microtask and zero-delay timer the render scheduled run,
- * so a query the page enabled would have reached the network by now.
- */
+// Lets every effect, microtask and zero-delay timer the render scheduled run,
+// so a query the page enabled would have reached the network by now.
 async function settle(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -263,7 +253,7 @@ describe("CardViewPage with valid keys", () => {
   });
 });
 
-/** A pair of route keys the COCRDSLC edits reject, and each key's text. */
+// A pair of route keys the COCRDSLC edits reject, and each key's text.
 type KeyCase = {
   name: string;
   entry: string;
@@ -300,7 +290,7 @@ const KEY_CASES: KeyCase[] = [
   },
 ];
 
-/** The key edit text under `label`, or `null` when the key passed. */
+// The key edit text under `label`, or `null` when the key passed.
 function keyError(label: string): string | null {
   const alert = within(valueOf(label)).queryByRole("alert");
   return alert === null ? null : alert.textContent;

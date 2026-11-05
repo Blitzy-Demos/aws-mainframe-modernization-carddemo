@@ -17,13 +17,13 @@
 // Query keys, form values and the text a page shows are the stored key; only
 // the URL carries the segment.
 
-/** The escape a key that would be a dot segment travels behind. */
+// The escape a key that would be a dot segment travels behind.
 const ESCAPE = "~";
 
-/** A key that is `.` or `..` after zero or more `~`. */
+// A key that is `.` or `..` after zero or more `~`.
 const DOT_KEY = /^~*\.\.?$/;
 
-/** A segment that is `.` or `..` after one or more `~`: an escaped key. */
+// A segment that is `.` or `..` after one or more `~`: an escaped key.
 const ESCAPED_DOT_KEY = /^~+\.\.?$/;
 
 /**

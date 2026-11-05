@@ -122,9 +122,12 @@ impl RewardEngine {
     /// # Errors
     ///
     /// - [`RewardError::Store`] with the port's error, unchanged, when a store
-    ///   call fails: [`PortError::Duplicate`] when the transaction already has
-    ///   an accrual, [`PortError::Unavailable`] on any other failure. A failed
-    ///   accrual insert credits no points.
+    ///   call fails, whichever outcome the [`RewardStore`] method documents:
+    ///   [`PortError::Duplicate`] when the transaction already has an accrual,
+    ///   [`PortError::Restricted`] when the accrual or the balance references
+    ///   a row that does not exist, [`PortError::Contention`] on a lock
+    ///   conflict with another unit of work, [`PortError::Unavailable`] on any
+    ///   other failure. A failed accrual insert credits no points.
     /// - [`RewardError::PointsOverflow`] when the points fall outside the
     ///   range of [`RewardPoints`].
     ///
@@ -134,6 +137,8 @@ impl RewardEngine {
     /// (AAP 0.3.5, 0.5.3.5).
     ///
     /// [`PortError::Duplicate`]: crate::ports::PortError::Duplicate
+    /// [`PortError::Restricted`]: crate::ports::PortError::Restricted
+    /// [`PortError::Contention`]: crate::ports::PortError::Contention
     /// [`PortError::Unavailable`]: crate::ports::PortError::Unavailable
     pub async fn accrue<S: RewardStore + Send>(
         store: &mut S,

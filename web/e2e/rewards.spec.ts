@@ -78,41 +78,43 @@ import {
 
 type RewardRuleResponse = components["schemas"]["RewardRuleResponse"];
 
-/** 2^53 + 1: a JavaScript number would show it as 9007199254740992. */
+// 2^53 + 1: a JavaScript number would show it as 9007199254740992.
 const EXACT_POINTS = "9007199254740993";
 const ROUNDED_POINTS = "9007199254740992";
 
-/** The CT02 amount the accrual tests add, and its audited screen form (V-COTRN02C-021). */
+// The CT02 amount the accrual tests add, and its audited screen form
+// (V-COTRN02C-021).
 const ADD_AMOUNT = "12.34";
 const ADD_AMOUNT_ENTERED = "+00000012.34";
 
 const SCREENS = REWARD_SCREENS;
 
-/** A text input by its label, in the page content. */
+// A text input by its label, in the page content.
 function textbox(page: Page, label: LabelText): Locator {
   return content(page).getByRole("textbox", { name: nameMatcher(label) });
 }
 
-/** RewardsPage for `accountId`: the account lookup, submitted with "Look up". */
+// RewardsPage for `accountId`: the account lookup, submitted with "Look up".
 async function openRewards(page: Page, accountId: string): Promise<void> {
   await page.goto(SCREENS.rewards.route);
   await textbox(page, UNMAPPED_LABELS.rewards.accountId).fill(accountId);
   await content(page).getByRole("button", { name: SCREENS.rewards.lookUp, exact: true }).click();
 }
 
-/** The dashboard account lookup (F-COACTVW-001) for `accountId`. */
+// The dashboard account lookup (F-COACTVW-001) for `accountId`.
 async function lookUpOnDashboard(page: Page, accountId: string): Promise<void> {
   await page.goto(mapControl("F-COACTVW-001").route);
   await mapInput(content(page), rowInput("F-COACTVW-001", 0)).fill(accountId);
   await controlLocator(page, mapControl("F-COACTVW-001")).click();
 }
 
-/** The SummaryCard titled `title` (a group named by its title). */
+// The SummaryCard titled `title` (a group named by its title).
 function summaryCard(page: Page, title: string): Locator {
   return content(page).getByRole("group", { name: title, exact: true });
 }
 
-/** Asserts that the card `title` shows exactly `value`, and `roundedAway` nowhere in it. */
+// Asserts that the card `title` shows exactly `value`, and `roundedAway`
+// nowhere in it.
 async function expectCardValue(page: Page, title: string, value: string, roundedAway?: string): Promise<void> {
   const card = summaryCard(page, title);
   await expect(card).toHaveCount(1);
@@ -122,23 +124,21 @@ async function expectCardValue(page: Page, title: string, value: string, rounded
   }
 }
 
-/** RewardsPage's history table. */
+// RewardsPage's history table.
 function history(page: Page): Locator {
   return tableByCaption(content(page), SCREENS.rewards.historyCaption);
 }
 
-/** A paging control of the page's DataTable (PF7 "Previous", PF8 "Next"). */
+// A paging control of the page's DataTable (PF7 "Previous", PF8 "Next").
 function pagingControl(page: Page, name: "Previous" | "Next"): Locator {
   return content(page).getByRole("button", { name, exact: true });
 }
 
-/**
- * The points and rule the RewardEngine credits for a `typeCode`/`categoryCode`
- * add of `amount` at the processing instant (processingClock), computed by
- * PostgreSQL: among the rules active at that instant whose bounds hold the
- * amount, the highest rate wins and a tie goes to the lowest rule_id;
- * points = ceil(amount × rate). "points|rule_id".
- */
+// The points and rule the RewardEngine credits for a `typeCode`/`categoryCode`
+// add of `amount` at the processing instant (processingClock), computed by
+// PostgreSQL: among the rules active at that instant whose bounds hold the
+// amount, the highest rate wins and a tie goes to the lowest rule_id;
+// points = ceil(amount × rate). "points|rule_id".
 async function expectedAccrual(typeCode: string, categoryCode: string, amount: string): Promise<string> {
   if (!/^[0-9]+\.[0-9]{2}$/.test(amount)) {
     throw new Error(`not an amount: ${amount}`);
@@ -163,19 +163,18 @@ async function expectedAccrual(typeCode: string, categoryCode: string, amount: s
   return expected;
 }
 
-/** PostgreSQL's clock_timestamp() as text: one bound of an add the system clock stamps. */
+// PostgreSQL's clock_timestamp() as text: one bound of an add the system
+// clock stamps.
 async function databaseClock(): Promise<string> {
   return psql("SELECT clock_timestamp()");
 }
 
-/**
- * Asserts that the accrual of the live TRAN-ID `tranId` was stamped at the
- * processing clock expectedAccrual chose its rule at: exactly
- * CARDDEMO_CLOCK_OVERRIDE when this run sets it, else between `before` and
- * `after`, databaseClock readings taken just before and just after the add.
- * A mismatch means the API under test and this Playwright run do not share
- * CARDDEMO_CLOCK_OVERRIDE, so the expected rule was chosen at another instant.
- */
+// Asserts that the accrual of the live TRAN-ID `tranId` was stamped at the
+// processing clock expectedAccrual chose its rule at: exactly
+// CARDDEMO_CLOCK_OVERRIDE when this run sets it, else between `before` and
+// `after`, databaseClock readings taken just before and just after the add.
+// A mismatch means the API under test and this Playwright run do not share
+// CARDDEMO_CLOCK_OVERRIDE, so the expected rule was chosen at another instant.
 async function expectAccruedAtProcessingClock(tranId: string, before: string, after: string): Promise<void> {
   const clock = processingClock();
   const stamped =
@@ -200,7 +199,8 @@ async function expectAccruedAtProcessingClock(tranId: string, before: string, af
   ).toBe("t");
 }
 
-/** "transaction_id|points_earned|rule_id" of the accrual of the live TRAN-ID `tranId`. */
+// "transaction_id|points_earned|rule_id" of the accrual of the live TRAN-ID
+// `tranId`.
 async function accrualOf(tranId: string): Promise<string> {
   return psql(
     `SELECT t.transaction_id || '|' || a.points_earned || '|' || a.rule_id
@@ -216,7 +216,7 @@ async function rules(request: APIRequestContext): Promise<RewardRuleResponse[]> 
   return readJson(response, z.array(rewardRuleResponseSchema));
 }
 
-/** Orders decimal integer strings by value, without converting them to numbers. */
+// Orders decimal integer strings by value, without converting them to numbers.
 function byDecimal(a: string, b: string): number {
   if (a.length !== b.length) {
     return a.length - b.length;
@@ -224,14 +224,14 @@ function byDecimal(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** The Status badge text the rule list shows for each server `status`. */
+// The Status badge text the rule list shows for each server `status`.
 const RULE_STATUS_LABELS = {
   active: SCREENS.ruleList.active,
   scheduled: SCREENS.ruleList.scheduled,
   ended: SCREENS.ruleList.ended,
 } as const satisfies Record<RewardRuleResponse["status"], string>;
 
-/** The table row of the rule `ruleId` on the rule list. */
+// The table row of the rule `ruleId` on the rule list.
 function ruleRow(page: Page, ruleId: string): Locator {
   return tableByCaption(content(page), SCREENS.ruleList.caption)
     .getByRole("row")
@@ -240,7 +240,7 @@ function ruleRow(page: Page, ruleId: string): Locator {
 
 type RuleField = keyof typeof UNMAPPED_LABELS.rewardRule;
 
-/** The reward-rule form's fields in screen order. */
+// The reward-rule form's fields in screen order.
 const RULE_FIELDS = [
   "typeCode",
   "categoryCode",
@@ -251,7 +251,7 @@ const RULE_FIELDS = [
   "activeTo",
 ] as const satisfies readonly RuleField[];
 
-/** A rule the server accepts: the rule-test pair, unbounded and open-ended. */
+// A rule the server accepts: the rule-test pair, unbounded and open-ended.
 const VALID_RULE: Readonly<Record<RuleField, string>> = {
   typeCode: FIXTURE_KEYS.ruleTestTypeCode,
   categoryCode: FIXTURE_KEYS.ruleTestCategoryCode,
@@ -262,13 +262,11 @@ const VALID_RULE: Readonly<Record<RuleField, string>> = {
   activeTo: "",
 };
 
-/**
- * The three rule checks (AAP 0.3.5), each as the field values that fail it,
- * the field it is reported on and its messages.rs text. The form's schema
- * answers a signed rate before any request is sent; the server answers the
- * two cross-field checks with 400 and the field in `fields[]`. The text is
- * the same on either path.
- */
+// The three rule checks (AAP 0.3.5), each as the field values that fail it,
+// the field it is reported on and its messages.rs text. The form's schema
+// answers a signed rate before any request is sent; the server answers the
+// two cross-field checks with 400 and the field in `fields[]`. The text is
+// the same on either path.
 const INVALID_RULES = [
   {
     check: "a negative reward rate",
@@ -295,14 +293,14 @@ const INVALID_RULES = [
   message: string;
 }[];
 
-/** Fills every field of the reward-rule form with `values`, in screen order. */
+// Fills every field of the reward-rule form with `values`, in screen order.
 async function fillRuleForm(page: Page, values: Readonly<Record<RuleField, string>>): Promise<void> {
   for (const field of RULE_FIELDS) {
     await textbox(page, UNMAPPED_LABELS.rewardRule[field]).fill(values[field]);
   }
 }
 
-/** The FieldError of `input`: the alert inside the input's Field. */
+// The FieldError of `input`: the alert inside the input's Field.
 function fieldErrorOf(input: Locator): Locator {
   return input.locator('xpath=ancestor::*[@data-slot="field"][1]').getByRole("alert");
 }

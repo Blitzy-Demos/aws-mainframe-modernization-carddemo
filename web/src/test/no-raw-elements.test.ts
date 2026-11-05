@@ -18,7 +18,7 @@ import { describe, expect, it } from "vitest";
 // AAP 0.4.5 names.
 const RAW_ELEMENT = /<(button|input|select|table)(?=[\s/>])/g;
 
-/** One raw element found in a source: its 1-based line, tag name and trimmed line. */
+// One raw element found in a source: its 1-based line, tag name and trimmed line.
 interface RawElement {
   readonly line: number;
   readonly element: string;

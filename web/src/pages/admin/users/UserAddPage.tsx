@@ -58,18 +58,16 @@ const INITIAL_FIELD = "first_name" satisfies keyof UserAddFormValues;
 type TextFieldProps = {
   control: Control<UserAddFormValues>;
   name: keyof UserAddFormValues;
-  /** The BMS caption without its colon. */
+  // The BMS caption without its colon.
   label: string;
-  /** The PIC X(n) width of the BMS input. */
+  // The PIC X(n) width of the BMS input.
   maxLength: number;
-  /** The hint the map prints beside the input. */
+  // The hint the map prints beside the input.
   description?: string;
   type?: "text" | "password";
   autoComplete: string;
-  /**
-   * Keeps an on-screen keyboard from capitalising or correcting the value, which
-   * must reach the server as typed (E-20).
-   */
+  // Keeps an on-screen keyboard from capitalising or correcting the value, which
+  // must reach the server as typed (E-20).
   verbatim?: boolean;
 };
 

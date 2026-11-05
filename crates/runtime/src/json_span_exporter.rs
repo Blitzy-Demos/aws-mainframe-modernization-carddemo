@@ -38,9 +38,10 @@ const SERVICE_NAME_KEY: &str = "service.name";
 ///
 /// `W` is any [`MakeWriter`]: in the binaries, the writer `telemetry::init`
 /// passes, which queues each line for a thread that writes it to standard
-/// output; a capture buffer in tests. The `service` key of every line comes from
-/// the `service.name` attribute of the tracer provider's resource, which the SDK
-/// hands over through [`SpanExporter::set_resource`].
+/// output, or drops and counts it when that bounded queue is full or the line
+/// is above 256 KiB; a capture buffer in tests. The `service` key of every line
+/// comes from the `service.name` attribute of the tracer provider's resource,
+/// which the SDK hands over through [`SpanExporter::set_resource`].
 pub struct JsonSpanExporter<W = fn() -> Stdout> {
     writer: W,
     service_name: Option<String>,

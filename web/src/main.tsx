@@ -28,7 +28,6 @@ import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import "./index.css";
 
-// How many times a failed query is sent again.
 const QUERY_RETRY_LIMIT = 1;
 
 // Whether a failed query is sent again. A 4xx is the server's final answer (a

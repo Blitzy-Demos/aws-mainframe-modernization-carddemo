@@ -87,11 +87,9 @@ export type RequestSchemas = typeof requestSchemas;
 
 type HttpMethod = "get" | "put" | "post" | "delete" | "options" | "head" | "patch" | "trace";
 
-/**
- * `"<METHOD> <path>"` of every operation `paths` declares, in the API's
- * `{param}` path syntax and without the `/api` proxy prefix. openapi-typescript
- * writes each method a path does not serve as `?: never`, which is excluded.
- */
+// `"<METHOD> <path>"` of every operation `paths` declares, in the API's
+// `{param}` path syntax and without the `/api` proxy prefix. openapi-typescript
+// writes each method a path does not serve as `?: never`, which is excluded.
 type OperationKey = {
   [P in keyof paths & string]: {
     [M in HttpMethod & keyof paths[P]]-?: [paths[P][M]] extends [undefined]

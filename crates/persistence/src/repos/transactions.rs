@@ -486,7 +486,7 @@ LIMIT $2"#,
 /// `transactions_master_tran_id` with SQLSTATE `23505`, which
 /// [`crate::tx::settle`] reports as [`PortError::Duplicate`].
 async fn insert_live(conn: &mut PgConnection, record: &RecordBinds) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar!(
+    sqlx::query!(
         "INSERT INTO transactions (
     tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,
     tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,
@@ -509,16 +509,18 @@ RETURNING transaction_id",
     )
     .fetch_one(conn)
     .await
+    .map(|row| row.transaction_id)
 }
 
 /// Whether a live row holds the TRAN-ID `id`.
 async fn is_live(conn: &mut PgConnection, id: &str) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar!(
+    sqlx::query!(
         r#"SELECT EXISTS (SELECT 1 FROM transaction_master WHERE tran_id = $1) AS "live!""#,
         id
     )
     .fetch_one(conn)
     .await
+    .map(|row| row.live)
 }
 
 /// Makes live again the row outside the live master that equals `record` in
@@ -529,7 +531,7 @@ async fn is_live(conn: &mut PgConnection, id: &str) -> Result<bool, sqlx::Error>
 /// `1.5` equals `1.50`. The outer `NOT in_master` makes the update skip a row
 /// a concurrent load revived first.
 async fn revive(conn: &mut PgConnection, record: &RecordBinds) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar!(
+    sqlx::query!(
         "UPDATE transactions SET in_master = TRUE
 WHERE NOT in_master
   AND transaction_id = (
@@ -559,6 +561,7 @@ RETURNING transaction_id",
     )
     .fetch_optional(conn)
     .await
+    .map(|row| row.map(|row| row.transaction_id))
 }
 
 /// The three steps of [`PgStore::load_combined_record`], in order, on the
@@ -964,7 +967,7 @@ LIMIT $2"#,
     /// timeout, [`PortError::Unavailable`] on any other failure.
     pub async fn exclude_master_writers(&mut self) -> PortResult<()> {
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
-        let result = sqlx::query_scalar!(
+        let result = sqlx::query!(
             r#"SELECT 1 AS "locked!" FROM pg_advisory_xact_lock($1)"#,
             TRAN_ID_LOCK_KEY
         )

@@ -63,24 +63,26 @@ import {
 
 type AccountResponse = components["schemas"]["AccountResponse"];
 
-/** A form value that has an input; `version` lives only in the form values. */
+// A form value that has an input; `version` lives only in the form values.
 type InputName = Exclude<keyof AccountUpdateFormValues, "version">;
 
-/** The BMS title of COACTUP [app/bms/COACTUP.bms:L78]. */
+// The BMS title of COACTUP [app/bms/COACTUP.bms:L78].
 const TITLE = "Update Account";
 
-/** Placeholder rows shown while the record is read. */
+// Placeholder rows shown while the record is read.
 const SKELETON_ROWS = 8;
 
 /**
- * The form values of `account`, split into the map's parts as COACTUPC moves
- * them: the `X(10)` dates by `(1:4)`, `(6:2)` and `(9:2)`
- * [app/cbl/COACTUPC.cbl:L3832-3834] [app/cbl/COACTUPC.cbl:L3857-3859], the
- * SSN by `(1:3)`, `(4:2)` and `(6:4)`, each `(xxx)xxx-xxxx` phone by `(2:3)`,
- * `(6:3)` and `(10:4)` [app/cbl/COACTUPC.cbl:L2826-2851]. The `X(10)` zip is
- * moved to the 5-character ACSZIPC, which keeps its first five characters.
- * Amounts stay the decimal strings the server sent. `version` is carried so
- * that the save echoes the token of the record shown.
+ * COACTUPC 3200-SETUP-SCREEN-VARS — P-COACTUPC-036,
+ * 3202-SHOW-ORIGINAL-VALUES — P-COACTUPC-037: the form values of `account`,
+ * split into the map's parts as COACTUPC moves them: the `X(10)` dates by
+ * `(1:4)`, `(6:2)` and `(9:2)` [app/cbl/COACTUPC.cbl:L3832-3834]
+ * [app/cbl/COACTUPC.cbl:L3857-3859], the SSN by `(1:3)`, `(4:2)` and `(6:4)`,
+ * each `(xxx)xxx-xxxx` phone by `(2:3)`, `(6:3)` and `(10:4)`
+ * [app/cbl/COACTUPC.cbl:L2826-2851]. The `X(10)` zip is moved to the
+ * 5-character ACSZIPC, which keeps its first five characters. Amounts stay the
+ * decimal strings the server sent. `version` is carried so that the save echoes
+ * the token of the record shown.
  */
 function toFormValues(account: AccountResponse): AccountUpdateFormValues {
   return {
@@ -134,22 +136,20 @@ function toFormValues(account: AccountResponse): AccountUpdateFormValues {
 type TextFieldProps = {
   control: Control<AccountUpdateFormValues>;
   name: InputName;
-  /** The COACTUP caption without its colon, unique on the page. */
+  // The COACTUP caption without its colon, unique on the page.
   label: ReactNode;
-  /** The BMS field length [app/cpy-bms/COACTUP.CPY]. */
+  // The BMS field length [app/cpy-bms/COACTUP.CPY].
   maxLength: number;
-  /** Digits only: a numeric keypad on touch devices. */
+  // Digits only: a numeric keypad on touch devices.
   numeric?: boolean;
-  /** A field COACTUPC protects once the details are shown. */
+  // A field COACTUPC protects once the details are shown.
   readOnly?: boolean;
-  /** Placement of the field in its section's grid. */
+  // Placement of the field in its section's grid.
   className?: string;
 };
 
-/**
- * One map field. The Controller's `field` (with its `ref`) goes to the Input,
- * so a client or server error focuses it.
- */
+// One map field. The Controller's `field` (with its `ref`) goes to the Input,
+// so a client or server error focuses it.
 function TextField({
   control,
   name,
@@ -191,16 +191,14 @@ type Part = { name: InputName; label: string; maxLength: number };
 
 type PartsFieldProps = {
   control: Control<AccountUpdateFormValues>;
-  /** The COACTUP caption of the whole value, such as "Opened" or "Phone 1". */
+  // The COACTUP caption of the whole value, such as "Opened" or "Phone 1".
   legend: string;
   parts: readonly [Part, Part, Part];
 };
 
-/**
- * A value the map splits into three numeric fields (a date, the SSN, a phone
- * number). Each part shows its short label; its accessible name is prefixed
- * with the legend, so every input has a unique name.
- */
+// A value the map splits into three numeric fields (a date, the SSN, a phone
+// number). Each part shows its short label; its accessible name is prefixed
+// with the legend, so every input has a unique name.
 function PartsField({ control, legend, parts }: PartsFieldProps): JSX.Element {
   return (
     <FieldSet className="gap-3">
@@ -229,7 +227,7 @@ function PartsField({ control, legend, parts }: PartsFieldProps): JSX.Element {
   );
 }
 
-/** The year, month and day parts of a CSUTLDPY date. */
+// The year, month and day parts of a CSUTLDPY date.
 function dateParts(
   year: InputName,
   month: InputName,
@@ -242,7 +240,7 @@ function dateParts(
   ];
 }
 
-/** The area code, prefix and line number of a US phone number. */
+// The area code, prefix and line number of a US phone number.
 function phoneParts(
   area: InputName,
   prefix: InputName,
@@ -261,13 +259,11 @@ const SSN_PARTS: readonly [Part, Part, Part] = [
   { name: "cust_ssn_3", label: "Last 4", maxLength: 4 },
 ];
 
-/**
- * A titled group of the form, one column up to `lg` and two from there. The
- * children fill the rows in order, so the reading order is the visual order
- * at both widths. Each row pairs two fields of one shape, two single fields or
- * two three-part values, so the inputs of a row line up; a lone field ends its
- * row. The form's last group carries the form's actions in its card footer.
- */
+// A titled group of the form, one column up to `lg` and two from there. The
+// children fill the rows in order, so the reading order is the visual order
+// at both widths. Each row pairs two fields of one shape, two single fields or
+// two three-part values, so the inputs of a row line up; a lone field ends its
+// row. The form's last group carries the form's actions in its card footer.
 function FormSection({
   legend,
   children,
@@ -292,21 +288,22 @@ function FormSection({
   );
 }
 
-/** A failed save, and the account it was sent for. */
+// A failed save, and the account it was sent for.
 type SaveFailure = { accountId: string; error: unknown };
 
 type AccountEditFormProps = {
   accountId: string;
-  /** The record as last read or saved. */
+  // The record as last read or saved.
   account: AccountResponse;
-  /** Reads the record again: the reloaded record, or the cached one when the read fails. */
+  // Reads the record again: the reloaded record, or the cached one when the
+  // read fails.
   reload: () => Promise<AccountResponse | undefined>;
-  /** A failed save not shown yet. */
+  // A failed save not shown yet.
   failure: SaveFailure | null;
   setFailure: (failure: SaveFailure | null) => void;
 };
 
-/** The COACTUP input fields of one fetched account, with Save and Cancel. */
+// The COACTUP input fields of one fetched account, with Save and Cancel.
 function AccountEditForm({
   accountId,
   account,
@@ -661,10 +658,8 @@ function AccountEditForm({
   );
 }
 
-/**
- * Toasts each failed read of the record once, as the message line shows it,
- * and returns its text for the page while the read stays failed.
- */
+// Toasts each failed read of the record once, as the message line shows it,
+// and returns its text for the page while the read stays failed.
 function useLoadErrorMessage(error: Error | null): string | null {
   const shown = useRef<Error | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -678,7 +673,7 @@ function useLoadErrorMessage(error: Error | null): string | null {
   return error === null ? null : message;
 }
 
-/** The record while it is read. */
+// The record while it is read.
 function LoadingAccount(): JSX.Element {
   return (
     <Card aria-busy="true">

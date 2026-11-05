@@ -365,7 +365,7 @@ impl RewardStore for PgRewardStore<'_, '_> {
         } = accrual;
         let created_at = repos::exact_instant(created_at, ACCRUALS_TABLE, "created_at")?;
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
-        let result = sqlx::query_scalar!(
+        let result = sqlx::query!(
             "INSERT INTO reward_accruals \
                  (account_id, transaction_id, rule_id, points_earned, created_at) \
              VALUES ($1, $2, $3, $4, $5) \
@@ -377,7 +377,8 @@ impl RewardStore for PgRewardStore<'_, '_> {
             created_at,
         )
         .fetch_one(&mut *sp)
-        .await;
+        .await
+        .map(|row| row.accrual_id);
         let accrual_id = AccrualId::from(settle(sp, result).await?);
         tracing::debug!(
             %accrual_id,

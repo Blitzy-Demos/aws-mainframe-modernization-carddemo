@@ -432,7 +432,7 @@ async fn insert_rule(pool: &PgPool) -> i64 {
         .with_ymd_and_hms(2022, 7, 1, 0, 0, 0)
         .single()
         .expect("2022-07-01T00:00:00Z is one instant");
-    sqlx::query_scalar!(
+    sqlx::query!(
         r#"INSERT INTO reward_rules (
                transaction_type_cd, transaction_category_cd, reward_rate, active_from)
            VALUES ('02', 1, 2.5000, $1)
@@ -442,6 +442,7 @@ async fn insert_rule(pool: &PgPool) -> i64 {
     .fetch_one(pool)
     .await
     .expect("rule insert")
+    .rule_id
 }
 
 /// The state of both reward identity sequences, read from the sequences
@@ -465,7 +466,7 @@ async fn insert_accrual(pool: &PgPool, transaction_id: i64) -> i64 {
         .with_ymd_and_hms(2022, 7, 2, 12, 0, 0)
         .single()
         .expect("2022-07-02T12:00:00Z is one instant");
-    sqlx::query_scalar!(
+    sqlx::query!(
         r#"INSERT INTO reward_accruals (account_id, transaction_id, rule_id, points_earned, created_at)
            VALUES (1, $1, 1, 10, $2)
            RETURNING accrual_id"#,
@@ -475,6 +476,7 @@ async fn insert_accrual(pool: &PgPool, transaction_id: i64) -> i64 {
     .fetch_one(pool)
     .await
     .expect("accrual insert")
+    .accrual_id
 }
 
 /// Deletes the accrual of the transaction `transaction_id`, which frees the
@@ -503,10 +505,11 @@ async fn set_account_one_balance(pool: &PgPool, cents: i64) {
 
 /// The current balance of account 1.
 async fn account_one_balance(pool: &PgPool) -> Decimal {
-    sqlx::query_scalar!("SELECT acct_curr_bal FROM accounts WHERE account_id = 1")
+    sqlx::query!("SELECT acct_curr_bal FROM accounts WHERE account_id = 1")
         .fetch_one(pool)
         .await
         .expect("account 1 balance")
+        .acct_curr_bal
 }
 
 /// Renames the Db2 master type `01`, as CTTU, CTLI or `MNTTRDB2` would.
@@ -542,13 +545,14 @@ async fn edit_seeded_state(pool: &PgPool) -> i64 {
         3,
         "the rule after the two seed rules"
     );
-    let card = sqlx::query_scalar!(
+    let card = sqlx::query!(
         "SELECT xref_card_num FROM card_xref WHERE xref_acct_id = 1 ORDER BY xref_card_num LIMIT 1"
     )
     .fetch_one(pool)
     .await
-    .expect("a card of account 1");
-    let transaction_id = sqlx::query_scalar!(
+    .expect("a card of account 1")
+    .xref_card_num;
+    let transaction_id = sqlx::query!(
         r#"INSERT INTO transactions (
                tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,
                tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,
@@ -561,7 +565,8 @@ async fn edit_seeded_state(pool: &PgPool) -> i64 {
     )
     .fetch_one(pool)
     .await
-    .expect("transaction insert");
+    .expect("transaction insert")
+    .transaction_id;
     sqlx::query!(
         r#"INSERT INTO reward_balances (
                account_id, total_points_earned, total_points_redeemed, available_points)
@@ -1218,7 +1223,7 @@ fn users_are_hashed_and_typed() {
                 .fetch_all(db.pool())
                 .await
                 .expect("users");
-        let columns = sqlx::query_scalar!(
+        let columns: Vec<String> = sqlx::query!(
             r#"SELECT column_name::text AS "column_name!"
                  FROM information_schema.columns
                 WHERE table_schema = current_schema()
@@ -1228,7 +1233,10 @@ fn users_are_hashed_and_typed() {
         )
         .fetch_all(db.pool())
         .await
-        .expect("users columns");
+        .expect("users columns")
+        .into_iter()
+        .map(|row| row.column_name)
+        .collect();
         (users, columns)
     });
     assert_eq!(password_columns, ["password_hash"], "no plaintext column");
@@ -1414,12 +1422,13 @@ fn full_refresh_restores_fixtures_and_keeps_masters() {
             }
         );
         account_one_equals_fixture(&db).await;
-        let temp_user = sqlx::query_scalar!(
+        let temp_user = sqlx::query!(
             r#"SELECT EXISTS (SELECT 1 FROM users WHERE user_id = 'TEMP0001') AS "found!""#
         )
         .fetch_one(pool)
         .await
-        .expect("user lookup");
+        .expect("user lookup")
+        .found;
         assert!(!temp_user, "TEMP0001 is not a DUSRSECJ user");
         assert_eq!(reward_rules(pool).await, seed_rules());
         let found = descriptions(pool).await;
@@ -1432,13 +1441,14 @@ fn full_refresh_restores_fixtures_and_keeps_masters() {
             after.transactions, before.transactions,
             "row and content kept"
         );
-        let live = sqlx::query_scalar!(
+        let live = sqlx::query!(
             "SELECT in_master FROM transactions WHERE transaction_id = $1",
             transaction_id
         )
         .fetch_optional(pool)
         .await
-        .expect("transaction lookup");
+        .expect("transaction lookup")
+        .map(|row| row.in_master);
         assert_eq!(live, Some(true), "transaction {transaction_id} stays live");
         assert_eq!(
             insert_rule(pool).await,
@@ -1469,7 +1479,7 @@ fn only_tranextr_copies_masters_to_processing_copies() {
         }
     );
     block_on(Box::pin(async {
-        let type_mismatches = sqlx::query_scalar!(
+        let type_mismatches = sqlx::query!(
             r#"SELECT count(*) AS "mismatches!"
                  FROM transaction_types m
                  FULL JOIN trantype_file f ON f.tran_type = m.tr_type
@@ -1478,9 +1488,10 @@ fn only_tranextr_copies_masters_to_processing_copies() {
         )
         .fetch_one(pool)
         .await
-        .expect("type comparison");
+        .expect("type comparison")
+        .mismatches;
         assert_eq!(type_mismatches, 0);
-        let category_mismatches = sqlx::query_scalar!(
+        let category_mismatches = sqlx::query!(
             r#"SELECT count(*) AS "mismatches!"
                  FROM transaction_categories m
                  FULL JOIN trancatg_file f
@@ -1491,7 +1502,8 @@ fn only_tranextr_copies_masters_to_processing_copies() {
         )
         .fetch_one(pool)
         .await
-        .expect("category comparison");
+        .expect("category comparison")
+        .mismatches;
         assert_eq!(category_mismatches, 0);
         assert_eq!(counts(pool).await, fixture_counts());
         let found = descriptions(pool).await;

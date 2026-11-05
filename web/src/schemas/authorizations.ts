@@ -38,23 +38,21 @@ export const authDetailMessages = {
   invalidKey: "",
 } as const;
 
-/** `ACCTIDI PIC X(11)` (COPAU00.cpy:L60), the `maxLength` of the `account_id` query parameter. */
+// `ACCTIDI PIC X(11)` (COPAU00.cpy:L60), the `maxLength` of the `account_id` query parameter.
 const ACCOUNT_ID_LENGTH = 11;
 
-/** `ACCTIDI IS NUMERIC` on X(11): exactly eleven ASCII digits, no sign and no spaces. */
+// `ACCTIDI IS NUMERIC` on X(11): exactly eleven ASCII digits, no sign and no spaces.
 const ACCOUNT_ID_DIGITS = /^[0-9]{11}$/;
 
-/**
- * COPAUS0C PROCESS-ENTER-KEY — V-COPAUS0C-001, V-COPAUS0C-002: the account ID
- * as entered, edited in the server's order. A value longer than the screen
- * field is "not 11 digits" (the DTO length check runs before the rule), then
- * a blank value, then any other value that is not eleven digits. One issue at
- * most, so the field shows the single message the server would send.
- *
- * Blank is `ACCTIDI = SPACES OR LOW-VALUES` (COPAUS0C.cbl:L264). NUL-only text
- * is blank too because the server's edit (`auth_summary::edit_account_id`)
- * treats LOW-VALUES as the COBOL does.
- */
+// COPAUS0C PROCESS-ENTER-KEY — V-COPAUS0C-001, V-COPAUS0C-002: the account ID
+// as entered, edited in the server's order. A value longer than the screen
+// field is "not 11 digits" (the DTO length check runs before the rule), then
+// a blank value, then any other value that is not eleven digits. One issue at
+// most, so the field shows the single message the server would send.
+//
+// Blank is `ACCTIDI = SPACES OR LOW-VALUES` (COPAUS0C.cbl:L264). NUL-only text
+// is blank too because the server's edit (`auth_summary::edit_account_id`)
+// treats LOW-VALUES as the COBOL does.
 const accountIdField = z
   .string({ required_error: authSummaryMessages.pleaseEnterAcctId })
   .max(ACCOUNT_ID_LENGTH, { message: authSummaryMessages.acctIdMustBeNumeric })
@@ -96,17 +94,15 @@ export const authSummaryBmsFieldMap: Record<
   ACCTID: "account_id",
 };
 
-/** `i64::MAX`, the largest identity the server's key parse accepts. */
+// `i64::MAX`, the largest identity the server's key parse accepts.
 const AUTH_ID_MAX = "9223372036854775807";
 
-/** An optional `+`, then decimal digits: the text Rust's `i64` parse reads as a non-negative value. */
+// An optional `+`, then decimal digits: the text Rust's `i64` parse reads as a non-negative value.
 const UNSIGNED_DECIMAL = /^\+?([0-9]+)$/;
 
-/**
- * Whether `value` names a positive `i64`, the identity the server reads
- * (`parse_auth_id`, then `auth_detail` rejecting a value not above zero).
- * Compared as digit strings so no conversion can lose precision above 2^53.
- */
+// Whether `value` names a positive `i64`, the identity the server reads
+// (`parse_auth_id`, then `auth_detail` rejecting a value not above zero).
+// Compared as digit strings so no conversion can lose precision above 2^53.
 function isPositiveAuthId(value: string): boolean {
   const match = UNSIGNED_DECIMAL.exec(value);
   if (match === null) {

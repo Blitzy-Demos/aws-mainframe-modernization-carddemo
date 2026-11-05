@@ -21,7 +21,13 @@
 //! output themselves: each hands every line, whole, to a queue, and one writer
 //! thread writes the queued lines to standard output in order and flushes it.
 //! While the queue is open, a thread that logs or ends a span therefore never
-//! waits on standard output, and no line is ever dropped (see Lifecycle).
+//! waits on standard output. The queue is bounded: a slow standard output
+//! alone drops no line until the queue holds 16 384 lines or 8 MiB of them.
+//! Then the line being written is dropped whole, as is any line above 256 KiB,
+//! and counted, and the writer thread follows with one more JSON log line, a
+//! WARN event `telemetry lines dropped` whose `dropped_lines` and
+//! `dropped_bytes` give the count. A batch of lines that standard output fails
+//! to take is discarded, uncounted (see Lifecycle).
 //!
 //! # Filtering
 //!
@@ -97,13 +103,16 @@
 //! Until then, the lines reach standard output through the writer thread of
 //! [`init`]. Shutting the guard down, or dropping it, shuts the tracer provider
 //! down, then closes the queue, and returns only once the writer thread has
-//! written and flushed every line queued until then, the span lines the
-//! shutdown exports included. A line written after that, such as the event a
-//! binary logs when the shutdown fails, is written and flushed to standard
-//! output directly by the thread that writes it.
+//! handed every line queued until then to standard output, the span lines the
+//! shutdown exports included, followed by the report of any line dropped since
+//! the last one. Each is written and flushed unless standard output fails to
+//! take it. A line written after that, such as the event a binary logs when the
+//! shutdown fails, is written and flushed to standard output directly by the
+//! thread that writes it.
 
 use std::io::{self, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 
@@ -119,6 +128,7 @@ use tracing_subscriber::filter::{EnvFilter, FilterExt as _, ParseError, filter_f
 use tracing_subscriber::fmt::format::{
     Format, FormatEvent, FormatFields, Json, JsonFields, Writer,
 };
+use tracing_subscriber::fmt::time::{FormatTime as _, SystemTime};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::fmt::{self, FmtContext, MakeWriter};
 use tracing_subscriber::layer::{Layer as _, SubscriberExt};
@@ -258,14 +268,16 @@ pub enum TelemetryError {
 /// guard dropped after an explicit shutdown does not shut down a second time,
 /// which would fail and write a spurious error line.
 ///
-/// The guard [`init`] returns also owns the queue through which every line
-/// reaches standard output, and closes it after the provider, on shutdown and
+/// The guard [`init`] returns also owns the queue through which the lines
+/// reach standard output, and closes it after the provider, on shutdown and
 /// on drop alike, whether or not the provider shut down. Closing waits until
-/// the writer thread has written and flushed every line queued until then:
-/// the span lines the provider's shutdown exports, and the drop-time failure
-/// line. A line written after that goes straight to standard output, on the
-/// thread that writes it. A guard from [`subscriber_with_writer`] owns no
-/// queue: its writer is the caller's.
+/// the writer thread has handed every line queued until then to standard
+/// output, written and flushed unless standard output fails to take it: the
+/// span lines the provider's shutdown exports, the drop-time failure line, and
+/// the report of any line the bounded queue dropped since the last one. A line
+/// written after that goes straight to standard output, on the thread that
+/// writes it. A guard from [`subscriber_with_writer`] owns no queue: its
+/// writer is the caller's.
 #[must_use]
 #[derive(Debug)]
 pub struct TelemetryGuard {
@@ -279,7 +291,8 @@ pub struct TelemetryGuard {
 impl TelemetryGuard {
     /// Shuts the tracer provider down, which shuts down its JSON span exporter,
     /// then closes the standard output queue of a guard from [`init`], which
-    /// writes and flushes every line queued until then. Spans started
+    /// hands every line queued until then to standard output, written and
+    /// flushed unless standard output fails to take it. Spans started
     /// afterwards are not exported.
     ///
     /// # Errors
@@ -330,7 +343,8 @@ impl Drop for TelemetryGuard {
         if let Err(err) = self.shut_down_provider() {
             self.report_drop_failure(&err);
         }
-        // Closed last, so that the failure line is written and flushed as well.
+        // Closed last, so that the failure line, queued like every other, is
+        // handed to the sink as well.
         self.close_queue();
     }
 }
@@ -343,21 +357,46 @@ const BATCH_BYTES: usize = 64 * 1024;
 /// Name of the thread that writes the queued lines.
 const WRITER_THREAD_NAME: &str = "telemetry-stdout";
 
+/// Lines a [`LineQueue`] holds at most: the capacity of its channel. A line
+/// written while the queue holds this many is dropped.
+const QUEUE_LINES: usize = 16_384;
+
+/// Bytes of lines a [`LineQueue`] holds at most. A line that would take the
+/// queued lines above this many bytes is dropped.
+const QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes of the longest line a [`LineQueue`] takes. A longer line is dropped
+/// whatever the queue holds.
+const MAX_LINE_BYTES: usize = 256 * 1024;
+
+// A line the queue takes always fits into an empty queue.
+const _: () = assert!(MAX_LINE_BYTES <= QUEUE_BYTES);
+
+/// Message of the event line that reports dropped lines.
+const DROP_REPORT_MESSAGE: &str = "telemetry lines dropped";
+
 /// A queue of JSON lines and the writer thread that writes them to a sink:
 /// standard output in the binaries, a capture buffer or a slow stand-in in
 /// tests.
 ///
 /// Every write through a `&LineQueue` hands its whole buffer to the thread as
-/// one line and returns once the line is queued. The JSON formatter and
+/// one line, or drops it whole, and returns at once. The JSON formatter and
 /// [`JsonSpanExporter`] each write a line with a single `write_all`, so every
-/// line reaches the sink whole and lines never interleave. The thread writes
-/// the lines in the order they were queued.
+/// line the queue takes reaches the sink whole, unless the sink fails to take
+/// it, and lines never interleave. The thread writes the lines in the order
+/// they were queued.
 ///
-/// The queue has no capacity limit: a write only moves its line into the
-/// queue, so it never waits for the writer thread, and no line is dropped.
-/// Queued lines are held in memory only while the sink, standard output in the
-/// binaries, is behind the writers, and are released as the writer thread
-/// catches up.
+/// The queue is bounded, so that a sink that falls behind, such as standard
+/// output into a pipe whose reader stalls, cannot grow it without limit: it
+/// holds at most [`QUEUE_LINES`] lines and [`QUEUE_BYTES`] bytes of them, and
+/// takes no line above [`MAX_LINE_BYTES`]. A write never waits for room. A
+/// slow sink alone drops no line until the queue is full; then the line being
+/// written is dropped whole, as is a line above [`MAX_LINE_BYTES`] at any
+/// time, never cut short, and the lines already queued are kept. The write
+/// still reports success, so that neither the JSON formatter nor the span
+/// exporter prints an error outside standard output. Every dropped line is
+/// counted, and the writer thread reports the count as a `telemetry lines
+/// dropped` line (see [`write_lines`]).
 ///
 /// The queue has one sender, which writers borrow under the read lock and
 /// never clone, so that [`LineQueue::close`], under the write lock, can drop
@@ -365,6 +404,8 @@ const WRITER_THREAD_NAME: &str = "telemetry-stdout";
 struct LineQueue<S> {
     /// The sender and the writer thread, until the queue is closed.
     open: RwLock<Option<OpenQueue<S>>>,
+    /// The bytes queued and the lines dropped, shared with the writer thread.
+    counters: Arc<QueueCounters>,
     /// The sink the writer thread returned when the queue was closed, which
     /// every later write goes to directly.
     sink: Mutex<Option<S>>,
@@ -372,17 +413,119 @@ struct LineQueue<S> {
 
 /// The two ends of an open [`LineQueue`] that its writers do not own.
 struct OpenQueue<S> {
-    sender: Sender<Vec<u8>>,
+    sender: SyncSender<Vec<u8>>,
     /// The writer thread, which returns the sink once the queue is closed and
     /// drained.
     thread: JoinHandle<S>,
 }
 
+/// What the writers of a [`LineQueue`] and its writer thread share.
+///
+/// A writer reserves the bytes of its line before it queues the line, and the
+/// writer thread releases them as it takes the line, so `queued_bytes` never
+/// exceeds [`QUEUE_BYTES`]. A writer counts a dropped line's bytes before the
+/// line, and the writer thread takes the line count first and the byte count
+/// only when lines were dropped, so no dropped byte goes unreported.
+#[derive(Debug, Default)]
+struct QueueCounters {
+    /// Bytes of the lines queued and not yet taken by the writer thread.
+    queued_bytes: AtomicUsize,
+    /// Lines dropped since the writer thread last reported.
+    dropped_lines: AtomicUsize,
+    /// Bytes of those lines.
+    dropped_bytes: AtomicUsize,
+}
+
+impl QueueCounters {
+    /// Reserves `len` bytes for a line to queue; `false`, reserving nothing,
+    /// when the queued lines would then exceed [`QUEUE_BYTES`].
+    fn reserve(&self, len: usize) -> bool {
+        self.queued_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                queued
+                    .checked_add(len)
+                    .filter(|&total| total <= QUEUE_BYTES)
+            })
+            .is_ok()
+    }
+
+    /// Releases `len` reserved bytes: the line was taken, or never queued.
+    fn release(&self, len: usize) {
+        self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+    }
+
+    /// Counts one dropped line of `len` bytes. The first drop since the last
+    /// report also queues an empty message, which holds no line, to wake the
+    /// writer thread so that the report follows promptly even on an idle
+    /// queue. Should that fail, the queue is full and the writer thread wakes
+    /// for its lines anyway, or the thread is gone.
+    fn count_drop(&self, len: usize, sender: &SyncSender<Vec<u8>>) {
+        saturating_add(&self.dropped_bytes, len);
+        if saturating_add(&self.dropped_lines, 1) == 0 {
+            let _ = sender.try_send(Vec::new());
+        }
+    }
+
+    /// The report of the lines dropped since the last one, which resets both
+    /// counts, or `None` when no line was dropped.
+    fn take_drop_report(&self) -> Option<Vec<u8>> {
+        let lines = self.dropped_lines.swap(0, Ordering::Relaxed);
+        if lines == 0 {
+            return None;
+        }
+        let bytes = self.dropped_bytes.swap(0, Ordering::Relaxed);
+        Some(drop_report(lines, bytes))
+    }
+}
+
+/// Adds `n` to `counter`, stopping at `usize::MAX`, and returns the count
+/// before.
+fn saturating_add(counter: &AtomicUsize, n: usize) -> usize {
+    match counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        Some(count.saturating_add(n))
+    }) {
+        Ok(count) | Err(count) => count,
+    }
+}
+
+/// The JSON line reporting `lines` dropped lines of `bytes` bytes: a WARN
+/// event line with the JSON formatter's top-level keys, its clock and
+/// timestamp format, and this module as its target, for example
+///
+/// ```text
+/// {"fields":{"dropped_bytes":4096,"dropped_lines":12,"message":"telemetry lines dropped"},"level":"WARN","target":"carddemo_runtime::telemetry","timestamp":"2026-11-05T06:55:35.323547Z"}
+/// ```
+///
+/// with the keys in the order `serde_json` writes them. It is built here, not
+/// through a subscriber of its own, so it is written whatever the filter
+/// directives say and leaves every callsite's cached interest and the global
+/// maximum level as they are.
+fn drop_report(lines: usize, bytes: usize) -> Vec<u8> {
+    let mut timestamp = String::new();
+    // Formatting into a `String` cannot fail.
+    let _ = SystemTime.format_time(&mut Writer::new(&mut timestamp));
+    let report = serde_json::json!({
+        "timestamp": timestamp,
+        "level": Level::WARN.as_str(),
+        "fields": {
+            "message": DROP_REPORT_MESSAGE,
+            "dropped_lines": lines,
+            "dropped_bytes": bytes,
+        },
+        "target": module_path!(),
+    });
+    let mut line = report.to_string().into_bytes();
+    line.push(b'\n');
+    line
+}
+
 impl<S> LineQueue<S> {
     /// Closes the queue and waits for the writer thread to finish: every line
-    /// queued until then is written and flushed, in order, before this returns.
-    /// A channel delivers every queued line before it reports that its sender
-    /// is gone, so the thread ends only once the queue is empty.
+    /// queued until then is handed to the sink, in order, and written and
+    /// flushed unless the sink fails, followed by the report of any line
+    /// dropped since the last one, before this returns. A channel delivers
+    /// every queued line before it reports that its sender is gone, so the
+    /// thread ends only once the queue is empty.
     ///
     /// The write lock is held until the thread has returned the sink and the
     /// sink is in place, so a write that waits for the lock meanwhile goes to
@@ -404,6 +547,35 @@ impl<S> LineQueue<S> {
             *self.sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink);
         }
         drop(open);
+    }
+
+    /// Queues `line`, which is not empty, on the open `queue`, or drops it
+    /// whole when it is above [`MAX_LINE_BYTES`] or would take the queue above
+    /// [`QUEUE_BYTES`] bytes or [`QUEUE_LINES`] lines; never waits. A dropped
+    /// line is counted, and its length returned as for a queued one.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::BrokenPipe`] when the writer thread is gone.
+    fn enqueue(&self, queue: &OpenQueue<S>, line: &[u8]) -> io::Result<usize> {
+        let len = line.len();
+        // Checked before anything is copied, so a dropped line costs no allocation.
+        if len <= MAX_LINE_BYTES && self.counters.reserve(len) {
+            match queue.sender.try_send(line.to_vec()) {
+                Ok(()) => return Ok(len),
+                Err(TrySendError::Full(_)) => self.counters.release(len),
+                Err(TrySendError::Disconnected(_)) => {
+                    self.counters.release(len);
+                    return Err(writer_stopped());
+                }
+            }
+        }
+        // While the queue is open, the writer thread ends only by panicking.
+        if queue.thread.is_finished() {
+            return Err(writer_stopped());
+        }
+        self.counters.count_drop(len, &queue.sender);
+        Ok(len)
     }
 }
 
@@ -429,10 +601,11 @@ impl<S> std::fmt::Debug for LineQueue<S> {
 }
 
 impl<S: Write> Write for &LineQueue<S> {
-    /// Queues `buf` as one line, and returns its length once the line is
-    /// queued. An empty `buf` is not a line: nothing is queued and the result
-    /// is 0. Once the queue is closed, `buf` is written to the sink and the
-    /// sink flushed before this returns.
+    /// Queues `buf` as one line, or drops it whole when the bounded queue
+    /// cannot take it, and returns its length either way, without waiting for
+    /// the writer thread. An empty `buf` is not a line: nothing is
+    /// queued and the result is 0. Once the queue is closed, `buf` is written
+    /// to the sink and the sink flushed before this returns.
     ///
     /// # Errors
     ///
@@ -445,11 +618,7 @@ impl<S: Write> Write for &LineQueue<S> {
         }
         let open = self.open.read().unwrap_or_else(PoisonError::into_inner);
         if let Some(queue) = open.as_ref() {
-            return queue
-                .sender
-                .send(buf.to_vec())
-                .map(|()| buf.len())
-                .map_err(|_| writer_stopped());
+            return self.enqueue(queue, buf);
         }
         drop(open);
         let mut sink = self.sink.lock().unwrap_or_else(PoisonError::into_inner);
@@ -475,28 +644,51 @@ fn writer_stopped() -> io::Error {
 }
 
 /// The body of the writer thread: writes every line `lines` delivers to
-/// `sink`, and returns the sink once the queue is closed and empty.
+/// `sink`, releasing its bytes in `counters` as it takes it, and returns the
+/// sink once the queue is closed and empty.
 ///
 /// It waits for a line, gathers the lines already queued behind it into one
 /// batch of up to [`BATCH_BYTES`], then writes the batch with one `write_all`
-/// and flushes the sink. A batch the sink fails to take is dropped, and the
-/// thread goes on with the next one: the JSON formatter drops a line it fails
-/// to write as well, and a thread that stopped would lose every line queued
-/// after the failure.
-fn write_lines<S: Write>(lines: &Receiver<Vec<u8>>, mut sink: S) -> S {
+/// and flushes the sink. When lines were dropped since the last report, the
+/// batch ends with a new report: one `telemetry lines dropped` WARN event
+/// line ([`drop_report`]) whose `dropped_lines` and `dropped_bytes` count
+/// them. A report is written whatever the filter directives say, and is never
+/// itself queued, so the queue's bounds never drop it. An empty message is
+/// the wake-up of [`QueueCounters::count_drop`] and adds no line. Once the
+/// queue is closed and empty, a last report covers the lines dropped since the
+/// last batch.
+///
+/// A batch the sink fails to take is discarded, report included, uncounted,
+/// and the thread goes on with the next one: the JSON formatter drops a line
+/// it fails to write as well, and a thread that stopped would lose every line
+/// queued after the failure.
+fn write_lines<S: Write>(lines: &Receiver<Vec<u8>>, counters: &QueueCounters, mut sink: S) -> S {
     let mut batch = Vec::with_capacity(BATCH_BYTES);
     while let Ok(line) = lines.recv() {
+        counters.release(line.len());
         batch.extend_from_slice(&line);
         while batch.len() < BATCH_BYTES {
             let Ok(line) = lines.try_recv() else {
                 break;
             };
+            counters.release(line.len());
             batch.extend_from_slice(&line);
         }
-        // A batch the sink fails to take is dropped; the next one is written.
-        let _ = sink.write_all(&batch).and_then(|()| sink.flush());
+        if let Some(report) = counters.take_drop_report() {
+            batch.extend_from_slice(&report);
+        }
+        // A wake-up whose drops an earlier batch already reported leaves
+        // nothing to write.
+        if !batch.is_empty() {
+            // A batch the sink fails to take is discarded; the next one is written.
+            let _ = sink.write_all(&batch).and_then(|()| sink.flush());
+        }
         batch.clear();
         batch.shrink_to(BATCH_BYTES);
+    }
+    if let Some(report) = counters.take_drop_report() {
+        // As for a batch, a report the sink fails to take is discarded.
+        let _ = sink.write_all(&report).and_then(|()| sink.flush());
     }
     sink
 }
@@ -525,13 +717,17 @@ impl<S: Write + Send + 'static> QueuedWriter<S> {
     ///
     /// The error of a thread that cannot be started.
     fn start(sink: S) -> io::Result<Self> {
-        // Unbounded, so that a write never waits for the writer thread.
-        let (sender, lines) = mpsc::channel();
+        // Bounded to `QUEUE_LINES` lines; a write never waits for room, but
+        // drops its line when there is none (see `LineQueue::enqueue`).
+        let (sender, lines) = mpsc::sync_channel(QUEUE_LINES);
+        let counters = Arc::new(QueueCounters::default());
+        let thread_counters = Arc::clone(&counters);
         let thread = thread::Builder::new()
             .name(WRITER_THREAD_NAME.to_owned())
-            .spawn(move || write_lines(&lines, sink))?;
+            .spawn(move || write_lines(&lines, &thread_counters, sink))?;
         Ok(Self(Arc::new(LineQueue {
             open: RwLock::new(Some(OpenQueue { sender, thread })),
+            counters,
             sink: Mutex::new(None),
         })))
     }
@@ -647,8 +843,9 @@ fn span_trace_ids(otel: &OtelData) -> Option<(TraceId, SpanId)> {
 ///
 /// Each line is written to `writer` on the thread that emits the event or ends
 /// the span, a span line under the simple span processor's lock, so a slow
-/// `writer` holds that thread up. [`init`] passes a writer that only queues
-/// each line for a writer thread of its own.
+/// `writer` holds that thread up. [`init`] passes a writer that never waits:
+/// it queues each line for a writer thread of its own, or drops and counts it
+/// when the bounded queue is full or the line is above `MAX_LINE_BYTES`.
 ///
 /// The layers, in order:
 ///
@@ -739,9 +936,9 @@ where
     Ok((subscriber, guard))
 }
 
-/// Builds the subscriber of [`subscriber_with_writer`] over a [`LineQueue`]
-/// whose writer thread writes every line to `sink`, and gives the returned
-/// guard the queue to close at shutdown or drop.
+/// Builds the subscriber of [`subscriber_with_writer`] over a bounded
+/// [`LineQueue`] whose writer thread writes the queued lines to `sink`, and
+/// gives the returned guard the queue to close at shutdown or drop.
 ///
 /// # Errors
 ///
@@ -779,9 +976,14 @@ where
 /// Standard output is written by a thread of its own, named
 /// `telemetry-stdout`: the JSON formatter and the span exporter only queue
 /// each line for it, so a slow standard output, such as a pipe whose reader
-/// stalls, holds up no thread that logs or ends a span, and no line is
-/// dropped. The guard closes the queue, which writes and flushes every queued
-/// line, when it shuts down or is dropped.
+/// stalls, holds up no thread that logs or ends a span. The queue is bounded
+/// to 16 384 lines and 8 MiB, and takes no line above 256 KiB: a slow
+/// standard output alone drops no line until the queue is full, and every
+/// dropped line is counted and reported as a `telemetry lines dropped` WARN
+/// line with `dropped_lines` and `dropped_bytes`. The guard closes the
+/// queue, which hands every queued line to standard output, written and
+/// flushed unless standard output fails to take it, when it shuts down or is
+/// dropped.
 ///
 /// Call it once, at the start of the process, and keep the guard alive until
 /// exit, then call [`TelemetryGuard::shutdown`].
@@ -810,14 +1012,14 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::Value as Json;
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
-        BATCH_BYTES, QueuedWriter, TelemetryError, keys, subscriber_with_queue,
-        subscriber_with_writer,
+        BATCH_BYTES, DROP_REPORT_MESSAGE, MAX_LINE_BYTES, QUEUE_BYTES, QUEUE_LINES, QueuedWriter,
+        TelemetryError, keys, subscriber_with_queue, subscriber_with_writer,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1437,95 +1639,387 @@ mod tests {
         Ok(())
     }
 
-    /// Lines each case of [`writes_return_while_the_sink_is_blocked`] writes
-    /// while the sink is blocked, many times what the writer thread takes into
-    /// its first batch.
-    const BLOCKED_LINES: usize = 100_000;
+    /// A [`RecordingSink`] that reports through `entered` that its first write
+    /// has begun, so that a test knows which lines the writer thread holds in
+    /// its first batch while the sink's gate keeps it waiting.
+    struct EnteredSink {
+        sink: RecordingSink,
+        entered: Option<mpsc::Sender<()>>,
+    }
 
-    /// Length of the lines written to a blocked sink, short to keep the memory
-    /// the queued lines take low.
-    const BLOCKED_LINE_LEN: usize = 32;
+    impl Write for EnteredSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                // The test may have stopped waiting; the write goes on either way.
+                let _ = entered.send(());
+            }
+            self.sink.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.sink.flush()
+        }
+    }
+
+    /// `true` when `text` is a timestamp as the JSON formatter writes it, such
+    /// as `2026-11-05T06:55:35.323547Z`.
+    fn is_formatter_timestamp(text: &str) -> bool {
+        text.len() == 27
+            && text.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                10 => b == b'T',
+                13 | 16 => b == b':',
+                19 => b == b'.',
+                26 => b == b'Z',
+                _ => b.is_ascii_digit(),
+            })
+    }
+
+    /// The sorted keys of the JSON object `value`; none when it is no object.
+    fn sorted_keys(value: &Json) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Checks that `report` is a drop report line, a WARN event of this
+    /// module with the formatter's keys and timestamp, and returns its
+    /// `dropped_lines` and `dropped_bytes`, the first never 0.
+    fn drop_report_counts(report: &Json) -> Result<(usize, usize), Box<dyn Error>> {
+        assert_eq!(
+            sorted_keys(report),
+            ["fields", "level", "target", "timestamp"],
+            "{report}"
+        );
+        assert_eq!(report["level"], "WARN", "{report}");
+        assert_eq!(report["target"], "carddemo_runtime::telemetry", "{report}");
+        let timestamp = report["timestamp"].as_str().unwrap_or_default();
+        assert!(is_formatter_timestamp(timestamp), "{report}");
+        let fields = &report["fields"];
+        assert_eq!(
+            sorted_keys(fields),
+            ["dropped_bytes", "dropped_lines", "message"],
+            "{report}"
+        );
+        assert_eq!(fields["message"], DROP_REPORT_MESSAGE, "{report}");
+        let count = |key: &str| {
+            fields[key]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| format!("no `{key}` count: {report}"))
+        };
+        let lines = count("dropped_lines")?;
+        assert!(lines > 0, "a report of no dropped line: {report}");
+        Ok((lines, count("dropped_bytes")?))
+    }
+
+    /// What a queue delivered: its whole data lines and the sums of its drop
+    /// reports.
+    #[derive(Debug, Default, PartialEq)]
+    struct Delivery {
+        lines: usize,
+        bytes: usize,
+        reports: usize,
+        dropped_lines: usize,
+        dropped_bytes: usize,
+    }
+
+    /// Reads `bytes` as JSON lines, each either a drop report or a
+    /// [`numbered_line`] of `line_len` bytes. Line `n` belongs to producer
+    /// `n / lines_each`, and each producer's lines must arrive in increasing
+    /// order, with gaps where lines were dropped.
+    fn read_delivery(
+        bytes: &[u8],
+        lines_each: usize,
+        line_len: usize,
+    ) -> Result<Delivery, Box<dyn Error>> {
+        let text = std::str::from_utf8(bytes)?;
+        let mut last: Vec<Option<usize>> = Vec::new();
+        let mut delivery = Delivery::default();
+        for line in text.split_inclusive('\n') {
+            let value: Json = serde_json::from_str(line)
+                .map_err(|err| format!("line is not JSON ({err}): {line}"))?;
+            if value["fields"]["message"] == DROP_REPORT_MESSAGE {
+                let (lines, bytes) = drop_report_counts(&value)?;
+                delivery.reports += 1;
+                delivery.dropped_lines += lines;
+                delivery.dropped_bytes += bytes;
+                continue;
+            }
+            let n: usize = value["n"]
+                .as_str()
+                .ok_or_else(|| format!("neither a data line nor a report: {line}"))?
+                .parse()?;
+            assert_eq!(line, numbered_line(n, line_len), "a torn line");
+            let producer = n / lines_each;
+            if last.len() <= producer {
+                last.resize(producer + 1, None);
+            }
+            if let Some(before) = last[producer] {
+                assert!(n > before, "producer {producer}: {n} after {before}");
+            }
+            last[producer] = Some(n);
+            delivery.lines += 1;
+            delivery.bytes += line.len();
+        }
+        Ok(delivery)
+    }
 
     /// Lines a producer writes between two exchanges with the heartbeat thread.
-    const LINES_PER_HEARTBEAT: usize = 5_000;
+    const LINES_PER_HEARTBEAT: usize = 500;
 
-    /// Producers write [`BLOCKED_LINES`] lines between them while the sink
-    /// holds the writer thread, and every write returns before the sink takes
-    /// a byte. Between writes, each producer also exchanges a ping with a
+    /// One case of [`writes_return_and_the_queue_stays_bounded_while_the_sink_is_stalled`]:
+    /// the bound that fills, and the lines written while the sink is stalled,
+    /// between all producers, with their length.
+    struct StallCase {
+        bound: &'static str,
+        lines: usize,
+        line_len: usize,
+    }
+
+    const STALL_CASES: [StallCase; 2] = [
+        // `QUEUE_LINES` short lines hold far less than `QUEUE_BYTES`.
+        StallCase {
+            bound: "lines",
+            lines: 3 * QUEUE_LINES,
+            line_len: 32,
+        },
+        // Fewer than `QUEUE_LINES` lines of 4 KiB, three times `QUEUE_BYTES`.
+        StallCase {
+            bound: "bytes",
+            lines: 3 * QUEUE_BYTES / 4_096,
+            line_len: 4_096,
+        },
+    ];
+
+    /// While the sink is stalled, holding the writer thread with its first
+    /// batch, producers write many times what the queue holds, with the
+    /// production limits, and every write returns before the sink takes a
+    /// byte. Between writes, each producer also exchanges a ping with a
     /// heartbeat thread, as a tokio worker runs other tasks between the events
-    /// and spans of one task; those exchanges all complete while the queue
-    /// grows.
-    /// Once the sink is released, every line arrives whole and in order.
+    /// and spans of one task; those exchanges all complete while the queue is
+    /// full. The queue holds exactly as many lines as its bound allows, and
+    /// counts every other line as dropped. Once the sink is released, every
+    /// line it receives is JSON: each queued line whole and in its producer's
+    /// order, then drop reports that account for every missing line and byte.
     #[test]
-    fn writes_return_while_the_sink_is_blocked() -> TestResult {
-        for producers in [1, 4] {
-            let lines_each = BLOCKED_LINES / producers;
-            let (open_gate, gate) = mpsc::channel();
-            let (writer, recording) = recording_queue(Some(gate))?;
-            let heartbeats = AtomicUsize::new(0);
-            // Each message is the sender on which the heartbeat thread answers.
-            let (to_heartbeat, heartbeat_inbox) = mpsc::channel::<mpsc::Sender<()>>();
-            let produce = |producer: usize, to_heartbeat: mpsc::Sender<mpsc::Sender<()>>| {
-                let (answer, answers) = mpsc::channel();
-                for n in 0..lines_each {
-                    let line = numbered_line(producer * lines_each + n, BLOCKED_LINE_LEN);
-                    write_line(&writer, line.as_bytes())?;
-                    if (n + 1) % LINES_PER_HEARTBEAT == 0 {
-                        to_heartbeat
-                            .send(answer.clone())
-                            .map_err(io::Error::other)?;
-                        answers
-                            .recv_timeout(GATE_TIMEOUT)
-                            .map_err(io::Error::other)?;
-                    }
-                }
-                io::Result::Ok(())
-            };
-            thread::scope(|scope| -> TestResult {
-                let heartbeat = scope.spawn(|| {
-                    for answer in heartbeat_inbox {
-                        heartbeats.fetch_add(1, Ordering::Relaxed);
-                        // A producer that stopped waiting reports that itself.
-                        let _ = answer.send(());
-                    }
-                });
-                let handles: Vec<_> = (0..producers)
-                    .map(|producer| {
-                        let to_heartbeat = to_heartbeat.clone();
-                        scope.spawn(move || produce(producer, to_heartbeat))
-                    })
-                    .collect();
-                drop(to_heartbeat);
-                for handle in handles {
-                    handle.join().map_err(|_| "a producer panicked")??;
-                }
-                heartbeat
-                    .join()
-                    .map_err(|_| "the heartbeat thread panicked")?;
-                Ok(())
-            })?;
-            // Every exchange with the heartbeat thread completed, and the writer
-            // thread is still held at the gate with its first batch, so every
-            // write above returned without the sink taking a byte.
-            assert_eq!(
-                heartbeats.load(Ordering::Relaxed),
-                producers * (lines_each / LINES_PER_HEARTBEAT),
-                "{producers} producers"
-            );
-            assert!(
-                lock(&recording)?.calls.is_empty(),
-                "{producers} producers: a write waited on the sink"
-            );
-
-            drop(open_gate);
-            writer.0.close();
-            assert_whole_lines_in_order(
-                &lock(&recording)?.bytes,
-                producers,
-                lines_each,
-                BLOCKED_LINE_LEN,
-            )?;
+    fn writes_return_and_the_queue_stays_bounded_while_the_sink_is_stalled() -> TestResult {
+        for case in &STALL_CASES {
+            for producers in [1, 4] {
+                stall(case, producers)
+                    .map_err(|err| format!("{} bound, {producers} producers: {err}", case.bound))?;
+            }
         }
+        Ok(())
+    }
+
+    /// Has `producers` threads write `lines_each` [`numbered_line`]s of
+    /// `line_len` bytes each to `writer`, producer `p` numbering its lines from
+    /// `p * lines_each` up, and returns once every write has. After every
+    /// [`LINES_PER_HEARTBEAT`] lines, a producer also exchanges a ping with a
+    /// heartbeat thread; the result is the number of exchanges.
+    ///
+    /// # Errors
+    ///
+    /// The first failed write, or an exchange not answered within
+    /// [`GATE_TIMEOUT`].
+    fn produce_with_heartbeats(
+        writer: &QueuedWriter<EnteredSink>,
+        producers: usize,
+        lines_each: usize,
+        line_len: usize,
+    ) -> Result<usize, Box<dyn Error>> {
+        let heartbeats = AtomicUsize::new(0);
+        // Each message is the sender on which the heartbeat thread answers.
+        let (to_heartbeat, heartbeat_inbox) = mpsc::channel::<mpsc::Sender<()>>();
+        let produce = |producer: usize, to_heartbeat: mpsc::Sender<mpsc::Sender<()>>| {
+            let (answer, answers) = mpsc::channel();
+            for n in 0..lines_each {
+                let line = numbered_line(producer * lines_each + n, line_len);
+                write_line(writer, line.as_bytes())?;
+                if (n + 1) % LINES_PER_HEARTBEAT == 0 {
+                    to_heartbeat
+                        .send(answer.clone())
+                        .map_err(io::Error::other)?;
+                    answers
+                        .recv_timeout(GATE_TIMEOUT)
+                        .map_err(io::Error::other)?;
+                }
+            }
+            io::Result::Ok(())
+        };
+        thread::scope(|scope| -> TestResult {
+            let heartbeat = scope.spawn(|| {
+                for answer in heartbeat_inbox {
+                    heartbeats.fetch_add(1, Ordering::Relaxed);
+                    // A producer that stopped waiting reports that itself.
+                    let _ = answer.send(());
+                }
+            });
+            let handles: Vec<_> = (0..producers)
+                .map(|producer| {
+                    let to_heartbeat = to_heartbeat.clone();
+                    scope.spawn(move || produce(producer, to_heartbeat))
+                })
+                .collect();
+            drop(to_heartbeat);
+            for handle in handles {
+                handle.join().map_err(|_| "a producer panicked")??;
+            }
+            heartbeat
+                .join()
+                .map_err(|_| "the heartbeat thread panicked")?;
+            Ok(())
+        })?;
+        Ok(heartbeats.into_inner())
+    }
+
+    /// One run of [`writes_return_and_the_queue_stays_bounded_while_the_sink_is_stalled`].
+    fn stall(case: &StallCase, producers: usize) -> TestResult {
+        let line_len = case.line_len;
+        let lines_each = case.lines / producers;
+        let written = producers * lines_each;
+        // The queue fills to its bound behind the first batch and stays there.
+        let queued = QUEUE_LINES.min(QUEUE_BYTES / line_len);
+        assert!(queued < written, "the case fills no bound");
+
+        let (open_gate, gate) = mpsc::channel();
+        let (entered, first_write) = mpsc::channel();
+        let recording = Arc::new(Mutex::new(Recording::default()));
+        let writer = QueuedWriter::start(EnteredSink {
+            sink: RecordingSink {
+                recording: Arc::clone(&recording),
+                gate: Some(gate),
+            },
+            entered: Some(entered),
+        })?;
+        // The first batch is this one line, numbered after every producer's:
+        // the writer thread holds it at the gate before any producer starts.
+        let first = numbered_line(written, line_len);
+        write_line(&writer, first.as_bytes())?;
+        first_write.recv_timeout(GATE_TIMEOUT)?;
+
+        let heartbeats = produce_with_heartbeats(&writer, producers, lines_each, line_len)?;
+        // Every exchange with the heartbeat thread completed, and the writer
+        // thread is still held at the gate with its first batch, so every
+        // write returned without the sink taking a byte.
+        assert_eq!(heartbeats, producers * (lines_each / LINES_PER_HEARTBEAT));
+        assert!(
+            lock(&recording)?.calls.is_empty(),
+            "a write waited on the sink"
+        );
+        let counters = &writer.0.counters;
+        let queued_bytes = counters.queued_bytes.load(Ordering::Relaxed);
+        assert_eq!(queued_bytes, queued * line_len);
+        assert!(queued_bytes <= QUEUE_BYTES, "{queued_bytes} bytes queued");
+        let dropped = written - queued;
+        assert_eq!(counters.dropped_lines.load(Ordering::Relaxed), dropped);
+        assert_eq!(
+            counters.dropped_bytes.load(Ordering::Relaxed),
+            dropped * line_len
+        );
+
+        drop(open_gate);
+        writer.0.close();
+        for counter in [
+            &counters.queued_bytes,
+            &counters.dropped_lines,
+            &counters.dropped_bytes,
+        ] {
+            assert_eq!(counter.load(Ordering::Relaxed), 0, "a count left over");
+        }
+        let recording = lock(&recording)?;
+        assert!(
+            recording.bytes.starts_with(first.as_bytes()),
+            "the first batch"
+        );
+        let delivery = read_delivery(&recording.bytes, lines_each, line_len)?;
+        // Every line the queue took arrived, and no more than it can hold
+        // behind the first batch.
+        assert!(delivery.lines <= 1 + QUEUE_LINES, "{delivery:?}");
+        assert!(delivery.bytes <= first.len() + QUEUE_BYTES, "{delivery:?}");
+        assert!(delivery.reports >= 1, "{delivery:?}");
+        assert_eq!(
+            delivery,
+            Delivery {
+                lines: 1 + queued,
+                bytes: (1 + queued) * line_len,
+                reports: delivery.reports,
+                dropped_lines: 1 + written - delivery.lines,
+                dropped_bytes: (1 + written) * line_len - delivery.bytes,
+            }
+        );
+        Ok(())
+    }
+
+    /// Waits until `recording` holds at least `calls` calls, for at most
+    /// [`GATE_TIMEOUT`].
+    fn wait_for_calls(recording: &Mutex<Recording>, calls: usize) -> TestResult {
+        let start = Instant::now();
+        while lock(recording)?.calls.len() < calls {
+            if start.elapsed() > GATE_TIMEOUT {
+                return Err(format!("the sink did not receive {calls} calls").into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    /// A line of [`MAX_LINE_BYTES`] reaches the sink, and a longer one is
+    /// dropped whole. Its report follows at once, though the queue is idle,
+    /// and has the keys and timestamp of the JSON formatter's event lines.
+    #[test]
+    fn a_line_above_the_largest_is_dropped_whole_and_reported_at_once() -> TestResult {
+        let (writer, recording) = recording_queue(None)?;
+        let largest = numbered_line(0, MAX_LINE_BYTES);
+        write_line(&writer, largest.as_bytes())?;
+        // Written and flushed: the writer thread waits on an empty queue.
+        wait_for_calls(&recording, 2)?;
+        write_line(&writer, numbered_line(1, MAX_LINE_BYTES + 1).as_bytes())?;
+        // Only the wake-up of the first drop has the report written before
+        // the queue is closed.
+        wait_for_calls(&recording, 4)?;
+        writer.0.close();
+
+        let recording = lock(&recording)?;
+        let (written, report) = recording
+            .bytes
+            .split_at_checked(largest.len())
+            .ok_or("the largest line did not arrive")?;
+        assert_eq!(written, largest.as_bytes());
+        assert_eq!(
+            recording.calls,
+            [
+                SinkCall::Write(largest.len()),
+                SinkCall::Flush,
+                SinkCall::Write(report.len()),
+                SinkCall::Flush
+            ]
+        );
+        let text = std::str::from_utf8(report)?;
+        let report: Json = serde_json::from_str(
+            text.strip_suffix('\n')
+                .filter(|line| !line.contains('\n'))
+                .ok_or_else(|| format!("not one line: {text}"))?,
+        )?;
+        assert_eq!(drop_report_counts(&report)?, (1, MAX_LINE_BYTES + 1));
+
+        // An event line outside every span has the report's keys and the same
+        // timestamp shape.
+        let capture = Capture::default();
+        let (subscriber, guard) = subscriber_with_writer("test-svc", "info", capture.clone())?;
+        tracing::subscriber::with_default(subscriber, || tracing::warn!("an event line"));
+        guard.shutdown()?;
+        let lines = capture.json_lines()?;
+        let [event] = &lines[..] else {
+            return Err(format!("expected exactly one event line: {lines:?}").into());
+        };
+        assert_eq!(sorted_keys(event), sorted_keys(&report), "{event}");
+        let timestamp = event["timestamp"].as_str().unwrap_or_default();
+        assert!(is_formatter_timestamp(timestamp), "{event}");
         Ok(())
     }
 
@@ -1682,6 +2176,32 @@ mod tests {
             return Err("a write without a sink succeeded".into());
         };
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_the_queue_would_drop_fails_once_the_writer_thread_has_panicked() -> TestResult {
+        let writer = QueuedWriter::start(PanickingSink)?;
+        write_line(&writer, b"taken by the panicking sink\n")?;
+        let start = Instant::now();
+        loop {
+            let open = writer.0.open.read().map_err(|_| "queue lock poisoned")?;
+            let queue = open.as_ref().ok_or("the queue closed itself")?;
+            if queue.thread.is_finished() {
+                break;
+            }
+            drop(open);
+            if start.elapsed() > GATE_TIMEOUT {
+                return Err("the writer thread did not panic".into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Above `MAX_LINE_BYTES`, so the queue would drop it without sending it.
+        let Err(err) = write_line(&writer, numbered_line(0, MAX_LINE_BYTES + 1).as_bytes()) else {
+            return Err("a write to a panicked writer thread succeeded".into());
+        };
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+        writer.0.close();
         Ok(())
     }
 

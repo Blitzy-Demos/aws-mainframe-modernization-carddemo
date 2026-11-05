@@ -10,9 +10,10 @@
 //! (`CARDDEMO_QUEUE_PAUTH_REQUEST`). Every result comes from
 //! `carddemo_domain::rules::auth_decision`; this file sequences its steps:
 //!
-//! 1. [`Flow::handle`]: the conversion of the request text and the 500-byte
-//!    buffer check (`3100-READ-REQUEST-MQ`), the parse, the check that the
-//!    stored receivers are storable and the amount
+//! 1. [`Flow::handle`]: the conversion of the request text, which keeps no
+//!    more of it than the 500-byte buffer check reads, and that check
+//!    (`3100-READ-REQUEST-MQ`), the parse, the check that the stored receivers
+//!    are storable and the amount
 //!    (`2100-EXTRACT-REQUEST-MSG`), the reads in a read-only unit of work
 //!    (`5100` to `5500`), the decision and the reply (`6000`, `7100`);
 //! 2. the consumer publishes the reply, waits for its confirm and acknowledges
@@ -379,9 +380,12 @@ impl Cp00Flow {
     /// a summary written before a failed detail insert persists, as the
     /// audit's "persists on later failure" column records. Each read and write
     /// runs under its own savepoint in the store. A unit of work that cannot be
-    /// opened or committed loses the summary write, so it is logged as `I003`.
-    /// Every event logged here names `req`, the acknowledged request, by its
-    /// IDs.
+    /// opened loses the summary write, and so does a `COMMIT` the server
+    /// rejects; either is logged as `I003`. A `COMMIT` whose answer is lost, or
+    /// that outlives its deadline and is abandoned, is logged as `I003` too,
+    /// though the server may have committed the writes: the label is reported,
+    /// not proof, and the stored summary and detail tell what persisted. Every
+    /// event logged here names `req`, the acknowledged request, by its IDs.
     ///
     /// The `BEGIN`, the locked read, each write and the `COMMIT` run under the
     /// limits of `crate::db_deadline`, so a stalled database, or a purge that
@@ -400,8 +404,9 @@ impl Cp00Flow {
     ///
     /// Each record's location is recorded in the message span as soon as it
     /// is logged ([`consumer::record_location`]). A failed commit's `I003`
-    /// replaces an earlier `I004`, because the summary that record left in
-    /// place is lost with the commit.
+    /// replaces an earlier `I004`: a `COMMIT` the server rejects loses the
+    /// summary that record left in place, and one whose outcome is unknown is
+    /// reported the same way.
     async fn write(
         &self,
         req: &Request,
@@ -467,10 +472,12 @@ impl Cp00Flow {
 ///
 /// 1. the body is converted as the `MQGMO-CONVERT` get converts it
 ///    ([`auth_decision::convert_request`]); text that is not UTF-8 or holds a
-///    character outside ISO 8859-1 is unproven (E-80) and rejected at
-///    `3100-READ-REQUEST-MQ`;
+///    character outside ISO 8859-1 anywhere in the body, even past the
+///    buffer, is unproven (E-80) and rejected at `3100-READ-REQUEST-MQ`;
 /// 2. converted text longer than `W01-GET-BUFFER PIC X(500)` fails the get
-///    with the critical `M003` record;
+///    with the critical `M003` record; the conversion keeps only the buffer
+///    and the one byte past it that shows the overflow, so a message of any
+///    size allocates at most 501 bytes besides its body before it is rejected;
 /// 3. the converted text is parsed; a receiver the detail stores as text
 ///    holding X'00', which `PostgreSQL` text cannot hold
 ///    ([`auth_decision::storable`]), is unproven (E-81) and rejected at
@@ -1343,26 +1350,33 @@ mod tests {
     #[test]
     fn extract_converts_checks_the_buffer_then_parses_as_the_cobol_does() {
         // P-COPAUA0C-002, P-COPAUA0C-004 (E-80, E-81, E-28): text the
-        // conversion cannot pin is rejected at 3100; converted text past 500
-        // bytes is M003, whatever its UTF-8 length; a stored receiver holding
-        // X'00' and an unproven amount are rejected at 2100. None of them is
-        // read or answered.
+        // conversion cannot pin is rejected at 3100, even past the buffer;
+        // converted text past 500 bytes is M003, whatever its UTF-8 length or
+        // size; a stored receiver holding X'00' and an unproven amount are
+        // rejected at 2100. None of them is read or answered.
         let ascii = request_text(FIXTURE_CARD, "100.00", "TXN000000000001");
         let name = "FIXTURE MERCHANT";
         let named = |merchant: &str| ascii.replace(name, merchant);
         // The name that makes the converted text exactly the 500-byte buffer.
         let filling = "É".repeat(auth_decision::REQUEST_BUFFER_LEN - ascii.len() + name.len());
+        // A name that makes the message far longer than the buffer.
+        let oversize = "N".repeat(1 << 20);
         // The text as a Latin-1 sender encodes it: one byte per character.
         let latin1: Vec<u8> = named("CAFÉ MÜNCHEN")
             .chars()
             .map(|character| u8::try_from(character).expect("an ISO 8859-1 character"))
             .collect();
-        let cases: [(Vec<u8>, Result<i64, &str>); 9] = [
+        let cases: [(Vec<u8>, Result<i64, &str>); 11] = [
             (ascii.clone().into_bytes(), Ok(10_000)),
             (named("CAFÉ MÜNCHEN").into_bytes(), Ok(10_000)),
             (named(&filling).into_bytes(), Ok(10_000)),
             (named(&format!("{filling}É")).into_bytes(), Err("M003")),
+            (named(&oversize).into_bytes(), Err("M003")),
             (named("CAFÉ €").into_bytes(), Err(super::READ_PARAGRAPH)),
+            (
+                named(&format!("{oversize}€")).into_bytes(),
+                Err(super::READ_PARAGRAPH),
+            ),
             (latin1, Err(super::READ_PARAGRAPH)),
             (
                 named("NUL\0MERCHANT").into_bytes(),

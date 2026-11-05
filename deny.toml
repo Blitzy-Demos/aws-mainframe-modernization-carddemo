@@ -7,7 +7,8 @@
 
 [advisories]
 yanked = "deny"
-# Vulnerability advisories always fail the check; no field here lowers that.
+# Vulnerability advisories fail the check by default. The only exceptions are the
+# two `ignore` entries below, each with its reason (escalation E-11).
 # Unmaintained advisories fail only for direct dependencies of workspace crates.
 # The transitive unmaintained crates this scope excludes (escalation E-11) are
 # instant, paste, proc-macro-error2, rustls-pemfile and ttf-parser, each reached

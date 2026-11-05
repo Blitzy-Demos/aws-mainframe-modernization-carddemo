@@ -14,11 +14,11 @@ import schemaSource from "./schema.d.ts?raw";
 
 import type { components } from "@/api/schema";
 
-/** The member names of one object schema, each list sorted. */
+// The member names of one object schema, each list sorted.
 interface Members {
-  /** Every property name. */
+  // Every property name.
   names: string[];
-  /** The property names a value must carry. */
+  // The property names a value must carry.
   required: string[];
 }
 
@@ -36,7 +36,8 @@ function sortedNames(value: unknown, where: string): string[] {
   return [...value].sort();
 }
 
-/** The properties and `required` list of each component schema with properties. */
+// The properties and `required` list of each component schema with
+// properties.
 function documentedSchemas(document: unknown): Map<string, Members> {
   const components = isRecord(document) ? document.components : undefined;
   const schemas = isRecord(components) ? components.schemas : undefined;
@@ -66,7 +67,7 @@ function documentedSchemas(document: unknown): Map<string, Members> {
   return result;
 }
 
-/** The type of each member of `components.schemas` in the declaration file. */
+// The type of each member of `components.schemas` in the declaration file.
 function declaredSchemas(source: string): Map<string, ts.TypeNode> {
   const file = ts.createSourceFile(
     "schema.d.ts",
@@ -118,11 +119,9 @@ function memberName(member: ts.PropertySignature): string {
   );
 }
 
-/**
- * The members of the declared schema `name`: every property signature, and
- * those without `?`. An index signature, which declares no property, is
- * skipped.
- */
+// The members of the declared schema `name`: every property signature, and
+// those without `?`. An index signature, which declares no property, is
+// skipped.
 function declaredMembers(
   declared: Map<string, ts.TypeNode>,
   name: string,

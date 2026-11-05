@@ -52,6 +52,12 @@
 //! that may legitimately find nothing returns an empty `Vec` or `Ok(None)`
 //! instead, as its method documents.
 //!
+//! Any call, a plain read included, can lose a lock conflict with another unit
+//! of work: a lock timeout, a deadlock or a serialization failure, the Db2
+//! `SQLCODE` -911. It then fails with [`PortError::Contention`], which every
+//! method's errors name. [`PortError::Unavailable`] is every failure a method
+//! does not name otherwise.
+//!
 //! Two read shapes cover the sequential accesses:
 //!
 //! - an online browse (CICS `STARTBR` with `READNEXT`/`READPREV`, a Db2 cursor,
@@ -99,13 +105,18 @@ pub enum PortError {
     /// A delete is blocked by dependent rows: Db2 `SQLCODE` -532, the
     /// `ON DELETE RESTRICT` of the categories that reference a transaction type
     /// (`COTRTLIC` [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L1914],
-    /// `COTRTUPC` [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1638]).
+    /// `COTRTUPC` [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1638]). A
+    /// write whose row references a row that does not exist, such as an
+    /// accrual of a missing transaction, reports it too, unless the method
+    /// names another outcome for it, as [`AuthorizationStore::insert_detail`]
+    /// does with [`PortError::NotFound`].
     #[error("delete restricted by dependent records")]
     Restricted,
     /// The row is locked by another unit of work: Db2 `SQLCODE` -911, deadlock
     /// or lock timeout (`COTRTLIC`
     /// [app/app-transaction-type-db2/cbl/COTRTLIC.cbl:L1870], `COTRTUPC`
-    /// [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1561]).
+    /// [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L1561]). A unit of work
+    /// that loses a serialization conflict with another reports it too.
     #[error("record locked by another unit of work")]
     Contention,
     /// Any other I/O failure, the `WHEN OTHER` branch of the COBOL.
@@ -233,6 +244,7 @@ pub trait AccountReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no account has the ID (`NOTFND`, status 23);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_account(
         &mut self,
@@ -270,7 +282,8 @@ pub trait AccountWriter {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no account has the ID (`REWRITE` `INVALID
-    /// KEY`); [`PortError::Unavailable`] on any other failure.
+    /// KEY`); [`PortError::Contention`] on a lock conflict with another unit of
+    /// work; [`PortError::Unavailable`] on any other failure.
     fn rewrite_account(
         &mut self,
         account: Account,
@@ -288,6 +301,7 @@ pub trait CardReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no card has the number;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_card(&mut self, card: CardNumber)
     -> impl Future<Output = PortResult<Card>> + Send + '_;
@@ -318,8 +332,9 @@ pub trait CardReader {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; an empty page is `Ok` with no
-    /// rows.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; an empty page is `Ok`
+    /// with no rows.
     fn browse_cards(
         &mut self,
         browse: Browse<CardNumber>,
@@ -333,8 +348,9 @@ pub trait CardReader {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; an account with no card is
-    /// `Ok` with no rows.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; an account with no
+    /// card is `Ok` with no rows.
     fn cards_for_account(
         &mut self,
         id: AccountId,
@@ -350,6 +366,7 @@ pub trait CardWriter {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no card has the number;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn rewrite_card(&mut self, card: Card) -> impl Future<Output = PortResult<()>> + Send + '_;
 }
@@ -367,6 +384,7 @@ pub trait CustomerReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no customer has the ID;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_customer(
         &mut self,
@@ -399,6 +417,7 @@ pub trait CustomerWriter {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no customer has the ID;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn rewrite_customer(
         &mut self,
@@ -422,6 +441,7 @@ pub trait XrefReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no cross-reference has the card number;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_xref_by_card(
         &mut self,
@@ -439,6 +459,7 @@ pub trait XrefReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when the account has no cross-reference;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_xref_by_account(
         &mut self,
@@ -453,8 +474,9 @@ pub trait XrefReader {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; the end of the file is `Ok`
-    /// with no rows.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; the end of the file is
+    /// `Ok` with no rows.
     fn xrefs_after(
         &mut self,
         after: Option<CardNumber>,
@@ -477,6 +499,7 @@ pub trait TransactionReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no live transaction has the ID;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_transaction(
         &mut self,
@@ -496,7 +519,8 @@ pub trait TransactionReader {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; an empty page, the
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; an empty page, the
     /// `STARTBR` `NOTFND` of an empty file or of a start key above the highest
     /// key (P-COTRN00C-011), is `Ok` with no rows.
     fn browse_transactions(
@@ -515,7 +539,8 @@ pub trait TransactionReader {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure.
     fn highest_transaction(
         &mut self,
     ) -> impl Future<Output = PortResult<Option<Transaction>>> + Send + '_;
@@ -532,8 +557,9 @@ pub trait TransactionReader {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; an empty master is `Ok` with
-    /// no rows.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; an empty master is `Ok`
+    /// with no rows.
     fn transactions_by_card(
         &mut self,
         limit: u16,
@@ -558,8 +584,9 @@ pub trait TransactionReader {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; the end of the selection is
-    /// `Ok` with no rows.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; the end of the
+    /// selection is `Ok` with no rows.
     fn transactions_by_proc_date(
         &mut self,
         start: Alnum<10>,
@@ -585,7 +612,8 @@ pub trait TransactionWriter {
     /// # Errors
     ///
     /// [`PortError::Duplicate`] when a live transaction already has the TRAN-ID
-    /// (`DUPKEY`, `DUPREC`); [`PortError::Unavailable`] on any other failure.
+    /// (`DUPKEY`, `DUPREC`); [`PortError::Contention`] on a lock conflict with
+    /// another unit of work; [`PortError::Unavailable`] on any other failure.
     fn write_transaction(
         &mut self,
         tran: NewTransaction,
@@ -603,6 +631,7 @@ pub trait TranCatBalanceStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no balance has the key (status 23);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_tcatbal(
         &mut self,
@@ -615,6 +644,7 @@ pub trait TranCatBalanceStore {
     /// # Errors
     ///
     /// [`PortError::Duplicate`] when a balance already has the key;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn write_tcatbal(
         &mut self,
@@ -628,6 +658,7 @@ pub trait TranCatBalanceStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no balance has the key;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn rewrite_tcatbal(
         &mut self,
@@ -642,8 +673,9 @@ pub trait TranCatBalanceStore {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; the end of the file is `Ok`
-    /// with no rows.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; the end of the file is
+    /// `Ok` with no rows.
     fn tcatbals_after(
         &mut self,
         after: Option<TranCatBalanceKey>,
@@ -662,6 +694,7 @@ pub trait DisclosureGroupReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no group has the key (status 23);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_disclosure_group(
         &mut self,
@@ -760,6 +793,7 @@ pub trait TranTypeMasterStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no type has the code (`SQLCODE` +100);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_tran_type(
         &mut self,
@@ -804,7 +838,8 @@ pub trait TranTypeMasterStore {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure.
     fn count_tran_types(
         &mut self,
         filter: TranTypeFilter,
@@ -841,6 +876,7 @@ pub trait TranTypeMasterStore {
     /// # Errors
     ///
     /// [`PortError::Duplicate`] when a type has the code (`SQLCODE` -803);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn insert_tran_type(
         &mut self,
@@ -893,7 +929,8 @@ pub trait TranTypeFileReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no record has the code (status 23, the
-    /// `INVALID TRANSACTION TYPE` abend); [`PortError::Unavailable`] on any
+    /// `INVALID TRANSACTION TYPE` abend); [`PortError::Contention`] on a lock
+    /// conflict with another unit of work; [`PortError::Unavailable`] on any
     /// other failure.
     fn read_tran_type_file(
         &mut self,
@@ -906,8 +943,9 @@ pub trait TranTypeFileReader {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no record has the key (status 23, the
-    /// `INVALID TRAN CATG KEY` abend); [`PortError::Unavailable`] on any other
-    /// failure.
+    /// `INVALID TRAN CATG KEY` abend); [`PortError::Contention`] on a lock
+    /// conflict with another unit of work; [`PortError::Unavailable`] on any
+    /// other failure.
     fn read_tran_category_file(
         &mut self,
         code: TranTypeCode,
@@ -935,6 +973,7 @@ pub trait UserStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no user has the ID (`RESP` 13);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_user(
         &mut self,
@@ -950,6 +989,7 @@ pub trait UserStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no user has the ID (`RESP` 13);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_user_key(&mut self, id: UserId)
     -> impl Future<Output = PortResult<UserId>> + Send + '_;
@@ -994,8 +1034,9 @@ pub trait UserStore {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; an empty page, the `STARTBR`
-    /// `NOTFND` of P-COUSR00C-006, is `Ok` with no rows.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; an empty page, the
+    /// `STARTBR` `NOTFND` of P-COUSR00C-006, is `Ok` with no rows.
     fn browse_users(
         &mut self,
         browse: Browse<UserId>,
@@ -1008,6 +1049,7 @@ pub trait UserStore {
     /// # Errors
     ///
     /// [`PortError::Duplicate`] when a user has the ID (`DUPKEY`, `DUPREC`);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn insert_user(
         &mut self,
@@ -1021,6 +1063,7 @@ pub trait UserStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no user has the ID;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn update_user(
         &mut self,
@@ -1033,6 +1076,7 @@ pub trait UserStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no user has the ID;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn delete_user(&mut self, id: UserId) -> impl Future<Output = PortResult<()>> + Send + '_;
 }
@@ -1057,6 +1101,7 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when the account has no summary (status `GE`);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_summary(
         &mut self,
@@ -1105,8 +1150,9 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no detail has the identity or its account
-    /// has no summary (status `GE`); [`PortError::Unavailable`] on any other
-    /// failure.
+    /// has no summary (status `GE`); [`PortError::Contention`] on a lock
+    /// conflict with another unit of work; [`PortError::Unavailable`] on any
+    /// other failure.
     fn read_summary_of_detail(
         &mut self,
         id: AuthId,
@@ -1118,7 +1164,8 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::Duplicate`] when the account already has a summary (status
-    /// `II`); [`PortError::Unavailable`] on any other failure.
+    /// `II`); [`PortError::Contention`] on a lock conflict with another unit of
+    /// work; [`PortError::Unavailable`] on any other failure.
     fn insert_summary(
         &mut self,
         summary: PendingAuthSummary,
@@ -1131,6 +1178,7 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when the account has no summary;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn update_summary(
         &mut self,
@@ -1145,6 +1193,7 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when the account has no summary;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn delete_summary(&mut self, id: AccountId)
     -> impl Future<Output = PortResult<()>> + Send + '_;
@@ -1182,6 +1231,7 @@ pub trait AuthorizationStore {
     /// [`PortError::Duplicate`] when the summary already has a detail with the
     /// same `PAUT9CTS` key (status `II`); [`PortError::NotFound`] when the
     /// account has no summary to insert under (status `GE`);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn insert_detail(
         &mut self,
@@ -1195,6 +1245,7 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no detail has the identity (status `GE`);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn read_detail(
         &mut self,
@@ -1236,8 +1287,9 @@ pub trait AuthorizationStore {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; no detail, or the end of the
-    /// twins, is `Ok` with no rows.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; no detail, or the end
+    /// of the twins, is `Ok` with no rows.
     fn details_for_account(
         &mut self,
         id: AccountId,
@@ -1261,8 +1313,9 @@ pub trait AuthorizationStore {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure; the end of the twins is
-    /// `Ok(None)`.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure; the end of the twins
+    /// is `Ok(None)`.
     fn adjacent_detail(
         &mut self,
         account: AccountId,
@@ -1278,6 +1331,7 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no detail has the identity;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn update_detail(
         &mut self,
@@ -1290,6 +1344,7 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no detail has the identity;
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn delete_detail(&mut self, id: AuthId) -> impl Future<Output = PortResult<()>> + Send + '_;
 
@@ -1300,7 +1355,8 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::Duplicate`] when a report with the same `CARD_NUM` and
-    /// `AUTH_TS` exists (`SQLCODE` -803); [`PortError::Unavailable`] on any
+    /// `AUTH_TS` exists (`SQLCODE` -803); [`PortError::Contention`] on a lock
+    /// conflict with another unit of work; [`PortError::Unavailable`] on any
     /// other failure.
     fn insert_fraud(
         &mut self,
@@ -1316,6 +1372,7 @@ pub trait AuthorizationStore {
     /// # Errors
     ///
     /// [`PortError::NotFound`] when no report has the key (`SQLCODE` +100);
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
     /// [`PortError::Unavailable`] on any other failure.
     fn update_fraud(
         &mut self,

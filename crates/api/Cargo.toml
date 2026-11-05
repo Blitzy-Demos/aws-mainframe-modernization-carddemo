@@ -26,6 +26,9 @@ carddemo-persistence.workspace = true
 carddemo-runtime.workspace = true
 
 axum.workspace = true
+# The CR00 report body is streamed: axum's `Body::from_stream` takes a futures
+# `TryStream`, a trait neither axum nor tokio re-exports.
+futures-util.workspace = true
 jsonwebtoken.workspace = true
 serde.workspace = true
 serde_json.workspace = true

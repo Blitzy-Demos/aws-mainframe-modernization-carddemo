@@ -22,11 +22,16 @@
 //! Step 4 compares bytes, so the document is a function of the source alone:
 //!
 //! - utoipa keeps paths, component schemas, security schemes and schema
-//!   properties in `BTreeMap`s, which serialize in key order. Its
-//!   `preserve_order` and `preserve_path_order` features, which would switch
-//!   them to insertion order, stay disabled.
-//! - Tags keep the fixed order declared here; operations keep the order the
-//!   registry declares them in.
+//!   properties in `BTreeMap`s, which serialize in key order, so the paths
+//!   do not follow the order `crate::handlers::router()` registers them in.
+//!   Its `preserve_path_order` and `preserve_order` features, which would put
+//!   paths in insertion order and properties in struct-field order, stay
+//!   disabled.
+//! - The operations of one path are fixed fields of utoipa's `PathItem`, so
+//!   they serialize in its field order (`get`, `put`, `post`, `delete`,
+//!   `options`, `head`, `patch`, `trace`), whatever order the path's
+//!   `routes!` group lists its handlers in.
+//! - Tags are a list and keep the order declared here.
 //! - Nothing reads the environment, the clock or a random source at run time.
 //!   The version is the package version, fixed when the crate compiles, and
 //!   there is no `servers` entry: the SPA calls through the Vite `/api` proxy,

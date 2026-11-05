@@ -37,9 +37,11 @@
 //! deadline where there is one, by `READY_TIMEOUT` while the consumers
 //! subscribe, and by `BROKER_TIMEOUT` otherwise; [`bounded`] gives a test's own
 //! broker operations the same bound. One that does not complete in time
-//! panics, naming the operation, its queue and the bound. The crate enables
-//! no tokio timer, so the polling helpers sleep on a blocking thread, and each
-//! bound is a blocking thread that waits out the remaining time unless the
+//! panics, naming the operation, its queue and the bound. The polling helpers
+//! and the bounds are independent of the tokio timer, which the test runtime
+//! enables and the consumers' own limits use, so neither runs on the timer of
+//! the code under test: the polling helpers sleep on a blocking thread, and
+//! each bound is a blocking thread that waits out the remaining time unless the
 //! operation completes first and wakes it.
 
 // The std-only audit-table parser of `crates/audit`, shared by source: the

@@ -35,10 +35,13 @@
 //! and awaits the `ROLLBACK` before the outcome is recorded, rather than
 //! leaving the rollback to the unit being dropped. A `ROLLBACK` that fails
 //! after a failed store call is logged and that call's 500 stands; any other
-//! failed `ROLLBACK` answers 500. A failed `COMMIT` consumes the unit, whose
-//! transaction `PostgreSQL` has already ended. On every failure path nothing
-//! of the request is committed. Unlike the legacy writes, no rule write has
-//! to survive a later failure.
+//! failed `ROLLBACK` answers 500. A failed `COMMIT` consumes the unit. When
+//! the server rejects it, `PostgreSQL` has already ended the transaction as a
+//! rollback, so on that path, as on every other failure path, nothing of the
+//! request is committed. A `COMMIT` that fails otherwise, its connection lost
+//! or its answer missing, has an unknown outcome: the write may have
+//! committed, so the rules are listed again before it is retried. Unlike the
+//! legacy writes, no rule write has to survive a later failure.
 //!
 //! # Telemetry
 //!

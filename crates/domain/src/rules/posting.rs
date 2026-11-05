@@ -24,8 +24,16 @@
 //! the adapter. Every one of them persists when a later one fails: the VSAM
 //! files are `RECOVERY(NONE)` [app/csd/CARDDEMO.CSD:L1-96] (P-CBTRN02C-015,
 //! P-CBTRN02C-018, P-CBTRN02C-019). A failed write abends the run with a
-//! [`PostingAbend`]; `batch posttran` commits the record's completed writes,
-//! prints the abend's `DISPLAY` lines and `ABEND 999`, and exits 16.
+//! [`PostingAbend`], except an account rewrite that takes its `INVALID KEY`
+//! path ([`PortError::NotFound`]); `batch posttran` commits the record's
+//! completed writes, prints the abend's `DISPLAY` lines and `ABEND 999`, and
+//! exits 16.
+//!
+//! That rewrite sets reason 109, which nothing reads afterwards: the record is
+//! neither counted nor written to `DALYREJS`, the category balance update
+//! stands, the account is unchanged, the transaction write still runs, and
+//! [`Posted::account_rewrite_failed`] reports it (P-CBTRN02C-018,
+//! P-CBTRN02C-218, E-15).
 //!
 //! The reward accrual that `batch posttran` adds to each posted record, in the
 //! same database transaction, is not part of `CBTRN02C` and is not called here.
@@ -365,6 +373,8 @@ impl PostingAbend {
         self.file_status.map(file_status_message)
     }
 
+    /// CBTRN02C 9910-DISPLAY-IO-STATUS, 9999-ABEND-PROGRAM — P-CBTRN02C-021
+    ///
     /// An abend on a file the batch adapter handles itself, without a port,
     /// with the status `9910-DISPLAY-IO-STATUS` shows for it, if any.
     fn job_level(

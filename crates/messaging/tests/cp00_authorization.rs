@@ -534,8 +534,9 @@ fn assert_halted(h: &Harness, case: &Case, escalation: &str, paragraph: &str) {
     }
 }
 
-/// Sleeps for `period` on a blocking thread: the crate enables no tokio
-/// timer.
+/// Sleeps for `period` on a blocking thread, independent of the tokio timer
+/// that the test runtime enables and the consumers' own limits use, so the
+/// waits between polls do not run on the timer of the code under test.
 async fn pause(period: Duration) {
     tokio::task::spawn_blocking(move || std::thread::sleep(period))
         .await

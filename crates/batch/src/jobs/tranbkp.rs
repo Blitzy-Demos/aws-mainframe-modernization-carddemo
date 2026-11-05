@@ -148,9 +148,11 @@ const fn step10_runs(prior_condition_code: i32) -> bool {
 /// # Errors
 ///
 /// A setup failure (exit 16) when the emptying fails or the commit fails: the audit records no
-/// condition code for a failed `DELETE` beyond the `MAXCC` reset of a missing data set. The unit
-/// of work is then dropped uncommitted, which rolls it back, so the live master is unchanged and
-/// the cataloged backup stays as written.
+/// condition code for a failed `DELETE` beyond the `MAXCC` reset of a missing data set. After a
+/// failed emptying the unit of work is dropped uncommitted, which rolls it back, and a `COMMIT`
+/// the server rejects ends as a rollback, so the live master is unchanged. A `COMMIT` whose
+/// answer is lost, its connection gone, may have emptied it, so the live master is checked
+/// before a rerun. The cataloged backup stays as written either way.
 async fn step05_step10_empty_master(
     mut uow: UnitOfWork,
     step10_runs: bool,

@@ -58,27 +58,28 @@ import {
 
 type CardResponse = components["schemas"]["CardResponse"];
 
-/** The COCRDUP title line [app/bms/COCRDUP.bms:L75-78]. */
+// The COCRDUP title line [app/bms/COCRDUP.bms:L75-78].
 const TITLE = "Update Credit Card Details";
 
-/** The keys the screen was entered with: the route's card and account. */
+// The keys the screen was entered with: the route's card and account.
 type CardKeys = Pick<CardUpdateFormValues, "account_id" | "card_number">;
 
-/** The text of each key error, by key. */
+// The text of each key error, by key.
 type KeyErrors = Partial<Record<keyof CardKeys, string>>;
 
-/** The form fields that render a control: the unprotected COCRDUP fields. */
+// The form fields that render a control: the unprotected COCRDUP fields.
 type EditableField = Exclude<
   keyof CardUpdateFormValues,
   keyof CardKeys | "version"
 >;
 
 /**
- * The form values of `card` as COCRDUPC 3200-SETUP-SCREEN-VARS presents it:
- * the keys as entered, the fetched name and status, and the month and year
- * cut from the stored `YYYY-MM-DD` expiry, `CARD-EXPIRY-YEAR` (1:4) and
- * `CARD-EXPIRY-MONTH` (6:2) [app/cbl/COCRDUPC.cbl:L115-121]. `version` is the
- * token the PUT echoes; no control renders it.
+ * COCRDUPC 3200-SETUP-SCREEN-VARS — P-COCRDUPC-019: the form values of `card`
+ * as the paragraph presents it: the keys as entered, the fetched name and
+ * status, and the month and year cut from the stored `YYYY-MM-DD` expiry,
+ * `CARD-EXPIRY-YEAR` (1:4) and `CARD-EXPIRY-MONTH` (6:2)
+ * [app/cbl/COCRDUPC.cbl:L115-121]. `version` is the token the PUT echoes; no
+ * control renders it.
  */
 function toFormValues(
   card: CardResponse,
@@ -97,9 +98,10 @@ function toFormValues(
 }
 
 /**
- * The COCRDUPC key edits on the keys of the URL (V-COCRDUPC-002 to
- * V-COCRDUPC-006, the texts COCRDSLC shares): without both keys the card
- * cannot be read, so the screen shows the key errors instead of the form.
+ * COCRDUPC 1210-EDIT-ACCOUNT, 1220-EDIT-CARD — P-COCRDUPC-011, P-COCRDUPC-012:
+ * the key edits on the keys of the URL (V-COCRDUPC-002 to V-COCRDUPC-006, the
+ * texts COCRDSLC shares): without both keys the card cannot be read, so the
+ * screen shows the key errors instead of the form.
  */
 function checkKeys(keys: CardKeys): { valid: boolean; errors: KeyErrors } {
   const check = cardViewKeySchema.safeParse(keys);
@@ -119,7 +121,7 @@ function checkKeys(keys: CardKeys): { valid: boolean; errors: KeyErrors } {
   return { valid: false, errors };
 }
 
-/** ACCTSID and CARDSID with their COCRDUP captions, in map order. */
+// ACCTSID and CARDSID with their COCRDUP captions, in map order.
 const KEY_FIELDS = [
   { name: "account_id", label: "Account Number" },
   { name: "card_number", label: "Card Number" },
@@ -128,21 +130,19 @@ const KEY_FIELDS = [
 type KeyFieldProps = {
   name: keyof CardKeys;
   label: string;
-  /** The key as entered in the URL. */
+  // The key as entered in the URL.
   value: string;
   invalid: boolean;
-  /** The text of the key's error, from the key edits or the API. */
+  // The text of the key's error, from the key edits or the API.
   message?: string;
-  /** The form's binding of the key, while the form holds the card. */
+  // The form's binding of the key, while the form holds the card.
   field?: ControllerRenderProps<CardUpdateFormValues, keyof CardKeys>;
 };
 
-/**
- * One key, a read-only input showing the value entered. Bound through
- * `field`, its `ref` is the key's, so a key error the API reports moves focus
- * here, as COCRDUPC 3300-SETUP-SCREEN-ATTRS places the cursor with
- * `MOVE -1 TO ACCTSIDL` or `CARDSIDL` [app/cbl/COCRDUPC.cbl:L1217-1234].
- */
+// One key, a read-only input showing the value entered. Bound through
+// `field`, its `ref` is the key's, so a key error the API reports moves focus
+// here, as COCRDUPC 3300-SETUP-SCREEN-ATTRS places the cursor with
+// `MOVE -1 TO ACCTSIDL` or `CARDSIDL` [app/cbl/COCRDUPC.cbl:L1217-1234].
 function KeyField({
   name,
   label,
@@ -174,13 +174,13 @@ function KeyField({
 
 type KeyDetailsProps = {
   keys: CardKeys;
-  /** The key edits' texts, shown while no form binds the keys. */
+  // The key edits' texts, shown while no form binds the keys.
   errors: KeyErrors;
-  /** The form holding the card: it binds both keys and holds their errors. */
+  // The form holding the card: it binds both keys and holds their errors.
   control?: Control<CardUpdateFormValues>;
 };
 
-/** ACCTSID and CARDSID, read-only, with any error the edits or the API report. */
+// ACCTSID and CARDSID, read-only, with any error the edits or the API report.
 function KeyDetails({ keys, errors, control }: KeyDetailsProps): JSX.Element {
   return (
     <Card>
@@ -224,16 +224,14 @@ type CardTextFieldProps = {
   control: Control<CardUpdateFormValues>;
   name: EditableField;
   label: string;
-  /** The width of the BMS field, `LENGTH=` on COCRDUP. */
+  // The width of the BMS field, `LENGTH=` on COCRDUP.
   maxLength: number;
   numeric?: boolean;
 };
 
-/**
- * One unprotected COCRDUP field. `field.ref` reaches the input, so a field
- * error the resolver or the server reports moves focus here, as the COBOL
- * `MOVE -1 TO <field>L` places the cursor.
- */
+// One unprotected COCRDUP field. `field.ref` reaches the input, so a field
+// error the resolver or the server reports moves focus here, as the COBOL
+// `MOVE -1 TO <field>L` places the cursor.
 function CardTextField({
   control,
   name,
@@ -266,7 +264,7 @@ function CardTextField({
   );
 }
 
-/** The editable fields while the card is being read. */
+// The editable fields while the card is being read.
 function EditorSkeleton(): JSX.Element {
   return (
     <Card role="status" aria-busy="true">

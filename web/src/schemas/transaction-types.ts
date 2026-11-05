@@ -57,13 +57,11 @@ type TranTypeUpdateRequest = components["schemas"]["TranTypeUpdateRequest"];
 type TranTypeListField = components["schemas"]["TranTypeListField"];
 type TranTypeUpsertField = components["schemas"]["TranTypeUpsertField"];
 
-/** `TRTYPEI` of COTRTLI and `TRTYPCDI` of COTRTUP, `PIC X(2)`. */
+// `TRTYPEI` of COTRTLI and `TRTYPCDI` of COTRTUP, `PIC X(2)`.
 const TYPE_CODE_LENGTH = 2;
 
-/**
- * `TRDESCI` and `TRTYPD1I` to `TRTYPD7I` of COTRTLI and `TRTYDSCI` of
- * COTRTUP, `PIC X(50)`.
- */
+// `TRDESCI` and `TRTYPD1I` to `TRTYPD7I` of COTRTLI and `TRTYDSCI` of
+// COTRTUP, `PIC X(50)`.
 const DESCRIPTION_LENGTH = 50;
 
 /** The COTRTLIC texts of the edits this module repeats, byte for byte. */
@@ -98,57 +96,49 @@ export const TRAN_TYPE_UPSERT_MESSAGES = {
   recordNotFound: "No record found for this key in database",
 } as const;
 
-/** The two description texts, which both programs build alike. */
+// The two description texts, which both programs build alike.
 type DescriptionMessages = {
   readonly descriptionMustBeSupplied: string;
   readonly descriptionAlphanumericOnly: string;
 };
 
-/** `IS NUMERIC` on the `X(2)` type code filter: two digits. */
+// `IS NUMERIC` on the `X(2)` type code filter: two digits.
 const TWO_DIGITS = /^[0-9]{2}$/;
 
-/**
- * The arguments `FUNCTION TEST-NUMVAL` accepts in the two-byte key:
- * optional spaces, an optional leading `+` or `-` with optional spaces,
- * digits with an optional decimal point (at least one digit), optional
- * spaces, and, without a leading sign, an optional trailing `+` or `-` with
- * optional spaces. The `CR` and `DB` forms need two bytes beside a digit, so
- * no two-byte key holds one.
- */
+// The arguments `FUNCTION TEST-NUMVAL` accepts in the two-byte key: optional
+// spaces, an optional leading `+` or `-` with optional spaces, digits with an
+// optional decimal point (at least one digit), optional spaces, and, without
+// a leading sign, an optional trailing `+` or `-` with optional spaces. The
+// `CR` and `DB` forms need two bytes beside a digit, so no two-byte key holds
+// one.
 const NUMVAL_ARGUMENT =
   /^ *(?:[+-] *(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+) *|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+) *(?:[+-] *)?)$/;
 
-/** A digit other than zero: `FUNCTION NUMVAL(...)` of the argument is not 0. */
+// A digit other than zero: `FUNCTION NUMVAL(...)` of the argument is not 0.
 const NON_ZERO_DIGIT = /[1-9]/;
 
-/** The `INSPECT ... CONVERTING` of A-Z, a-z and 0-9 leaves only spaces. */
+// The `INSPECT ... CONVERTING` of A-Z, a-z and 0-9 leaves only spaces.
 const ALPHANUMERIC_OR_SPACE = /^[A-Za-z0-9 ]*$/;
 
-/** Every byte a space; the empty text included. */
+// Every byte a space; the empty text included.
 const ALL_SPACES = /^ *$/;
 
-/**
- * ASCII text, the OpenAPI `pattern` of the `{id}` path segment, which the
- * server checks for `PUT` with `origin=list` and `DELETE` without `origin`:
- * the issue keeps zod's default regex text, as the server's answer has no
- * message.
- */
+// ASCII text, the OpenAPI `pattern` of the `{id}` path segment, which the
+// server checks for `PUT` with `origin=list` and `DELETE` without `origin`:
+// the issue keeps zod's default regex text, as the server's answer has no
+// message.
 const ASCII_TEXT = /^[\x00-\x7F]*$/;
 
-/**
- * The length of a value in Unicode code points, not UTF-16 code units: the
- * server's `validator` length and the OpenAPI `maxLength` count Unicode
- * scalar values.
- */
+// The length of a value in Unicode code points, not UTF-16 code units: the
+// server's `validator` length and the OpenAPI `maxLength` count Unicode
+// scalar values.
 function codePointLength(value: string): number {
   return Array.from(value).length;
 }
 
-/**
- * The length check of a field of `width` characters, counted by
- * `codePointLength`: an over-length value gets the issue `.max(width)` gives,
- * with zod's own text.
- */
+// The length check of a field of `width` characters, counted by
+// `codePointLength`: an over-length value gets the issue `.max(width)` gives,
+// with zod's own text.
 function maxCodePoints(width: number) {
   return (value: string, ctx: z.RefinementCtx): void => {
     if (codePointLength(value) > width) {
@@ -163,18 +153,20 @@ function maxCodePoints(width: number) {
   };
 }
 
-/** The entry moved into its `X(width)` map field: padded with spaces. */
+// The entry moved into its `X(width)` map field: padded with spaces.
 function mapField(value: string, width: number): string {
   return value.padEnd(width, " ");
 }
 
 /**
- * The not-supplied test of COTRTUPC 1245-EDIT-NUM-REQD and
- * 1230-EDIT-ALPHANUM-REQD and of COTRTLIC 1240-EDIT-ALPHANUM-REQD, after the
- * entry is received: a field equal to `*` or to spaces is `LOW-VALUES`
- * (COTRTUPC 1150-STORE-MAP-IN-NEW, COTRTLIC 1100-RECEIVE-SCREEN), and a
- * field of spaces or of `LOW-VALUES` is not supplied. ` *` is supplied, and
- * so is a field holding both spaces and `LOW-VALUES`.
+ * The not-supplied test of COTRTUPC 1245-EDIT-NUM-REQD — P-COTRTUPC-018,
+ * COTRTUPC 1230-EDIT-ALPHANUM-REQD — P-COTRTUPC-017 and COTRTLIC
+ * 1240-EDIT-ALPHANUM-REQD — P-COTRTLIC-021, after the entry is received: a
+ * field equal to `*` or to spaces is `LOW-VALUES` (COTRTUPC
+ * 1150-STORE-MAP-IN-NEW — P-COTRTUPC-014, COTRTLIC
+ * 1100-RECEIVE-SCREEN — P-COTRTLIC-013), and a field of spaces or of
+ * `LOW-VALUES` is not supplied. ` *` is supplied, and so is a field holding
+ * both spaces and `LOW-VALUES`.
  */
 function isNotSupplied(value: string, width: number): boolean {
   const field = mapField(value, width);
@@ -182,9 +174,9 @@ function isNotSupplied(value: string, width: number): boolean {
 }
 
 /**
- * COTRTLIC 1220-EDIT-TYPECD — V-COTRTLIC-001: spaces or `LOW-VALUES` select
- * every type, two digits select one (`00`, the COBOL `ZEROS`, every type),
- * and anything else (`1`, `0`, `*`, `0A`) is refused.
+ * COTRTLIC 1220-EDIT-TYPECD — P-COTRTLIC-018, V-COTRTLIC-001: spaces or
+ * `LOW-VALUES` select every type, two digits select one (`00`, the COBOL
+ * `ZEROS`, every type), and anything else (`1`, `0`, `*`, `0A`) is refused.
  */
 function typeCodeFilterEdit(value: string, ctx: z.RefinementCtx): void {
   if (codePointLength(value) > TYPE_CODE_LENGTH) {
@@ -201,8 +193,9 @@ function typeCodeFilterEdit(value: string, ctx: z.RefinementCtx): void {
 }
 
 /**
- * COTRTUPC 1245-EDIT-NUM-REQD on the type code — V-COTRTUPC-012 to
- * V-COTRTUPC-014: not supplied, then not a `NUMVAL` argument, then zero.
+ * COTRTUPC 1245-EDIT-NUM-REQD — P-COTRTUPC-018 on the type code,
+ * V-COTRTUPC-012 to V-COTRTUPC-014: not supplied, then not a `NUMVAL`
+ * argument, then zero.
  *
  * Every `TEST-NUMVAL` form passes, not only two digits: COTRTUPC stores `1`,
  * ` 1`, `+7`, `1-`, `7.` and `.7` as two digits (P-COTRTUPC-015), so a
@@ -224,9 +217,11 @@ function typeCodeEditMessage(value: string): string | undefined {
 }
 
 /**
- * COTRTUPC 1230-EDIT-ALPHANUM-REQD and COTRTLIC 1240-EDIT-ALPHANUM-REQD on a
- * description of length 50: not supplied, then a character other than A-Z,
- * a-z, 0-9 or space.
+ * COTRTUPC 1230-EDIT-ALPHANUM-REQD — P-COTRTUPC-017 and COTRTLIC
+ * 1240-EDIT-ALPHANUM-REQD — P-COTRTLIC-021 on a description of length 50: not
+ * supplied (V-COTRTUPC-007, V-COTRTUPC-017, V-COTRTLIC-013), then a character
+ * other than A-Z, a-z, 0-9 or space (V-COTRTUPC-008, V-COTRTUPC-018,
+ * V-COTRTLIC-014).
  */
 function descriptionEditMessage(
   value: string,
@@ -241,12 +236,10 @@ function descriptionEditMessage(
   return undefined;
 }
 
-/**
- * A description field edited on its own: the length check, then, within the
- * length, the description edits, which refuse a character outside ASCII as
- * not alphanumeric, as both programs do. An absent description is the empty
- * field.
- */
+// A description field edited on its own: the length check, then, within the
+// length, the description edits, which refuse a character outside ASCII as
+// not alphanumeric, as both programs do. An absent description is the empty
+// field.
 function descriptionField(messages: DescriptionMessages) {
   return z
     .string({ required_error: messages.descriptionMustBeSupplied })
@@ -307,7 +300,7 @@ export const tranTypeListFilterSchema = z.object({
 
 export type TranTypeListFilterValues = z.infer<typeof tranTypeListFilterSchema>;
 
-/** A filter as sent: omitted when absent, empty or all spaces. */
+// A filter as sent: omitted when absent, empty or all spaces.
 function suppliedFilter(value: string | undefined): string | undefined {
   return value === undefined || ALL_SPACES.test(value) ? undefined : value;
 }
@@ -389,14 +382,12 @@ export const tranTypeInlineEditBmsFieldMap: Record<
 
 // --- CTTU add and update (COTRTUP TRTYPCD, TRTYDSC)
 
-/**
- * The add. Keys follow the audit `Order` (TRTYPCD 1, TRTYDSC 5). The
- * description is edited only when both lengths pass and the key passes its
- * edits, because COTRTUPC 1200-EDIT-MAP-INPUTS leaves before the description
- * edit when the key is blank or invalid
- * [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L716-737]. An absent member
- * is the empty field, answered with its must-be-supplied text.
- */
+// The add. Keys follow the audit `Order` (TRTYPCD 1, TRTYDSC 5). The
+// description is edited only when both lengths pass and the key passes its
+// edits, because COTRTUPC 1200-EDIT-MAP-INPUTS leaves before the description
+// edit when the key is blank or invalid
+// [app/app-transaction-type-db2/cbl/COTRTUPC.cbl:L716-737]. An absent member
+// is the empty field, answered with its must-be-supplied text.
 const createShape = {
   type_code: z
     .string({
@@ -441,10 +432,8 @@ export const tranTypeCreateSchema = z
     }
   }) satisfies z.ZodType<TranTypeCreateRequest>;
 
-/**
- * The update of the maintenance screen, `PUT` without `origin`: the
- * description only, the key being the path of a type already shown.
- */
+// The update of the maintenance screen, `PUT` without `origin`: the
+// description only, the key being the path of a type already shown.
 const updateShape = {
   description: descriptionField(TRAN_TYPE_UPSERT_MESSAGES),
 } satisfies Record<keyof TranTypeUpdateRequest, z.ZodTypeAny>;

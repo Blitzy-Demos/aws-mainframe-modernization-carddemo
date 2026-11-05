@@ -80,18 +80,18 @@ import {
   type TranTypeFormValues,
 } from "@/schemas/transaction-types";
 
-/** The CTLI list, where F3 returns (F-COTRTUP-005). */
+// The CTLI list, where F3 returns (F-COTRTUP-005).
 const LIST_ROUTE = "/admin/transaction-types";
 
-/** The empty key entry (F-COTRTUP-007, F-COTRTUP-014). */
+// The empty key entry (F-COTRTUP-007, F-COTRTUP-014).
 const KEY_ENTRY_ROUTE = "/admin/transaction-types/new";
 
-/** The edit route of a type on file, its code as the key segment. */
+// The edit route of a type on file, its code as the key segment.
 function editRoute(typeCode: string): string {
   return `${LIST_ROUTE}/${keyPathSegment(typeCode)}/edit`;
 }
 
-/** `TRTYPCDI` `X(2)` and `TRTYDSCI` `X(50)` of COTRTUP. */
+// `TRTYPCDI` `X(2)` and `TRTYDSCI` `X(50)` of COTRTUP.
 const TYPE_CODE_LENGTH = 2;
 const DESCRIPTION_LENGTH = 50;
 
@@ -109,12 +109,10 @@ const EMPTY_VALUES: TranTypeFormValues = { type_code: "", description: "" };
 const createResolver = zodResolver(tranTypeCreateSchema);
 const editResolver = zodResolver(tranTypeEditFormSchema);
 
-/**
- * The Look up's edits: the COTRTUPC key edits of tranTypeCreateSchema alone.
- * That schema edits the description only once the key passes, so any
- * description issue it reports belongs to the Add and is dropped here, as
- * COTRTUPC reads the key before the description is editable.
- */
+// The Look up's edits: the COTRTUPC key edits of tranTypeCreateSchema alone.
+// That schema edits the description only once the key passes, so any
+// description issue it reports belongs to the Add and is dropped here, as
+// COTRTUPC reads the key before the description is editable.
 const keyEntryResolver: Resolver<TranTypeFormValues> = async (
   values,
   context,
@@ -129,8 +127,8 @@ const keyEntryResolver: Resolver<TranTypeFormValues> = async (
 };
 
 /**
- * The two digits COTRTUPC reads a key by once its key edit has passed
- * (1210-EDIT-TRANTYPE, P-COTRTUPC-015): `FUNCTION NUMVAL` stored in the
+ * COTRTUPC 1210-EDIT-TRANTYPE — P-COTRTUPC-015: the two digits COTRTUPC reads
+ * a key by once its key edit has passed: `FUNCTION NUMVAL` stored in the
  * unsigned `9(02)` and moved back, so the sign is dropped and a fraction
  * rounds to the nearest integer (E-40): `1`, ` 1`, `+1`, `1-` and `-1` read
  * `01`, `.7` reads `01` and `.3` reads `00`. The list filter the Look up sends
@@ -153,23 +151,19 @@ function readKeyOf(entry: string): string | undefined {
   return integer.padStart(TYPE_CODE_LENGTH, "0");
 }
 
-/**
- * The location state with which the edit route hands the key entry a code
- * its read found no type for.
- */
+// The location state with which the edit route hands the key entry a code
+// its read found no type for.
 type KeyNotFoundState = { notFoundTypeCode: string };
 
 function keyNotFoundState(typeCode: string): KeyNotFoundState {
   return { notFoundTypeCode: typeCode };
 }
 
-/**
- * The code of the key entry's location state when it is a key-not-found
- * hand-over: a code the Look up would read as it stands, so one the COTRTUPC
- * key edits pass and that readKeyOf leaves unchanged. Any other state (none,
- * another shape, a key the edits refuse such as `00`, or one the read would
- * change such as `1`) hands nothing over, and the key entry opens empty.
- */
+// The code of the key entry's location state when it is a key-not-found
+// hand-over: a code the Look up would read as it stands, so one the COTRTUPC
+// key edits pass and that readKeyOf leaves unchanged. Any other state (none,
+// another shape, a key the edits refuse such as `00`, or one the read would
+// change such as `1`) hands nothing over, and the key entry opens empty.
 function keyNotFoundOf(state: unknown): string | undefined {
   if (
     typeof state !== "object" ||
@@ -194,15 +188,16 @@ function keyNotFoundOf(state: unknown): string | undefined {
 
 type TranTypeFieldsProps = {
   form: UseFormReturn<TranTypeFormValues>;
-  /** The key is the looked-up code (add) or the route's code (edit). */
+  // The key is the looked-up code (add) or the route's code (edit).
   typeCodeReadOnly: boolean;
-  /** The description stays protected until a type to add or update is known. */
+  // The description stays protected until a type to add or update is known.
   descriptionDisabled: boolean;
-  /** The field focused on mount: the key on entry (BMS `IC`), else the description. */
+  // The field focused on mount: the key on entry (BMS `IC`), else the
+  // description.
   autoFocus: keyof TranTypeFormValues;
 };
 
-/** TRTYPCD and TRTYDSC: one column at md, two at lg. */
+// TRTYPCD and TRTYDSC: one column at md, two at lg.
 function TranTypeFields({
   form,
   typeCodeReadOnly,
@@ -277,7 +272,7 @@ function TranTypeFields({
   );
 }
 
-/** Both fields' place while the type of the edit route loads. */
+// Both fields' place while the type of the edit route loads.
 function FieldsSkeleton(): JSX.Element {
   return (
     <div className="grid gap-4 lg:grid-cols-2">
@@ -288,10 +283,10 @@ function FieldsSkeleton(): JSX.Element {
   );
 }
 
-/** The key entry (Look up) and, for a code not on file, the add (Add). */
+// The key entry (Look up) and, for a code not on file, the add (Add).
 type AddPhase = "entry" | "add";
 
-/** /admin/transaction-types/new: key entry and add. */
+// /admin/transaction-types/new: key entry and add.
 function TranTypeAddForm(): JSX.Element {
   const navigate = useNavigate();
   const location = useLocation();
@@ -319,18 +314,16 @@ function TranTypeAddForm(): JSX.Element {
     form.setFocus(phase === "add" ? "description" : "type_code");
   }, [form, phase]);
 
-  /** Back to the empty key entry. */
+  // Back to the empty key entry.
   function toKeyEntry(): void {
     form.reset(EMPTY_VALUES);
     setPhase("entry");
   }
 
-  /**
-   * COTRTUPC TTUP-DETAILS-NOT-FOUND, for the Look up and the edit route
-   * alike: the add of the key, the F5 the screen then offers, with the read's
-   * text on the key (V-COTRTUPC-004). The Add's edits replace that text, and
-   * Cancel clears it with the entry.
-   */
+  // COTRTUPC TTUP-DETAILS-NOT-FOUND, for the Look up and the edit route
+  // alike: the add of the key, the F5 the screen then offers, with the read's
+  // text on the key (V-COTRTUPC-004). The Add's edits replace that text, and
+  // Cancel clears it with the entry.
   const toAddOfKeyNotFound = useCallback((): void => {
     setPhase("add");
     form.setError("type_code", {
@@ -350,12 +343,10 @@ function TranTypeAddForm(): JSX.Element {
     navigate(KEY_ENTRY_ROUTE, { replace: true });
   }, [handedOver, navigate, toAddOfKeyNotFound]);
 
-  /**
-   * Reads the edited key through the list's type code filter: a type on file
-   * opens its edit route; none (the list's 404, or a page without that code)
-   * opens the add of a key not found. The list's own text for an empty result
-   * is COTRTLIC's, not COTRTUPC's, so it is not shown; any other failure is.
-   */
+  // Reads the edited key through the list's type code filter: a type on file
+  // opens its edit route; none (the list's 404, or a page without that code)
+  // opens the add of a key not found. The list's own text for an empty result
+  // is COTRTLIC's, not COTRTUPC's, so it is not shown; any other failure is.
   async function lookUp(entry: string): Promise<void> {
     const key = readKeyOf(entry);
     if (key !== undefined) {
@@ -508,11 +499,11 @@ function TranTypeAddForm(): JSX.Element {
 }
 
 type TranTypeEditFormProps = {
-  /** The `:code` route parameter, the key of the type shown. */
+  // The `:code` route parameter, the key of the type shown.
   code: string;
 };
 
-/** /admin/transaction-types/:code/edit: update and delete of a type on file. */
+// /admin/transaction-types/:code/edit: update and delete of a type on file.
 function TranTypeEditForm({ code }: TranTypeEditFormProps): JSX.Element {
   const navigate = useNavigate();
   const titleId = useId();

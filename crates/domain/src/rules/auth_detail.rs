@@ -66,10 +66,14 @@
 //! and `AO` for any other database failure, the codes E-44 proposes.
 //!
 //! COPAUS2C is a direct call here, not a CICS `LINK`, so the LINK failure that
-//! rolls back without a message (V-COPAUS1C-008) has no counterpart. The
-//! scheduling failure of `SCHEDULE-PSB` (P-COPAUS1C-016, P-COPAUS1C-017) has
-//! none either: no PSB is scheduled, and a database failure is the read
-//! failure of the call that met it.
+//! rolls back without a message (V-COPAUS1C-008) has no counterpart. No PSB is
+//! scheduled either, and no rule here returns the `SCHEDULE-PSB` text: the
+//! counterpart of `SCHEDULE-PSB` is the adapter's opening of the authorization
+//! unit of work. When that cannot be opened, the request answers the text of
+//! [`super::auth_summary::schedule_psb_failure`], with the status `AO`, on
+//! [`CARD_NUM_FIELD`] (V-COPAUS1C-002, P-COPAUS1C-016), and does not abend
+//! after it as the COBOL does (P-COPAUS1C-017, E-71). Once the store is open,
+//! a database failure is the failure of the read or write that met it.
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 

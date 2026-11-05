@@ -14,10 +14,11 @@
 //   rule's dates are sent as midnight UTC. An edit validates with the stored
 //   rule's schema, which sends a date left unchanged as the stored instant,
 //   time of day included, and only a changed date as midnight UTC.
-// - The former PF keys are controls in DOM order after the fields: Save (PF5),
-//   Reset (PF4) and Back (PF3), the shared BackLink, which therefore sits in
-//   the form's footer rather than the page header. Enter in any field submits
-//   through handleSubmit.
+// - Save, Reset and Back are the form's own actions, in DOM and tab order
+//   after the fields, borrowing the Save, Reset, Back pattern of the ported
+//   admin forms (UserAddPage's Add user, Reset, Back). Back is the shared
+//   BackLink, which therefore sits in the form's footer rather than the page
+//   header. Enter in any field submits through handleSubmit.
 import {
   useEffect,
   useId,
@@ -61,7 +62,7 @@ import {
 
 const LIST_ROUTE = "/admin/reward-rules";
 
-/** The new-rule form's starting values: every field empty. */
+// The new-rule form's starting values: every field empty.
 const EMPTY: RewardRuleFormInput = {
   transaction_type_cd: "",
   transaction_category_cd: "",
@@ -76,7 +77,7 @@ type FieldSpec = {
   name: keyof RewardRuleFormInput;
   label: string;
   description?: string;
-  /** Grid placement of the field at `lg`, where the form has two columns. */
+  // Grid placement of the field at `lg`, where the form has two columns.
   className?: string;
   inputProps: Pick<
     ComponentProps<"input">,
@@ -140,16 +141,14 @@ const FIELDS: readonly FieldSpec[] = [
 ];
 
 type RewardRuleFormProps = {
-  /** The routed rule ID in edit mode; `undefined` creates a rule. */
+  // The routed rule ID in edit mode; `undefined` creates a rule.
   ruleId: string | undefined;
-  /** The values the form starts from and Reset restores. */
+  // The values the form starts from and Reset restores.
   initialValues: RewardRuleFormInput;
-  /**
-   * The resolver's schema: `rewardRuleSchema` for a new rule, the edited
-   * rule's `rewardRuleEditSchema` in edit mode.
-   */
+  // The resolver's schema: `rewardRuleSchema` for a new rule, the edited
+  // rule's `rewardRuleEditSchema` in edit mode.
   schema: typeof rewardRuleSchema;
-  /** The form's accessible name: the page heading. */
+  // The form's accessible name: the page heading.
   label: string;
 };
 

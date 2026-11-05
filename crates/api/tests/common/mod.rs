@@ -10,7 +10,9 @@
 //! [`carddemo_testkit::TestStack`]. Requests go through `reqwest`, so every
 //! test crosses the same HTTP layer the SPA does: extractors, the bearer
 //! token, the `{code, message, fields}` error body and the status mapping of
-//! `carddemo_api::error`. Docker must be running.
+//! `carddemo_api::error`. [`TestApp::router`] is the same router over the same
+//! state, for a test that reads a response body frame by frame in process.
+//! Docker must be running.
 //!
 //! Tests are plain `#[test]` functions, never `#[tokio::test]`:
 //!
@@ -47,6 +49,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::time::Duration;
 
+use axum::Router;
 use carddemo_audit::{
     Document, IdKind, PARITY_AUDIT_PATH, Repo, Row, Table, VALIDATION_AUDIT_PATH, citations,
     code_span, key_values,
@@ -102,8 +105,8 @@ pub type Resp = (StatusCode, Value, String);
 /// The API router served on `127.0.0.1` over a seeded test database.
 ///
 /// Fields drop in declaration order after [`Drop::drop`] has aborted the
-/// server task: the client, the base URL, the task handle, and last the stack,
-/// whose own drop removes the container.
+/// server task: the client, the base URL, the task handle, the router and its
+/// pool handle, and last the stack, whose own drop removes the container.
 ///
 /// A `TestApp` must be dropped outside `carddemo_testkit::block_on`: create it
 /// before the first `block_on` of a test and let it drop when the test
@@ -112,6 +115,7 @@ pub struct TestApp {
     client: Client,
     base_url: String,
     server: JoinHandle<()>,
+    router: Router,
     stack: TestStack,
 }
 
@@ -172,7 +176,7 @@ impl TestApp {
             .unwrap_or_else(|error| {
                 panic!("building the bounded test HTTP client failed: {error}")
             });
-        let (stack, port, server) = block_on(async move {
+        let (stack, port, server, router) = block_on(async move {
             let stack = TestStack::postgres().await;
             stack
                 .seed()
@@ -193,17 +197,20 @@ impl TestApp {
                 .local_addr()
                 .unwrap_or_else(|error| panic!("reading the bound test address failed: {error}"))
                 .port();
+            let router = carddemo_api::app(state);
+            let app = router.clone();
             let server = tokio::spawn(async move {
-                if let Err(error) = axum::serve(listener, carddemo_api::app(state)).await {
+                if let Err(error) = axum::serve(listener, app).await {
                     eprintln!("the carddemo-api test server stopped: {error}");
                 }
             });
-            (stack, port, server)
+            (stack, port, server, router)
         });
         Self {
             client,
             base_url: format!("http://127.0.0.1:{port}"),
             server,
+            router,
             stack,
         }
     }
@@ -221,6 +228,14 @@ impl TestApp {
     #[must_use]
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
+    }
+
+    /// The router the server task serves, over the same state and so the
+    /// same pool and admission limits, for a request a test sends in process
+    /// with `tower::ServiceExt::oneshot`: the response body then arrives frame
+    /// by frame, as the body yields them to the server.
+    pub fn router(&self) -> Router {
+        self.router.clone()
     }
 
     /// The HTTP client, for requests the helpers below do not shape, such as

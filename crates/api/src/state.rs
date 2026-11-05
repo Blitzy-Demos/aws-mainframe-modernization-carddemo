@@ -14,7 +14,7 @@
 //!   keys come from the path, query or body, and the navigation fields are the
 //!   SPA's routes.
 //! - Everything per process does: the database handle, the settings, the
-//!   processing clock, the token keys, the CORS origin and the two admission
+//!   processing clock, the token keys, the CORS origin and the three admission
 //!   limits. All of it is built once at start-up, by [`PreparedState::new`]
 //!   from the settings before any connection opens and by
 //!   [`PreparedState::into_state`] once the database handle exists. It is
@@ -23,10 +23,11 @@
 //!
 //! # Admission limits
 //!
-//! Two semaphores bound work whose cost would otherwise grow with the number
+//! Three semaphores bound work whose cost would otherwise grow with the number
 //! of concurrent requests. A request beyond a limit waits for a permit, in
 //! arrival order; none is refused and none times out, because the API has no
-//! rate limiting.
+//! rate limiting. No setting sizes them: each is derived from the pool or the
+//! CPUs.
 //!
 //! - `AppState::admit_tran_id_writer` admits the CT02 adds and confirmed
 //!   CB00 payments, the requests that allocate a TRAN-ID. The allocation
@@ -42,6 +43,18 @@
 //!   a permit instead of each taking a blocking thread and its memory, so the
 //!   process's peak memory has a fixed ceiling. `run_argon2` keeps the
 //!   permit inside the blocking task until the step returns.
+//! - `AppState::admit_report` admits the CR00 reports. A report holds one
+//!   pooled connection and one database snapshot from the start of its run
+//!   until its streamed answer is sent or abandoned, and besides them one
+//!   page of records, the chunk of JSON it is filling and what the server's
+//!   bounded write buffer holds, whatever its size.
+//!   It therefore takes its permit before it opens its unit of work, and its
+//!   response body keeps the permit: at most `report_permits` reports run or
+//!   send at once, overlapping reports queue here holding no connection, and
+//!   the other operations keep the rest of the pool. A client that reads its
+//!   report slowly, or not at all, keeps the permit and the connection until
+//!   it has read the answer or disconnected, since the API has no timeout,
+//!   rate limiting or proxy.
 //!
 //! # Time
 //!
@@ -88,11 +101,15 @@ use crate::error::ApiError;
 /// `carddemo_persistence::ids` documents, as on a full-sized pool.
 const MIN_TRAN_ID_WRITERS: usize = 2;
 
+/// The fewest CR00 reports [`report_permits`] admits at once, whatever the
+/// pool size, so a report can always run.
+const MIN_REPORTS: usize = 1;
+
 /// The shared state of the API process.
 ///
-/// Cloning copies a pool handle, six reference counts and the origin header;
-/// every clone sees the same connections, settings, clock, keys and admission
-/// limits.
+/// Cloning copies a pool handle, seven reference counts and the origin
+/// header; every clone sees the same connections, settings, clock, keys and
+/// admission limits.
 #[derive(Clone)]
 pub struct AppState {
     db: Db,
@@ -103,6 +120,7 @@ pub struct AppState {
     cors_origin: HeaderValue,
     tran_id_writers: Arc<Semaphore>,
     argon2_work: Arc<Semaphore>,
+    report_work: Arc<Semaphore>,
 }
 
 impl fmt::Debug for AppState {
@@ -110,7 +128,7 @@ impl fmt::Debug for AppState {
     /// secrets out: [`Settings`] redacts the database and broker URLs and the
     /// JWT secret, [`JwtKeys`] prints only its algorithm and lifetime,
     /// [`VersionKey`] prints `VersionKey(<redacted>)`, and [`Db`] only its
-    /// pool's size and options. The two admission limits show the permits
+    /// pool's size and options. The three admission limits show the permits
     /// they have free.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Exhaustive destructuring: a field added to `AppState` fails to
@@ -124,6 +142,7 @@ impl fmt::Debug for AppState {
             cors_origin,
             tran_id_writers,
             argon2_work,
+            report_work,
         } = self;
         f.debug_struct("AppState")
             .field("db", db)
@@ -137,6 +156,7 @@ impl fmt::Debug for AppState {
                 &tran_id_writers.available_permits(),
             )
             .field("argon2_permits_free", &argon2_work.available_permits())
+            .field("report_permits_free", &report_work.available_permits())
             .finish()
     }
 }
@@ -160,13 +180,15 @@ pub enum StateError {
     /// rejected, because the one-entry allow-list compares the header byte
     /// for byte and `tower-http` panics on `*`.
     ///
-    /// The value is quoted with `Debug` escapes, so a control character in it
-    /// cannot break the one-line report; it is a public origin, not a secret.
-    #[error("invalid CARDDEMO_CORS_ORIGIN: {value:?}: {reason}")]
+    /// The rejected value is never retained or reported, by `Display` or by
+    /// `Debug`: a mistaken value can hold user information, a query or a
+    /// fragment that carries a credential. The setting's name and the fixed
+    /// reason of the rule the value breaks identify the fault, and neither
+    /// holds a line break, so the report stays one line.
+    #[error("invalid CARDDEMO_CORS_ORIGIN: {reason}")]
     CorsOrigin {
-        /// The rejected value, as set.
-        value: String,
-        /// Why it is not a serialized origin.
+        /// Why the value is not a serialized origin: the fixed text of the
+        /// first rule it breaks.
         reason: &'static str,
     },
     /// `CARDDEMO_JWT_TTL_SECS` is a lifetime no token can be issued with:
@@ -263,9 +285,9 @@ impl PreparedState {
     }
 
     /// The state of the process: the derived values with `db`, the pool
-    /// opened on [`Settings::database_url`], and the TRAN-ID writer admission,
-    /// whose `tran_id_writer_permits` are sized from that pool's connection
-    /// limit.
+    /// opened on [`Settings::database_url`], and the TRAN-ID writer admission
+    /// and the report admission, whose `tran_id_writer_permits` and
+    /// `report_permits` are sized from that pool's connection limit.
     #[must_use]
     pub fn into_state(self, db: Db) -> AppState {
         let Self {
@@ -276,7 +298,9 @@ impl PreparedState {
             version_key,
             argon2_work,
         } = self;
-        let writers = tran_id_writer_permits(db.pool().options().get_max_connections());
+        let max_connections = db.pool().options().get_max_connections();
+        let writers = tran_id_writer_permits(max_connections);
+        let reports = report_permits(max_connections);
         AppState {
             db,
             settings: Arc::new(settings),
@@ -286,6 +310,7 @@ impl PreparedState {
             cors_origin,
             tran_id_writers: Arc::new(Semaphore::new(writers)),
             argon2_work: Arc::new(argon2_work),
+            report_work: Arc::new(Semaphore::new(reports)),
         }
     }
 }
@@ -323,12 +348,26 @@ fn argon2_permits() -> usize {
     }
 }
 
+/// The permits of the report admission for a pool of `max_connections`: a
+/// quarter of the connections, rounded down, and never fewer than
+/// [`MIN_REPORTS`]. A pool of 10 admits 2 reports, the testkit pool of 5
+/// admits 1.
+///
+/// The reports admitted at once are the most connections and database
+/// snapshots reports hold together. With the TRAN-ID writers, they leave 4
+/// of a pool of 10 to the other reads and to the `USRSEC` read that checks
+/// every request's bearer token, however many reports and writers queue.
+fn report_permits(max_connections: u32) -> usize {
+    // A `u32` fits the `usize` of every 32- and 64-bit target.
+    usize::try_from(max_connections / 4).map_or(MIN_REPORTS, |quarter| quarter.max(MIN_REPORTS))
+}
+
 /// A permit of `permits`, the admission limit named `admission`, once one is
 /// free.
 ///
 /// # Errors
 ///
-/// [`ApiError::unexpected`] when the semaphore is closed. Neither admission
+/// [`ApiError::unexpected`] when the semaphore is closed. No admission
 /// semaphore is ever closed, so the cause is logged as the defect it would
 /// be, and the request answers without internal detail.
 async fn admitted(
@@ -406,12 +445,10 @@ mod cors_reason {
 ///
 /// # Errors
 ///
-/// [`StateError::CorsOrigin`] with the first rule `value` breaks.
+/// [`StateError::CorsOrigin`] with the reason of the first rule `value`
+/// breaks. The error holds no part of `value`, which may carry a credential.
 fn cors_origin(value: &str) -> Result<HeaderValue, StateError> {
-    let reject = |reason| StateError::CorsOrigin {
-        value: value.to_owned(),
-        reason,
-    };
+    let reject = |reason| StateError::CorsOrigin { reason };
     check_origin(value).map_err(reject)?;
     // Every character `check_origin` accepts is visible ASCII, which a
     // header value always carries.
@@ -654,6 +691,19 @@ impl AppState {
     pub(crate) async fn admit_argon2(&self) -> Result<OwnedSemaphorePermit, ApiError> {
         admitted(&self.argon2_work, "argon2_work").await
     }
+
+    /// Waits for a report permit, the admission of the module documentation.
+    /// A CR00 report takes it before it opens its read-only unit of work, and
+    /// its response body holds it until the body is sent or dropped, so a
+    /// report queued here holds no pooled connection and no snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::unexpected`] when the semaphore is closed, which nothing
+    /// does; the cause is logged.
+    pub(crate) async fn admit_report(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        admitted(&self.report_work, "report_work").await
+    }
 }
 
 impl FromRef<AppState> for Arc<JwtKeys> {
@@ -681,7 +731,7 @@ mod tests {
     use tokio::sync::{Semaphore, oneshot};
 
     use super::{
-        AppState, PreparedState, StateError, admitted, cors_reason, run_argon2,
+        AppState, PreparedState, StateError, admitted, cors_reason, report_permits, run_argon2,
         tran_id_writer_permits,
     };
     use crate::auth::jwt::{JwtKeys, UserType};
@@ -817,8 +867,7 @@ mod tests {
         ] {
             let err = derive(&settings_with(None, origin)).expect_err("the origin is rejected");
             match &err {
-                StateError::CorsOrigin { value, reason } => {
-                    assert_eq!(value, origin);
+                StateError::CorsOrigin { reason } => {
                     assert_eq!(*reason, expected, "{origin:?}");
                 }
                 StateError::Clock(_) | StateError::JwtTtl { .. } | StateError::VersionKey(_) => {
@@ -828,9 +877,63 @@ mod tests {
             let text = err.to_string();
             assert_eq!(
                 text,
-                format!("invalid CARDDEMO_CORS_ORIGIN: {origin:?}: {expected}")
+                format!("invalid CARDDEMO_CORS_ORIGIN: {expected}"),
+                "{origin:?}"
             );
             assert!(!text.contains(['\n', '\r']), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn rejected_origin_never_reaches_the_error_text_or_debug() {
+        // The credential-bearing origins are assembled here, so no source
+        // line holds a URL with a password in it.
+        let user = "carddemo";
+        let password = "example-password-7f3a";
+        let query_secret = "example-query-secret-7f3a";
+        let fragment_secret = "example-fragment-secret-7f3a";
+        let path_secret = "example-path-secret-7f3a";
+        let secrets = [password, query_secret, fragment_secret, path_secret];
+        for (origin, expected) in [
+            (
+                format!("http://{user}:{password}@localhost:5173"),
+                cors_reason::USER_INFO,
+            ),
+            (
+                format!("http://{password}@localhost:5173"),
+                cors_reason::USER_INFO,
+            ),
+            (
+                format!("http://localhost:5173?token={query_secret}"),
+                cors_reason::PATH,
+            ),
+            (
+                format!("http://localhost:5173#access_token={fragment_secret}"),
+                cors_reason::PATH,
+            ),
+            (
+                format!("http://localhost:5173/{path_secret}"),
+                cors_reason::PATH,
+            ),
+            (
+                format!("http://{user}:{password}@localhost:5173/?token={query_secret}"),
+                cors_reason::PATH,
+            ),
+        ] {
+            let err = derive(&settings_with(None, &origin)).expect_err("the origin is rejected");
+            assert!(
+                matches!(err, StateError::CorsOrigin { reason } if reason == expected),
+                "{err:?}"
+            );
+            let text = err.to_string();
+            assert_eq!(text, format!("invalid CARDDEMO_CORS_ORIGIN: {expected}"));
+            let debug = format!("{err:?}");
+            for report in [&text, &debug] {
+                assert!(!report.contains(&origin), "{report:?} holds the origin");
+                for secret in secrets {
+                    assert!(!report.contains(secret), "{report:?} holds {secret:?}");
+                }
+            }
         }
     }
 
@@ -985,6 +1088,20 @@ mod tests {
         for (max_connections, permits) in [(1, 2), (2, 2), (3, 2), (5, 2), (10, 4), (11, 5)] {
             assert_eq!(
                 tran_id_writer_permits(max_connections),
+                permits,
+                "a pool of {max_connections}"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_are_a_quarter_of_the_pool_and_never_fewer_than_one() {
+        // (pool connections, reports admitted at once): the testkit pool
+        // holds 5 connections and the `api` pool 10.
+        for (max_connections, permits) in [(0, 1), (1, 1), (4, 1), (5, 1), (8, 2), (10, 2), (12, 3)]
+        {
+            assert_eq!(
+                report_permits(max_connections),
                 permits,
                 "a pool of {max_connections}"
             );

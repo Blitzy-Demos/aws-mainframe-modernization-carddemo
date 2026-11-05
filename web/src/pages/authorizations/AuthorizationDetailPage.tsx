@@ -41,10 +41,8 @@ import { authDetailKeySchema } from "@/schemas/authorizations";
 // [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L291-357]
 // ---------------------------------------------------------------------------
 
-/**
- * An `X(n)` value at its full width. The API drops trailing spaces, which the
- * COBOL reference-modified moves still copy into the screen field.
- */
+// An `X(n)` value at its full width. The API drops trailing spaces, which the
+// COBOL reference-modified moves still copy into the screen field.
 function stored(value: string, width: number): string {
   return value.padEnd(width, " ");
 }
@@ -76,10 +74,10 @@ function cardExpiry(value: string): string {
   return `${expiry.slice(0, 2)}/${expiry.slice(2, 4)}`;
 }
 
-/** The scale-2 decimal text the API sends for `PA-APPROVED-AMT S9(10)V99`. */
+// The scale-2 decimal text the API sends for `PA-APPROVED-AMT S9(10)V99`.
 const DECIMAL_TEXT = /^(-?)([0-9]+)\.([0-9]{2})$/;
 
-/** The integer positions of `WS-AUTH-AMT PIC -zzzzzzz9.99`. */
+// The integer positions of `WS-AUTH-AMT PIC -zzzzzzz9.99`.
 const AMOUNT_INTEGER_DIGITS = 8;
 
 /**
@@ -105,9 +103,9 @@ function approvedAmount(value: string): string {
   return `${negative ? "-" : ""}${integer}.${cents}`;
 }
 
-/** `PA-FRAUD-CONFIRMED`, the `PA-AUTH-FRAUD` value of a reported fraud. */
+// `PA-FRAUD-CONFIRMED`, the `PA-AUTH-FRAUD` value of a reported fraud.
 const FRAUD_CONFIRMED = "F";
-/** `PA-FRAUD-REMOVED`, the value once the report was taken back. */
+// `PA-FRAUD-REMOVED`, the value once the report was taken back.
 const FRAUD_REMOVED = "R";
 
 /**
@@ -125,36 +123,37 @@ function fraudStatus(detail: AuthDetail): string {
 // COPAU01 output fields
 // ---------------------------------------------------------------------------
 
-/** The response properties that hold screen text, so a field cannot name `next_id` or `message`. */
+// The response properties that hold screen text, so a field cannot name `next_id` or `message`.
 type TextKey = {
   [K in keyof AuthDetail]-?: AuthDetail[K] extends string ? K : never;
 }[keyof AuthDetail];
 
-/** The status-flag badges of the component mapping (AAP 0.4.2). */
+// The status-flag badges of the component mapping (AAP 0.4.2).
 type StatusBadge = "secondary" | "destructive";
 
 type DetailField = Readonly<{
-  /** The COPAU01 output field. */
+  // The COPAU01 output field.
   bms: string;
-  /** Its BMS caption, without the colon. */
+  // Its BMS caption, without the colon.
   label: string;
-  /** The response property POPULATE-AUTH-DETAILS moves into it. */
+  // The response property POPULATE-AUTH-DETAILS moves into it.
   key: TextKey;
-  /** The edit made on the move, for a field that shows more than the stored text. */
+  // The edit made on the move, for a field that shows more than the stored text.
   show?: (detail: AuthDetail) => string;
-  /** The badge the value is shown in, or `null` for plain text. */
+  // The badge the value is shown in, or `null` for plain text.
   badge?: (detail: AuthDetail) => StatusBadge | null;
 }>;
 
 /**
- * COPAUS1C writes AUTHRSPO in green for `A` and in red for `D`
+ * COPAUS1C POPULATE-AUTH-DETAILS — P-COPAUS1C-005: the badge of AUTHRSPO,
+ * which COPAUS1C writes in green for `A` and in red for `D`
  * [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L311-317].
  */
 function responseBadge(detail: AuthDetail): StatusBadge {
   return detail.approved === "A" ? "secondary" : "destructive";
 }
 
-/** A confirmed fraud is the destructive flag; a removed one stays marked as secondary. */
+// A confirmed fraud is the destructive flag; a removed one stays marked as secondary.
 function fraudBadge(detail: AuthDetail): StatusBadge | null {
   switch (detail.pa_auth_fraud) {
     case FRAUD_CONFIRMED:
@@ -166,7 +165,7 @@ function fraudBadge(detail: AuthDetail): StatusBadge | null {
   }
 }
 
-/** COPAU01 lines 7 to 15, in screen order [app/app-authorization-ims-db2-mq/bms/COPAU01.bms:L80-228]. */
+// COPAU01 lines 7 to 15, in screen order [app/app-authorization-ims-db2-mq/bms/COPAU01.bms:L80-228].
 const AUTHORIZATION_FIELDS: ReadonlyArray<DetailField> = [
   { bms: "CARDNUM", label: "Card #", key: "card_number" },
   {
@@ -211,7 +210,7 @@ const AUTHORIZATION_FIELDS: ReadonlyArray<DetailField> = [
   },
 ];
 
-/** The "Merchant Details" lines 19 and 21 [app/app-authorization-ims-db2-mq/bms/COPAU01.bms:L229-283]. */
+// The "Merchant Details" lines 19 and 21 [app/app-authorization-ims-db2-mq/bms/COPAU01.bms:L229-283].
 const MERCHANT_FIELDS: ReadonlyArray<DetailField> = [
   { bms: "MERNAME", label: "Name", key: "pa_merchant_name" },
   { bms: "MERID", label: "Merchant ID", key: "pa_merchant_id" },
@@ -220,14 +219,12 @@ const MERCHANT_FIELDS: ReadonlyArray<DetailField> = [
   { bms: "MERZIP", label: "Zip", key: "pa_merchant_zip" },
 ];
 
-/** One column at `md`, two at `lg` (AAP 0.5.4.4). */
+// One column at `md`, two at `lg` (AAP 0.5.4.4).
 const FIELD_GRID = "grid grid-cols-1 gap-x-6 gap-y-2 lg:grid-cols-2";
 
-/**
- * The fields as captions and values. Each value is at least one text line
- * high (`min-h-6`, the line height of its `text-base`), so a blank value
- * takes the height of a shown one and of its skeleton.
- */
+// The fields as captions and values. Each value is at least one text line
+// high (`min-h-6`, the line height of its `text-base`), so a blank value
+// takes the height of a shown one and of its skeleton.
 function DetailList({
   fields,
   detail,
@@ -273,12 +270,10 @@ function AuthorizationCard({ detail }: { detail: AuthDetail }): JSX.Element {
   );
 }
 
-/**
- * The fields' places while the record is read. Each caption and each value
- * is a skeleton centred in its line box, the 20px of the caption's text-sm
- * (h-4 with my-0.5) and the 24px of the value's text-base (h-5 with my-0.5),
- * so every field takes the height it takes once read.
- */
+// The fields' places while the record is read. Each caption and each value
+// is a skeleton centred in its line box, the 20px of the caption's text-sm
+// (h-4 with my-0.5) and the 24px of the value's text-base (h-5 with my-0.5),
+// so every field takes the height it takes once read.
 function FieldSkeletons({
   fields,
 }: {
@@ -296,12 +291,10 @@ function FieldSkeletons({
   );
 }
 
-/**
- * The card while the record is read, hidden from assistive technology: the
- * page's status announces the read. The titles are skeletons as high as
- * their `leading-none` lines (h-4), and the merchant fields sit under theirs
- * as in the card read, so nothing moves when the record arrives.
- */
+// The card while the record is read, hidden from assistive technology: the
+// page's status announces the read. The titles are skeletons as high as
+// their `leading-none` lines (h-4), and the merchant fields sit under theirs
+// as in the card read, so nothing moves when the record arrives.
 function AuthorizationSkeleton(): JSX.Element {
   return (
     <Card aria-hidden="true">
@@ -324,18 +317,14 @@ function AuthorizationSkeleton(): JSX.Element {
 // Read status
 // ---------------------------------------------------------------------------
 
-/**
- * How long the read's status stays empty before it announces the read's
- * progress, DataTable's delay. The cleared status is committed first, so the
- * identical result of a repeated read is still announced as a change.
- */
+// How long the read's status stays empty before it announces the read's
+// progress, DataTable's delay. The cleared status is committed first, so the
+// identical result of a repeated read is still announced as a change.
 const STATUS_ANNOUNCE_DELAY_MS = 150;
 
-/**
- * The completed read as the status announces it: the authorization's identity,
- * its transaction ID, or the authorization's own ID when the record carries no
- * transaction ID, never its amount or card number.
- */
+// The completed read as the status announces it: the authorization's identity,
+// its transaction ID, or the authorization's own ID when the record carries no
+// transaction ID, never its amount or card number.
 function loadedText(detail: AuthDetail): string {
   return detail.pa_transaction_id.trim() === ""
     ? `Authorization ${detail.auth_id} loaded`
@@ -377,10 +366,10 @@ function isNoMessageNotFound(error: Error): boolean {
 // Navigation
 // ---------------------------------------------------------------------------
 
-/** The CPVS route, the parent of this one. */
+// The CPVS route, the parent of this one.
 const SUMMARY_PATH = "/authorizations";
 
-/** `pathname` with the `account_id` the CPVS page searches for, when one is known. */
+// `pathname` with the `account_id` the CPVS page searches for, when one is known.
 function withAccount(pathname: string, accountId: string): To {
   return accountId === ""
     ? pathname
@@ -391,7 +380,7 @@ function detailLocation(authId: string, accountId: string): To {
   return withAccount(`${SUMMARY_PATH}/${encodeURIComponent(authId)}`, accountId);
 }
 
-/** No lookup: an empty account ID keeps the summary query from sending anything. */
+// No lookup: an empty account ID keeps the summary query from sending anything.
 const NO_LOOKUP: AuthSummaryParams = { account_id: "" };
 
 /**
@@ -462,11 +451,9 @@ function useNextAuthorization(
 
 type FraudAction = "mark" | "remove";
 
-/**
- * COPAUS1C MARK-AUTH-FRAUD — P-COPAUS1C-006: a record flagged `F` has its
- * fraud removed (`R`); any other record is reported as fraud (`F`). The
- * control names are those of F-COPAU01-003 and F-COPAU01-004.
- */
+// COPAUS1C MARK-AUTH-FRAUD — P-COPAUS1C-006: a record flagged `F` has its
+// fraud removed (`R`); any other record is reported as fraud (`F`). The
+// control names are those of F-COPAU01-003 and F-COPAU01-004.
 const FRAUD_ACTIONS: Readonly<
   Record<FraudAction, Readonly<{ control: string; title: string; describe: (tranId: string) => string }>>
 > = {
@@ -482,18 +469,16 @@ const FRAUD_ACTIONS: Readonly<
   },
 };
 
-/**
- * The confirm of one PF5. `authId` is the route key of the record it was
- * opened on, the only one its Confirm may toggle, and `action` the PF5 that
- * record's fraud flag named then (F-COPAU01-003, F-COPAU01-004), the only one
- * its Confirm may send. The action and transaction ID stay set while it
- * closes, so its text does not change mid-animation.
- */
+// The confirm of one PF5. `authId` is the route key of the record it was
+// opened on, the only one its Confirm may toggle, and `action` the PF5 that
+// record's fraud flag named then (F-COPAU01-003, F-COPAU01-004), the only one
+// its Confirm may send. The action and transaction ID stay set while it
+// closes, so its text does not change mid-animation.
 type FraudDialog = Readonly<{ open: boolean; action: FraudAction; authId: string; tranId: string }>;
 
 const CLOSED_DIALOG: FraudDialog = { open: false, action: "mark", authId: "", tranId: "" };
 
-/** The failure a toast has shown, kept as the screen's message line. */
+// The failure a toast has shown, kept as the screen's message line.
 type ShownError = Readonly<{ error: Error; message: string }>;
 
 // ---------------------------------------------------------------------------

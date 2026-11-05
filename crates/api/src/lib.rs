@@ -112,14 +112,18 @@ use tracing::{Level, Span};
 ///
 /// # Response header layer
 ///
-/// Every answer, the 404 and 405 answers and CORS preflights included,
-/// carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
-/// The answers hold per-account and admin data (balances, card numbers,
-/// reward points, user records, reward rules), so no browser or intermediary
-/// may keep a copy, and no browser may read a body as any type other than its
-/// declared `Content-Type`. Each header is added only to an answer that does
-/// not carry it already: a handler that sets its own value keeps it, and no
-/// answer carries either header twice.
+/// Every answer, handler errors, the 404 and 405 answers and CORS preflights
+/// included, carries `Cache-Control: no-store`, `X-Content-Type-Options:
+/// nosniff`, `X-Frame-Options: DENY` and `Content-Security-Policy:
+/// frame-ancestors 'none'`. The answers hold per-account and admin data
+/// (balances, card numbers, reward points, user records, reward rules), so no
+/// browser or intermediary may keep a copy, no browser may read a body as any
+/// type other than its declared `Content-Type`, and no page may frame an
+/// answer: `frame-ancestors` forbids it to browsers that apply Content
+/// Security Policy, and `X-Frame-Options` to browsers that predate it. Each
+/// header is added only to an answer that does not carry it already: a
+/// handler that sets its own value keeps it, and no answer carries any of
+/// them twice.
 ///
 /// # CORS layer
 ///
@@ -353,9 +357,14 @@ fn bounded_method(method: &Method) -> &str {
 }
 
 /// The response header layer of [`app`]: `response` with
-/// `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, each added
-/// only when `response` does not carry that header already, so a value its
-/// handler set wins and neither header is ever sent twice.
+/// `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`,
+/// `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors
+/// 'none'`, each added only when `response` does not carry that header
+/// already, so a value its handler set wins and no header is ever sent twice.
+///
+/// The two frame headers keep every page from framing an answer:
+/// `frame-ancestors` is the control of browsers that apply Content Security
+/// Policy, and `X-Frame-Options` that of browsers that predate it.
 async fn add_response_headers(mut response: Response<Body>) -> Response<Body> {
     let headers = response.headers_mut();
     headers
@@ -364,6 +373,12 @@ async fn add_response_headers(mut response: Response<Body>) -> Response<Body> {
     headers
         .entry(header::CACHE_CONTROL)
         .or_insert(HeaderValue::from_static("no-store"));
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static("frame-ancestors 'none'"));
     response
 }
 
@@ -487,9 +502,14 @@ mod tests {
     /// `Cache-Control`.
     const CACHED: &str = "/cached";
 
+    /// The path of [`layered`]'s route whose GET handler answers with an
+    /// error.
+    const DENIED: &str = "/denied";
+
     /// A stand-in for the registry: one path with a GET and a PUT, as
-    /// `/accounts/{id}` has, and [`CACHED`], whose GET sets its own
-    /// `Cache-Control: max-age=60`.
+    /// `/accounts/{id}` has, [`CACHED`], whose GET sets its own
+    /// `Cache-Control: max-age=60`, and [`DENIED`], whose GET answers
+    /// [`ApiError::unauthenticated`].
     fn layered() -> Router {
         let routes = Router::new()
             .route(
@@ -499,7 +519,8 @@ mod tests {
             .route(
                 CACHED,
                 get(|| async { ([(header::CACHE_CONTROL, "max-age=60")], "cached") }),
-            );
+            )
+            .route(DENIED, get(|| async { ApiError::unauthenticated() }));
         with_layers(routes, HeaderValue::from_static(ORIGIN))
     }
 
@@ -743,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_answer_is_no_store_and_nosniff_unless_its_handler_sets_its_own() {
+    async fn every_answer_is_no_store_nosniff_and_unframeable_unless_its_handler_sets_its_own() {
         const ACCOUNT: &str = "/accounts/00000000001";
         const NO_STORE: &str = "no-store";
         let admitted: &[(HeaderName, &str)] = &[(header::ORIGIN, ORIGIN)];
@@ -762,6 +783,11 @@ mod tests {
             (
                 request(Method::PUT, ACCOUNT, admitted),
                 StatusCode::OK,
+                NO_STORE,
+            ),
+            (
+                request(Method::GET, DENIED, admitted),
+                StatusCode::UNAUTHORIZED,
                 NO_STORE,
             ),
             (preflight(ORIGIN), StatusCode::OK, NO_STORE),
@@ -804,6 +830,8 @@ mod tests {
             for (name, expected) in [
                 (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
                 (header::CACHE_CONTROL, cache_control),
+                (header::X_FRAME_OPTIONS, "DENY"),
+                (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
             ] {
                 let sent: Vec<&str> = headers
                     .get_all(&name)

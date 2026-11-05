@@ -35,8 +35,8 @@
 //!   slots per card of the `CBSTM03A` tables, where the COBOL result is undefined
 //!   (P-CBSTM03A-1256, halt escalation E-33).
 //! - 16, setup failure: a failure with no COBOL counterpart, such as the statement lock held by
-//!   another job, the database transaction or a statement file that cannot be deleted, rendered
-//!   or written.
+//!   another job, a statement directory shared with other users (the "Permissions" section), the
+//!   database transaction or a statement file that cannot be deleted, rendered or written.
 //!
 //! `CBSTM03A` opens `STMTFILE` and `HTMLFILE` before it reads anything (P-CBSTM03A-001), and both
 //! DDs are `DISP=(NEW,CATLG,DELETE)` [app/jcl/CREASTMT.JCL:L87-96]: an abend deletes what the
@@ -57,6 +57,16 @@
 //! the lock over. A job killed before it could release the lock (`SIGKILL`, a power loss) leaves
 //! the file behind, and every later run is refused until an operator removes it, which is safe
 //! only while no batch job is running.
+//!
+//! # Permissions
+//!
+//! The statements hold customer and account data, so `CARDDEMO_STATEMENT_DIR` and the three
+//! files are owner-only, by the policy of `crate::generations` (its "Permissions" section): the
+//! directory is created with mode `0700`, or an existing one loses its group and other
+//! permission bits, before the lock is taken, and the lock file and the three statement files
+//! are created with mode `0600`. A shared directory, writable by others or sticky as `/tmp` is,
+//! or one whose permissions cannot be changed, ends the job with a setup failure (exit 16) that
+//! names the directory and its mode; nothing is deleted or written.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -76,7 +86,9 @@ use tracing::Span;
 
 use super::{JobContext, JobCounts, count_of, setup_failure, span_count};
 use crate::exit::ExitStatus;
-use crate::generations::{LockFile, blocking, encode_fixed_lines, write_replacing};
+use crate::generations::{
+    LockFile, blocking, create_private_dir, encode_fixed_lines, write_replacing,
+};
 use crate::pdf::render_statement;
 
 /// `STMTFILE` `DSN=AWS.M2.CARDDEMO.STATEMNT.PS` [app/jcl/CREASTMT.JCL:L87-91].
@@ -563,22 +575,24 @@ fn discard_written(files: &StatementFiles) {
     }
 }
 
-/// Takes the statement lock [`LOCK_FILE`] in the statement directory `dir`, creating the
-/// directory first: the JES enqueue on `STATEMNT.PS` and `STATEMNT.HTML` that CREASTMT STEP030 —
-/// P-CREASTMT-004 (`DISP=(MOD,DELETE,DELETE)`) and STEP040 — P-CREASTMT-005
+/// Takes the statement lock [`LOCK_FILE`] in the statement directory `dir`, first creating the
+/// directory owner-only, or restricting an existing one to its owner, with
+/// [`create_private_dir`]: the JES enqueue on `STATEMNT.PS` and `STATEMNT.HTML` that CREASTMT
+/// STEP030 — P-CREASTMT-004 (`DISP=(MOD,DELETE,DELETE)`) and STEP040 — P-CREASTMT-005
 /// (`DISP=(NEW,CATLG,DELETE)`) allocate [app/jcl/CREASTMT.JCL:L66-96]. The lock is released when
 /// the returned guard is dropped.
 ///
 /// # Errors
 ///
-/// A setup failure when the directory cannot be created, when another batch job holds the lock
-/// or a killed job left it behind (the text names the lock file), or when the lock file cannot
-/// be created or written. No statement file is deleted or written.
+/// A setup failure when the directory cannot be created, when it is shared with other users or
+/// cannot be restricted to its owner (the text names the directory and its mode), when another
+/// batch job holds the lock or a killed job left it behind (the text names the lock file), or
+/// when the lock file cannot be created or written. No statement file is deleted or written.
 fn lock_statement_dir(dir: &Path) -> Result<LockFile, ExitStatus> {
-    fs::create_dir_all(dir).map_err(|err| {
+    create_private_dir(dir).map_err(|err| {
         setup_failure(
-            "statement directory could not be created",
-            format!("{}: {err}", dir.display()),
+            "statement directory could not be created or restricted",
+            err,
         )
     })?;
     LockFile::acquire(dir.join(LOCK_FILE), "statement lock")
@@ -615,6 +629,7 @@ fn remove_if_present(path: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::thread;
@@ -633,6 +648,7 @@ mod tests {
         read_xref_file, remove_if_present, statement_failure, step030_delete, write_files,
     };
     use crate::exit::ExitStatus;
+    use crate::generations::tests::{dir_mode_of, mode_of};
     use crate::pdf::render_statement;
 
     /// The `CARDDEMO_CLOCK_OVERRIDE` instant of the statement tests.
@@ -963,10 +979,14 @@ mod tests {
             .iter()
             .map(|path| fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())))
             .collect();
+        let modes: Vec<u32> = files.all().iter().map(|path| mode_of(path)).collect();
+        let dir_mode = dir_mode_of(&dir.join("statements"));
         remove_dir(&dir);
 
         assert_eq!(written, Ok(()));
         assert_eq!(contents, [prepared.stmt, prepared.html, prepared.pdf]);
+        assert_eq!(modes, [0o600; 3], "the statement files are owner-only");
+        assert_eq!(dir_mode, 0o700, "the statement directory is owner-only");
     }
 
     #[test]
@@ -996,6 +1016,7 @@ mod tests {
         let lock = lock_statement_dir(&statements).expect("a free lock in a new directory");
         let held = fs::read_to_string(&lock_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", lock_path.display()));
+        let modes = (dir_mode_of(&statements), mode_of(&lock_path));
         drop(lock);
         let released = !lock_path.exists();
         let again = lock_statement_dir(&statements).map(drop);
@@ -1003,6 +1024,11 @@ mod tests {
         remove_dir(&dir);
 
         assert_eq!(held, format!("{}\n", std::process::id()));
+        assert_eq!(
+            modes,
+            (0o700, 0o600),
+            "the directory and the lock file are owner-only"
+        );
         assert!(released, "dropping the guard deletes the lock file");
         assert_eq!(again, Ok(()), "a released lock is taken again");
         assert!(!left, "the second guard releases the lock too");
@@ -1086,6 +1112,33 @@ mod tests {
             ),
             "{status:?}"
         );
+    }
+
+    /// A statement directory shared with other users is refused before the lock is taken: the
+    /// job ends with a setup failure naming the directory and its mode, creates nothing in it
+    /// and leaves its mode as it is.
+    #[test]
+    fn a_shared_statement_directory_is_a_setup_failure() {
+        let dir = scratch_dir("lock-shared");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777))
+            .unwrap_or_else(|e| panic!("chmod {}: {e}", dir.display()));
+
+        let locked = lock_statement_dir(&dir).map(drop);
+        let entries = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("list {}: {e}", dir.display()))
+            .count();
+        let mode = mode_of(&dir);
+        remove_dir(&dir);
+
+        let status = locked.expect_err("a shared directory is refused");
+        assert_eq!(status.code(), 16);
+        let refusal = format!("output directory {} has mode 1777, ", dir.display());
+        assert!(
+            matches!(status, ExitStatus::SetupFailure(ref text) if text.starts_with(&refusal)),
+            "{status:?}"
+        );
+        assert_eq!(entries, 0, "no lock or statement file is created");
+        assert_eq!(mode, 0o1777, "the shared directory is left as it is");
     }
 
     #[test]

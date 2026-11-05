@@ -32,25 +32,23 @@ type ErrorBody = components["schemas"]["ErrorBody"];
 
 const ACCOUNT_ID = "00000000001";
 
-/** Where the client sends `/accounts/{id}`: under the Vite proxy prefix. */
+// Where the client sends `/accounts/{id}`: under the Vite proxy prefix.
 const ACCOUNT_PATH = `/api/accounts/${ACCOUNT_ID}`;
 
-/** The token of the record as first read. */
+// The token of the record as first read.
 const VERSION = "0123456789abcdef";
 
-/** The token of the record after a save, or after another writer's change. */
+// The token of the record after a save, or after another writer's change.
 const NEXT_VERSION = "fedcba9876543210";
 
-/** The token of a record saved after Cancel re-read it at NEXT_VERSION. */
+// The token of a record saved after Cancel re-read it at NEXT_VERSION.
 const SAVED_VERSION = "00112233445566ff";
 
-/**
- * Account 00000000001 as `GET /accounts/{id}` returns it from the seeded
- * fixtures: the account [app/data/ASCII/acctdata.txt:L1], its customer
- * 000000001 [app/data/ASCII/custdata.txt:L1] and card 9680294154603697
- * [app/data/ASCII/cardxref.txt:L49], as in
- * crates/api/tests/snapshots/cavw_account_view__account_00000000001.snap.
- */
+// Account 00000000001 as `GET /accounts/{id}` returns it from the seeded
+// fixtures: the account [app/data/ASCII/acctdata.txt:L1], its customer
+// 000000001 [app/data/ASCII/custdata.txt:L1] and card 9680294154603697
+// [app/data/ASCII/cardxref.txt:L49], as in
+// crates/api/tests/snapshots/cavw_account_view__account_00000000001.snap.
 const ACCOUNT: AccountResponse = {
   account_id: ACCOUNT_ID,
   acct_active_status: "Y",
@@ -85,15 +83,13 @@ const ACCOUNT: AccountResponse = {
   version: VERSION,
 };
 
-/**
- * The `PUT /accounts/{id}` body of ACCOUNT unchanged: each value split as
- * COACTUPC moves it to the map, the `X(10)` dates by `(1:4)`, `(6:2)` and
- * `(9:2)`, the SSN by `(1:3)`, `(4:2)` and `(6:4)`, each `(xxx)xxx-xxxx`
- * phone by `(2:3)`, `(6:3)` and `(10:4)` [app/cbl/COACTUPC.cbl:L2826-2851],
- * with the token of the record shown and without the account number, which
- * is the `{id}` path segment. Written out rather than derived, so the test
- * does not repeat the page's own splitting.
- */
+// The `PUT /accounts/{id}` body of ACCOUNT unchanged: each value split as
+// COACTUPC moves it to the map, the `X(10)` dates by `(1:4)`, `(6:2)` and
+// `(9:2)`, the SSN by `(1:3)`, `(4:2)` and `(6:4)`, each `(xxx)xxx-xxxx`
+// phone by `(2:3)`, `(6:3)` and `(10:4)` [app/cbl/COACTUPC.cbl:L2826-2851],
+// with the token of the record shown and without the account number, which
+// is the `{id}` path segment. Written out rather than derived, so the test
+// does not repeat the page's own splitting.
 const UNCHANGED_BODY: AccountUpdateRequest = {
   version: VERSION,
   acct_active_status: "Y",
@@ -140,37 +136,35 @@ const UNCHANGED_BODY: AccountUpdateRequest = {
   cust_pri_card_holder_ind: "Y",
 };
 
-/** The first name the tests enter: alphabetic, so the form schema passes it. */
+// The first name the tests enter: alphabetic, so the form schema passes it.
 const NEW_FIRST_NAME = "Imanuel";
 
-/** P-COACTUPC-015: the text after both rewrites. */
+// P-COACTUPC-015: the text after both rewrites.
 const CHANGES_COMMITTED = "Changes committed to database";
 
-/** V-COACTUPC-010: the text when every value equals the fetched one. */
+// V-COACTUPC-010: the text when every value equals the fetched one.
 const NO_CHANGE_DETECTED = "No change detected with respect to values fetched.";
 
-/** V-COACTUPC-012: the schema's text for a status other than `Y` or `N`. */
+// V-COACTUPC-012: the schema's text for a status other than `Y` or `N`.
 const STATUS_NOT_YES_NO = "Account Status must be Y or N.";
 
-/** V-COACTUPC-081: FICO 274 of customer 000000001 is outside 300 to 850. */
+// V-COACTUPC-081: FICO 274 of customer 000000001 is outside 300 to 850.
 const FICO_OUT_OF_RANGE = "FICO Score: should be between 300 and 850";
 
-/** V-COACTUPC-111: area code 373 is no general purpose area code. */
+// V-COACTUPC-111: area code 373 is no general purpose area code.
 const PHONE_2_AREA_CODE_NOT_VALID =
   "Phone Number 2: Not valid North America general purpose area code";
 
-/** V-COACTUPC-123: `NC` with a zip starting `12` is no state and zip pair. */
+// V-COACTUPC-123: `NC` with a zip starting `12` is no state and zip pair.
 const INVALID_ZIP_FOR_STATE = "Invalid zip code for state";
 
-/** V-COACTUPC-126: the record changed between the read and the save. */
+// V-COACTUPC-126: the record changed between the read and the save.
 const RECORD_CHANGED = "Record changed by some one else. Please review";
 
-/**
- * The server's answer to ACCOUNT with only a new first name: the fixture's
- * own values fail three server-only edits, the lowest Order supplies the
- * message, and `fields` lists every flagged field in Order, the state and zip
- * pair flagging both (crates/domain/src/rules/account_update.rs).
- */
+// The server's answer to ACCOUNT with only a new first name: the fixture's
+// own values fail three server-only edits, the lowest Order supplies the
+// message, and `fields` lists every flagged field in Order, the state and zip
+// pair flagging both (crates/domain/src/rules/account_update.rs).
 const FIXTURE_EDIT_ERRORS: ErrorBody = {
   code: "INVALID",
   message: FICO_OUT_OF_RANGE,
@@ -182,18 +176,16 @@ const FIXTURE_EDIT_ERRORS: ErrorBody = {
   ],
 };
 
-/** The 409 of 9700-CHECK-CHANGE-IN-REC, the cursor on the account number. */
+// The 409 of 9700-CHECK-CHANGE-IN-REC, the cursor on the account number.
 const RECORD_CHANGED_ERROR: ErrorBody = {
   code: "CONFLICT",
   message: RECORD_CHANGED,
   fields: [{ field: "ACCTSID", message: RECORD_CHANGED }],
 };
 
-/**
- * ACCOUNT after another writer raised the credit limit by 1 and renamed the
- * customer between the read and the save, as
- * crates/api/tests/caup_account_update.rs does (P-COACTUPC-012).
- */
+// ACCOUNT after another writer raised the credit limit by 1 and renamed the
+// customer between the read and the save, as
+// crates/api/tests/caup_account_update.rs does (P-COACTUPC-012).
 const CHANGED_ELSEWHERE: AccountResponse = {
   ...ACCOUNT,
   acct_credit_limit: "2021.00",
@@ -201,10 +193,10 @@ const CHANGED_ELSEWHERE: AccountResponse = {
   version: NEXT_VERSION,
 };
 
-/** A GET answer; a promise holds the GET until the test settles it. */
+// A GET answer; a promise holds the GET until the test settles it.
 type Read = AccountResponse | Promise<AccountResponse>;
 
-/** The answers of one test: GETs take `reads` in turn, the last repeating. */
+// The answers of one test: GETs take `reads` in turn, the last repeating.
 type Network = {
   reads: readonly [Read, ...Read[]];
   writes?: readonly Response[];
@@ -231,7 +223,7 @@ function stubNetwork({ reads, writes = [] }: Network) {
   });
   vi.stubGlobal("fetch", network);
   return {
-    /** The requests sent with `method`, in order. */
+    // The requests sent with `method`, in order.
     sent(method: "GET" | "PUT"): Request[] {
       return network.mock.calls
         .map(([request]) => request)
@@ -253,7 +245,7 @@ function pathOf(request: Request): string {
   return new URL(request.url).pathname;
 }
 
-/** The path and parsed JSON body of a sent PUT. */
+// The path and parsed JSON body of a sent PUT.
 async function contentOf(
   request: Request,
 ): Promise<{ path: string; body: unknown }> {
@@ -261,10 +253,8 @@ async function contentOf(
   return { path: pathOf(request), body };
 }
 
-/**
- * Renders the page for the account `key` of the route beside the account
- * view it links back to.
- */
+// Renders the page for the account `key` of the route beside the account
+// view it links back to.
 function renderEdit(key: string): void {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -297,10 +287,8 @@ function renderEdit(key: string): void {
   );
 }
 
-/**
- * Renders the page at /accounts/00000000001/edit and waits for the record to
- * fill the form.
- */
+// Renders the page at /accounts/00000000001/edit and waits for the record to
+// fill the form.
 async function renderPage() {
   const user = userEvent.setup();
   renderEdit(ACCOUNT_ID);
@@ -316,10 +304,8 @@ function input(name: string): HTMLInputElement {
   return element;
 }
 
-/**
- * The field error an input is described by, the FieldError beneath it
- * (`role="alert"`), or null while the input has none.
- */
+// The field error an input is described by, the FieldError beneath it
+// (`role="alert"`), or null while the input has none.
 function errorOf(field: HTMLInputElement): string | null {
   const id = field.getAttribute("aria-describedby");
   if (id === null) {
@@ -330,12 +316,10 @@ function errorOf(field: HTMLInputElement): string | null {
   return message?.textContent ?? null;
 }
 
-/**
- * Waits for the newest toast to show `message` and checks it is the neutral
- * toast of a 200 that wrote nothing: neither a success nor an error, and no
- * icon. Sonner keeps its toasts across tests and puts the newest in front, so
- * an earlier toast with the same text is never the one checked.
- */
+// Waits for the newest toast to show `message` and checks it is the neutral
+// toast of a 200 that wrote nothing: neither a success nor an error, and no
+// icon. Sonner keeps its toasts across tests and puts the newest in front, so
+// an earlier toast with the same text is never the one checked.
 async function expectPrompt(message: string): Promise<void> {
   const shown = await waitFor(() => {
     const front = document.querySelector<HTMLElement>(
@@ -352,10 +336,8 @@ async function expectPrompt(message: string): Promise<void> {
   expect(shown.querySelector("[data-icon]")).toBeNull();
 }
 
-/**
- * Lets every effect, microtask and zero-delay timer scheduled so far run,
- * among them TanStack Query's notification of the page about new data.
- */
+// Lets every effect, microtask and zero-delay timer scheduled so far run,
+// among them TanStack Query's notification of the page about new data.
 async function settle(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));

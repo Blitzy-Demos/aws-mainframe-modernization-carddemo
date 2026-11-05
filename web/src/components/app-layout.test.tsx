@@ -430,9 +430,9 @@ const BILL_PAYMENT_MODULE: PageModule = { default: PlainPage };
 // the loader waits on its own.
 type PendingLoads = {
   loader: () => Promise<null>;
-  /** Settles the latest run, inside act so that its render commits. */
+  // Settles the latest run, inside act so that its render commits.
   finishLatest: () => Promise<void>;
-  /** The number of runs the router has started. */
+  // The number of runs the router has started.
   count: () => number;
 };
 

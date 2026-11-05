@@ -392,10 +392,11 @@ impl ColumnType {
 
 /// Whether sqlx's bookkeeping table exists in the database of `pool`.
 async fn migration_table_exists(pool: &PgPool) -> bool {
-    sqlx::query_scalar!(r#"SELECT to_regclass('public._sqlx_migrations') IS NOT NULL AS "exists!""#)
+    sqlx::query!(r#"SELECT to_regclass('public._sqlx_migrations') IS NOT NULL AS "exists!""#)
         .fetch_one(pool)
         .await
         .expect("look up the _sqlx_migrations table")
+        .exists
 }
 
 /// Every version recorded in `_sqlx_migrations`, in version order.
@@ -727,7 +728,7 @@ VALUES ($1, 'Y', 194.00, 2020.00, 1020.00, '2014-11-20', '2025-05-20', '2025-05-
 /// Db2-form processing timestamp `CBTRN02C` writes, leaving `in_master` to its
 /// column default. Returns the row's `transaction_id`.
 async fn insert_transaction(pool: &PgPool, tran_id: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar!(
+    sqlx::query!(
         "INSERT INTO transactions (
     tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt, tran_merchant_id,
     tran_merchant_name, tran_merchant_city, tran_merchant_zip, tran_card_num, tran_orig_ts,
@@ -740,6 +741,7 @@ RETURNING transaction_id",
     )
     .fetch_one(pool)
     .await
+    .map(|row| row.transaction_id)
 }
 
 /// Sets `in_master` of the transaction row `transaction_id`.
@@ -756,13 +758,14 @@ async fn set_live(pool: &PgPool, transaction_id: i64, live: bool) -> Result<(), 
 
 /// The `in_master` flag of the transaction row `transaction_id`.
 async fn is_live(pool: &PgPool, transaction_id: i64) -> bool {
-    sqlx::query_scalar!(
+    sqlx::query!(
         "SELECT in_master FROM transactions WHERE transaction_id = $1",
         transaction_id
     )
     .fetch_one(pool)
     .await
     .expect("read in_master of the transaction row")
+    .in_master
 }
 
 /// The rows of the view and of the base table: (view rows, live rows, all rows).
@@ -806,7 +809,7 @@ async fn insert_rule(
     reward_rate: Decimal,
     (min_amount, max_amount): (Option<Decimal>, Option<Decimal>),
 ) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar!(
+    sqlx::query!(
         "INSERT INTO reward_rules (
     transaction_type_cd, transaction_category_cd, reward_rate, min_transaction_amount,
     max_transaction_amount, active_from, active_to)
@@ -818,6 +821,7 @@ RETURNING rule_id",
     )
     .fetch_one(pool)
     .await
+    .map(|row| row.rule_id)
 }
 
 /// Inserts an accrual of `points` for the transaction row `transaction_id`
@@ -828,7 +832,7 @@ async fn insert_accrual(
     rule_id: i64,
     points: i64,
 ) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar!(
+    sqlx::query!(
         "INSERT INTO reward_accruals (account_id, transaction_id, rule_id, points_earned, created_at)
 VALUES ($1, $2, $3, $4, '2022-07-01 12:00:00+00')
 RETURNING accrual_id",
@@ -839,6 +843,7 @@ RETURNING accrual_id",
     )
     .fetch_one(pool)
     .await
+    .map(|row| row.accrual_id)
 }
 
 /// Deletes the transaction row `transaction_id`.
@@ -1050,7 +1055,7 @@ fn tables_and_view_exist() {
 
 /// The schema holds exactly five foreign keys, with the delete rules of their
 /// sources: the Db2 `ON DELETE RESTRICT` of the categories on their type
-/// (`app/app-transaction-type-db2/ddl/TRNTYCAT.ddl:L9-10`), the cascade of the
+/// (`app/app-transaction-type-db2/ddl/TRNTYCAT.ddl:L6-7`), the cascade of the
 /// IMS child segment `PAUTDTL1` with its root `PAUTSUM0`, and the three reward
 /// keys of AAP 0.3.5, `reward_accruals.transaction_id` with `ON DELETE
 /// RESTRICT` (E-09). No table replacing a VSAM file declares one, the
@@ -1388,7 +1393,7 @@ const EXPECTED_INDEXES: [ExpectedIndex; 20] = [
         unique: true,
         primary: true,
         predicate: None,
-        replaces: "PRIMARY KEY(TR_TYPE), index XTRAN_TYPE (TRNTYPE.ddl:L4)",
+        replaces: "PRIMARY KEY(TR_TYPE), index XTRAN_TYPE (TRNTYPE.ddl:L4, XTRNTYPE.ddl:L1-3)",
     },
     ExpectedIndex {
         table: "transaction_types",
@@ -1407,7 +1412,8 @@ const EXPECTED_INDEXES: [ExpectedIndex; 20] = [
         unique: true,
         primary: true,
         predicate: None,
-        replaces: "PRIMARY KEY(TRC_TYPE_CODE,TRC_TYPE_CATEGORY), index X_TRAN_TYPE_CATG (TRNTYCAT.ddl:L8)",
+        replaces: "PRIMARY KEY(TRC_TYPE_CODE,TRC_TYPE_CATEGORY), index X_TRAN_TYPE_CATG \
+                   (TRNTYCAT.ddl:L5, XTRNTYCAT.ddl:L1-3)",
     },
     ExpectedIndex {
         table: "cards",
@@ -1834,14 +1840,17 @@ fn live_tran_id_is_unique_only_among_live_rows() {
         "reviving a non-live row whose TRAN-ID is live again",
     );
 
-    let in_view = block_on(
-        sqlx::query_scalar!(
+    let in_view: Vec<i64> = block_on(
+        sqlx::query!(
             r#"SELECT transaction_id AS "transaction_id!" FROM transaction_master WHERE tran_id = $1"#,
             TRAN_ID
         )
         .fetch_all(pool),
     )
-    .expect("read the TRAN-ID through transaction_master");
+    .expect("read the TRAN-ID through transaction_master")
+    .into_iter()
+    .map(|row| row.transaction_id)
+    .collect();
     assert_eq!(in_view, [second], "the view holds the live row only");
     assert_eq!(
         block_on(transaction_counts(pool)),

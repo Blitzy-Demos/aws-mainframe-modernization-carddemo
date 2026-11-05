@@ -23,44 +23,38 @@ import { z } from "zod";
 
 import type { components, paths } from "@/api/schema";
 
-/** The body of `PUT /accounts/{id}`. */
+// The body of `PUT /accounts/{id}`.
 type AccountUpdateRequest = components["schemas"]["AccountUpdateRequest"];
 
-/**
- * A map field `COACTVWC` 2210-EDIT-ACCOUNT and `COACTUPC` 1100-RECEIVE-MAP
- * read as not entered: empty, spaces, or `*` followed only by spaces (the
- * space-padded `= '*'` comparison). Only the space is blank, as in the COBOL
- * comparison; a tab or any other character is entered text. This is narrower
- * than `trim()`, which would also call tabs blank and miss `*`.
- */
+// A map field `COACTVWC` 2210-EDIT-ACCOUNT and `COACTUPC` 1100-RECEIVE-MAP
+// read as not entered: empty, spaces, or `*` followed only by spaces (the
+// space-padded `= '*'` comparison). Only the space is blank, as in the COBOL
+// comparison; a tab or any other character is entered text. This is narrower
+// than `trim()`, which would also call tabs blank and miss `*`.
 const NOT_ENTERED = /^(?: *|\* *)$/;
 
-/** Every character a digit (`IS NUMERIC` of the entered characters). */
+// Every character a digit (`IS NUMERIC` of the entered characters).
 const DIGITS = /^[0-9]+$/;
 
-/** Every character the digit zero (`= ZEROES`). */
+// Every character the digit zero (`= ZEROES`).
 const ALL_ZEROS = /^0+$/;
 
-/**
- * Every character a letter or a space: `INSPECT … CONVERTING` turns the 52
- * letters into spaces and the rest must then be blank (1225-EDIT-ALPHA-REQD,
- * 1235-EDIT-ALPHA-OPT).
- */
+// Every character a letter or a space: `INSPECT … CONVERTING` turns the 52
+// letters into spaces and the rest must then be blank (1225-EDIT-ALPHA-REQD,
+// 1235-EDIT-ALPHA-OPT).
 const ALPHABETIC = /^[A-Za-z ]*$/;
 
-/**
- * Text `FUNCTION TEST-NUMVAL-C` (currency sign `$`) accepts under some reading
- * of the IBM formats, `sp` being spaces and `num` digits with an optional
- * decimal point and fraction, or a decimal point and digits:
- * `[sp][+|-][sp][$][sp]num[sp]` or `[sp][$][sp]num[sp][+|-|CR|DB][sp]`.
- * Grouping commas in the integer part and a lower-case `cr` or `db` are
- * accepted too: the server holds those inputs at halt (E-40) and answers them
- * itself, so only text no reading accepts gets the "is not valid" text.
- */
+// Text `FUNCTION TEST-NUMVAL-C` (currency sign `$`) accepts under some reading
+// of the IBM formats, `sp` being spaces and `num` digits with an optional
+// decimal point and fraction, or a decimal point and digits:
+// `[sp][+|-][sp][$][sp]num[sp]` or `[sp][$][sp]num[sp][+|-|CR|DB][sp]`.
+// Grouping commas in the integer part and a lower-case `cr` or `db` are
+// accepted too: the server holds those inputs at halt (E-40) and answers them
+// itself, so only text no reading accepts gets the "is not valid" text.
 const NUMVAL_C_ARGUMENT =
   /^ *(?:[+-] *(?:\$ *)?(?:[0-9,]*[0-9][0-9,]*(?:\.[0-9]*)?|,*\.[0-9]+) *|(?:\$ *)?(?:[0-9,]*[0-9][0-9,]*(?:\.[0-9]*)?|,*\.[0-9]+) *(?:(?:[+-]|[Cc][Rr]|[Dd][Bb]) *)?)$/;
 
-/** `ACCTSIDI PIC X(11)` [app/cpy-bms/COACTVW.CPY], `CC-ACCT-ID X(11)`. */
+// `ACCTSIDI PIC X(11)` [app/cpy-bms/COACTVW.CPY], `CC-ACCT-ID X(11)`.
 const ACCOUNT_ID_LENGTH = 11;
 
 // --- COACTVW: the account number lookup (CAVW)
@@ -147,262 +141,258 @@ export const accountViewBmsFieldMap: Record<
 
 // --- COACTUP: the account update form (CAUP)
 
-/**
- * The `COACTUPC` 1200-EDIT-MAP-INPUTS texts the form mirrors, by body
- * property: each the trimmed `WS-EDIT-VARIABLE-NAME` label and the edit's
- * literal, `STRING`ed into `WS-RETURN-MSG X(75)` [app/cbl/COACTUPC.cbl:L1472-1662]
- * [app/cpy/CSUTLDPY.cpy:L18-165].
- */
+// The `COACTUPC` 1200-EDIT-MAP-INPUTS texts the form mirrors, by body
+// property: each the trimmed `WS-EDIT-VARIABLE-NAME` label and the edit's
+// literal, `STRING`ed into `WS-RETURN-MSG X(75)` [app/cbl/COACTUPC.cbl:L1472-1662]
+// [app/cpy/CSUTLDPY.cpy:L18-165].
 const ACCOUNT_UPDATE_MESSAGES = {
   acct_active_status: {
-    /** V-COACTUPC-011 */
+    // V-COACTUPC-011
     supplied: "Account Status must be supplied.",
-    /** V-COACTUPC-012 */
+    // V-COACTUPC-012
     notYesNo: "Account Status must be Y or N.",
   },
   acct_open_year: {
-    /** V-COACTUPC-013 */
+    // V-COACTUPC-013
     supplied: "Open Date : Year must be supplied.",
-    /** V-COACTUPC-014 */
+    // V-COACTUPC-014
     notNumeric: "Open Date must be 4 digit number.",
   },
   acct_open_mon: {
-    /** V-COACTUPC-016 */
+    // V-COACTUPC-016
     supplied: "Open Date : Month must be supplied.",
   },
   acct_open_day: {
-    /** V-COACTUPC-018 */
+    // V-COACTUPC-018
     supplied: "Open Date : Day must be supplied.",
   },
   acct_credit_limit: {
-    /** V-COACTUPC-024 */
+    // V-COACTUPC-024
     supplied: "Credit Limit must be supplied.",
-    /** V-COACTUPC-025 */
+    // V-COACTUPC-025
     notValid: "Credit Limit is not valid",
   },
   acct_exp_year: {
-    /** V-COACTUPC-026 */
+    // V-COACTUPC-026
     supplied: "Expiry Date : Year must be supplied.",
-    /** V-COACTUPC-027 */
+    // V-COACTUPC-027
     notNumeric: "Expiry Date must be 4 digit number.",
   },
   acct_exp_mon: {
-    /** V-COACTUPC-029 */
+    // V-COACTUPC-029
     supplied: "Expiry Date : Month must be supplied.",
   },
   acct_exp_day: {
-    /** V-COACTUPC-031 */
+    // V-COACTUPC-031
     supplied: "Expiry Date : Day must be supplied.",
   },
   acct_cash_credit_limit: {
-    /** V-COACTUPC-037 */
+    // V-COACTUPC-037
     supplied: "Cash Credit Limit must be supplied.",
-    /** V-COACTUPC-038 */
+    // V-COACTUPC-038
     notValid: "Cash Credit Limit is not valid",
   },
   acct_reissue_year: {
-    /** V-COACTUPC-039 */
+    // V-COACTUPC-039
     supplied: "Reissue Date : Year must be supplied.",
-    /** V-COACTUPC-040 */
+    // V-COACTUPC-040
     notNumeric: "Reissue Date must be 4 digit number.",
   },
   acct_reissue_mon: {
-    /** V-COACTUPC-042 */
+    // V-COACTUPC-042
     supplied: "Reissue Date : Month must be supplied.",
   },
   acct_reissue_day: {
-    /** V-COACTUPC-044 */
+    // V-COACTUPC-044
     supplied: "Reissue Date : Day must be supplied.",
   },
   acct_curr_bal: {
-    /** V-COACTUPC-050 */
+    // V-COACTUPC-050
     supplied: "Current Balance must be supplied.",
-    /** V-COACTUPC-051 */
+    // V-COACTUPC-051
     notValid: "Current Balance is not valid",
   },
   // The 26-byte label 'Current Cycle Credit Limit' is cut to the 25 bytes of
   // WS-EDIT-VARIABLE-NAME (E-45).
   acct_curr_cyc_credit: {
-    /** V-COACTUPC-052 */
+    // V-COACTUPC-052
     supplied: "Current Cycle Credit Limi must be supplied.",
-    /** V-COACTUPC-053 */
+    // V-COACTUPC-053
     notValid: "Current Cycle Credit Limi is not valid",
   },
   acct_curr_cyc_debit: {
-    /** V-COACTUPC-054 */
+    // V-COACTUPC-054
     supplied: "Current Cycle Debit Limit must be supplied.",
-    /** V-COACTUPC-055 */
+    // V-COACTUPC-055
     notValid: "Current Cycle Debit Limit is not valid",
   },
   cust_ssn_1: {
-    /** V-COACTUPC-056 */
+    // V-COACTUPC-056
     supplied: "SSN: First 3 chars must be supplied.",
-    /** V-COACTUPC-057 */
+    // V-COACTUPC-057
     notNumeric: "SSN: First 3 chars must be all numeric.",
-    /** V-COACTUPC-058 */
+    // V-COACTUPC-058
     zero: "SSN: First 3 chars must not be zero.",
   },
   cust_ssn_2: {
-    /** V-COACTUPC-060 */
+    // V-COACTUPC-060
     supplied: "SSN 4th & 5th chars must be supplied.",
-    /** V-COACTUPC-061 */
+    // V-COACTUPC-061
     notNumeric: "SSN 4th & 5th chars must be all numeric.",
-    /** V-COACTUPC-062 */
+    // V-COACTUPC-062
     zero: "SSN 4th & 5th chars must not be zero.",
   },
   cust_ssn_3: {
-    /** V-COACTUPC-063 */
+    // V-COACTUPC-063
     supplied: "SSN Last 4 chars must be supplied.",
-    /** V-COACTUPC-064 */
+    // V-COACTUPC-064
     notNumeric: "SSN Last 4 chars must be all numeric.",
-    /** V-COACTUPC-065 */
+    // V-COACTUPC-065
     zero: "SSN Last 4 chars must not be zero.",
   },
   cust_dob_year: {
-    /** V-COACTUPC-066 */
+    // V-COACTUPC-066
     supplied: "Date of Birth : Year must be supplied.",
-    /** V-COACTUPC-067 */
+    // V-COACTUPC-067
     notNumeric: "Date of Birth must be 4 digit number.",
   },
   cust_dob_mon: {
-    /** V-COACTUPC-069 */
+    // V-COACTUPC-069
     supplied: "Date of Birth : Month must be supplied.",
   },
   cust_dob_day: {
-    /** V-COACTUPC-071 */
+    // V-COACTUPC-071
     supplied: "Date of Birth : Day must be supplied.",
   },
   cust_fico_credit_score: {
-    /** V-COACTUPC-078 */
+    // V-COACTUPC-078
     supplied: "FICO Score must be supplied.",
-    /** V-COACTUPC-079 */
+    // V-COACTUPC-079
     notNumeric: "FICO Score must be all numeric.",
-    /** V-COACTUPC-080 */
+    // V-COACTUPC-080
     zero: "FICO Score must not be zero.",
   },
   cust_first_name: {
-    /** V-COACTUPC-082 */
+    // V-COACTUPC-082
     supplied: "First Name must be supplied.",
-    /** V-COACTUPC-083 */
+    // V-COACTUPC-083
     notAlphabetic: "First Name can have alphabets only.",
   },
   cust_middle_name: {
-    /** V-COACTUPC-084 */
+    // V-COACTUPC-084
     notAlphabetic: "Middle Name can have alphabets only.",
   },
   cust_last_name: {
-    /** V-COACTUPC-085 */
+    // V-COACTUPC-085
     supplied: "Last Name must be supplied.",
-    /** V-COACTUPC-086 */
+    // V-COACTUPC-086
     notAlphabetic: "Last Name can have alphabets only.",
   },
   cust_addr_line_1: {
-    /** V-COACTUPC-087 */
+    // V-COACTUPC-087
     supplied: "Address Line 1 must be supplied.",
   },
   cust_addr_state_cd: {
-    /** V-COACTUPC-088 */
+    // V-COACTUPC-088
     supplied: "State must be supplied.",
-    /** V-COACTUPC-089 */
+    // V-COACTUPC-089
     notAlphabetic: "State can have alphabets only.",
   },
   cust_addr_zip: {
-    /** V-COACTUPC-091 */
+    // V-COACTUPC-091
     supplied: "Zip must be supplied.",
-    /** V-COACTUPC-092 */
+    // V-COACTUPC-092
     notNumeric: "Zip must be all numeric.",
-    /** V-COACTUPC-093 */
+    // V-COACTUPC-093
     zero: "Zip must not be zero.",
   },
   cust_addr_line_3: {
-    /** V-COACTUPC-094 */
+    // V-COACTUPC-094
     supplied: "City must be supplied.",
-    /** V-COACTUPC-095 */
+    // V-COACTUPC-095
     notAlphabetic: "City can have alphabets only.",
   },
   cust_addr_country_cd: {
-    /** V-COACTUPC-096 */
+    // V-COACTUPC-096
     supplied: "Country must be supplied.",
-    /** V-COACTUPC-097 */
+    // V-COACTUPC-097
     notAlphabetic: "Country can have alphabets only.",
   },
   cust_phone_num_1a: {
-    /** V-COACTUPC-098 */
+    // V-COACTUPC-098
     supplied: "Phone Number 1: Area code must be supplied.",
-    /** V-COACTUPC-099 */
+    // V-COACTUPC-099
     notNumeric: "Phone Number 1: Area code must be A 3 digit number.",
-    /** V-COACTUPC-100 */
+    // V-COACTUPC-100
     zero: "Phone Number 1: Area code cannot be zero",
   },
   cust_phone_num_1b: {
-    /** V-COACTUPC-102 */
+    // V-COACTUPC-102
     supplied: "Phone Number 1: Prefix code must be supplied.",
-    /** V-COACTUPC-103 */
+    // V-COACTUPC-103
     notNumeric: "Phone Number 1: Prefix code must be A 3 digit number.",
-    /** V-COACTUPC-104 */
+    // V-COACTUPC-104
     zero: "Phone Number 1: Prefix code cannot be zero",
   },
   cust_phone_num_1c: {
-    /** V-COACTUPC-105 */
+    // V-COACTUPC-105
     supplied: "Phone Number 1: Line number code must be supplied.",
-    /** V-COACTUPC-106 */
+    // V-COACTUPC-106
     notNumeric: "Phone Number 1: Line number code must be A 4 digit number.",
-    /** V-COACTUPC-107 */
+    // V-COACTUPC-107
     zero: "Phone Number 1: Line number code cannot be zero",
   },
   cust_phone_num_2a: {
-    /** V-COACTUPC-108 */
+    // V-COACTUPC-108
     supplied: "Phone Number 2: Area code must be supplied.",
-    /** V-COACTUPC-109 */
+    // V-COACTUPC-109
     notNumeric: "Phone Number 2: Area code must be A 3 digit number.",
-    /** V-COACTUPC-110 */
+    // V-COACTUPC-110
     zero: "Phone Number 2: Area code cannot be zero",
   },
   cust_phone_num_2b: {
-    /** V-COACTUPC-112 */
+    // V-COACTUPC-112
     supplied: "Phone Number 2: Prefix code must be supplied.",
-    /** V-COACTUPC-113 */
+    // V-COACTUPC-113
     notNumeric: "Phone Number 2: Prefix code must be A 3 digit number.",
-    /** V-COACTUPC-114 */
+    // V-COACTUPC-114
     zero: "Phone Number 2: Prefix code cannot be zero",
   },
   cust_phone_num_2c: {
-    /** V-COACTUPC-115 */
+    // V-COACTUPC-115
     supplied: "Phone Number 2: Line number code must be supplied.",
-    /** V-COACTUPC-116 */
+    // V-COACTUPC-116
     notNumeric: "Phone Number 2: Line number code must be A 4 digit number.",
-    /** V-COACTUPC-117 */
+    // V-COACTUPC-117
     zero: "Phone Number 2: Line number code cannot be zero",
   },
   cust_eft_account_id: {
-    /** V-COACTUPC-118 */
+    // V-COACTUPC-118
     supplied: "EFT Account Id must be supplied.",
-    /** V-COACTUPC-119 */
+    // V-COACTUPC-119
     notNumeric: "EFT Account Id must be all numeric.",
-    /** V-COACTUPC-120 */
+    // V-COACTUPC-120
     zero: "EFT Account Id must not be zero.",
   },
   cust_pri_card_holder_ind: {
-    /** V-COACTUPC-121 */
+    // V-COACTUPC-121
     supplied: "Primary Card Holder must be supplied.",
-    /** V-COACTUPC-122 */
+    // V-COACTUPC-122
     notYesNo: "Primary Card Holder must be Y or N.",
   },
 } as const satisfies Partial<
   Record<keyof AccountUpdateRequest, Readonly<Record<string, string>>>
 >;
 
-/**
- * The `COACTUP` form values in the order the validation audit ranks them: the
- * `version` token (Order 1), the account number (Orders 2 and 3), then the
- * input fields in map order, which is the order 1200-EDIT-MAP-INPUTS edits
- * them in. Each bound is the BMS field length [app/cpy-bms/COACTUP.CPY], the
- * OpenAPI `maxLength`.
- *
- * Keyed by the DTO's own properties plus `account_id`, so a property the DTO
- * adds or drops fails `tsc` here: `satisfies z.ZodType<AccountUpdateRequest>`
- * alone would accept a form value the DTO no longer has.
- */
+// The `COACTUP` form values in the order the validation audit ranks them: the
+// `version` token (Order 1), the account number (Orders 2 and 3), then the
+// input fields in map order, which is the order 1200-EDIT-MAP-INPUTS edits
+// them in. Each bound is the BMS field length [app/cpy-bms/COACTUP.CPY], the
+// OpenAPI `maxLength`.
+//
+// Keyed by the DTO's own properties plus `account_id`, so a property the DTO
+// adds or drops fails `tsc` here: `satisfies z.ZodType<AccountUpdateRequest>`
+// alone would accept a form value the DTO no longer has.
 const accountUpdateShape = {
   // V-COACTUPC-001: the token GET /accounts/{id} returned, echoed unchanged.
   // OpenAPI declares no pattern for it, and the server answers a missing or
@@ -464,45 +454,45 @@ const accountUpdateShape = {
 
 const accountUpdateFields = z.object(accountUpdateShape);
 
-/** The form values before the edits. */
+// The form values before the edits.
 type AccountUpdateFieldValues = z.infer<typeof accountUpdateFields>;
 
-/** The BMS length of each bounded form value, from its `.max()`. */
+// The BMS length of each bounded form value, from its `.max()`.
 const BMS_LENGTHS: ReadonlyMap<string, number> = new Map(
   Object.entries(accountUpdateFields.shape).flatMap(([name, field]) =>
     field.maxLength === null ? [] : [[name, field.maxLength] as const],
   ),
 );
 
-/** A form value 1200-EDIT-MAP-INPUTS edits. */
+// A form value 1200-EDIT-MAP-INPUTS edits.
 type EditedField = keyof typeof ACCOUNT_UPDATE_MESSAGES;
 
-/** The edited fields whose texts include those of `T`. */
+// The edited fields whose texts include those of `T`.
 type FieldsWith<T> = {
   [K in EditedField]: (typeof ACCOUNT_UPDATE_MESSAGES)[K] extends T
     ? K
     : never;
 }[EditedField];
 
-/** The texts of an edit that rejects a value not entered. */
+// The texts of an edit that rejects a value not entered.
 type SuppliedTexts = { readonly supplied: string };
 
-/** The texts of 1220-EDIT-YESNO. */
+// The texts of 1220-EDIT-YESNO.
 type YesNoTexts = SuppliedTexts & { readonly notYesNo: string };
 
-/** The texts of CSUTLDPY EDIT-YEAR-CCYY that the form mirrors. */
+// The texts of CSUTLDPY EDIT-YEAR-CCYY that the form mirrors.
 type YearTexts = SuppliedTexts & { readonly notNumeric: string };
 
-/** The texts of 1250-EDIT-SIGNED-9V2. */
+// The texts of 1250-EDIT-SIGNED-9V2.
 type AmountTexts = SuppliedTexts & { readonly notValid: string };
 
-/** The texts of 1245-EDIT-NUM-REQD and of the three phone-part edits. */
+// The texts of 1245-EDIT-NUM-REQD and of the three phone-part edits.
 type DigitTexts = YearTexts & { readonly zero: string };
 
-/** The texts of the alphabetic test of 1225 and 1235. */
+// The texts of the alphabetic test of 1225 and 1235.
 type AlphaTexts = { readonly notAlphabetic: string };
 
-/** Flags `field` with `message`, as `MOVE -1 TO <field>L` marks it. */
+// Flags `field` with `message`, as `MOVE -1 TO <field>L` marks it.
 function reject(
   ctx: z.RefinementCtx,
   field: EditedField,
@@ -511,17 +501,17 @@ function reject(
   ctx.addIssue({ code: z.ZodIssueCode.custom, path: [field], message });
 }
 
-/**
- * `IS NUMERIC` of the field as received: the entry is padded with spaces to
- * the BMS length, so a shorter entry is not numeric.
- */
+// `IS NUMERIC` of the field as received: the entry is padded with spaces to
+// the BMS length, so a shorter entry is not numeric.
 function fillsWithDigits(value: string, field: EditedField): boolean {
   return value.length === BMS_LENGTHS.get(field) && DIGITS.test(value);
 }
 
 /**
- * COACTUPC 1220-EDIT-YESNO: not entered, a space or `0` is not supplied, and
- * anything but an upper-case `Y` or `N` (88 FLG-YES-NO-ISVALID) is rejected.
+ * COACTUPC 1220-EDIT-YESNO — P-COACTUPC-021
+ *
+ * Not entered, a space or `0` is not supplied, and anything but an upper-case
+ * `Y` or `N` (88 FLG-YES-NO-ISVALID) is rejected.
  */
 function editYesNo(
   values: AccountUpdateFieldValues,
@@ -537,7 +527,15 @@ function editYesNo(
   }
 }
 
-/** An edit whose only mirrored rejection is a value not entered. */
+/**
+ * COACTUPC 1215-EDIT-MANDATORY — P-COACTUPC-020
+ * CSUTLDPY EDIT-MONTH — P-CSUTLDPY-005
+ * CSUTLDPY EDIT-DAY — P-CSUTLDPY-007
+ *
+ * An edit whose only mirrored rejection is a value not entered: address line 1
+ * (1215-EDIT-MANDATORY), and the month and the day of a date (EDIT-MONTH,
+ * EDIT-DAY).
+ */
 function editSupplied(
   values: AccountUpdateFieldValues,
   ctx: z.RefinementCtx,
@@ -549,11 +547,16 @@ function editSupplied(
 }
 
 /**
- * CSUTLDPY EDIT-DATE-CCYYMMDD as far as the form mirrors it: the year not
- * entered or not four digits (EDIT-YEAR-CCYY), the month and the day not
- * entered (EDIT-MONTH, EDIT-DAY). Each `GO TO <paragraph>-EXIT` leaves only
- * its own paragraph, so every part is edited whatever the others hold. The
- * century, the month and day values and the calendar are the server's.
+ * CSUTLDPY EDIT-DATE-CCYYMMDD — P-CSUTLDPY-001
+ * CSUTLDPY EDIT-YEAR-CCYY — P-CSUTLDPY-002, P-CSUTLDPY-003
+ * CSUTLDPY EDIT-MONTH — P-CSUTLDPY-005
+ * CSUTLDPY EDIT-DAY — P-CSUTLDPY-007
+ *
+ * EDIT-DATE-CCYYMMDD as far as the form mirrors it: the year not entered or
+ * not four digits (EDIT-YEAR-CCYY), the month and the day not entered
+ * (EDIT-MONTH, EDIT-DAY). Each `GO TO <paragraph>-EXIT` leaves only its own
+ * paragraph, so every part is edited whatever the others hold. The century,
+ * the month and day values and the calendar are the server's.
  */
 function editDate(
   values: AccountUpdateFieldValues,
@@ -574,8 +577,9 @@ function editDate(
 }
 
 /**
- * COACTUPC 1250-EDIT-SIGNED-9V2: not entered is not supplied, and text
- * `TEST-NUMVAL-C` rejects is not valid.
+ * COACTUPC 1250-EDIT-SIGNED-9V2 — P-COACTUPC-026
+ *
+ * Not entered is not supplied, and text `TEST-NUMVAL-C` rejects is not valid.
  */
 function editAmount(
   values: AccountUpdateFieldValues,
@@ -592,9 +596,15 @@ function editAmount(
 }
 
 /**
- * COACTUPC 1245-EDIT-NUM-REQD, and EDIT-AREA-CODE, EDIT-US-PHONE-PREFIX and
- * EDIT-US-PHONE-LINENUM up to their lookups: not entered, not all digits,
- * then all zeros. Whether the edit passed (FLG-ALPHNANUM-ISVALID).
+ * COACTUPC 1245-EDIT-NUM-REQD — P-COACTUPC-025
+ * COACTUPC EDIT-AREA-CODE — P-COACTUPC-028
+ * COACTUPC EDIT-US-PHONE-PREFIX — P-COACTUPC-029
+ * COACTUPC EDIT-US-PHONE-LINENUM — P-COACTUPC-030
+ *
+ * 1245-EDIT-NUM-REQD, EDIT-AREA-CODE up to its `CSLKPCDY` lookup, and
+ * EDIT-US-PHONE-PREFIX and EDIT-US-PHONE-LINENUM, which have none: not
+ * entered, not all digits, then all zeros. Whether the edit passed
+ * (FLG-ALPHNANUM-ISVALID).
  */
 function editDigits(
   values: AccountUpdateFieldValues,
@@ -616,8 +626,10 @@ function editDigits(
 }
 
 /**
- * COACTUPC 1225-EDIT-ALPHA-REQD: not entered is not supplied, and a character
- * other than a letter or a space is rejected.
+ * COACTUPC 1225-EDIT-ALPHA-REQD — P-COACTUPC-022
+ *
+ * Not entered is not supplied, and a character other than a letter or a space
+ * is rejected.
  */
 function editAlphaRequired(
   values: AccountUpdateFieldValues,
@@ -634,8 +646,9 @@ function editAlphaRequired(
 }
 
 /**
- * COACTUPC 1235-EDIT-ALPHA-OPT: a value not entered passes; otherwise the
- * alphabetic test of 1225.
+ * COACTUPC 1235-EDIT-ALPHA-OPT — P-COACTUPC-024
+ *
+ * A value not entered passes; otherwise the alphabetic test of 1225.
  */
 function editAlphaOptional(
   values: AccountUpdateFieldValues,
@@ -649,10 +662,11 @@ function editAlphaOptional(
 }
 
 /**
- * COACTUPC 1265-EDIT-US-SSN: part 1 edited as three required digits. The IF
- * that tests part 1 closes only at the paragraph's period
- * [app/cbl/COACTUPC.cbl:L2448-2488], so parts 2 and 3 are edited only when
- * part 1 passed that edit (E-45).
+ * COACTUPC 1265-EDIT-US-SSN — P-COACTUPC-031
+ *
+ * Part 1 edited as three required digits. The IF that tests part 1 closes only
+ * at the paragraph's period [app/cbl/COACTUPC.cbl:L2448-2488], so parts 2 and
+ * 3 are edited only when part 1 passed that edit (E-45).
  *
  * The 666 and 900-999 test of part 1 (V-COACTUPC-059) stays with the server,
  * as the FICO range does: 4 and 21 of the 50 fixture customers fail them, and
@@ -668,9 +682,11 @@ function editSsn(values: AccountUpdateFieldValues, ctx: z.RefinementCtx): void {
 }
 
 /**
- * COACTUPC 1260-EDIT-US-PHONE-NUM: a phone number with no part entered is
- * valid and absent; otherwise the area code, prefix and line number are each
- * edited. The area-code lookup in `CSLKPCDY` is the server's.
+ * COACTUPC 1260-EDIT-US-PHONE-NUM — P-COACTUPC-027
+ *
+ * A phone number with no part entered is valid and absent; otherwise the area
+ * code, prefix and line number are each edited. The area-code lookup in
+ * `CSLKPCDY` is the server's.
  */
 function editPhone(
   values: AccountUpdateFieldValues,
@@ -690,7 +706,7 @@ function editPhone(
 }
 
 /**
- * COACTUPC 1200-EDIT-MAP-INPUTS — V-COACTUPC-011 to V-COACTUPC-122
+ * COACTUPC 1200-EDIT-MAP-INPUTS — P-COACTUPC-006, V-COACTUPC-011 to V-COACTUPC-122
  *
  * The mirrored edits in the paragraph's order [app/cbl/COACTUPC.cbl:L1472-1669],
  * each failing edit flagging its own field, so the issues follow the audit

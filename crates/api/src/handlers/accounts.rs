@@ -76,7 +76,7 @@
 //! | `rejected` | A 4xx answer with nothing written; any unit of work was rolled back |
 //! | `failed` | A 5xx answer with nothing written: a failed read, no unit of work, or an input class held at `halt`; any unit of work was rolled back |
 //! | `committed` | The update's writes ran and committed; the status tells whether they all succeeded |
-//! | `rolled_back` | The commit failed, so the server discarded the update's writes |
+//! | `rolled_back` | The commit failed. A `COMMIT` the server rejected discarded the update's writes; one whose answer was lost, its connection gone, may have committed them, so the label proves no rollback and the account is read again before a retry |
 //! | `cancelled` | The request was dropped before its answer, its client gone: an open unit of work is rolled back as it is dropped, unless its commit had already reached the server |
 
 use axum::Json;
@@ -449,8 +449,10 @@ async fn load_snapshot(
 ///
 /// - `apply`'s error with its mapped status once the commit succeeded:
 ///   409 for a changed record, 500 with the lock or rewrite text otherwise.
-/// - 500 with [`messages::UNEXPECTED_ERROR`] when the commit fails; the
-///   server then discards every write of the unit.
+/// - 500 with [`messages::UNEXPECTED_ERROR`] when the commit fails. A
+///   `COMMIT` the server rejects discards every write of the unit; one whose
+///   answer is lost, its connection gone, may have committed them, so the
+///   account is read again before the update is retried.
 async fn persist(
     mut uow: UnitOfWork,
     key: &VersionKey,

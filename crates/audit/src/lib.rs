@@ -1996,7 +1996,7 @@ mod tests {
         }
         assert!(is_no_message(" no-message (E-24)"));
         assert!(is_no_message("no-message"));
-        assert!(!is_no_message(r#"`"Account ID NOT found..."`"#));
+        assert!(!is_no_message(r#"`"Synthetic message text"`"#));
     }
 
     #[test]

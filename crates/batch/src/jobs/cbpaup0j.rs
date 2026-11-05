@@ -78,8 +78,10 @@ use crate::exit::ExitStatus;
 /// Such a failure has no COBOL text, so it is reported as a setup failure. A failed exclusion
 /// comes before any read or delete, and the unit of work is dropped uncommitted, which rolls it
 /// back. The commit stands in for the final `9000-TAKE-CHECKPOINT`, where a failed `CHKP`
-/// performs `9999-ABEND` and so also ends with 16 (P-CBPAUP0C-008). After a failed commit, none
-/// of the run's deletes persist.
+/// performs `9999-ABEND` and so also ends with 16 (P-CBPAUP0C-008). After a `COMMIT` the server
+/// rejects, none of the run's deletes persist. A `COMMIT` whose answer is lost, its connection
+/// gone, leaves the outcome unknown: every delete may have committed, so the pending
+/// authorizations are read again before the job is rerun.
 pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Cbpaup0jArgs) -> ExitStatus {
     let params = auth_purge::parse_sysin(&args.sysin);
     log_parameters(&BoundedSysin::of(&args.sysin), &params);

@@ -1290,6 +1290,9 @@ fn date_bytes(parts: DateParts) -> Vec<u8> {
         .collect()
 }
 
+/// COACTUPC 9500-STORE-FETCHED-DATA, 1205-COMPARE-OLD-NEW — P-COACTUPC-004,
+/// P-COACTUPC-005
+///
 /// The year, month and day of a stored `X(10)` date as `9500-STORE-FETCHED-DATA`
 /// moves them: `(1:4)`, `(6:2)` and `(9:2)`.
 fn fetched_date_bytes(date: &Alnum<10>) -> Vec<u8> {
@@ -2245,6 +2248,8 @@ pub fn record_version(
         .map_err(|_| DomainError::unexpected(UNEXPECTED_ERROR).with_field(FIELD_ACCTSID))
 }
 
+/// COACTUPC 9700-CHECK-CHANGE-IN-REC — P-COACTUPC-012
+///
 /// The `(1:4)`, `(6:2)` and `(9:2)` of a stored `X(10)` date, the three
 /// operands `9700-CHECK-CHANGE-IN-REC` compares.
 fn date_parts(date: &Alnum<10>) -> [Vec<u8>; 3] {
@@ -2418,6 +2423,10 @@ where
     })
 }
 
+/// COACTUPC 9600-WRITE-PROCESSING — P-COACTUPC-010, P-COACTUPC-011,
+/// P-COACTUPC-013, P-COACTUPC-014, V-COACTUPC-124, V-COACTUPC-125,
+/// V-COACTUPC-127, V-COACTUPC-128
+///
 /// A failed lock or rewrite of `9600-WRITE-PROCESSING`: `message` at
 /// `ACCTSID`.
 fn write_failure(message: &'static str) -> DomainError {

@@ -47,7 +47,7 @@ type ErrorBody = components["schemas"]["ErrorBody"];
 
 type FieldName = keyof RewardRuleFormInput;
 
-/** A value for every form field, as typed; `""` leaves the field blank. */
+// A value for every form field, as typed; `""` leaves the field blank.
 type FormEntry = Record<FieldName, string>;
 
 const NEW_ROUTE = "/admin/reward-rules/new";
@@ -671,7 +671,7 @@ describe("RewardRuleFormPage (Reset and Back)", () => {
 
       // A change Back must leave unsaved.
       await user.type(textbox("Maximum transaction amount"), "99.00");
-      // From the last field: Save (PF5), Reset (PF4), then Back (PF3).
+      // From the last field: Save, Reset, then Back.
       await user.click(textbox("Active to"));
       await user.tab();
       expect(document.activeElement).toBe(

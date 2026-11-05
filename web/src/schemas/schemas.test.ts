@@ -26,7 +26,7 @@ import {
 // The parts of the OpenAPI document this test reads
 // ---------------------------------------------------------------------------------------
 
-/** A property schema, or a schema a property refers to. */
+// A property schema, or a schema a property refers to.
 interface PropertySchema {
   readonly type?: string | readonly string[];
   readonly maxLength?: number;
@@ -38,7 +38,7 @@ interface PropertySchema {
   readonly enum?: readonly unknown[];
 }
 
-/** A component schema, with its members when it describes an object. */
+// A component schema, with its members when it describes an object.
 interface ObjectSchema extends PropertySchema {
   readonly properties?: ReadonlyMap<string, PropertySchema>;
   readonly required?: readonly string[];
@@ -49,7 +49,7 @@ interface MediaTypeSchema {
 }
 
 interface RequestBodySchema {
-  /** Media type → its schema. Empty when the body declares no content. */
+  // Media type → its schema. Empty when the body declares no content.
   readonly content: ReadonlyMap<string, MediaTypeSchema>;
 }
 
@@ -58,14 +58,14 @@ interface OperationSchema {
 }
 
 interface OpenApiDoc {
-  /** Path → lower-case HTTP method → operation. */
+  // Path → lower-case HTTP method → operation.
   readonly paths: ReadonlyMap<string, ReadonlyMap<string, OperationSchema>>;
   readonly components: { readonly schemas: ReadonlyMap<string, ObjectSchema> };
 }
 
 type JsonObject = { readonly [key: string]: unknown };
 
-/** The fields of a path item that are operations; `parameters` and the like are not. */
+// The fields of a path item that are operations; `parameters` and the like are not.
 const HTTP_METHODS: ReadonlySet<string> = new Set([
   "get",
   "put",
@@ -119,7 +119,7 @@ function typeAt(value: unknown, where: string): string | readonly string[] {
   return Array.isArray(value) ? stringsAt(value, where) : stringAt(value, where);
 }
 
-/** `object[key]` read by `read` when present, `undefined` when absent. */
+// `object[key]` read by `read` when present, `undefined` when absent.
 function member<T>(
   object: JsonObject,
   key: string,
@@ -129,7 +129,7 @@ function member<T>(
   return key in object ? read(object[key], `${where}.${key}`) : undefined;
 }
 
-/** Entries of a JSON object, each value read by `read`, as a map. */
+// Entries of a JSON object, each value read by `read`, as a map.
 function mapAt<T>(
   value: unknown,
   where: string,
@@ -200,7 +200,7 @@ function pathItemAt(value: unknown, where: string): ReadonlyMap<string, Operatio
   );
 }
 
-/** The paths and component schemas of the document, checked as they are read. */
+// The paths and component schemas of the document, checked as they are read.
 function readDoc(raw: unknown): OpenApiDoc {
   const root = objectAt(raw, "document");
   const components = objectAt(root.components, "components");
@@ -214,17 +214,15 @@ function readDoc(raw: unknown): OpenApiDoc {
 
 const doc = readDoc(openapi);
 
-/** The component name a `#/components/schemas/<Name>` reference names. */
+// The component name a `#/components/schemas/<Name>` reference names.
 function componentName(ref: string): string | undefined {
   return ref.startsWith(COMPONENT_REF) ? ref.slice(COMPONENT_REF.length) : undefined;
 }
 
-/**
- * The schema whose `maxLength` and `pattern` govern a property: a `$ref` is followed
- * into `components.schemas`, and of a `oneOf`, `anyOf` or `allOf` the one member that
- * is not `null` is taken. Any other shape throws with its location, so the reader is
- * extended rather than a constraint silently missed.
- */
+// The schema whose `maxLength` and `pattern` govern a property: a `$ref` is followed
+// into `components.schemas`, and of a `oneOf`, `anyOf` or `allOf` the one member that
+// is not `null` is taken. Any other shape throws with its location, so the reader is
+// extended rather than a constraint silently missed.
 function resolveProperty(
   property: PropertySchema,
   where: string,
@@ -261,7 +259,7 @@ function resolveProperty(
 // The request body contract of each DTO
 // ---------------------------------------------------------------------------------------
 
-/** The published constraints of one request body property, read from its effective schema. */
+// The published constraints of one request body property, read from its effective schema.
 interface PropertyContract {
   readonly name: string;
   readonly maxLength?: number;
@@ -273,7 +271,7 @@ interface DtoContract {
   readonly required: readonly string[];
 }
 
-/** The contract of the component object schema `name`; `undefined` when it has none. */
+// The contract of the component object schema `name`; `undefined` when it has none.
 function contractOf(name: string): DtoContract | undefined {
   const schema = doc.components.schemas.get(name);
   if (schema?.properties === undefined) {
@@ -291,7 +289,7 @@ function contractOf(name: string): DtoContract | undefined {
   };
 }
 
-/** Each operation with a request body, and the DTO its JSON body refers to, if any. */
+// Each operation with a request body, and the DTO its JSON body refers to, if any.
 const requestBodies = [...doc.paths].flatMap(([path, operations]) =>
   [...operations].flatMap(([method, operation]) => {
     if (operation.requestBody === undefined) {
@@ -307,7 +305,7 @@ const requestBodies = [...doc.paths].flatMap(([path, operations]) =>
   }),
 );
 
-/** JSON Schema counts a string's length in code points, not UTF-16 code units. */
+// JSON Schema counts a string's length in code points, not UTF-16 code units.
 function codePoints(value: string): number {
   return [...value].length;
 }
@@ -316,20 +314,18 @@ function codePoints(value: string): number {
 // Entries
 // ---------------------------------------------------------------------------------------
 
-/** A token of the shape `GET` returns for `version`: 16 lower-case hex digits. */
+// A token of the shape `GET` returns for `version`: 16 lower-case hex digits.
 const VERSION = "0f1e2d3c4b5a6978";
 
-/**
- * One entry of each form that every client edit accepts, typed by the form's input so a
- * form or DTO change fails `tsc` here. Values are fixture records within the widths of
- * their BMS fields: account 00000000001 [app/data/ASCII/acctdata.txt:L1], its customer
- * 000000001 [app/data/ASCII/custdata.txt:L1] and card 9680294154603697
- * [app/data/ASCII/carddata.txt:L49], the merchant of the first daily transaction
- * [app/data/ASCII/dailytran.txt:L1], the DUSRSECJ users ADMIN001 and USER0001
- * [app/jcl/DUSRSECJ.jcl:L35, L40], and the type and category of the retail reward seed
- * rule. Each fills every member its DTO declares, so each published constraint is met
- * by a real value.
- */
+// One entry of each form that every client edit accepts, typed by the form's input so a
+// form or DTO change fails `tsc` here. Values are fixture records within the widths of
+// their BMS fields: account 00000000001 [app/data/ASCII/acctdata.txt:L1], its customer
+// 000000001 [app/data/ASCII/custdata.txt:L1] and card 9680294154603697
+// [app/data/ASCII/carddata.txt:L49], the merchant of the first daily transaction
+// [app/data/ASCII/dailytran.txt:L1], the DUSRSECJ users ADMIN001 and USER0001
+// [app/jcl/DUSRSECJ.jcl:L35, L40], and the type and category of the retail reward seed
+// rule. Each fills every member its DTO declares, so each published constraint is met
+// by a real value.
 const validSamples: { [K in RequestDtoName]: z.input<RequestSchemas[K]> } = {
   LoginRequest: { user_id: "ADMIN001", password: "PASSWORD" },
   AccountUpdateRequest: {
@@ -433,14 +429,12 @@ const validSamples: { [K in RequestDtoName]: z.input<RequestSchemas[K]> } = {
   },
 };
 
-/**
- * Values tried, in order, as a pattern violation: the first the pattern rejects and the
- * property's maxLength admits is used. The euro sign (U+20AC) ends the list because the
- * free-text, user and reward type-code patterns admit every ASCII character, and the
- * type code every Latin-1 one, so only a character above U+00FF violates them. A
- * pattern none of these violates fails its test, so the list is extended rather than
- * the check skipped.
- */
+// Values tried, in order, as a pattern violation: the first the pattern rejects and the
+// property's maxLength admits is used. The euro sign (U+20AC) ends the list because the
+// free-text, user and reward type-code patterns admit every ASCII character, and the
+// type code every Latin-1 one, so only a character above U+00FF violates them. A
+// pattern none of these violates fails its test, so the list is extended rather than
+// the check skipped.
 const PATTERN_VIOLATIONS: readonly string[] = ["!", "x", "-", "0", "Z", "a b", "~~", "\u20ac"];
 
 function violationOf({ maxLength, pattern }: PropertyContract): string | undefined {
@@ -462,12 +456,12 @@ function issuesOf(schema: z.ZodTypeAny, entry: Entry): readonly z.ZodIssue[] {
   return result.success ? [] : result.error.issues;
 }
 
-/** The issues of `entry` that name `property` as the failing member. */
+// The issues of `entry` that name `property` as the failing member.
 function issuesAt(schema: z.ZodTypeAny, entry: Entry, property: string): readonly z.ZodIssue[] {
   return issuesOf(schema, entry).filter((issue) => issue.path[0] === property);
 }
 
-/** Each way the parsed body `body` departs from the published maxLength and pattern. */
+// Each way the parsed body `body` departs from the published maxLength and pattern.
 function contractViolations(contract: DtoContract, body: unknown): string[] {
   if (!isObject(body)) {
     return ["the parsed body is not an object"];

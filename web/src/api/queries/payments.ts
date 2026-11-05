@@ -51,14 +51,12 @@ const PAYING_CONFIRMATIONS: readonly string[] = ["Y", "y"];
 // 4xx refuses the request before any write.
 const FAILURES_AFTER_A_WRITE: readonly number[] = [404, 409];
 
-/**
- * Whether a settled CB00 request may have changed a record. Only a confirmed
- * one can. Of its answers, a 201 wrote, and so may have:
- * - a 201 whose body did not arrive, an ApiError with that status;
- * - a failure in FAILURES_AFTER_A_WRITE or any 5xx;
- * - a request without a complete answer (the client's RequestTimeoutError, a
- *   network failure), which may have reached the server.
- */
+// Whether a settled CB00 request may have changed a record. Only a confirmed
+// one can. Of its answers, a 201 wrote, and so may have:
+// - a 201 whose body did not arrive, an ApiError with that status;
+// - a failure in FAILURES_AFTER_A_WRITE or any 5xx;
+// - a request without a complete answer (the client's RequestTimeoutError, a
+//   network failure), which may have reached the server.
 function mayHaveWritten(
   confirm: PaymentBody["confirm"],
   result: { status: number } | undefined,

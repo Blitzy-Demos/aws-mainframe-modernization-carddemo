@@ -20,7 +20,7 @@ import {
 
 type ErrorBody = components["schemas"]["ErrorBody"];
 
-/** A form of two fields, the CB00 entry. */
+// A form of two fields, the CB00 entry.
 type Values = { account_id: string; confirm: string };
 
 const fieldMap: BmsFieldMap<"ACTIDIN" | "CONFIRM", Values> = {

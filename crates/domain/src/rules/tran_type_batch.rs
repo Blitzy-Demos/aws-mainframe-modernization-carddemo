@@ -185,6 +185,8 @@ impl RecordOutcome {
         }
     }
 
+    /// COBTUPDT 9999-ABEND — P-COBTUPDT-010.
+    ///
     /// Whether `9999-ABEND` was performed for the record.
     #[must_use]
     pub const fn is_failed(&self) -> bool {
@@ -326,6 +328,8 @@ impl Statement {
     }
 }
 
+/// COBTUPDT 9999-ABEND — P-COBTUPDT-010.
+///
 /// A record for which `9999-ABEND` is performed with `message`.
 fn failed(message: impl Into<String>) -> RecordOutcome {
     RecordOutcome::Failed {

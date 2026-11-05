@@ -57,7 +57,7 @@
 //! | `rejected` | A 4xx answer before any write: a rejected edit, a key not found, an unconfirmed CT02 add |
 //! | `failed` | A 5xx answer before any write: a failed read, no unit of work, an input class held at `halt` |
 //! | `committed` | A CT02 add whose unit of work committed |
-//! | `rolled_back` | A CT02 add that failed after validation, rolled back whole |
+//! | `rolled_back` | A CT02 add that failed after validation, rolled back whole; after a failed `COMMIT` a reported label only, since a `COMMIT` the server rejects rolls the add back whole but one whose answer is lost may have committed it whole |
 //! | `cancelled` | A request dropped before its answer, its client gone: an open unit of work is rolled back as it is dropped, unless its commit had already reached the server |
 //!
 //! CT02 also records `reward_points` when the add accrued points. Each field
@@ -138,7 +138,8 @@ const OUTCOME_FAILED: &str = "failed";
 const OUTCOME_COMMITTED: &str = "committed";
 
 /// `outcome` of a CT02 add that failed after validation and was rolled back
-/// whole.
+/// whole, or whose `COMMIT` failed: a `COMMIT` the server rejects rolls the
+/// add back whole, but one whose answer is lost may have committed it whole.
 const OUTCOME_ROLLED_BACK: &str = "rolled_back";
 
 /// `tran_id_rejected` of a CT01 Tran ID that was not entered.
@@ -415,8 +416,12 @@ async fn view_one(state: &AppState, tran_id: String) -> Result<TransactionRespon
 /// - 500 when a cross-reference read, the TRAN-ID allocation or the write
 ///   fails (V-COTRN02C-005, V-COTRN02C-007, V-COTRN02C-030, V-COTRN02C-031,
 ///   V-COTRN02C-033), and when the reward accrual or the commit fails or no
-///   unit of work can be opened. A failure after validation rolls back the
-///   insert, the accrual and the balance update together.
+///   unit of work can be opened. A failure after validation and before the
+///   `COMMIT`, or a `COMMIT` the server rejects, rolls back the insert, the
+///   accrual and the balance update together. A `COMMIT` whose answer is
+///   lost, its connection gone, leaves the outcome unknown: the three
+///   committed or rolled back together, so the transactions are listed again
+///   before the add is retried.
 #[utoipa::path(
     post,
     path = "/transactions",
@@ -428,7 +433,7 @@ async fn view_one(state: &AppState, tran_id: String) -> Result<TransactionRespon
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 404, description = "No cross-reference for the account or card, or an empty transaction master", body = ErrorBody),
         (status = 409, description = "The allocated Tran ID is already live", body = ErrorBody),
-        (status = 500, description = "A read, the allocation, the write, the reward accrual or the commit failed; nothing was persisted", body = ErrorBody),
+        (status = 500, description = "A read, the allocation, the write, the reward accrual or the commit failed; nothing was persisted unless a `COMMIT` lost its answer with its connection, which leaves the outcome unknown, so the transactions are listed again before a retry", body = ErrorBody),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -492,8 +497,10 @@ async fn add_transaction(
     match insert_and_accrue(&mut uow, &validated, state.clock(), span).await {
         Ok(added) => match uow.commit().await {
             Ok(()) => (OUTCOME_COMMITTED, Ok(added)),
-            // A failed `COMMIT` leaves nothing behind: the server ends the
-            // transaction without applying it.
+            // `rolled_back` is the reported label, not proof: a `COMMIT`
+            // the server rejects ends the transaction without applying it,
+            // but one whose answer is lost, its connection gone, may have
+            // committed it.
             Err(err) => (OUTCOME_ROLLED_BACK, Err(ApiError::from(err))),
         },
         Err(err) => {

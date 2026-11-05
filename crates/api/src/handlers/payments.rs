@@ -75,9 +75,13 @@ const OUTCOME_PROMPTED: &str = "prompted";
 /// both writes or, after a failed write, the one that succeeded (E-19).
 const OUTCOME_COMMITTED: &str = "committed";
 
-/// The span `outcome` of a confirmed payment that persisted nothing: it could
-/// not be admitted as a TRAN-ID writer, the unit of work could not be opened,
-/// no TRAN-ID could be allocated, or the commit failed.
+/// The span `outcome` of a confirmed payment reported as persisting nothing:
+/// it could not be admitted as a TRAN-ID writer, the unit of work could not
+/// be opened, no TRAN-ID could be allocated, or the commit failed. After a
+/// failed commit the label proves no rollback: a `COMMIT` the server rejects
+/// persists nothing, but one whose answer is lost, its connection gone, may
+/// have committed the payment, so the account and its transactions are read
+/// again before the payment is retried.
 const OUTCOME_ROLLED_BACK: &str = "rolled_back";
 
 /// The span `outcome` of a request an edit or a read answered with a 4xx

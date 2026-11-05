@@ -237,8 +237,8 @@ type RouteAnnouncement = { id: number; title: string };
 // - The status region announces the destination's title, the heading
 //   PageHeader shows (usePageTitle), also when the new page keeps its own
 //   focus. Each announcement is a new node, so two destinations with the same
-//   title (the two TranTypeFormPage routes, AuthorizationDetailPage's
-//   Next/Previous) are each announced.
+//   title (the two TranTypeFormPage routes, consecutive
+//   AuthorizationDetailPage records opened with Next) are each announced.
 //
 // The document load is no route change: focus stays on the body, so the
 // first Tab reaches the skip link, and the region stays empty. A shell first

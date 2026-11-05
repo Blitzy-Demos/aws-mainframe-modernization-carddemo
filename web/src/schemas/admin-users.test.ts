@@ -23,7 +23,7 @@ import {
   userUpdateSchema,
 } from "./admin-users";
 
-/** An add form every client edit accepts. */
+// An add form every client edit accepts.
 const VALID_ADD: UserAddFormValues = {
   first_name: "Ann",
   last_name: "Lee",
@@ -32,7 +32,7 @@ const VALID_ADD: UserAddFormValues = {
   usr_type: "U",
 };
 
-/** An edit form every client edit accepts, the password switch off. */
+// An edit form every client edit accepts, the password switch off.
 const VALID_UPDATE: UserUpdateFormInput = {
   user_id: "USER0001",
   first_name: "Ann",
@@ -41,7 +41,7 @@ const VALID_UPDATE: UserUpdateFormInput = {
   usr_type: "U",
 };
 
-/** Every audited COUSR01C and COUSR02C text the schemas can report. */
+// Every audited COUSR01C and COUSR02C text the schemas can report.
 const AUDITED: readonly string[] = [
   ...Object.values(USER_ADD_MESSAGES),
   ...Object.values(USER_UPDATE_MESSAGES),
@@ -63,22 +63,20 @@ function updateIssuesAt(values: UserUpdateFormInput, member: UpdateMember): z.Zo
   return result.success ? [] : result.error.issues.filter((issue) => issue.path[0] === member);
 }
 
-/** Whether `issues` hold zod's regex issue. */
+// Whether `issues` hold zod's regex issue.
 function hasRegexIssue(issues: z.ZodIssue[]): boolean {
   return issues.some((issue) => issue.code === z.ZodIssueCode.invalid_string);
 }
 
-/** Asserts that `issues` are zod's one regex issue, with no audited text. */
+// Asserts that `issues` are zod's one regex issue, with no audited text.
 function expectRegexIssueOnly(issues: z.ZodIssue[]): void {
   expect(issues).toHaveLength(1);
   expect(issues[0]).toMatchObject({ code: z.ZodIssueCode.invalid_string, validation: "regex" });
   expect(AUDITED).not.toContain(issues[0]?.message);
 }
 
-/**
- * NUL characters beside other text, within `width`: inside, leading, trailing, before and
- * after a space, and a full width with one other character.
- */
+// NUL characters beside other text, within `width`: inside, leading, trailing, before and
+// after a space, and a full width with one other character.
 function mixedNulEntries(width: number): string[] {
   return [
     "A\u0000B",
@@ -90,17 +88,17 @@ function mixedNulEntries(width: number): string[] {
   ];
 }
 
-/** NUL characters alone, fewer than `width`. */
+// NUL characters alone, fewer than `width`.
 function shortNulEntries(width: number): string[] {
   return ["\u0000", "\u0000".repeat(width - 1)];
 }
 
-/** Text without NUL characters that every member of `width` accepts. */
+// Text without NUL characters that every member of `width` accepts.
 function textEntries(width: number): string[] {
   return ["", " ".repeat(width), "x".repeat(width), "\u007f"];
 }
 
-/** The pattern the API document publishes for the start_key of GET /admin/users. */
+// The pattern the API document publishes for the start_key of GET /admin/users.
 function publishedStartKeyPattern(): string {
   const parameter = openapi.paths["/admin/users"].get.parameters.find(
     (candidate) => candidate.name === "start_key",
@@ -112,7 +110,7 @@ function publishedStartKeyPattern(): string {
   return schema.pattern;
 }
 
-/** The issues the list filter gives `entered` as its start_key. */
+// The issues the list filter gives `entered` as its start_key.
 function startKeyIssues(entered: string): z.ZodIssue[] {
   const result = userListFilterSchema.safeParse({ start_key: entered });
   return result.success

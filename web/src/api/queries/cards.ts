@@ -107,11 +107,11 @@ export function useCard(cardNumber: string, accountId: string) {
  * ('Record changed by some one else. Please review', COCRDUPC
  * 9300-CHECK-CHANGE-IN-REC) refreshes the same detail, so the page holds the
  * current record and its new `version`. Both refreshes are returned, so the
- * mutation settles only once the active queries they reach have reloaded:
- * the 409 then reaches the page with the current record already in place, as
- * COCRDUPC redisplays the changed record with its message, and a form reset
- * on the reloaded record cannot clear the field error the page sets
- * afterwards.
+ * mutation settles only once the active queries they reach have reloaded: a
+ * 409 settles with the current record and its new `version` already in the
+ * cache, as COCRDUPC redisplays the changed record with its message. The hook
+ * does not order the page's render: CardEditPage resets its form to the
+ * reloaded record before it applies the server's field errors.
  */
 export function useCardUpdateMutation(cardNumber: string) {
   const queryClient = useQueryClient();

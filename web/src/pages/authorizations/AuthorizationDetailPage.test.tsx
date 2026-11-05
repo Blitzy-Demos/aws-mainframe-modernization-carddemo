@@ -47,31 +47,29 @@ type FetchImpl = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-/** `GET /authorizations` under the client's `/api` base path. */
+// `GET /authorizations` under the client's `/api` base path.
 const SUMMARY_PATH = "/api/authorizations";
 
-/** `GET /authorizations/{id}` under the client's `/api` base path. */
+// `GET /authorizations/{id}` under the client's `/api` base path.
 const DETAIL_PATH_PREFIX = `${SUMMARY_PATH}/`;
 
-/** What the test router shows at the summary route. */
+// What the test router shows at the summary route.
 const SUMMARY_MARKER = "Authorization summary";
 
-/** Account 1 of the fixture [app/data/ASCII/acctdata.txt:L1], zero-padded. */
+// Account 1 of the fixture [app/data/ASCII/acctdata.txt:L1], zero-padded.
 const ACCOUNT_1 = "00000000001";
 
-/** The BMS field the errors of `GET /authorizations/{id}` name. */
+// The BMS field the errors of `GET /authorizations/{id}` name.
 const CARDNUM: AuthDetailField = "CARDNUM";
 
-/** The status text while the authorization is read. */
+// The status text while the authorization is read.
 const LOADING = "Loading authorization";
 
-/** Longer than the page's 150 ms announce delay, so a due announcement is shown. */
+// Longer than the page's 150 ms announce delay, so a due announcement is shown.
 const ANNOUNCE_WAIT_MS = 300;
 
-/**
- * An approved authorization CP00 stored for account 1, on its card
- * 9680294154603697 [app/data/ASCII/cardxref.txt:L49], as the API answers it.
- */
+// An approved authorization CP00 stored for account 1, on its card
+// 9680294154603697 [app/data/ASCII/cardxref.txt:L49], as the API answers it.
 function authorization(
   authId: string,
   tranId: string,
@@ -107,19 +105,19 @@ function authorization(
   };
 }
 
-/** The authorization the route opens, with a next one under its summary. */
+// The authorization the route opens, with a next one under its summary.
 const NEWEST = authorization("7", "QA00000000007", "6");
 
-/** The next older authorization, the one PF8 opens from NEWEST. */
+// The next older authorization, the one PF8 opens from NEWEST.
 const FOLLOWING = authorization("6", "QA00000000006", "5");
 
-/** The status text once NEWEST is read: its identity alone. */
+// The status text once NEWEST is read: its identity alone.
 const NEWEST_LOADED = `Authorization of transaction ${NEWEST.pa_transaction_id} loaded`;
 
-/** The status text once FOLLOWING is read. */
+// The status text once FOLLOWING is read.
 const FOLLOWING_LOADED = `Authorization of transaction ${FOLLOWING.pa_transaction_id} loaded`;
 
-/** The summary page one row on from NEWEST: FOLLOWING's list row. */
+// The summary page one row on from NEWEST: FOLLOWING's list row.
 const PAGE_AFTER_NEWEST: AuthSummaryResponse = {
   account_id: ACCOUNT_1,
   customer_id: "000000001",
@@ -156,7 +154,7 @@ const PAGE_AFTER_NEWEST: AuthSummaryResponse = {
   prev_key: FOLLOWING.auth_id,
 };
 
-/** The answer to a request no test expects; afterEach reports it. */
+// The answer to a request no test expects; afterEach reports it.
 const UNEXPECTED: ErrorBody = { code: "UNEXPECTED", message: "Unexpected error" };
 
 function jsonResponse(
@@ -169,7 +167,7 @@ function jsonResponse(
   });
 }
 
-/** A response held until the test sends it, so a read stays in flight. */
+// A response held until the test sends it, so a read stays in flight.
 type HeldResponse = { reply: Promise<Response>; send: (response: Response) => void };
 
 function holdResponse(): HeldResponse {
@@ -186,7 +184,7 @@ let unexpected: string[];
 let queryClient: QueryClient;
 let toastError: MockInstance<typeof toast.error>;
 
-/** Whether `request` is the read of authorization `authId`. */
+// Whether `request` is the read of authorization `authId`.
 function isDetailRead(request: Request, authId: string): boolean {
   const url = new URL(request.url);
   return (
@@ -196,7 +194,7 @@ function isDetailRead(request: Request, authId: string): boolean {
   );
 }
 
-/** Whether `request` is PF5's fraud toggle of authorization `authId`. */
+// Whether `request` is PF5's fraud toggle of authorization `authId`.
 function isFraudToggle(request: Request, authId: string): boolean {
   const url = new URL(request.url);
   return (
@@ -206,7 +204,7 @@ function isFraudToggle(request: Request, authId: string): boolean {
   );
 }
 
-/** Whether `request` is PF8's summary read one row on from NEWEST. */
+// Whether `request` is PF8's summary read one row on from NEWEST.
 function isNextLookup(request: Request): boolean {
   const url = new URL(request.url);
   const query = url.searchParams;
@@ -220,7 +218,7 @@ function isNextLookup(request: Request): boolean {
   );
 }
 
-/** The store the API reads: NEWEST, FOLLOWING and the page between them. */
+// The store the API reads: NEWEST, FOLLOWING and the page between them.
 function readStore(request: Request): Response {
   if (isDetailRead(request, NEWEST.auth_id)) {
     return jsonResponse(200, NEWEST);
@@ -236,7 +234,7 @@ function readStore(request: Request): Response {
   return jsonResponse(500, UNEXPECTED);
 }
 
-/** Every request the page sent, as method, path and query, in the order sent. */
+// Every request the page sent, as method, path and query, in the order sent.
 function sent(): string[] {
   return fetchMock.mock.calls.map(([input, init]) => {
     const request = input instanceof Request ? input : new Request(input, init);
@@ -245,15 +243,13 @@ function sent(): string[] {
   });
 }
 
-/** The polite status the page keeps mounted to announce the read. */
+// The polite status the page keeps mounted to announce the read.
 function readStatus(): HTMLElement {
   return screen.getByRole("status");
 }
 
-/**
- * The elements outside the toasts whose whole text is `text`: the screen's
- * message line, compared byte for byte, a leading space included.
- */
+// The elements outside the toasts whose whole text is `text`: the screen's
+// message line, compared byte for byte, a leading space included.
 function messageLines(text: string): HTMLElement[] {
   return screen.queryAllByText(
     (_content, element) =>
@@ -264,7 +260,7 @@ function messageLines(text: string): HTMLElement[] {
   );
 }
 
-/** Waits out the announce delay, so a status still empty announces nothing. */
+// Waits out the announce delay, so a status still empty announces nothing.
 async function afterAnnounceDelay(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => {
@@ -273,26 +269,24 @@ async function afterAnnounceDelay(): Promise<void> {
   });
 }
 
-/** The location of NEWEST as the summary's "View" link opens it. */
+// The location of NEWEST as the summary's "View" link opens it.
 const NEWEST_ROUTE = `/authorizations/${NEWEST.auth_id}?account_id=${ACCOUNT_1}`;
 
-/** V-COPAUS1C-006's text for IMS status `AO` (E-44). */
+// V-COPAUS1C-006's text for IMS status `AO` (E-44).
 const DETAIL_READ_FAILED = " System error while reading Auth Details: Code:AO";
 
-/** The API's 404 text for a path no route serves (crates/domain/src/messages.rs ROUTE_NOT_FOUND). */
+// The API's 404 text for a path no route serves (crates/domain/src/messages.rs ROUTE_NOT_FOUND).
 const ROUTE_NOT_FOUND = "Resource not found";
 
-/**
- * The failed reads of the record, each with the text the page toasts and
- * keeps as its message line, or `null` when it shows none:
- *
- * - V-COPAUS1C-005, an ID no detail holds (a purged authorization, say): a
- *   404 whose message is blank, empty or spaces. COPAUS1C sets no message and
- *   shows no authorization (E-49), so nothing is toasted or shown.
- * - A 404 that carries a text, such as the API's answer to a path no route
- *   serves, shown as every other message is.
- * - V-COPAUS1C-006, a failed detail read, 500.
- */
+// The failed reads of the record, each with the text the page toasts and
+// keeps as its message line, or `null` when it shows none:
+//
+// - V-COPAUS1C-005, an ID no detail holds (a purged authorization, say): a
+//   404 whose message is blank, empty or spaces. COPAUS1C sets no message and
+//   shows no authorization (E-49), so nothing is toasted or shown.
+// - A 404 that carries a text, such as the API's answer to a path no route
+//   serves, shown as every other message is.
+// - V-COPAUS1C-006, a failed detail read, 500.
 const READ_FAILURES: ReadonlyArray<{
   answer: string;
   status: number;
@@ -329,11 +323,9 @@ const READ_FAILURES: ReadonlyArray<{
   },
 ];
 
-/**
- * The text the page shows outside its header, its read status and the
- * toasts, leaf element by leaf element: the message line, or a record's
- * fields. The skeleton's blocks hold none.
- */
+// The text the page shows outside its header, its read status and the
+// toasts, leaf element by leaf element: the message line, or a record's
+// fields. The skeleton's blocks hold none.
 function pageText(): string[] {
   const header = document.querySelector("header");
   return screen
@@ -349,14 +341,12 @@ function pageText(): string[] {
     .map((element) => element.textContent ?? "");
 }
 
-/**
- * The screen once a read of NEWEST failed, the first read or a read again
- * alike: nothing announced, no record, PF5 or PF8, and Back to the account's
- * summary. A failure with a message is toasted once and its text kept as the
- * message line, the only text outside the header. The 404 without one
- * (`shown` null) is neither toasted nor shown: the header and Back alone, as
- * for a rejected key.
- */
+// The screen once a read of NEWEST failed, the first read or a read again
+// alike: nothing announced, no record, PF5 or PF8, and Back to the account's
+// summary. A failure with a message is toasted once and its text kept as the
+// message line, the only text outside the header. The 404 without one
+// (`shown` null) is neither toasted nor shown: the header and Back alone, as
+// for a rejected key.
 async function expectFailedRead(shown: string | null): Promise<void> {
   if (shown === null) {
     await waitFor(() => {
@@ -387,11 +377,9 @@ async function expectFailedRead(shown: string | null): Promise<void> {
   );
 }
 
-/**
- * Renders the page at `path` in a data router nested as the application's
- * route table nests it, which PageHeader's useMatches needs: the summary at
- * /authorizations and the detail at /authorizations/:authId.
- */
+// Renders the page at `path` in a data router nested as the application's
+// route table nests it, which PageHeader's useMatches needs: the summary at
+// /authorizations and the detail at /authorizations/:authId.
 function renderAt(path: string): { user: UserEvent; router: ReturnType<typeof createMemoryRouter> } {
   queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -552,7 +540,7 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read status", () => {
   });
 });
 
-/** The card's content: the skeleton's while the record is read, then the record's. */
+// The card's content: the skeleton's while the record is read, then the record's.
 function cardContent(): Element {
   const content = document.querySelector("[data-slot='card'] [data-slot='card-content']");
   if (content === null) {
@@ -561,17 +549,17 @@ function cardContent(): Element {
   return content;
 }
 
-/** The classes that set the height of `element`'s line. */
+// The classes that set the height of `element`'s line.
 function heightClasses(element: Element): string[] {
   return Array.from(element.classList).filter((name) => /^(my|h|min-h)-/.test(name));
 }
 
-/** Each field of a skeleton grid as the height classes of its caption and value bars. */
+// Each field of a skeleton grid as the height classes of its caption and value bars.
 function fieldBars(grid: Element): string[][][] {
   return Array.from(grid.children, (field) => Array.from(field.children, heightClasses));
 }
 
-/** A field's caption bar in its 20px text-sm line and value bar in its 24px text-base line. */
+// A field's caption bar in its 20px text-sm line and value bar in its 24px text-base line.
 const FIELD_BARS = [
   ["my-0.5", "h-4"],
   ["my-0.5", "h-5"],
@@ -615,7 +603,7 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) skeleton", () => {
   });
 });
 
-/** The detail route of `authId`, from the summary of account 1, as the router receives it. */
+// The detail route of `authId`, from the summary of account 1, as the router receives it.
 function routeOf(authId: string): string {
   return `/authorizations/${encodeURIComponent(authId)}?account_id=${ACCOUNT_1}`;
 }
@@ -671,10 +659,10 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) route key", () => {
   });
 });
 
-/** The COPAUS1C UPDATE-AUTH-DETAILS text of a committed mark (P-COPAUS1C-008). */
+// The COPAUS1C UPDATE-AUTH-DETAILS text of a committed mark (P-COPAUS1C-008).
 const MARKED_TEXT = "AUTH MARKED FRAUD...";
 
-/** NEWEST as the PUT answers it once marked: the replaced detail, read with no PF8 neighbour. */
+// NEWEST as the PUT answers it once marked: the replaced detail, read with no PF8 neighbour.
 const MARKED_NEWEST: AuthDetailResponse = {
   ...NEWEST,
   pa_auth_fraud: "F",
@@ -682,7 +670,7 @@ const MARKED_NEWEST: AuthDetailResponse = {
   next_id: null,
 };
 
-/** V-COPAUS1C-011's text for IMS status `AO`: the detail replace failed, so the mark rolled back (E-44). */
+// V-COPAUS1C-011's text for IMS status `AO`: the detail replace failed, so the mark rolled back (E-44).
 const FRAUD_TAGGING_FAILED = " System error while FRAUD Tagging, ROLLBACK||AO";
 
 describe("AuthorizationDetailPage (CPVD, COPAU01) PF5 fraud mark", () => {
@@ -743,11 +731,9 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) PF5 fraud mark", () => {
     expect(toastError).not.toHaveBeenCalled();
   });
 
-  /**
-   * NEWEST shown, its mark confirmed with the PUT held, and the confirm opened
-   * again from the fraud button, which stays enabled while the mark is sent:
-   * the mark's confirm, with both buttons disabled. `sendMark` answers the PUT.
-   */
+  // NEWEST shown, its mark confirmed with the PUT held, and the confirm opened
+  // again from the fraud button, which stays enabled while the mark is sent:
+  // the mark's confirm, with both buttons disabled. `sendMark` answers the PUT.
   async function reopenConfirmDuringMark(): Promise<{
     user: UserEvent;
     trigger: HTMLElement;
@@ -861,7 +847,7 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) PF5 fraud mark", () => {
   });
 });
 
-/** PF8's summary read one row on from NEWEST once no authorization follows it. */
+// PF8's summary read one row on from NEWEST once no authorization follows it.
 const NO_PAGE_AFTER_NEWEST: AuthSummaryResponse = {
   ...PAGE_AFTER_NEWEST,
   items: [],
@@ -938,14 +924,12 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read again after a record was 
     },
   );
 
-  /**
-   * NEWEST shown, Next pressed with its lookup held, and PF5's confirm opened
-   * meanwhile. `sendLookup` answers the lookup with the dialog open: no row
-   * after NEWEST, whose read again then fails as a purge's 404, when
-   * `purged`; FOLLOWING's row otherwise. The application reads only on
-   * navigation or action, so PF8's answer is what can change the record
-   * under the dialog.
-   */
+  // NEWEST shown, Next pressed with its lookup held, and PF5's confirm opened
+  // meanwhile. `sendLookup` answers the lookup with the dialog open: no row
+  // after NEWEST, whose read again then fails as a purge's 404, when
+  // `purged`; FOLLOWING's row otherwise. The application reads only on
+  // navigation or action, so PF8's answer is what can change the record
+  // under the dialog.
   async function openConfirmDuringNext(purged: boolean): Promise<{
     user: UserEvent;
     router: ReturnType<typeof createMemoryRouter>;

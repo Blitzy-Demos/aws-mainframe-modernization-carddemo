@@ -1176,6 +1176,8 @@ fn program_abend(display: String, status: [u8; 2]) -> ExitStatus {
     }
 }
 
+/// CBTRN03C 9910-DISPLAY-IO-STATUS / 9999-ABEND-PROGRAM — P-CBTRN03C-484, P-CBTRN03C-485
+///
 /// The `DISPLAY` lines of a CBTRN03C abend: `display`, `FILE STATUS IS: NNNN` with `status`
 /// (`9910-DISPLAY-IO-STATUS`) and `ABENDING PROGRAM` (`9999-ABEND-PROGRAM`).
 fn abend_display(display: String, status: [u8; 2]) -> Vec<String> {

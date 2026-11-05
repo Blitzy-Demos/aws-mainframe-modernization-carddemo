@@ -490,7 +490,9 @@ export interface paths {
          *     - 500 `Unable to Update User...`, field `FNAME`, for an unknown user, whose
          *       failed read the COBOL follows with a failing rewrite (V-COUSR02C-009,
          *       E-46), for a failed rewrite (V-COUSR02C-012), and when the password
-         *       cannot be verified or hashed. Nothing is written on any error.
+         *       cannot be verified or hashed. Nothing is written on any error, unless a
+         *       `COMMIT` loses its answer with its connection: the rewrite may then have
+         *       committed, so the user is read again before the update is retried.
          */
         put: operations["update_user"];
         post?: never;
@@ -518,7 +520,9 @@ export interface paths {
          *     - 500 `Unable to Update User...`, field `FNAME` (the COBOL's own text,
          *       reproduced): for an unknown user, whose failed read the COBOL follows
          *       with a failing delete (V-COUSR03C-005, E-46), and for a failed delete
-         *       (V-COUSR03C-007). Nothing is deleted on any error.
+         *       (V-COUSR03C-007). Nothing is deleted on any error, unless a `COMMIT`
+         *       loses its answer with its connection: the delete may then have
+         *       committed, so the user is read again before the delete is retried.
          */
         delete: operations["delete_user"];
         options?: never;
@@ -696,7 +700,8 @@ export interface paths {
          *
          *     # Errors
          *
-         *     Each on `CARDNUM`, and nothing is written:
+         *     Each on `CARDNUM`, and nothing is written except by a `COMMIT` whose
+         *     answer is lost:
          *
          *     - 400 with no message when `{id}` is not a positive integer.
          *     - 401 without a valid bearer token.
@@ -712,7 +717,9 @@ export interface paths {
          *       or `COPAUS2C` text when the fraud-table write or the detail replace
          *       fails, or the scheduling text when the authorization store cannot be
          *       opened; 500 `Unexpected error` when the cross-reference read or the
-         *       commit fails.
+         *       commit fails. A `COMMIT` the server rejects writes nothing; one whose
+         *       answer is lost, its connection gone, may have toggled the mark, so the
+         *       authorization is read again before the mark is retried.
          */
         put: operations["toggle_fraud"];
         post?: never;
@@ -1019,8 +1026,12 @@ export interface paths {
          *     - 500 when a cross-reference read, the TRAN-ID allocation or the write
          *       fails (V-COTRN02C-005, V-COTRN02C-007, V-COTRN02C-030, V-COTRN02C-031,
          *       V-COTRN02C-033), and when the reward accrual or the commit fails or no
-         *       unit of work can be opened. A failure after validation rolls back the
-         *       insert, the accrual and the balance update together.
+         *       unit of work can be opened. A failure after validation and before the
+         *       `COMMIT`, or a `COMMIT` the server rejects, rolls back the insert, the
+         *       accrual and the balance update together. A `COMMIT` whose answer is
+         *       lost, its connection gone, leaves the outcome unknown: the three
+         *       committed or rolled back together, so the transactions are listed again
+         *       before the add is retried.
          */
         post: operations["create_transaction"];
         delete?: never;
@@ -4116,7 +4127,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description A read or write failed and nothing was changed */
+            /** @description A read, a write or the commit failed; nothing was changed unless a `COMMIT` lost its answer with its connection, which leaves the mark unknown, so the authorization is read again before a retry */
             500: {
                 headers: {
                     [name: string]: unknown;
@@ -4733,7 +4744,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description A read, the allocation, the write, the reward accrual or the commit failed; nothing was persisted */
+            /** @description A read, the allocation, the write, the reward accrual or the commit failed; nothing was persisted unless a `COMMIT` lost its answer with its connection, which leaves the outcome unknown, so the transactions are listed again before a retry */
             500: {
                 headers: {
                     [name: string]: unknown;

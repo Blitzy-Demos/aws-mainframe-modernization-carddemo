@@ -554,8 +554,10 @@ async fn traced<T>(
 ///
 /// # Errors
 ///
-/// The rule's error, or a 500 when the commit fails, in which case nothing
-/// was stored.
+/// The rule's error, or a 500 when the commit fails. Nothing was stored when
+/// the server rejected the `COMMIT`; when its answer was lost, its connection
+/// gone, the write may have committed, so the type is read again before it is
+/// retried.
 async fn commit_or_roll_back<T>(
     uow: UnitOfWork,
     result: Result<T, DomainError>,

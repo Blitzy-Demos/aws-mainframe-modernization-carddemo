@@ -36,13 +36,11 @@ import AccountViewPage from "./AccountViewPage";
 type AccountResponse = components["schemas"]["AccountResponse"];
 type ErrorBody = components["schemas"]["ErrorBody"];
 
-/**
- * `GET /accounts/00000000001` on the seeded corpus: account record
- * [app/data/ASCII/acctdata.txt:L1], customer 000000001
- * [app/data/ASCII/custdata.txt:L1] and the account's card from its
- * cross-reference [app/data/ASCII/cardxref.txt:L49], as the API answers them
- * (crates/api/tests/snapshots/cavw_account_view__account_00000000001.snap).
- */
+// `GET /accounts/00000000001` on the seeded corpus: account record
+// [app/data/ASCII/acctdata.txt:L1], customer 000000001
+// [app/data/ASCII/custdata.txt:L1] and the account's card from its
+// cross-reference [app/data/ASCII/cardxref.txt:L49], as the API answers them
+// (crates/api/tests/snapshots/cavw_account_view__account_00000000001.snap).
 const account: AccountResponse = {
   account_id: "00000000001",
   acct_active_status: "Y",
@@ -77,15 +75,15 @@ const account: AccountResponse = {
   version: "3f2a9c1e5b7d0846",
 };
 
-/** V-COACTVWC-003: no cross-reference for the account, 404 at ACCTSID. */
+// V-COACTVWC-003: no cross-reference for the account, 404 at ACCTSID.
 const XREF_NOT_FOUND =
   "Account:99999999999 not found in Cross ref file.  Resp:000000013  Reas:0000";
 
-/** The status region's texts while the account is read and once it is. */
+// The status region's texts while the account is read and once it is.
 const ACCOUNT_LOADING = "Loading account";
 const ACCOUNT_LOADED = `Account ${account.account_id} loaded`;
 
-/** The global the API client sends each Request through. */
+// The global the API client sends each Request through.
 type FetchFn = (input: Request, init?: RequestInit) => Promise<Response>;
 
 let fetchMock: Mock<FetchFn>;
@@ -97,12 +95,12 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
-/** Answers every request with `status` and `body`. */
+// Answers every request with `status` and `body`.
 function respondWith(status: number, body: AccountResponse | ErrorBody): void {
   fetchMock.mockImplementation(async () => jsonResponse(status, body));
 }
 
-/** The requests the page sent, in order. */
+// The requests the page sent, in order.
 function sentRequests(): Request[] {
   return fetchMock.mock.calls.map(([request]) => request);
 }
@@ -134,12 +132,12 @@ function renderPage(initialEntry: string) {
   return { router };
 }
 
-/** ACCTSID, by the label F-COACTVW-001 gives it. */
+// ACCTSID, by the label F-COACTVW-001 gives it.
 function accountInput(): HTMLElement {
   return screen.getByLabelText("Account number");
 }
 
-/** Each detail-list label with the text of its value. */
+// Each detail-list label with the text of its value.
 function renderedDetails(): Record<string, string | null | undefined> {
   return Object.fromEntries(
     Array.from(document.querySelectorAll("dt"), (term) => [
@@ -149,7 +147,7 @@ function renderedDetails(): Record<string, string | null | undefined> {
   );
 }
 
-/** A promise and its resolver, so a test decides when an answer arrives. */
+// A promise and its resolver, so a test decides when an answer arrives.
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve: (value: T) => void = () => undefined;
   const promise = new Promise<T>((settle) => {
@@ -158,7 +156,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   return { promise, resolve };
 }
 
-/** Holds the next answer back until the returned function sends it. */
+// Holds the next answer back until the returned function sends it.
 function holdNextAnswer(): (
   status: number,
   body: AccountResponse | ErrorBody,
@@ -170,7 +168,7 @@ function holdNextAnswer(): (
   };
 }
 
-/** The page's status region, the one on the page. */
+// The page's status region, the one on the page.
 function lookupStatus(): HTMLElement {
   return screen.getByRole("status");
 }

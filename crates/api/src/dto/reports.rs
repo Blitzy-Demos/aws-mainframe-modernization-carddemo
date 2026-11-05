@@ -836,7 +836,7 @@ mod tests {
         assert_eq!(
             response,
             ReportResponse {
-                report_name: "Monthly".to_owned(),
+                report_name: messages::REPORT_NAME_MONTHLY.to_owned(),
                 start_date: "2022-07-01".to_owned(),
                 end_date: "2022-07-31".to_owned(),
                 lines: lines.clone(),
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(
             wire,
             json!({
-                "report_name": "Monthly",
+                "report_name": messages::REPORT_NAME_MONTHLY,
                 "start_date": "2022-07-01",
                 "end_date": "2022-07-31",
                 "lines": lines,

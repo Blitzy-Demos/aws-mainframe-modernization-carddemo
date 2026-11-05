@@ -19,10 +19,10 @@ import {
 
 type LoginField = components["schemas"]["LoginField"];
 
-/** The width of the USERIDI and PASSWDI map fields, PIC X(8). */
+// The width of the USERIDI and PASSWDI map fields, PIC X(8).
 const WIDTH = 8;
 
-/** One issue the schema must report, matched on these members only. */
+// One issue the schema must report, matched on these members only.
 interface ExpectedIssue {
   path: [keyof LoginFormValues];
   code: z.ZodIssueCode;
@@ -46,7 +46,7 @@ const PASSWORD_EMPTY: ExpectedIssue = {
   message: LOGIN_MESSAGES.passwordEmpty,
 };
 
-/** Every audited COSGN00C text the schema module can report. */
+// Every audited COSGN00C text the schema module can report.
 const AUDITED: readonly string[] = Object.values(LOGIN_MESSAGES);
 
 function issuesOf(values: unknown): z.ZodIssue[] {

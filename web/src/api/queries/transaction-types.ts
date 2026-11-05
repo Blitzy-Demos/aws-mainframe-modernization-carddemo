@@ -112,19 +112,17 @@ export const tranTypeKeys = {
   list: (params: TranTypeListParams) => [...ALL, "list", params] as const,
 };
 
-/**
- * Whether a failed write may have been stored all the same: no usable answer
- * arrived (the client's deadline, a network failure, a success body that
- * could not be read, or a 2xx without one), or the answer is a 5xx, which the
- * Vite proxy also sends when the API's connection ends after its commit.
- * Every 4xx refuses the write before anything is stored: an edit (400), no
- * valid session (401), no admin (403), no type with the code (404), a
- * duplicate code or a referencing category (409).
- *
- * Each write hook's onError then invalidates `all` without returning the
- * reads: TanStack Query awaits that callback before the caller's onError, so
- * the error shown would otherwise wait for the reads.
- */
+// Whether a failed write may have been stored all the same: no usable answer
+// arrived (the client's deadline, a network failure, a success body that
+// could not be read, or a 2xx without one), or the answer is a 5xx, which the
+// Vite proxy also sends when the API's connection ends after its commit.
+// Every 4xx refuses the write before anything is stored: an edit (400), no
+// valid session (401), no admin (403), no type with the code (404), a
+// duplicate code or a referencing category (409).
+//
+// Each write hook's onError then invalidates `all` without returning the
+// reads: TanStack Query awaits that callback before the caller's onError, so
+// the error shown would otherwise wait for the reads.
 function mayHaveWritten(error: Error): boolean {
   if (!(error instanceof ApiError)) {
     return true;

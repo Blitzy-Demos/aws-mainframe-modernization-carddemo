@@ -8,8 +8,11 @@
 //
 // While a read of the list is in flight (the first read, PF8 to a page not
 // read yet, ENTER again on the account shown, PF8 back to a page already
-// read), the list is busy: Skeleton rows instead of any held row, Previous and
-// Next disabled, and nothing announced until the read settles.
+// read), the list is busy: Previous and Next disabled, and nothing announced
+// until the read settles. Skeleton rows stand in only while no rows are held
+// (of these, the first read of the account); on a later read the rows held
+// (the page left, or the cached page a PF8 back returns to) stay shown,
+// dimmed and ignoring the pointer, until the answer replaces them.
 //
 // The network is the global the API client looks up on every request, stubbed
 // per test; every answer is typed with the OpenAPI schema, so drift in the
@@ -38,13 +41,13 @@ type AuthSummaryItem = components["schemas"]["AuthSummaryItem"];
 type AuthSummaryField = components["schemas"]["AuthSummaryField"];
 type ErrorBody = components["schemas"]["ErrorBody"];
 
-/** Account 1 of the fixture [app/data/ASCII/acctdata.txt:L1], as `ACCTIDI PIC X(11)` holds it. */
+// Account 1 of the fixture [app/data/ASCII/acctdata.txt:L1], as `ACCTIDI PIC X(11)` holds it.
 const ACCOUNT_1 = "00000000001";
 
-/** An account no cross-reference names [app/data/ASCII/cardxref.txt]. */
+// An account no cross-reference names [app/data/ASCII/cardxref.txt].
 const UNKNOWN_ACCOUNT = "99999999999";
 
-/** The one BMS field every COPAUS0C message puts the cursor on. */
+// The one BMS field every COPAUS0C message puts the cursor on.
 const ACCTID: AuthSummaryField = "ACCTID";
 
 const AUTHORIZATION: AuthSummaryItem = {
@@ -58,12 +61,10 @@ const AUTHORIZATION: AuthSummaryItem = {
   pa_approved_amt: "50.47",
 };
 
-/**
- * The first page of account 1: its account record, customer 1 (its
- * cross-reference customer [app/data/ASCII/cardxref.txt:L49],
- * [app/data/ASCII/custdata.txt:L1]) and a summary with one approved
- * authorization. No page precedes or follows it, and no boundary text is set.
- */
+// The first page of account 1: its account record, customer 1 (its
+// cross-reference customer [app/data/ASCII/cardxref.txt:L49],
+// [app/data/ASCII/custdata.txt:L1]) and a summary with one approved
+// authorization. No page precedes or follows it, and no boundary text is set.
 const summaryOk: AuthSummaryResponse = {
   account_id: ACCOUNT_1,
   customer_id: "000000001",
@@ -97,7 +98,7 @@ function jsonResponse(status: number, body: AuthSummaryResponse | ErrorBody): Re
   });
 }
 
-/** Answers every request with `status` and `body`. */
+// Answers every request with `status` and `body`.
 function stubApi(status: number, body: AuthSummaryResponse | ErrorBody) {
   const fetchMock = vi.fn(
     async (_input: Request | string | URL, _init?: RequestInit) =>
@@ -109,7 +110,7 @@ function stubApi(status: number, body: AuthSummaryResponse | ErrorBody) {
 
 type FetchMock = ReturnType<typeof stubApi>;
 
-/** The request of the mock's first call. openapi-fetch hands over a Request. */
+// The request of the mock's first call. openapi-fetch hands over a Request.
 function firstRequest(fetchMock: FetchMock): Request {
   const [call] = fetchMock.mock.calls;
   if (call === undefined) {
@@ -119,7 +120,7 @@ function firstRequest(fetchMock: FetchMock): Request {
   return input instanceof Request ? input : new Request(input);
 }
 
-/** The page on a data router, so PageHeader's useMatches() sees the route handle. */
+// The page on a data router, so PageHeader's useMatches() sees the route handle.
 function renderPage(initialEntry = "/authorizations") {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -144,12 +145,12 @@ function renderPage(initialEntry = "/authorizations") {
   return { router };
 }
 
-/** The ACCTID input of F-COPAU00-001. */
+// The ACCTID input of F-COPAU00-001.
 function accountField(): HTMLElement {
   return screen.getByRole("textbox", { name: "Account ID" });
 }
 
-/** The ENTER control of F-COPAU00-001. */
+// The ENTER control of F-COPAU00-001.
 function searchButton(): HTMLElement {
   return screen.getByRole("button", { name: "Search" });
 }
@@ -340,12 +341,12 @@ describe("CPVS ENTER answered with a server error", () => {
   );
 });
 
-/** An authorization of account 1's list, told apart by its identity and transaction ID. */
+// An authorization of account 1's list, told apart by its identity and transaction ID.
 function listedAuthorization(authId: string): AuthSummaryItem {
   return { ...AUTHORIZATION, auth_id: authId, pa_transaction_id: `22070112000000${authId}` };
 }
 
-/** Account 1 with seven approved authorizations, as the summary segment counts them. */
+// Account 1 with seven approved authorizations, as the summary segment counts them.
 const sevenAuthorizations: AuthSummaryResponse = {
   ...summaryOk,
   pa_approved_auth_cnt: 7,
@@ -353,7 +354,7 @@ const sevenAuthorizations: AuthSummaryResponse = {
   pa_credit_balance: "353.29",
 };
 
-/** The first five, newest first: ENTER, and PF7 from the second page's `prev_key`. */
+// The first five, newest first: ENTER, and PF7 from the second page's `prev_key`.
 const firstPage: AuthSummaryResponse = {
   ...sevenAuthorizations,
   items: ["7", "6", "5", "4", "3"].map(listedAuthorization),
@@ -361,7 +362,7 @@ const firstPage: AuthSummaryResponse = {
   prev_key: null,
 };
 
-/** The last two: PF8 from the first page's `next_key`. */
+// The last two: PF8 from the first page's `next_key`.
 const secondPage: AuthSummaryResponse = {
   ...sevenAuthorizations,
   items: ["2", "1"].map(listedAuthorization),
@@ -369,7 +370,7 @@ const secondPage: AuthSummaryResponse = {
   prev_key: "2",
 };
 
-/** The page a request's cursor names: PF8 from key "3" is the second page, any other the first. */
+// The page a request's cursor names: PF8 from key "3" is the second page, any other the first.
 function pageAt(request: Request): AuthSummaryResponse {
   const query = new URL(request.url).searchParams;
   return query.get("start_key") === "3" && query.get("direction") === "forward"
@@ -377,11 +378,9 @@ function pageAt(request: Request): AuthSummaryResponse {
     : firstPage;
 }
 
-/**
- * Answers each request with the page its cursor names. `holdNextRead` keeps
- * the answer to the next request back until the function it returns is
- * called, so that read stays in flight in between.
- */
+// Answers each request with the page its cursor names. `holdNextRead` keeps
+// the answer to the next request back until the function it returns is
+// called, so that read stays in flight in between.
 function stubPages() {
   let held: Promise<void> | null = null;
   const fetchMock = vi.fn(async (input: Request | string | URL, _init?: RequestInit) => {
@@ -406,7 +405,7 @@ function stubPages() {
   return { fetchMock, holdNextRead };
 }
 
-/** The request of the mock's last call. */
+// The request of the mock's last call.
 function lastRequest(fetchMock: FetchMock): Request {
   const call = fetchMock.mock.lastCall;
   if (call === undefined) {
@@ -416,20 +415,18 @@ function lastRequest(fetchMock: FetchMock): Request {
   return input instanceof Request ? input : new Request(input);
 }
 
-/** The pending-authorization list. */
+// The pending-authorization list.
 function list(): HTMLElement {
   return screen.getByRole("table");
 }
 
-/** The rows of the list's body. */
+// The rows of the list's body.
 function bodyRows(): HTMLTableRowElement[] {
   return Array.from(list().querySelectorAll<HTMLTableRowElement>("tbody tr"));
 }
 
-/**
- * A row's text outside the invisible column placeholders a skeleton row's
- * cells hold to take their columns' widths: what the row shows.
- */
+// A row's text outside the invisible column placeholders a skeleton row's
+// cells hold to take their columns' widths: what the row shows.
 function shownText(row: HTMLTableRowElement): string {
   const texts = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
   let shown = "";
@@ -441,7 +438,7 @@ function shownText(row: HTMLTableRowElement): string {
   return shown;
 }
 
-/** The list's polite status region, which announces each completed page. */
+// The list's polite status region, which announces each completed page.
 function listStatus(): HTMLElement {
   const card = list().closest<HTMLElement>('[data-slot="card"]');
   if (card === null) {
@@ -450,15 +447,15 @@ function listStatus(): HTMLElement {
   return within(card).getByRole("status");
 }
 
-/** The Previous (PF7) or Next (PF8) control. */
+// The Previous (PF7) or Next (PF8) control.
 function pagingControl(name: "Previous" | "Next"): HTMLElement {
   return screen.getByRole("button", { name });
 }
 
-/** ENTER on the empty field, ENTER again with the Search button, PF7 or PF8. */
+// ENTER on the empty field, ENTER again with the Search button, PF7 or PF8.
 type Press = "Enter" | "Search" | "Previous" | "Next";
 
-/** The page each press reads from the page it is made on, over the two pages above. */
+// The page each press reads from the page it is made on, over the two pages above.
 const READS: Record<Press, AuthSummaryResponse> = {
   Enter: firstPage,
   Search: firstPage,
@@ -476,13 +473,13 @@ async function press(user: ReturnType<typeof userEvent.setup>, control: Press): 
   }
 }
 
-/** Longer than the delay after which DataTable announces a completed page. */
+// Longer than the delay after which DataTable announces a completed page.
 const ANNOUNCE_WAIT_MS = 200;
 
-/** The five rows of a COPAU00 list page, which the table keeps room for. */
+// The five rows of a COPAU00 list page, which the table keeps room for.
 const PAGE_ROWS = 5;
 
-/** Lets `ms` pass on the real clock. */
+// Lets `ms` pass on the real clock.
 async function elapse(ms: number): Promise<void> {
   await act(async () => {
     await new Promise<void>((resolve) => {
@@ -491,7 +488,7 @@ async function elapse(ms: number): Promise<void> {
   });
 }
 
-/** The list settled on `page`: its rows, no busy state, its paging keys, and the status naming it. */
+// The list settled on `page`: its rows, no busy state, its paging keys, and the status naming it.
 async function expectSettledOn(page: AuthSummaryResponse): Promise<void> {
   for (const item of page.items) {
     expect((await screen.findByText(item.pa_transaction_id)).tagName).toBe("SPAN");
@@ -514,14 +511,12 @@ async function expectSettledOn(page: AuthSummaryResponse): Promise<void> {
   );
 }
 
-/**
- * The list while a read is in flight, checked again after the announcement
- * delay has passed: busy, a full page of rows, Previous and Next disabled,
- * and the status empty. With no page `held`, every row is a Skeleton row
- * showing no content; with one, its rows stay shown, dimmed and ignoring the
- * pointer, over hidden filler rows without content, and no other page's rows
- * are shown.
- */
+// The list while a read is in flight, checked again after the announcement
+// delay has passed: busy, a full page of rows, Previous and Next disabled,
+// and the status empty. With no page `held`, every row is a Skeleton row
+// showing no content; with one, its rows stay shown, dimmed and ignoring the
+// pointer, over hidden filler rows without content, and no other page's rows
+// are shown.
 async function expectBusy(held: AuthSummaryResponse | null): Promise<void> {
   await waitFor(() => expect(list().getAttribute("aria-busy")).toBe("true"));
   await elapse(ANNOUNCE_WAIT_MS);
@@ -559,15 +554,15 @@ describe("CPVS while a read of the list is in flight", () => {
 
   it.each<{
     read: string;
-    /** The presses made, each read to completion, before the one whose read is held. */
+    // The presses made, each read to completion, before the one whose read is held.
     before: readonly Press[];
     held: Press;
-    /** The cursor of the held request. */
+    // The cursor of the held request.
     startKey: string | null;
     direction: string | null;
-    /** The page held, busy, while it is in flight: none (5 Skeleton rows), the page left, or the cached page. */
+    // The page held, busy, while it is in flight: none (5 Skeleton rows), the page left, or the cached page.
     shown: AuthSummaryResponse | null;
-    /** Whether the account header is already shown, from an earlier read. */
+    // Whether the account header is already shown, from an earlier read.
     header: boolean;
   }>([
     {
@@ -668,7 +663,7 @@ describe("CPVS while a read of the list is in flight", () => {
   });
 });
 
-/** Previous and Next, and every row of either page, are gone from the screen. */
+// Previous and Next, and every row of either page, are gone from the screen.
 function expectNoListShown(): void {
   expect(screen.queryByRole("table")).toBeNull();
   expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
@@ -678,12 +673,10 @@ function expectNoListShown(): void {
   }
 }
 
-/**
- * A page already shown, read again: ENTER on the account shown, or PF8 back
- * to a page read before. `heldHeader` tells whether the Search that follows
- * the failure holds a first page read earlier, busy, while it reads: only
- * when the failure was another page's.
- */
+// A page already shown, read again: ENTER on the account shown, or PF8 back
+// to a page read before. `heldHeader` tells whether the Search that follows
+// the failure holds a first page read earlier, busy, while it reads: only
+// when the failure was another page's.
 const REREADS: ReadonlyArray<{
   read: string;
   before: readonly Press[];
@@ -704,7 +697,7 @@ const REREADS: ReadonlyArray<{
   },
 ];
 
-/** The server's rejections of account 1 a read again can meet (V-COPAUS0C-004, V-COPAUS0C-005). */
+// The server's rejections of account 1 a read again can meet (V-COPAUS0C-004, V-COPAUS0C-005).
 const REREAD_FAILURES: ReadonlyArray<{ row: string; status: number; code: string; message: string }> = [
   {
     row: "V-COPAUS0C-004",

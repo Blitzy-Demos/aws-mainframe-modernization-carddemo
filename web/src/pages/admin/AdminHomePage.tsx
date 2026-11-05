@@ -19,7 +19,7 @@ import type { JSX } from "react";
 import { MenuOptionList } from "@/components/app-sidebar";
 import { PageHeader } from "@/components/page-header";
 
-/** The map title [app/bms/COADM01.bms:L79], naming the menu landmark. */
+// The map title [app/bms/COADM01.bms:L79], naming the menu landmark.
 const MENU_LANDMARK_LABEL = "Admin Menu";
 
 export default function AdminHomePage(): JSX.Element {

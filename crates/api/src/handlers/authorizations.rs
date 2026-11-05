@@ -318,7 +318,8 @@ async fn read_with_next<S: AuthorizationStore>(
 ///
 /// # Errors
 ///
-/// Each on `CARDNUM`, and nothing is written:
+/// Each on `CARDNUM`, and nothing is written except by a `COMMIT` whose
+/// answer is lost:
 ///
 /// - 400 with no message when `{id}` is not a positive integer.
 /// - 401 without a valid bearer token.
@@ -334,7 +335,9 @@ async fn read_with_next<S: AuthorizationStore>(
 ///   or `COPAUS2C` text when the fraud-table write or the detail replace
 ///   fails, or the scheduling text when the authorization store cannot be
 ///   opened; 500 `Unexpected error` when the cross-reference read or the
-///   commit fails.
+///   commit fails. A `COMMIT` the server rejects writes nothing; one whose
+///   answer is lost, its connection gone, may have toggled the mark, so the
+///   authorization is read again before the mark is retried.
 #[utoipa::path(
     put,
     path = "/authorizations/{id}",
@@ -345,7 +348,7 @@ async fn read_with_next<S: AuthorizationStore>(
         (status = 400, description = "The identity is not a positive integer", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 404, description = "No authorization has the identity, or its account has no card cross-reference", body = ErrorBody),
-        (status = 500, description = "A read or write failed and nothing was changed", body = ErrorBody),
+        (status = 500, description = "A read, a write or the commit failed; nothing was changed unless a `COMMIT` lost its answer with its connection, which leaves the mark unknown, so the authorization is read again before a retry", body = ErrorBody),
     ),
     security(("bearer_auth" = [])),
 )]

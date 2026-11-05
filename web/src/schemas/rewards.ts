@@ -21,7 +21,7 @@ import type { paths } from "@/api/schema";
 
 import { accountKeySchema } from "./accounts";
 
-/** The path parameter both reward endpoints take. */
+// The path parameter both reward endpoints take.
 type RewardsAccountId =
   paths["/rewards/balance/{account_id}"]["get"]["parameters"]["path"]["account_id"];
 

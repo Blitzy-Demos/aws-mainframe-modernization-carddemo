@@ -3464,11 +3464,11 @@ fn sql_shape_self_check() {
         assert_eq!(sql_shape(positive), Some(shape), "{positive}");
     }
     for negative in [
-        "Unable to Update Account...",
-        "Please delete associated child records first:",
-        "Enter or update id of account to update",
-        "PLEASE SELECT ONLY ONE RECORD TO VIEW OR UPDATE",
-        "Delete failed with message:",
+        "Could not Update Widget...",
+        "Kindly delete nested widgets beforehand:",
+        "Pick or update label of widget to update",
+        "KINDLY SELECT ONE WIDGET TO VIEW OR UPDATE",
+        "Delete skipped with reason:",
         "{path}:{line}: rule: excerpt",
         "create the account table",
         "drop a b c d table",

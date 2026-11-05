@@ -99,8 +99,9 @@ const RC_PERMANENT_ERROR: &str = "30";
 fn return_code(error: &PortError) -> &'static str {
     match error {
         PortError::NotFound => RC_NOT_FOUND,
-        // A read reports only `NotFound` or `Unavailable` (crate::ports); every
-        // other outcome is the same store failure.
+        // A read fails with `NotFound`, `Contention` or `Unavailable`
+        // (crate::ports); every outcome but `NotFound` is a store failure,
+        // reported as the permanent I/O error `30` (`RC_PERMANENT_ERROR`).
         PortError::Duplicate
         | PortError::Restricted
         | PortError::Contention

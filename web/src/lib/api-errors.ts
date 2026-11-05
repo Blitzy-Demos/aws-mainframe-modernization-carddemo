@@ -3,15 +3,15 @@
 // COSGN00.CPY:L84], into Sonner toasts, and the COBOL cursor placement,
 // `MOVE -1 TO <field>L` [app/cbl/COSGN00C.cbl:L121, L126]
 // [app/cbl/COBIL00C.cbl:L115, L239], into react-hook-form field errors and
-// focus. Pages import it and never toast, set errors or move focus themselves.
+// focus. Pages call its functions and never themselves toast an API outcome,
+// set the server's `fields[]` errors on a form or move focus to them. Focus a
+// page places on its own, such as its initial field or the field after a
+// reset, and the client-side validation of its input through its schema stay
+// with the page.
 //
-// - A form page passes its schema module's bmsFieldMap:
-//
-//     mutation.mutate(values, {
-//       onSuccess: (d) => showSuccess(d.message),
-//       onError: (e) => applyApiError(e, form, bmsFieldMap),
-//     });
-//
+// - A form page's mutation callbacks pass showSuccess the answer's message,
+//   and pass applyApiError the error, the form and its schema module's
+//   bmsFieldMap.
 // - A page without a form (lists, detail views, guards) calls showApiError.
 // - A 200 answer that only carries a message, writing nothing (CB00's blank
 //   confirm 'Confirm to make a bill payment...' [app/cbl/COBIL00C.cbl:L237],
@@ -26,10 +26,9 @@
 // - A request that got no usable answer (noUsableAnswer) leaves a write's
 //   outcome unknown: the server may still carry it out, and sending it again
 //   may repeat it. A caller whose request may write passes an
-//   `unknownOutcome` note, which the toast shows under the message and keeps
-//   on screen until the user dismisses it:
-//
-//     onError: (e) => applyApiError(e, form, bmsFieldMap, { unknownOutcome }),
+//   `unknownOutcome` note in the options of applyApiError or showApiError
+//   (ApiErrorOptions), which the toast shows under the message and keeps on
+//   screen until the user dismisses it.
 //
 //   A 4xx or 5xx error body is the server's answer, so its text is shown
 //   alone, as a plain `toast.error(message)` like every other error.

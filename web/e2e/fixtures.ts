@@ -67,44 +67,34 @@ function readRepoText(relative: string): string {
 
 const execFileAsync = promisify(execFile);
 
-/**
- * PostgreSQL's bounds on each statement a psql() call sends: the longest wait
- * for a lock, and the longest run, lock wait included. They reach the psql
- * inside the container through PGOPTIONS, which adds no output line. The
- * fixtures' statements are small, so only a blocked or runaway statement
- * meets them.
- */
+// PostgreSQL's bounds on each statement a psql() call sends: the longest wait
+// for a lock, and the longest run, lock wait included. They reach the psql
+// inside the container through PGOPTIONS, which adds no output line. The
+// fixtures' statements are small, so only a blocked or runaway statement
+// meets them.
 const PSQL_LOCK_TIMEOUT = "15s";
 const PSQL_STATEMENT_TIMEOUT = "30s";
 
-/**
- * How often a running statement checks that its psql is still connected (also
- * through PGOPTIONS), so a backend whose psql was killed aborts its statement,
- * and with it the rest of the call's SQL, within this interval.
- */
+// How often a running statement checks that its psql is still connected (also
+// through PGOPTIONS), so a backend whose psql was killed aborts its statement,
+// and with it the rest of the call's SQL, within this interval.
 const PSQL_CONNECTION_CHECK_INTERVAL = "500ms";
 
-/**
- * The bound on one whole psql() command, in seconds, applied inside the
- * container: `timeout` kills psql with SIGKILL once it has run this long,
- * however many statements its SQL holds. It exceeds PSQL_STATEMENT_TIMEOUT, so
- * a single statement's own error normally arrives first.
- */
+// The bound on one whole psql() command, in seconds, applied inside the
+// container: `timeout` kills psql with SIGKILL once it has run this long,
+// however many statements its SQL holds. It exceeds PSQL_STATEMENT_TIMEOUT, so
+// a single statement's own error normally arrives first.
 const PSQL_COMMAND_TIMEOUT_S = 45;
 
-/**
- * The client's backstop on one `docker compose exec` child, in milliseconds:
- * the in-container bound plus room for a slow docker start. It stays below the
- * 120 s Playwright test timeout.
- */
+// The client's backstop on one `docker compose exec` child, in milliseconds:
+// the in-container bound plus room for a slow docker start. It stays below the
+// 120 s Playwright test timeout.
 const PSQL_CHILD_TIMEOUT_MS = 75_000;
 
-/**
- * The bounds of the reap that follows a failed call (reapSession): one
- * attempt's in-container and client bounds, how long it waits for each
- * signalled backend to exit, and how many attempts it makes, a second apart,
- * before it reports the session unconfirmed.
- */
+// The bounds of the reap that follows a failed call (reapSession): one
+// attempt's in-container and client bounds, how long it waits for each
+// signalled backend to exit, and how many attempts it makes, a second apart,
+// before it reports the session unconfirmed.
 const REAP_COMMAND_TIMEOUT_S = 12;
 const REAP_CHILD_TIMEOUT_MS = 20_000;
 const REAP_TERMINATE_WAIT_MS = 5_000;

@@ -137,15 +137,16 @@ const KEY_COLUMN: &str = "tran_id";
 /// - [`PersistenceError::Corrupt`] when the highest stored key is not 16 ASCII
 ///   digits, the only keys [`TranId::next`] can add one to.
 pub async fn next_tran_id(tx: &mut Transaction<'_, Postgres>) -> Result<TranId, PersistenceError> {
-    sqlx::query_scalar!(
+    sqlx::query!(
         r#"SELECT 1 AS "locked!" FROM pg_advisory_xact_lock($1)"#,
         TRAN_ID_LOCK_KEY
     )
     .fetch_one(&mut **tx)
     .await?;
-    let highest = sqlx::query_scalar!("SELECT max(tran_id) AS max_tran_id FROM transaction_master")
+    let highest = sqlx::query!("SELECT max(tran_id) AS max_tran_id FROM transaction_master")
         .fetch_one(&mut **tx)
-        .await?;
+        .await
+        .map(|row| row.max_tran_id)?;
     next_after(highest.as_deref())
 }
 
@@ -179,7 +180,7 @@ pub async fn lock_account_reference(
     tx: &mut Transaction<'_, Postgres>,
     account_id: AccountId,
 ) -> Result<(), PersistenceError> {
-    sqlx::query_scalar!(
+    sqlx::query!(
         "SELECT account_id FROM accounts WHERE account_id = $1 FOR KEY SHARE",
         account_id.to_i64()
     )

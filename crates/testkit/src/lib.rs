@@ -39,7 +39,10 @@ pub use containers::TestStack;
 
 /// The one runtime of the test process. Connection pools, AMQP connections and
 /// containers keep their I/O bound to the runtime that created them, so every
-/// [`block_on`] call and every [`TestStack`] drop uses this instance.
+/// [`block_on`] call uses this instance. A [`TestStack`] dropped outside any
+/// runtime enters it to remove its containers; one dropped inside a runtime
+/// keeps that runtime for them. Either way, the stack's network is removed on a
+/// thread of its own with its own current-thread runtime.
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// Returns the process-wide multi-thread runtime, building it on first use.

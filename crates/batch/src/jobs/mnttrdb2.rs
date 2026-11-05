@@ -28,8 +28,11 @@
 //! `rejected` (failed records) once every record is treated, before the `STOP RUN` commit, and
 //! then `posted` (inserts, updates and deletes), and the job span `written` (inserts and
 //! updates) and `deleted`, as the commit leaves the master: the statements' counts when it
-//! commits, 0 when it fails and every statement is undone, the undone counts then going to one
-//! `warn` event. A run that ends before its records are treated leaves every count 0.
+//! commits, 0 when it fails, the counts reported undone then going to one `warn` event. Those
+//! 0 counts are reported values: a `COMMIT` the server rejects undoes every statement, but one
+//! whose answer is lost, its connection gone, may have committed them all, so the master is
+//! read again before a rerun. A run that ends before its records are treated leaves every
+//! count 0.
 
 use std::fmt;
 use std::fs::File;
@@ -100,10 +103,12 @@ enum InputError {
 /// - the input cannot be read or framed (P-COBTUPDT-011, E-36), or the runtime shuts down
 ///   before it is read, before any change and with every count 0;
 /// - the unit of work cannot begin, before any change and with every count 0;
-/// - the commit at `STOP RUN` fails, which leaves every statement of the run undone. The job's
-///   counts keep the `read` and `rejected` set before the commit and `posted` stays 0, the job
-///   span records `written` and `deleted` as 0, and one `warn` event carries the inserts,
-///   updates and deletes undone.
+/// - the commit at `STOP RUN` fails. A `COMMIT` the server rejects leaves every statement of
+///   the run undone; one whose answer is lost, its connection gone, may have committed them
+///   all, so the master is read again before a rerun. Either way the job's counts keep the
+///   `read` and `rejected` set before the commit and `posted` stays 0, the job span records
+///   `written` and `deleted` as 0, and one `warn` event carries the inserts, updates and
+///   deletes it reports undone.
 pub(super) async fn run(ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> ExitStatus {
     let input = args.input.clone();
     let records = match blocking(move || load_records(&input)).await {

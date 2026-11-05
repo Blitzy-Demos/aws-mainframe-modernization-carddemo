@@ -54,24 +54,24 @@ import {
   type SeededAuthorization,
 } from "./fixtures";
 
-/** The narrowest viewport the SPA targets and the lg breakpoint (Tailwind 4 defaults). */
+// The narrowest viewport the SPA targets and the lg breakpoint (Tailwind 4
+// defaults).
 const MD_MIN_WIDTH = 768;
 const LG_MIN_WIDTH = 1024;
-/** Bounds on the generated sidebar container: the 3rem icon rail and the 16rem panel. */
+// Bounds on the generated sidebar container: the 3rem icon rail and the 16rem
+// panel.
 const ICON_RAIL_MAX_WIDTH = 100;
 const EXPANDED_MIN_WIDTH = 200;
 
 type SidebarState = "collapsed" | "expanded";
 
-/**
- * The generated sidebar's root, the element web/src/components/ui/sidebar.tsx
- * gives data-state and data-collapsible (its data-slot is "sidebar").
- */
+// The generated sidebar's root, the element web/src/components/ui/sidebar.tsx
+// gives data-state and data-collapsible (its data-slot is "sidebar").
 function sidebarRoot(page: Page): Locator {
   return page.locator('[data-slot="sidebar"][data-state]');
 }
 
-/** The fixed panel inside it whose width is the rail's or the panel's. */
+// The fixed panel inside it whose width is the rail's or the panel's.
 function sidebarContainer(page: Page): Locator {
   return sidebarRoot(page).locator('[data-slot="sidebar-container"]');
 }
@@ -94,11 +94,9 @@ async function widthOf(element: Locator): Promise<number> {
   return box.width;
 }
 
-/**
- * Asserts the sidebar mode `state`: its root's data-state (and, collapsed,
- * data-collapsible "icon"), and the container's width once the transition
- * has run.
- */
+// Asserts the sidebar mode `state`: its root's data-state (and, collapsed,
+// data-collapsible "icon"), and the container's width once the transition
+// has run.
 async function expectSidebar(page: Page, state: SidebarState): Promise<void> {
   const root = sidebarRoot(page);
   await expect(root).toHaveAttribute("data-state", state);
@@ -111,11 +109,12 @@ async function expectSidebar(page: Page, state: SidebarState): Promise<void> {
   }
 }
 
-/** The sidebar mode of the project's breakpoint: collapsed at md, expanded at lg. */
+// The sidebar mode of the project's breakpoint: collapsed at md, expanded at
+// lg.
 const initialState = (page: Page): SidebarState => (isLg(page) ? "expanded" : "collapsed");
 const flipped = (state: SidebarState): SidebarState => (state === "expanded" ? "collapsed" : "expanded");
 
-/** Asserts that the document is no wider than the viewport. */
+// Asserts that the document is no wider than the viewport.
 async function expectNoHorizontalOverflow(page: Page): Promise<void> {
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -123,7 +122,7 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
   expect(overflow, "page scrolls sideways").toBeLessThanOrEqual(0);
 }
 
-/** The left and top edges of every text input of the page's form, in DOM order. */
+// The left and top edges of every text input of the page's form, in DOM order.
 async function inputEdges(page: Page): Promise<{ left: number; top: number }[]> {
   const inputs = content(page).locator("form").first().getByRole("textbox");
   await expect(inputs.first()).toBeVisible();
@@ -137,10 +136,8 @@ async function inputEdges(page: Page): Promise<{ left: number; top: number }[]> 
   return edges;
 }
 
-/**
- * The one row `sql` selects, as its `width` column values (psql separates
- * them with `|`). Throws on no row, more than one, or another column count.
- */
+// The one row `sql` selects, as its `width` column values (psql separates
+// them with `|`). Throws on no row, more than one, or another column count.
 async function storedRow(sql: string, width: number): Promise<string[]> {
   const out = await psql(sql);
   const values = out.split("|");
@@ -150,19 +147,18 @@ async function storedRow(sql: string, width: number): Promise<string[]> {
   return values;
 }
 
-/** The lowest card number, the first row of the card list's unfiltered first page. */
+// The lowest card number, the first row of the card list's unfiltered first
+// page.
 async function lowestCardNumber(): Promise<string> {
   const [card] = await storedRow("SELECT min(card_number) FROM cards", 1);
   return card;
 }
 
-/**
- * Asserts that `scope` has settled on what it shows: nothing in it is busy (a
- * DataTable's table, a page's loading card, the lazy route's fallback), no
- * Skeleton placeholder is left (data-slot "skeleton",
- * web/src/components/ui/skeleton.tsx), no key or field error is shown
- * (FieldError's data-slot "field-error"), and no request failure is toasted.
- */
+// Asserts that `scope` has settled on what it shows: nothing in it is busy (a
+// DataTable's table, a page's loading card, the lazy route's fallback), no
+// Skeleton placeholder is left (data-slot "skeleton",
+// web/src/components/ui/skeleton.tsx), no key or field error is shown
+// (FieldError's data-slot "field-error"), and no request failure is toasted.
 async function expectSettled(page: Page, scope: Locator): Promise<void> {
   await expect(scope.locator('[aria-busy="true"]'), "nothing is loading").toHaveCount(0);
   await expect(scope.locator('[data-slot="skeleton"]'), "no placeholder is shown").toHaveCount(0);
@@ -170,12 +166,10 @@ async function expectSettled(page: Page, scope: Locator): Promise<void> {
   await expect(page.locator('[data-sonner-toast][data-type="error"]'), "no request failure is toasted").toHaveCount(0);
 }
 
-/**
- * Asserts that `table` shows exactly one data row matching `has` (by default
- * a cell reading `value`), that its `column` cell reads `value`, and that the
- * table is no longer busy. DataTable's loading rows are aria-hidden skeletons
- * that hold no text, so only a row of the page's answer can match.
- */
+// Asserts that `table` shows exactly one data row matching `has` (by default
+// a cell reading `value`), that its `column` cell reads `value`, and that the
+// table is no longer busy. DataTable's loading rows are aria-hidden skeletons
+// that hold no text, so only a row of the page's answer can match.
 async function expectRow(table: Locator, column: string, value: string, has?: Locator): Promise<void> {
   const row = dataRows(table).filter({
     has: has ?? table.page().getByRole("cell", { name: value, exact: true }),
@@ -185,7 +179,7 @@ async function expectRow(table: Locator, column: string, value: string, has?: Lo
   await expect(table, "the table is not loading").not.toHaveAttribute("aria-busy", "true");
 }
 
-/** The value (dd) of the detail list entry captioned (dt) exactly `caption`. */
+// The value (dd) of the detail list entry captioned (dt) exactly `caption`.
 function detailValue(scope: Locator, caption: string): Locator {
   return scope
     .locator("dt")
@@ -193,15 +187,13 @@ function detailValue(scope: Locator, caption: string): Locator {
     .locator("xpath=following-sibling::dd[1]");
 }
 
-/** The textbox of the page content named exactly `name`. */
+// The textbox of the page content named exactly `name`.
 function textbox(page: Page, name: string): Locator {
   return content(page).getByRole("textbox", { name, exact: true });
 }
 
-/**
- * Asserts the initial state of the entry form of function-map row `id`: its
- * submit is enabled and its first input, when the row lists one, is enabled.
- */
+// Asserts the initial state of the entry form of function-map row `id`: its
+// submit is enabled and its first input, when the row lists one, is enabled.
 async function expectEntryForm(page: Page, id: string): Promise<void> {
   const control = mapControl(id);
   const scope = routeScope(page, control.route);
@@ -212,7 +204,8 @@ async function expectEntryForm(page: Page, id: string): Promise<void> {
   }
 }
 
-/** Asserts that the menu landmark `landmark` of the page content links every option of `entries`. */
+// Asserts that the menu landmark `landmark` of the page content links every
+// option of `entries`.
 async function expectMenuOptions(page: Page, landmark: string, entries: readonly MenuEntry[]): Promise<void> {
   const nav = content(page).getByRole("navigation", { name: landmark, exact: true });
   for (const entry of entries) {
@@ -220,33 +213,34 @@ async function expectMenuOptions(page: Page, landmark: string, entries: readonly
   }
 }
 
-/** What the every-route checks read from the store before they open the routes. */
+// What the every-route checks read from the store before they open the routes.
 type RouteKeys = {
   params: RouteParams;
-  /** The lowest card number, the first row of the unfiltered card list. */
+  // The lowest card number, the first row of the unfiltered card list.
   firstCard: string;
-  /** The card number of params.tranId, the lowest TRAN-ID. */
+  // The card number of params.tranId, the lowest TRAN-ID.
   tranCard: string;
-  /** Account 1's card (FIXTURE_KEYS.card) as stored: CARD-ACTIVE-STATUS and the expiry date's parts. */
+  // Account 1's card (FIXTURE_KEYS.card) as stored: CARD-ACTIVE-STATUS and the
+  // expiry date's parts.
   cardActive: string;
   cardExpiryYear: string;
   cardExpiryMonth: string;
-  /** The stored description of FIXTURE_KEYS.tranType. */
+  // The stored description of FIXTURE_KEYS.tranType.
   tranTypeDescription: string;
-  /** The type code of params.ruleId, the lowest rule. */
+  // The type code of params.ruleId, the lowest rule.
   ruleTypeCode: string;
-  /** PA-TRANSACTION-ID of params.authId, the seeded authorization. */
+  // PA-TRANSACTION-ID of params.authId, the seeded authorization.
   authTranId: string;
 };
 
 type RouteCheck = {
-  /** The search keys the route's page reads, after its path. */
+  // The search keys the route's page reads, after its path.
   search?: (keys: RouteKeys) => Record<string, string>;
-  /** Waits until the route shows the content the keys select. */
+  // Waits until the route shows the content the keys select.
   ready: (page: Page, keys: RouteKeys) => Promise<void>;
 };
 
-/** A route key the every-route checks set up, read by each check that needs it. */
+// A route key the every-route checks set up, read by each check that needs it.
 function routeKey(keys: RouteKeys, name: keyof RouteParams): string {
   const value = keys.params[name];
   if (value === undefined) {
@@ -259,14 +253,12 @@ const tranIdOf = (keys: RouteKeys): string => routeKey(keys, "tranId");
 const authIdOf = (keys: RouteKeys): string => routeKey(keys, "authId");
 const ruleIdOf = (keys: RouteKeys): string => routeKey(keys, "ruleId");
 
-/** The account the card and authorization pages are opened for. */
+// The account the card and authorization pages are opened for.
 const forAccount = (): Record<string, string> => ({ account_id: FIXTURE_KEYS.account });
 
-/**
- * The real content of every route of APP_ROUTES. A screen that reads nothing
- * until a key is entered is measured in that initial state, its entry form;
- * each entry says why.
- */
+// The real content of every route of APP_ROUTES. A screen that reads nothing
+// until a key is entered is measured in that initial state, its entry form;
+// each entry says why.
 const ROUTE_CHECKS: ReadonlyMap<string, RouteCheck> = new Map<string, RouteCheck>([
   // Sign-on reads nothing until it is submitted.
   ["/login", { ready: (page) => expectEntryForm(page, "F-COSGN00-001") }],

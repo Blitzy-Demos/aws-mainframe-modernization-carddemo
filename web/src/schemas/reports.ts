@@ -34,7 +34,7 @@ type ReportQuery = NonNullable<
 
 type ReportType = NonNullable<ReportQuery["report_type"]>;
 
-/** The query a valid form produces: a report type is always selected. */
+// The query a valid form produces: a report type is always selected.
 type ReportRequest = {
   report_type: ReportType;
   start_date?: ReportQuery["start_date"];
@@ -42,12 +42,10 @@ type ReportRequest = {
   confirm?: ReportQuery["confirm"];
 };
 
-/**
- * The audited `CORPT00C` texts the client answers itself, byte for byte as
- * in `docs/parity/validation-audit.md`. The confirmation prompt
- * (V-CORPT00C-016) and the cleared screen of `N` (V-CORPT00C-017, no message)
- * are server answers and have no entry.
- */
+// The audited `CORPT00C` texts the client answers itself, byte for byte as
+// in `docs/parity/validation-audit.md`. The confirmation prompt
+// (V-CORPT00C-016) and the cleared screen of `N` (V-CORPT00C-017, no message)
+// are server answers and have no entry.
 const REPORT_MESSAGES = {
   // V-CORPT00C-001
   selectReportType: "Select a report type to print report...",
@@ -85,40 +83,36 @@ const REPORT_MESSAGES = {
   invalidConfirmTail: '" is not a valid value to confirm...',
 } as const;
 
-/** The OpenAPI `report_type` values, in the map's selector order. */
+// The OpenAPI `report_type` values, in the map's selector order.
 const REPORT_TYPES = [
   "monthly",
   "yearly",
   "custom",
 ] as const satisfies readonly ReportType[];
 
-/**
- * The OpenAPI `maxLength` of `start_date` and `end_date`: `SDTYYYYI X(4)`,
- * `SDTMMI X(2)`, `SDTDDI X(2)` and two hyphens.
- */
+// The OpenAPI `maxLength` of `start_date` and `end_date`: `SDTYYYYI X(4)`,
+// `SDTMMI X(2)`, `SDTDDI X(2)` and two hyphens.
 const DATE_TEXT_MAX_LENGTH = 10;
 
-/** The OpenAPI `maxLength` of `confirm`: `CONFIRMI X(1)`. */
+// The OpenAPI `maxLength` of `confirm`: `CONFIRMI X(1)`.
 const CONFIRM_MAX_LENGTH = 1;
 
-/**
- * ASCII text, the OpenAPI `pattern` of `confirm`, which the server checks
- * before the rule because the rule quotes the confirmation back from its
- * one-byte field: the issue keeps zod's default regex text, as the server's
- * answer has no message.
- */
+// ASCII text, the OpenAPI `pattern` of `confirm`, which the server checks
+// before the rule because the rule quotes the confirmation back from its
+// one-byte field: the issue keeps zod's default regex text, as the server's
+// answer has no message.
 const ASCII_TEXT = /^[\x00-\x7F]*$/;
 
-/** One date part: its map field width, its value limit and its two texts. */
+// One date part: its map field width, its value limit and its two texts.
 interface DatePartRule {
   readonly width: number;
-  /** The `> '12'` or `> '31'` operand; the year has none. */
+  // The `> '12'` or `> '31'` operand; the year has none.
   readonly limit?: string;
   readonly empty: string;
   readonly invalid: string;
 }
 
-/** One date: its form field, its parts in screen order and its date text. */
+// One date: its form field, its parts in screen order and its date text.
 interface DateRule {
   readonly field: "start_date" | "end_date";
   readonly month: DatePartRule;
@@ -171,24 +165,22 @@ const END_DATE: DateRule = {
   invalidDate: REPORT_MESSAGES.endDateInvalid,
 };
 
-/** The first rule issue: the form field it stands on and its text. */
+// The first rule issue: the form field it stands on and its text.
 interface Rejection {
   readonly field: keyof ReportRequest;
   readonly message: string;
 }
 
-/** A date part as the server receives it, with the rule that edits it. */
+// A date part as the server receives it, with the rule that edits it.
 interface ReceivedPart {
   readonly rule: DatePartRule;
   readonly text: string;
   readonly field: DateRule["field"];
 }
 
-/**
- * One `YYYY-MM-DD` text split at its first two hyphens into year, month and
- * day exactly as entered, as the server splits it: a missing part is empty,
- * and text after a third hyphen stays in the day.
- */
+// One `YYYY-MM-DD` text split at its first two hyphens into year, month and
+// day exactly as entered, as the server splits it: a missing part is empty,
+// and text after a third hyphen stays in the day.
 function splitDate(
   value: string | undefined,
 ): readonly [year: string, month: string, day: string] {
@@ -208,13 +200,13 @@ function splitDate(
   ];
 }
 
-/** One entered date with the rules of its parts. */
+// One entered date with the rules of its parts.
 interface EnteredDate {
   readonly rule: DateRule;
   readonly value: string | undefined;
 }
 
-/** The parts of one date in screen order: month, day, year. */
+// The parts of one date in screen order: month, day, year.
 function receiveParts({ rule, value }: EnteredDate): ReceivedPart[] {
   const [year, month, day] = splitDate(value);
   return [
@@ -224,21 +216,17 @@ function receiveParts({ rule, value }: EnteredDate): ReceivedPart[] {
   ];
 }
 
-/**
- * A part blank in its map field: no longer than the field and `SPACES` or
- * `LOW-VALUES`. Text longer than the field is never blank.
- */
+// A part blank in its map field: no longer than the field and `SPACES` or
+// `LOW-VALUES`. Text longer than the field is never blank.
 const isBlankPart = ({ rule, text }: ReceivedPart): boolean =>
   text.length <= rule.width && isSpacesOrLowValues(text);
 
-/**
- * The value edit of one part (`IS NOT NUMERIC OR > '12'`, `> '31'`, year
- * `IS NOT NUMERIC`), where the client can decide it. A part longer than its
- * map field fails, as the server rejects it with the part's own text (E-28).
- * A part of exactly its width in digits is compared as the COBOL compares the
- * alphanumeric field. Any other part depends on how `NUMVAL-C` reads it, which
- * only the server decides; the client's date form rejects it instead.
- */
+// The value edit of one part (`IS NOT NUMERIC OR > '12'`, `> '31'`, year
+// `IS NOT NUMERIC`), where the client can decide it. A part longer than its
+// map field fails, as the server rejects it with the part's own text (E-28).
+// A part of exactly its width in digits is compared as the COBOL compares the
+// alphanumeric field. Any other part depends on how `NUMVAL-C` reads it, which
+// only the server decides; the client's date form rejects it instead.
 function failsValueEdit({ rule, text }: ReceivedPart): boolean {
   if (text.length > rule.width) {
     return true;
@@ -248,6 +236,8 @@ function failsValueEdit({ rule, text }: ReceivedPart): boolean {
 }
 
 /**
+ * CORPT00C PROCESS-ENTER-KEY — P-CORPT00C-005, P-CORPT00C-007, P-CORPT00C-008.
+ *
  * The custom range edits in the `CORPT00C` order: the empty checks of the six
  * parts (V-CORPT00C-002 to V-CORPT00C-007), their value edits
  * (V-CORPT00C-008 to V-CORPT00C-013), then the `YYYY-MM-DD` form of the start
@@ -282,6 +272,8 @@ function customRangeRejection(
 }
 
 /**
+ * CORPT00C SUBMIT-JOB-TO-INTRDR — P-CORPT00C-011.
+ *
  * The confirmation edit (V-CORPT00C-018): `Y`, `y`, `N`, `n` and a blank value
  * are the server's to answer (it runs the report, clears the form, or asks for
  * confirmation); any other value is quoted back as entered, which
@@ -305,12 +297,10 @@ function confirmRejection(confirm: string | undefined): Rejection | undefined {
   };
 }
 
-/**
- * An optional query text within `maxLength` and, when given, matching
- * `pattern`: `""` is not sent, any other value goes as entered. A value that
- * fails either check leaves the form object invalid, so the rule refinement
- * does not run, as the server checks both before its rule.
- */
+// An optional query text within `maxLength` and, when given, matching
+// `pattern`: `""` is not sent, any other value goes as entered. A value that
+// fails either check leaves the form object invalid, so the rule refinement
+// does not run, as the server checks both before its rule.
 const optionalText = (maxLength: number, pattern?: RegExp) => {
   const text = z.string().max(maxLength);
   return (pattern === undefined ? text : text.regex(pattern))

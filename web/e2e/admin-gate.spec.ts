@@ -62,9 +62,9 @@ type RewardRuleRequest = components["schemas"]["RewardRuleRequest"];
 type Method = "GET" | "POST" | "PUT" | "DELETE";
 type AdminCall = { method: Method; path: string; data?: object };
 
-/** A seeded regular user the refused writes name (DUSRSECJ). */
+// A seeded regular user the refused writes name (DUSRSECJ).
 const TARGET_USER = "USER0002";
-/** A type code and a user ID no seeded row holds, for the refused adds. */
+// A type code and a user ID no seeded row holds, for the refused adds.
 const UNUSED_TYPE_CODE = "98";
 const UNUSED_USER_ID = "E2EGATE1";
 
@@ -229,7 +229,7 @@ test.describe("UI gate", () => {
     );
   }
 
-  /** The sign-on screen's User ID textbox (F-COSGN00-001). */
+  // The sign-on screen's User ID textbox (F-COSGN00-001).
   const signOnUserId = (page: Page): Locator => mapInput(page, rowInput("F-COSGN00-001", 0));
 
   const adminToast = (page: Page): Locator =>

@@ -38,7 +38,10 @@
 //! connection attempt, so an unreachable database never hides an invalid
 //! setting. A failure after telemetry is installed is also an ERROR event on
 //! standard output. No database URL or secret is ever written: neither the
-//! settings errors nor the database errors carry one.
+//! settings errors nor the database errors carry one. A rejected
+//! `CARDDEMO_CORS_ORIGIN` is never echoed either, since a mistaken origin can
+//! carry a credential in its user information, query or fragment: the report
+//! names only the setting and the reason it is not an origin.
 //!
 //! # Stopping
 //!

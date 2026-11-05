@@ -64,25 +64,23 @@ import {
   type TranTypeListFilterValues,
 } from "@/schemas/transaction-types";
 
-/** `TRTYPE` and the row `TRTTYPn`, `X(2)`. */
+// `TRTYPE` and the row `TRTTYPn`, `X(2)`.
 const TYPE_CODE_MAX_LENGTH = 2;
 
-/** `TRDESC` and the row `TRTYPDn`, `X(50)`. */
+// `TRDESC` and the row `TRTYPDn`, `X(50)`.
 const DESCRIPTION_MAX_LENGTH = 50;
 
-/**
- * The one width of `TRTYPDn`, shown or open for input. With a 50-character
- * description on the page, the table fits its card at 768px beside the icon
- * rail and at 1024px beside the expanded sidebar, and from `lg` the input
- * shows a typical 50-character description whole: Save sits under it below
- * `xl` and beside it from `xl`.
- */
+// The one width of `TRTYPDn`, shown or open for input. With a 50-character
+// description on the page, the table fits its card at 768px beside the icon
+// rail and at 1024px beside the expanded sidebar, and from `lg` the input
+// shows a typical 50-character description whole: Save sits under it below
+// `xl` and beside it from `xl`.
 const DESCRIPTION_WIDTH = "w-112 lg:w-125 xl:w-144";
 
-/** One array for every page without rows, so the table sees one empty result. */
+// One array for every page without rows, so the table sees one empty result.
 const NO_ROWS: TranType[] = [];
 
-/** The seven rows of a COTRTLI page, the server's default page size. */
+// The seven rows of a COTRTLI page, the server's default page size.
 const PAGE_ROWS = 7;
 
 // The notes under the error of a write that got no usable answer: the server
@@ -94,7 +92,7 @@ const DELETE_OUTCOME_UNKNOWN =
 
 type Direction = NonNullable<TranTypeListParams["direction"]>;
 
-/** The filters of a list request, without its cursor. */
+// The filters of a list request, without its cursor.
 function filterOf(params: TranTypeListParams): TranTypeListParams {
   const filter: TranTypeListParams = {};
   if (params.type_code !== undefined) {
@@ -106,7 +104,7 @@ function filterOf(params: TranTypeListParams): TranTypeListParams {
   return filter;
 }
 
-/** Whether two list requests have one query key, so neither refetches the other. */
+// Whether two list requests have one query key, so neither refetches the other.
 function sameRequest(a: TranTypeListParams, b: TranTypeListParams): boolean {
   return (
     a.type_code === b.type_code &&
@@ -117,18 +115,16 @@ function sameRequest(a: TranTypeListParams, b: TranTypeListParams): boolean {
   );
 }
 
-/**
- * What the row cells share with the page. The columns are module constants,
- * so the table renders the same cell components on every page render and a
- * row's inline form keeps its state while the page re-renders around it.
- */
+// What the row cells share with the page. The columns are module constants,
+// so the table renders the same cell components on every page render and a
+// row's inline form keeps its state while the page re-renders around it.
 type RowActions = {
-  /** The type code of the row whose description is open for input. */
+  // The type code of the row whose description is open for input.
   editingCode: string | null;
   toggleEdit: (typeCode: string) => void;
   finishEdit: (typeCode: string) => void;
   requestDelete: (tranType: TranType) => void;
-  /** Prefix of the ids that name each row's type code cell. */
+  // Prefix of the ids that name each row's type code cell.
   idPrefix: string;
 };
 
@@ -148,7 +144,7 @@ function typeCodeCellId(idPrefix: string, rowIndex: number): string {
 
 type RowCellProps = { tranType: TranType; rowIndex: number };
 
-/** `TRTTYPn`: the row's type code, which describes the row's actions. */
+// `TRTTYPn`: the row's type code, which describes the row's actions.
 function TypeCodeCell({ tranType, rowIndex }: RowCellProps): JSX.Element {
   const { idPrefix } = useRowActions();
   return (
@@ -158,12 +154,10 @@ function TypeCodeCell({ tranType, rowIndex }: RowCellProps): JSX.Element {
   );
 }
 
-/**
- * `TRTYPDn` opened for input after the `U` selector, with F10=Save
- * (COTRTLIC 1211-EDIT-ARRAY-DESC, 9200-UPDATE-RECORD). The update is sent
- * with `origin: "list"`, which selects the COTRTLIC inline edits and texts.
- * Its errors name no BMS field, so they show as toasts.
- */
+// `TRTYPDn` opened for input after the `U` selector, with F10=Save
+// (COTRTLIC 1211-EDIT-ARRAY-DESC, 9200-UPDATE-RECORD). The update is sent
+// with `origin: "list"`, which selects the COTRTLIC inline edits and texts.
+// Its errors name no BMS field, so they show as toasts.
 function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Element {
   const { finishEdit } = useRowActions();
   const inputId = useId();
@@ -284,12 +278,10 @@ function InlineDescriptionForm({ tranType }: { tranType: TranType }): JSX.Elemen
   );
 }
 
-/**
- * `TRTYPDn`: the description, or its inline form while the row is selected.
- * The text and the form take the one fixed width, DESCRIPTION_WIDTH, and the
- * text wraps inside it rather than widening the cell, so the table's automatic
- * column widths do not move when a row opens or closes.
- */
+// `TRTYPDn`: the description, or its inline form while the row is selected.
+// The text and the form take the one fixed width, DESCRIPTION_WIDTH, and the
+// text wraps inside it rather than widening the cell, so the table's automatic
+// column widths do not move when a row opens or closes.
 function DescriptionCell({ tranType }: RowCellProps): JSX.Element {
   const { editingCode } = useRowActions();
   if (editingCode !== tranType.type_code) {
@@ -306,12 +298,10 @@ function DescriptionCell({ tranType }: RowCellProps): JSX.Element {
   );
 }
 
-/**
- * `TRTSELn`: the `U` and `D` selectors as row buttons. "Edit" is a toggle:
- * pressing it again closes the row, as the COBOL user blanks the selector,
- * since the map gives the inline update no cancel key. One row is open at a
- * time, the one-action rule of COTRTLIC 1210-EDIT-ARRAY.
- */
+// `TRTSELn`: the `U` and `D` selectors as row buttons. "Edit" is a toggle:
+// pressing it again closes the row, as the COBOL user blanks the selector,
+// since the map gives the inline update no cancel key. One row is open at a
+// time, the one-action rule of COTRTLIC 1210-EDIT-ARRAY.
 function RowActionsCell({ tranType, rowIndex }: RowCellProps): JSX.Element {
   const { editingCode, toggleEdit, requestDelete, idPrefix } = useRowActions();
   const editing = editingCode === tranType.type_code;
@@ -367,12 +357,10 @@ function RowActionsCell({ tranType, rowIndex }: RowCellProps): JSX.Element {
   );
 }
 
-/**
- * Reports its own mount and unmount. Inside the confirm dialog's content it
- * tells the page when that content, closing animation included, has left the
- * document: React runs the cleanups of a removed subtree parent first, so
- * this one runs after the dialog's own, which un-hide the rest of the page.
- */
+// Reports its own mount and unmount. Inside the confirm dialog's content it
+// tells the page when that content, closing animation included, has left the
+// document: React runs the cleanups of a removed subtree parent first, so
+// this one runs after the dialog's own, which un-hide the rest of the page.
 function MountSignal({
   onChange,
 }: {

@@ -60,7 +60,11 @@ function unexpectedErrorBody(): ErrorBody {
   };
 }
 
-/** A non-2xx answer: the HTTP status and the server's error body. */
+/**
+ * An answer the caller cannot use: a non-2xx answer, with its HTTP status and
+ * the server's error body, or a 2xx answer without the body its operation
+ * returns, with that status and a copy of UNEXPECTED_ERROR_BODY.
+ */
 export class ApiError extends Error {
   readonly status: number;
   readonly body: ErrorBody;

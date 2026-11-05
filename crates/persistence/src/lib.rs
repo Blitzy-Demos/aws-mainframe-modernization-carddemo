@@ -40,11 +40,11 @@
 //!
 //! # SQL
 //!
-//! Every statement is a `sqlx::query!`, `sqlx::query_as!` or
-//! `sqlx::query_scalar!` invocation, checked at compile time against the
-//! migrated schema, or against the committed `.sqlx/` metadata when built
-//! offline. No SQL is assembled from strings. Legacy reads of the transaction
-//! master go through the view `transaction_master` (E-09).
+//! Every statement is a `sqlx::query!` or `sqlx::query_as!` invocation,
+//! checked at compile time against the migrated schema, or against the
+//! committed `.sqlx/` metadata when built offline. No SQL is assembled from
+//! strings. Legacy reads of the transaction master go through the view
+//! `transaction_master` (E-09).
 //!
 //! # Errors
 //!

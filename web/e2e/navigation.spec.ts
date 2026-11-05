@@ -20,7 +20,8 @@
 // - every crumb of a nested route's breadcrumb trail (the PF3 replacement)
 //   opens its screen;
 // - the @smoke test signs ADMIN001 on and loads the dashboard (AAP 0.10.4,
-//   startup in both modes). It reads no database and runs under no hook.
+//   startup in both modes). It reads no database and runs under no hook;
+// - the SPA's document refuses to be framed by another page.
 //
 // Controls whose request writes (Confirm, Save, Add, …) are only located
 // here; forms.spec.ts drives them and restores what they change. The paging
@@ -81,7 +82,7 @@ import {
   type SeededAuthorization,
 } from "./fixtures";
 
-/** The 21 BMS maps of the carried online programs (AAP 0.9.1). */
+// The 21 BMS maps of the carried online programs (AAP 0.9.1).
 const BMS_MAPS = [
   "COSGN00",
   "COMEN01",
@@ -106,18 +107,16 @@ const BMS_MAPS = [
   "COTRTLI",
 ] as const;
 
-/** A type code no TRANSACTION_TYPE row holds (7 seeded types, 01 to 07). */
+// A type code no TRANSACTION_TYPE row holds (7 seeded types, 01 to 07).
 const MISSING_TYPE_CODE = "99";
 
-/**
- * The rows of one page of the lists whose paging rows need a second page:
- * COUSR00 shows 10 users, COTRTLI 7 types and COPAU00 5 authorizations (the
- * screen rows of COUSR00C, COTRTLIC and COPAUS0C, the API's page defaults).
- */
+// The rows of one page of the lists whose paging rows need a second page:
+// COUSR00 shows 10 users, COTRTLI 7 types and COPAU00 5 authorizations (the
+// screen rows of COUSR00C, COTRTLIC and COPAUS0C, the API's page defaults).
 const USER_PAGE_ROWS = "10";
 const TYPE_PAGE_ROWS = "7";
 const AUTH_PAGE_ROWS = 5;
-/** The user IDs and type codes the seeded-keys describe adds for a second page. */
+// The user IDs and type codes the seeded-keys describe adds for a second page.
 const EXTRA_USER_PREFIX = "E2ENAV";
 const EXTRA_TYPE_CODES = "tr_type BETWEEN '90' AND '97'";
 
@@ -125,7 +124,7 @@ const EXTRA_TYPE_CODES = "tr_type BETWEEN '90' AND '97'";
 type NavParams = Required<
   Pick<RouteParams, "accountId" | "cardNumber" | "tranId" | "authId" | "userId" | "code" | "ruleId">
 > & {
-  /** A pending authorization of account 1 already reported as fraud. */
+  // A pending authorization of account 1 already reported as fraud.
   reportedAuthId: string;
 };
 
@@ -133,11 +132,12 @@ type NavParams = Required<
 type Reveal = (page: Page, params: NavParams) => Promise<void>;
 
 type NavCase =
-  /** The row's key has no web control; `escalation` is the E-ID that says why. */
+  // The row's key has no web control; `escalation` is the E-ID that says why.
   | { kind: "none"; escalation: string }
   | {
       kind: "control";
-      /** The route to open in place of the row's own, for a key carried by state. */
+      // The route to open in place of the row's own, for a key carried by
+      // state.
       start?: (params: NavParams) => string;
       reveal?: Reveal;
     };
@@ -152,13 +152,13 @@ async function press(page: Page, id: string): Promise<void> {
   await controlLocator(page, mapControl(id)).click();
 }
 
-/** CAVW lookup on the dashboard (F-COACTVW-001) for account 1. */
+// CAVW lookup on the dashboard (F-COACTVW-001) for account 1.
 async function lookUpAccount(page: Page): Promise<void> {
   await mapInput(content(page), rowInput("F-COACTVW-001", 0)).fill(FIXTURE_KEYS.account);
   await press(page, "F-COACTVW-001");
 }
 
-/** The card list filtered to account 1 (F-COCRDLI-001), then a row action. */
+// The card list filtered to account 1 (F-COCRDLI-001), then a row action.
 function openCardWith(rowActionId: string): Reveal {
   return async (page) => {
     await mapInput(content(page), rowInput("F-COCRDLI-001", 0)).fill(FIXTURE_KEYS.account);
@@ -172,13 +172,13 @@ function openCardWith(rowActionId: string): Reveal {
   };
 }
 
-/** The pending authorizations of account 1 (F-COPAU00-001). */
+// The pending authorizations of account 1 (F-COPAU00-001).
 async function searchAuthorizations(page: Page): Promise<void> {
   await mapInput(content(page), rowInput("F-COPAU00-001", 0)).fill(FIXTURE_KEYS.account);
   await press(page, "F-COPAU00-001");
 }
 
-/** Presses the control of row `openerId`, which opens the confirm dialog. */
+// Presses the control of row `openerId`, which opens the confirm dialog.
 function openDialogWith(openerId: string): Reveal {
   return async (page) => {
     await press(page, openerId);
@@ -186,14 +186,14 @@ function openDialogWith(openerId: string): Reveal {
   };
 }
 
-/** CT02 with account 1 entered, the key PF5 validates before it copies. */
+// CT02 with account 1 entered, the key PF5 validates before it copies.
 async function enterAddAccount(page: Page): Promise<void> {
   await content(page)
     .getByRole("textbox", { name: nameMatcher(UNMAPPED_LABELS.transactionAdd.accountId) })
     .fill(FIXTURE_KEYS.account);
 }
 
-/** CT02 with account 1, PF5 copy of the last transaction, then the add submit. */
+// CT02 with account 1, PF5 copy of the last transaction, then the add submit.
 async function copyLastAndAdd(page: Page): Promise<void> {
   await enterAddAccount(page);
   await press(page, "F-COTRN02-006");
@@ -201,28 +201,28 @@ async function copyLastAndAdd(page: Page): Promise<void> {
   await expect(confirmDialog(page)).toBeVisible();
 }
 
-/** The CR00 report type radio `index` of F-CORPT00-001, checked. */
+// The CR00 report type radio `index` of F-CORPT00-001, checked.
 function chooseReport(index: number): Reveal {
   return async (page) => {
     await mapInput(content(page), rowInput("F-CORPT00-001", index)).check();
   };
 }
 
-/** CR00 monthly report submitted, which asks for the confirmation. */
+// CR00 monthly report submitted, which asks for the confirmation.
 async function monthlyReport(page: Page, params: NavParams): Promise<void> {
   await chooseReport(0)(page, params);
   await press(page, "F-CORPT00-001");
   await expect(confirmDialog(page)).toBeVisible();
 }
 
-/** CB00 review of account 1's balance, which asks for the confirmation. */
+// CB00 review of account 1's balance, which asks for the confirmation.
 async function reviewPayment(page: Page): Promise<void> {
   await mapInput(content(page), rowInput("F-COBIL00-001", 0)).fill(FIXTURE_KEYS.account);
   await press(page, "F-COBIL00-001");
   await expect(confirmDialog(page)).toBeVisible();
 }
 
-/** CTTU lookup of a type code not on file, which opens the add path. */
+// CTTU lookup of a type code not on file, which opens the add path.
 async function lookUpMissingType(page: Page): Promise<void> {
   await mapInput(content(page), rowInput("F-COTRTUP-001", 0)).fill(MISSING_TYPE_CODE);
   await press(page, "F-COTRTUP-001");
@@ -234,11 +234,9 @@ function pressFirst(id: string): Reveal {
   };
 }
 
-/**
- * One entry per map row, keyed by its F-ID. A control entry names only what
- * the row itself cannot: a different starting route or the steps that bring
- * the control on screen. Everything else comes from the row.
- */
+// One entry per map row, keyed by its F-ID. A control entry names only what
+// the row itself cannot: a different starting route or the steps that bring
+// the control on screen. Everything else comes from the row.
 const CASES: Readonly<Record<string, NavCase>> = {
   // COSGN00: sign-on
   "F-COSGN00-001": GENERIC,
@@ -440,7 +438,8 @@ function checkOf(row: MapRow, control: MapControl): Check {
   return control.role === "form-submit" ? "submit" : "present";
 }
 
-/** Runs `action` and asserts that the page sends a request of `endpoint` meanwhile. */
+// Runs `action` and asserts that the page sends a request of `endpoint`
+// meanwhile.
 async function expectRequest(page: Page, endpoint: Endpoint, action: () => Promise<void>): Promise<void> {
   await Promise.all([page.waitForRequest((request) => isRequestTo(request, endpoint)), action()]);
 }
@@ -632,6 +631,34 @@ test("ADMIN001 signs on and loads the dashboard", { tag: "@smoke" }, async ({ pa
   await page.reload();
   await expect(page).toHaveURL(urlPath("/"));
   await expect(lookup).toBeVisible();
+});
+
+// No other page may frame the SPA and steer a click onto a payment or an
+// admin action (clickjacking). The document of the sign-on screen, the
+// dashboard and a deep admin route forbid every frame ancestor, and Chromium
+// replaces a frame of the SPA with its error document although the SPA's
+// document reached it.
+test("the SPA document refuses framing", async ({ page, request, baseURL }) => {
+  for (const path of ["/", "/login", "/admin/users"]) {
+    const response = await request.get(path);
+    expect(response.status(), path).toBe(200);
+    const headers = response.headers();
+    expect(headers["content-type"], path).toContain("text/html");
+    expect(headers["content-security-policy"], path).toBe("frame-ancestors 'none'");
+    expect(headers["x-frame-options"], path).toBe("DENY");
+  }
+  if (baseURL === undefined) {
+    throw new Error("playwright.config.ts sets no baseURL");
+  }
+  const target = new URL("/login", baseURL).href;
+  const framed = page.waitForResponse(target);
+  await page.setContent(`<iframe title="framed SPA" src="${target}"></iframe>`);
+  expect((await framed).status(), "the framed document arrived").toBe(200);
+  const childFrameUrls = (): string[] =>
+    page.frames().filter((frame) => frame !== page.mainFrame()).map((frame) => frame.url());
+  await expect
+    .poll(childFrameUrls, "Chromium replaced the frame with its error document")
+    .toEqual(["chrome-error://chromewebdata/"]);
 });
 
 test.describe("sidebar menus", () => {

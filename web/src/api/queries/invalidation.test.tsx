@@ -57,11 +57,9 @@ const USER = "USER0001";
 const OTHER_USER = "ADMIN001";
 const NEW_USER = "NEWUSR01";
 
-/**
- * What the stubbed network answers the one write a test sends: a JSON body;
- * a body sent as the raw `text`, for one the client cannot read as JSON; a
- * network failure; or nothing before the client's deadline.
- */
+// What the stubbed network answers the one write a test sends: a JSON body;
+// a body sent as the raw `text`, for one the client cannot read as JSON; a
+// network failure; or nothing before the client's deadline.
 type Reply =
   | { readonly status: number; readonly body: unknown }
   | {
@@ -117,25 +115,23 @@ function wrapper({ children }: { children: ReactNode }) {
   );
 }
 
-/** Caches `keys`, each as an entry no observer reads. */
+// Caches `keys`, each as an entry no observer reads.
 function seed(keys: readonly QueryKey[]): void {
   for (const key of keys) {
     queryClient.setQueryData(key, { seeded: key });
   }
 }
 
-/** The entries of `keys` marked stale, in the order given. */
+// The entries of `keys` marked stale, in the order given.
 function invalidated(keys: readonly QueryKey[]): QueryKey[] {
   return keys.filter(
     (key) => queryClient.getQueryState(key)?.isInvalidated === true,
   );
 }
 
-/**
- * Runs `mutate` to its end, `reply` answering its request, and reports
- * whether it resolved. Its success and settle callbacks have finished then,
- * since the mutation settles only once their promises have.
- */
+// Runs `mutate` to its end, `reply` answering its request, and reports
+// whether it resolved. Its success and settle callbacks have finished then,
+// since the mutation settles only once their promises have.
 async function settle(mutate: () => Promise<unknown>): Promise<boolean> {
   let resolved = false;
   await act(async () => {
@@ -147,10 +143,8 @@ async function settle(mutate: () => Promise<unknown>): Promise<boolean> {
   return resolved;
 }
 
-/**
- * Whether the hook resolves on `answer`: a 2xx JSON body does; a failure, a
- * body the client cannot read and a request without an answer reject.
- */
+// Whether the hook resolves on `answer`: a 2xx JSON body does; a failure, a
+// body the client cannot read and a request without an answer reject.
 function resolvesOn(answer: Reply): boolean {
   return typeof answer === "object" && "body" in answer && answer.status < 400;
 }
@@ -823,12 +817,12 @@ describe("transaction type administration (CTTU, CTLI)", () => {
   const WRITES: readonly {
     write: string;
     request: string;
-    /** The status of the write's success. */
+    // The status of the write's success.
     status: number;
     answer: Schemas["TranTypeMessageResponse"];
-    /** The 4xx answers that refuse the write before anything is stored. */
+    // The 4xx answers that refuse the write before anything is stored.
     refusals: readonly { outcome: string; reply: Reply }[];
-    /** Renders the hook; the call returned sends the write. */
+    // Renders the hook; the call returned sends the write.
     start: () => () => Promise<unknown>;
   }[] = [
     {

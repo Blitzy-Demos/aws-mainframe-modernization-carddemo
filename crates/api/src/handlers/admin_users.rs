@@ -28,9 +28,12 @@
 //! (section B of the parity audit: "n/a (single write)"), and a failed write
 //! has already rolled back to its own savepoint. So a rule that succeeds is
 //! committed, a rule that fails is rolled back, and nothing persists on any
-//! failure. The list and the fetch write nothing and roll back. A failed
-//! rollback is logged and never replaces the rule's answer: the server
-//! discards the transaction when the connection closes.
+//! failure but one: a `COMMIT` the server rejects ends as a rollback, while
+//! one whose answer is lost, its connection gone, may have committed, so the
+//! user is read again before the write is retried. The list and the fetch
+//! write nothing and roll back. A failed rollback is logged and never
+//! replaces the rule's answer: the server discards the transaction when the
+//! connection closes.
 //!
 //! # Passwords (E-20, E-21)
 //!
@@ -484,7 +487,9 @@ async fn fetch(
 /// - 500 `Unable to Update User...`, field `FNAME`, for an unknown user, whose
 ///   failed read the COBOL follows with a failing rewrite (V-COUSR02C-009,
 ///   E-46), for a failed rewrite (V-COUSR02C-012), and when the password
-///   cannot be verified or hashed. Nothing is written on any error.
+///   cannot be verified or hashed. Nothing is written on any error, unless a
+///   `COMMIT` loses its answer with its connection: the rewrite may then have
+///   committed, so the user is read again before the update is retried.
 #[utoipa::path(
     put,
     path = "/admin/users/{id}",
@@ -598,7 +603,9 @@ async fn update(
 /// - 500 `Unable to Update User...`, field `FNAME` (the COBOL's own text,
 ///   reproduced): for an unknown user, whose failed read the COBOL follows
 ///   with a failing delete (V-COUSR03C-005, E-46), and for a failed delete
-///   (V-COUSR03C-007). Nothing is deleted on any error.
+///   (V-COUSR03C-007). Nothing is deleted on any error, unless a `COMMIT`
+///   loses its answer with its connection: the delete may then have
+///   committed, so the user is read again before the delete is retried.
 #[utoipa::path(
     delete,
     path = "/admin/users/{id}",

@@ -57,7 +57,7 @@ const TOKEN_PATTERNS: readonly (readonly [StoreToken, RegExp])[] =
       ] as const,
   );
 
-/** One token found in a source: its 1-based line, the token and the trimmed line. */
+// One token found in a source: its 1-based line, the token and the trimmed line.
 interface TokenHit {
   readonly line: number;
   readonly token: StoreToken;

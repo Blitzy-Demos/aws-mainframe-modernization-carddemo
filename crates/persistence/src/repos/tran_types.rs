@@ -165,6 +165,12 @@ impl MasterRow {
     }
 }
 
+/// The one column of the `SELECT COUNT(1)` statements of
+/// `count_tran_types` and `count_tran_types_before`.
+struct CountRow {
+    count: i64,
+}
+
 /// The masters of a cursor's rows, in the order fetched.
 ///
 /// # Errors
@@ -362,7 +368,8 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match type_code.as_deref() {
             Some(code) => {
-                sqlx::query_scalar!(
+                sqlx::query_as!(
+                    CountRow,
                     r#"SELECT COUNT(1) AS "count!"
                          FROM transaction_types
                         WHERE tr_type = $1::text
@@ -374,7 +381,8 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
                 .await
             }
             None => {
-                sqlx::query_scalar!(
+                sqlx::query_as!(
+                    CountRow,
                     r#"SELECT COUNT(1) AS "count!"
                          FROM transaction_types
                         WHERE ($1::text IS NULL OR tr_description LIKE $1::text ESCAPE '')"#,
@@ -384,7 +392,7 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
                 .await
             }
         };
-        let count = settle(sp, result).await?;
+        let count = settle(sp, result).await?.count;
         u64::try_from(count)
             .map_err(|_| PortError::Unavailable("COUNT(1) returned a negative count".to_owned()))
     }
@@ -420,7 +428,8 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match type_code.as_deref() {
             Some(code) => {
-                sqlx::query_scalar!(
+                sqlx::query_as!(
+                    CountRow,
                     r#"SELECT COUNT(1) AS "count!"
                          FROM transaction_types
                         WHERE tr_type = $1::text
@@ -434,7 +443,8 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
                 .await
             }
             None => {
-                sqlx::query_scalar!(
+                sqlx::query_as!(
+                    CountRow,
                     r#"SELECT COUNT(1) AS "count!"
                          FROM transaction_types
                         WHERE rpad(tr_type, 2) COLLATE "C" < rpad($1::text, 2)
@@ -446,7 +456,7 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
                 .await
             }
         };
-        let count = settle(sp, result).await?;
+        let count = settle(sp, result).await?.count;
         u64::try_from(count)
             .map_err(|_| PortError::Unavailable("COUNT(1) returned a negative count".to_owned()))
     }

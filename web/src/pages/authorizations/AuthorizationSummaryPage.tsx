@@ -56,24 +56,24 @@ type AuthSummaryItem = components["schemas"]["AuthSummaryItem"];
 
 type AuthColumns = DataTableProps<AuthSummaryItem>["columns"];
 
-/** The page position: none for the first page (ENTER), a key and a direction for PF7 and PF8. */
+// The page position: none for the first page (ENTER), a key and a direction for PF7 and PF8.
 type Cursor = Pick<AuthSummaryParams, "start_key" | "direction">;
 
 const FIRST_PAGE: Cursor = {};
 
-/** The rows of the table while the first page of an account loads. */
+// The rows of the table while the first page of an account loads.
 const NO_ITEMS: AuthSummaryItem[] = [];
 
-/** The five rows of a COPAU00 list page, the server's default page size. */
+// The five rows of a COPAU00 list page, the server's default page size.
 const PAGE_ROWS = 5;
 
-/** `ACCTIDI PIC X(11)` (COPAU00.cpy:L60). */
+// `ACCTIDI PIC X(11)` (COPAU00.cpy:L60).
 const ACCOUNT_ID_LENGTH = 11;
 
 const ACCOUNT_FIELD_ID = "account_id";
 const ACCOUNT_ERROR_ID = "account_id-error";
 
-/** Whether `accountId` passes the ENTER edits, so that it may be requested. */
+// Whether `accountId` passes the ENTER edits, so that it may be requested.
 function isSearchable(accountId: string): boolean {
   return authSummaryFilterSchema.safeParse({ account_id: accountId }).success;
 }
@@ -82,28 +82,24 @@ function isSearchable(accountId: string): boolean {
 // Screen text the COBOL builds from the record fields
 // ---------------------------------------------------------------------------
 
-/**
- * `CNAMEO`, `ADDR001O` and `ADDR002O` are `PIC X(25)` (COPAU00.cpy:L440,
- * L452, L464): STRING stops filling them at their last byte.
- */
+// `CNAMEO`, `ADDR001O` and `ADDR002O` are `PIC X(25)` (COPAU00.cpy:L440,
+// L452, L464): STRING stops filling them at their last byte.
 const SCREEN_LINE_LENGTH = 25;
 
-/** A STRING operand `DELIMITED BY delimiter`: the text before the delimiter's first occurrence. */
+// A STRING operand `DELIMITED BY delimiter`: the text before the delimiter's first occurrence.
 function delimitedBy(value: string, delimiter: string): string {
   const at = value.indexOf(delimiter);
   return at === -1 ? value : value.slice(0, at);
 }
 
-/**
- * A STRING operand `DELIMITED BY SIZE` of a `length`-byte field: the value
- * as the field holds it. The API right-trims text, so the field's trailing
- * spaces are put back.
- */
+// A STRING operand `DELIMITED BY SIZE` of a `length`-byte field: the value
+// as the field holds it. The API right-trims text, so the field's trailing
+// spaces are put back.
 function bySize(value: string, length: number): string {
   return value.padEnd(length, " ").slice(0, length);
 }
 
-/** The STRING of `parts` INTO a 25-byte screen field. */
+// The STRING of `parts` INTO a 25-byte screen field.
 function intoScreenLine(...parts: string[]): string {
   return parts.join("").slice(0, SCREEN_LINE_LENGTH);
 }
@@ -123,7 +119,11 @@ function customerName(summary: AuthSummary): string {
   );
 }
 
-/** `ADDR001O`: address lines 1 and 2, each DELIMITED BY two spaces, joined by a comma (COPAUS0C.cbl:L766-770). */
+/**
+ * COPAUS0C GATHER-ACCOUNT-DETAILS — P-COPAUS0C-006: `ADDR001O`, address lines
+ * 1 and 2, each DELIMITED BY two spaces, joined by a comma
+ * (COPAUS0C.cbl:L766-770).
+ */
 function addressLine1(summary: AuthSummary): string {
   return intoScreenLine(
     delimitedBy(summary.cust_addr_line_1, "  "),
@@ -132,7 +132,11 @@ function addressLine1(summary: AuthSummary): string {
   );
 }
 
-/** `ADDR002O`: address line 3 DELIMITED BY two spaces, the state and the first five ZIP characters (COPAUS0C.cbl:L771-777). */
+/**
+ * COPAUS0C GATHER-ACCOUNT-DETAILS — P-COPAUS0C-006: `ADDR002O`, address line 3
+ * DELIMITED BY two spaces, the state and the first five ZIP characters
+ * (COPAUS0C.cbl:L771-777).
+ */
 function addressLine2(summary: AuthSummary): string {
   return intoScreenLine(
     delimitedBy(summary.cust_addr_line_3, "  "),
@@ -143,24 +147,24 @@ function addressLine2(summary: AuthSummary): string {
   );
 }
 
-/** The scale-2 decimal text the API sends for an `S9(n)V99` field. */
+// The scale-2 decimal text the API sends for an `S9(n)V99` field.
 const DECIMAL_TEXT = /^(-?)([0-9]+)\.([0-9]{2})$/;
 
-/** `WS-AUTH-AMT` and `WS-DISPLAY-AMT12 PIC -zzzzzzz9.99`: 8 integer positions (COPAUS0C.cbl:L55-56). */
+// `WS-AUTH-AMT` and `WS-DISPLAY-AMT12 PIC -zzzzzzz9.99`: 8 integer positions (COPAUS0C.cbl:L55-56).
 const AMOUNT_12_INTEGER_DIGITS = 8;
 
-/** `WS-DISPLAY-AMT9 PIC -zzzz9.99`: 5 integer positions (COPAUS0C.cbl:L57). */
+// `WS-DISPLAY-AMT9 PIC -zzzz9.99`: 5 integer positions (COPAUS0C.cbl:L57).
 const AMOUNT_9_INTEGER_DIGITS = 5;
 
 /**
- * A scale-2 amount MOVEd to an edited picture `-z…z9.99` with
- * `integerDigits` integer positions (P-COPAUS0C-006, P-COPAUS0C-013). The
- * MOVE drops the high-order digits the picture has no position for, as the
- * COBOL does; leading zeros are suppressed down to the units digit, and a
- * negative amount gets its `-`. The suppressed positions are blanks, which
- * HTML collapses, so they are left out. The text is edited as text, never
- * converted to a JavaScript number; a value that is not the declared decimal
- * text is shown as sent.
+ * COPAUS0C GATHER-ACCOUNT-DETAILS, POPULATE-AUTH-LIST — P-COPAUS0C-006,
+ * P-COPAUS0C-013: a scale-2 amount MOVEd to an edited picture `-z…z9.99` with
+ * `integerDigits` integer positions. The MOVE drops the high-order digits the
+ * picture has no position for, as the COBOL does; leading zeros are
+ * suppressed down to the units digit, and a negative amount gets its `-`. The
+ * suppressed positions are blanks, which HTML collapses, so they are left
+ * out. The text is edited as text, never converted to a JavaScript number; a
+ * value that is not the declared decimal text is shown as sent.
  */
 function editedAmount(value: string, integerDigits: number): string {
   const match = DECIMAL_TEXT.exec(value);
@@ -175,6 +179,7 @@ function editedAmount(value: string, integerDigits: number): string {
 }
 
 /**
+ * COPAUS0C GATHER-ACCOUNT-DETAILS — P-COPAUS0C-006:
  * `WS-DISPLAY-COUNT PIC 9(03)` (COPAUS0C.cbl:L58), the field APPRCNTO and
  * DECLCNTO are moved through: the count's low-order three digits, unsigned
  * and zero-filled.
@@ -200,15 +205,15 @@ function screenTime(hhmmss: string): string {
 // ---------------------------------------------------------------------------
 
 type HeaderField = {
-  /** The COPAU00 output field or fields the entry shows. */
+  // The COPAU00 output field or fields the entry shows.
   bms: string;
-  /** The BMS caption. */
+  // The BMS caption.
   label: string;
-  /** What an abbreviated caption stands for. */
+  // What an abbreviated caption stands for.
   expansion?: string;
-  /** The entry's lines, as the screen shows them. */
+  // The entry's lines, as the screen shows them.
   lines: (summary: AuthSummary) => readonly string[];
-  /** Figures line up in tabular digits. */
+  // Figures line up in tabular digits.
   figure?: boolean;
 };
 
@@ -327,17 +332,15 @@ function AccountHeader({ summary }: { summary: AuthSummary }): JSX.Element {
   );
 }
 
-/** The screen lines of an entry: one per COPAU00 output field it shows. */
+// The screen lines of an entry: one per COPAU00 output field it shows.
 function screenLineCount(field: HeaderField): number {
   return field.bms.split(" ").length;
 }
 
-/**
- * The header card while the first page of an account loads; the table's busy
- * state announces the wait. Each caption and each value line is a skeleton
- * centred in the 20px line box of the header's text-sm (h-4 with my-0.5), so
- * every entry takes the height it takes once read.
- */
+// The header card while the first page of an account loads; the table's busy
+// state announces the wait. Each caption and each value line is a skeleton
+// centred in the 20px line box of the header's text-sm (h-4 with my-0.5), so
+// every entry takes the height it takes once read.
 function AccountHeaderSkeleton(): JSX.Element {
   return (
     <Card aria-hidden="true">
@@ -368,7 +371,7 @@ function AccountHeaderSkeleton(): JSX.Element {
 
 type BadgeVariant = NonNullable<ComponentProps<typeof Badge>["variant"]>;
 
-/** `PAPRV0nI`: `A` approved, `D` declined; the letter is shown, so colour is never the only cue. */
+// `PAPRV0nI`: `A` approved, `D` declined; the letter is shown, so colour is never the only cue.
 function approvalVariant(approved: string): BadgeVariant {
   if (approved === "A") {
     return "secondary";
@@ -376,16 +379,14 @@ function approvalVariant(approved: string): BadgeVariant {
   return approved === "D" ? "destructive" : "outline";
 }
 
-/**
- * The COPAU00 list columns in BMS order, then the row action that replaces
- * the `S` selector. Each "View" link keeps the exact name of F-COPAU00-005
- * and is described by its row's transaction ID, so links are told apart
- * without changing their name. Each placeholder is its cell's markup around a
- * value of the column's display format: a 15-position alphanumeric
- * transaction ID (letters, then digits), `MM/DD/YY`, `HH:MM:SS`, the type, the
- * A/D and match-status letters, an amount as wide as the widest of the seeded
- * amounts, and the row action.
- */
+// The COPAU00 list columns in BMS order, then the row action that replaces
+// the `S` selector. Each "View" link keeps the exact name of F-COPAU00-005
+// and is described by its row's transaction ID, so links are told apart
+// without changing their name. Each placeholder is its cell's markup around a
+// value of the column's display format: a 15-position alphanumeric
+// transaction ID (letters, then digits), `MM/DD/YY`, `HH:MM:SS`, the type, the
+// A/D and match-status letters, an amount as wide as the widest of the seeded
+// amounts, and the row action.
 function authorizationColumns(detailSearch: string, idPrefix: string): AuthColumns {
   const transactionIdOf = (authId: string): string => `${idPrefix}-tran-${authId}`;
   return [
@@ -487,27 +488,23 @@ function authorizationColumns(detailSearch: string, idPrefix: string): AuthColum
   ];
 }
 
-/**
- * The paging callbacks of the table shown before the first page arrives:
- * there is no key to page from yet, and DataTable disables Previous and Next
- * while it loads.
- */
+// The paging callbacks of the table shown before the first page arrives:
+// there is no key to page from yet, and DataTable disables Previous and Next
+// while it loads.
 const ignorePageRequest = (): undefined => undefined;
 
 type AuthorizationResultsProps = {
-  /** An account ID that passes the ENTER edits. */
+  // An account ID that passes the ENTER edits.
   accountId: string;
-  /** Counts the searches of this same account; each one reads it again from the first page. */
+  // Counts the searches of this same account; each one reads it again from the first page.
   search: number;
-  /** Shows a failed read on the search form. */
+  // Shows a failed read on the search form.
   onError: (error: unknown) => void;
 };
 
-/**
- * The header and the list of one account. Mounted per account (keyed by the
- * page), so every account starts on its first page, as COPAUS0C's
- * GATHER-DETAILS resets the page number.
- */
+// The header and the list of one account. Mounted per account (keyed by the
+// page), so every account starts on its first page, as COPAUS0C's
+// GATHER-DETAILS resets the page number.
 function AuthorizationResults({
   accountId,
   search,

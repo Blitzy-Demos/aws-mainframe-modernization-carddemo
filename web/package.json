@@ -51,5 +51,13 @@
     "typescript": "5.9.3",
     "vite": "6.4.5",
     "vitest": "3.2.7"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "minimatch@10.2.6": "patches/minimatch@10.2.6.patch",
+      "deepmerge@4.3.1": "patches/deepmerge@4.3.1.patch",
+      "@vitest/mocker@3.2.7": "patches/@vitest__mocker@3.2.7.patch",
+      "tinypool@1.1.1": "patches/tinypool@1.1.1.patch"
+    }
   }
 }

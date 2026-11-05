@@ -146,7 +146,7 @@ function json(status: number, body: unknown): Response {
   });
 }
 
-/** A promise and its resolver, so a test decides when an answer arrives. */
+// A promise and its resolver, so a test decides when an answer arrives.
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve: (value: T) => void = () => undefined;
   const promise = new Promise<T>((settle) => {

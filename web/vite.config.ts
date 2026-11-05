@@ -39,6 +39,18 @@ const apiProxyTargetOf = (value: string | undefined): string => {
 
 const apiProxyTarget = apiProxyTargetOf(process.env.CARDDEMO_API_PROXY_TARGET);
 
+// Sent with every document, module and asset the server delivers, so that no
+// other page can frame the signed-on SPA and steer a click onto a payment or
+// an admin action (clickjacking). Both headers, because older engines honour
+// only X-Frame-Options. The policy holds frame-ancestors alone: a script or
+// style directive would block the inline code of Vite's dev client and HMR.
+// `vite preview` sends server.headers when preview.headers is unset, so the
+// built SPA it serves carries them too.
+const documentHeaders: Record<string, string> = {
+  "Content-Security-Policy": "frame-ancestors 'none'",
+  "X-Frame-Options": "DENY",
+};
+
 // Vendor chunks, which aim to keep each chunk under Vite's 500 kB warning;
 // pages are split further by route-level React.lazy. The warning-free
 // `pnpm build` verifies the result: a chunk it still reports is split further,
@@ -111,6 +123,7 @@ export default defineConfig({
     // processes started on the host stay on localhost.
     port: 5173,
     strictPort: true,
+    headers: documentHeaders,
     proxy: {
       "/api": {
         target: apiProxyTarget,

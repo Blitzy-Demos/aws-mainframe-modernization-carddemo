@@ -1,11 +1,15 @@
 //! The single error type of the record codecs.
 //!
-//! Every decode, encode and framing function in this crate returns
+//! Every fallible decode, encode and framing function in this crate returns
 //! [`CodecError`]: the failure itself ([`CodecErrorKind`]) plus where it was
 //! found, from the layout down to the byte offset, so a report such as
 //! `CVACT01Y record 49 field ACCT-ADDR-ZIP at offset 102: …` points straight
 //! at the fixture bytes. Bytes are shown in hex because the offending byte is
-//! often a control character or an EBCDIC-only value.
+//! often a control character or an EBCDIC-only value. The encoders that only
+//! lay out bytes cannot fail: [`Layout::encode`](crate::Layout::encode),
+//! [`encode_ascii_lf`](crate::framing::encode_ascii_lf) and
+//! [`encode_ebcdic_file`](crate::framing::encode_ebcdic_file) return their
+//! bytes directly.
 
 use std::fmt;
 

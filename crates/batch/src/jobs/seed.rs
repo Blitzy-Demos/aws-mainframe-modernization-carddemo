@@ -29,8 +29,9 @@ use crate::generations::blocking;
 /// Runs the seed `args` selects against `db` and records the rows it wrote in `written` on
 /// the job span, and sets them in `read` and `posted` in the job's counts too, since every row
 /// read from a source is loaded. `rejected` stays 0, since a source that does not decode fails
-/// the run rather than leaving a row out, and a run that fails writes no row and leaves every
-/// count 0.
+/// the run rather than leaving a row out, and a run that fails leaves every count 0 and writes
+/// no row, unless its `COMMIT` failed without the server's answer, its connection lost: the run
+/// may then have committed, so the database is checked before the seed is run again.
 ///
 /// The sources resolve against the current directory, the repository root the runbook runs
 /// every command from: the fixture directory is `CARDDEMO_FIXTURE_DIR` (default

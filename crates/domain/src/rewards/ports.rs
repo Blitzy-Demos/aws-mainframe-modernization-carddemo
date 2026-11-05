@@ -59,8 +59,11 @@ pub trait RewardStore {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] on any failure of the read.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work;
+    /// [`PortError::Unavailable`] on any other failure of the read, a stored
+    /// rule that does not fit its domain type included.
     ///
+    /// [`PortError::Contention`]: crate::ports::PortError::Contention
     /// [`PortError::Unavailable`]: crate::ports::PortError::Unavailable
     fn candidate_rules(
         &mut self,
@@ -84,11 +87,18 @@ pub trait RewardStore {
     /// [`PortError::Duplicate`] when an accrual for the same `transaction_id`
     /// already exists: the `UNIQUE (transaction_id)` constraint
     /// `reward_accruals_transaction_id_key`, one row per qualifying
-    /// transaction. [`PortError::Unavailable`] when `created_at` is not a
-    /// whole microsecond, with nothing written, and on any other failure.
+    /// transaction. [`PortError::Restricted`] when `transaction_id` names no
+    /// `transactions` row or `rule_id` no rule: the foreign keys
+    /// `reward_accruals_transaction_id_fkey` and
+    /// `reward_accruals_rule_id_fkey`. [`PortError::Contention`] on a lock
+    /// conflict with another unit of work. [`PortError::Unavailable`] when
+    /// `created_at` is not a whole microsecond, with nothing written, and on
+    /// any other failure.
     ///
     /// [`is_whole_microsecond`]: crate::clock::is_whole_microsecond
     /// [`PortError::Duplicate`]: crate::ports::PortError::Duplicate
+    /// [`PortError::Restricted`]: crate::ports::PortError::Restricted
+    /// [`PortError::Contention`]: crate::ports::PortError::Contention
     /// [`PortError::Unavailable`]: crate::ports::PortError::Unavailable
     fn insert_accrual(
         &mut self,
@@ -109,9 +119,17 @@ pub trait RewardStore {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] when the new earned total exceeds the
-    /// `BIGINT` column, and on any other failure.
+    /// [`PortError::Restricted`] when `account_id` names no `accounts` row:
+    /// the foreign key `reward_balances_account_id_fkey`.
+    /// [`PortError::Contention`] on a lock conflict with another unit of work,
+    /// such as a deadlock while the upsert waits for the balance row a
+    /// concurrent credit holds. [`PortError::Unavailable`] when the new earned
+    /// total exceeds the `BIGINT` column, with nothing changed, when the
+    /// balance read back breaks `available = earned - redeemed` or does not
+    /// fit its domain types, and on any other failure.
     ///
+    /// [`PortError::Restricted`]: crate::ports::PortError::Restricted
+    /// [`PortError::Contention`]: crate::ports::PortError::Contention
     /// [`PortError::Unavailable`]: crate::ports::PortError::Unavailable
     fn add_points(
         &mut self,

@@ -214,7 +214,7 @@ export function AppSidebar(): JSX.Element {
   );
 }
 
-/** The nav/menu.ts entries of each menu section, in COBOL option order. */
+// The nav/menu.ts entries of each menu section, in COBOL option order.
 const MENU_OPTIONS: Readonly<Record<MenuSection, readonly MenuEntry[]>> = {
   user: userMenu,
   admin: adminMenu,

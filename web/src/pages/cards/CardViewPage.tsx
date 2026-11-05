@@ -40,19 +40,21 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { showApiError } from "@/lib/api-errors";
 import { cardViewKeySchema, type CardViewKeyValues } from "@/schemas/cards";
 
-/** The COCRDSL screen title [app/bms/COCRDSL.bms:L75-78]. */
+// The COCRDSL screen title [app/bms/COCRDSL.bms:L75-78].
 const TITLE = "View Credit Card Detail";
 
-/** The F3=Exit target, the card list (F-COCRDSL-002). */
+// The F3=Exit target, the card list (F-COCRDSL-002).
 const BACK_TARGET = "/cards";
 
-/** The key edits' texts for each key, in the order the schema reports them. */
+// The key edits' texts for each key, in the order the schema reports them.
 type KeyIssues = Record<keyof CardViewKeyValues, { message: string }[]>;
 
 /**
- * The COCRDSLC 2210-EDIT-ACCOUNT and 2220-EDIT-CARD outcome of the route keys,
- * through the schema that mirrors them: `null` when both keys pass, else each
- * key's audited texts. A key error skips the card read
+ * COCRDSLC 2210-EDIT-ACCOUNT, 2220-EDIT-CARD — P-COCRDSLC-002, P-COCRDSLC-003:
+ * the outcome of the route keys, through the schema that mirrors them: `null`
+ * when both keys pass, else each key's audited texts; with both keys blank,
+ * COCRDSLC 2200-EDIT-MAP-INPUTS — P-COCRDSLC-015 replaces the account's text
+ * with 'No input received' (V-COCRDSLC-005). A key error skips the card read
  * [app/cbl/COCRDSLC.cbl:L357-371], so the page sends no request for it.
  */
 function editKeys(keys: CardViewKeyValues): KeyIssues | null {
@@ -71,22 +73,23 @@ function editKeys(keys: CardViewKeyValues): KeyIssues | null {
 }
 
 /**
- * EXPMON '/' EXPYEAR, cut from `CARD-EXPIRAION-DATE X(10)` through its
- * redefine: CARD-EXPIRY-YEAR X(4) at (1:4) and CARD-EXPIRY-MONTH X(2) at
- * (6:2) [app/cbl/COCRDSLC.cbl:L84-90] [app/cbl/COCRDSLC.cbl:L477-482]. The
- * '/' is a constant of the map [app/bms/COCRDSL.bms:L130-132], shown even
- * when the stored date is blank.
+ * COCRDSLC 1200-SETUP-SCREEN-VARS — P-COCRDSLC-006, P-COCRDSLC-010: EXPMON
+ * '/' EXPYEAR, cut from `CARD-EXPIRAION-DATE X(10)` through its redefine:
+ * CARD-EXPIRY-YEAR X(4) at (1:4) and CARD-EXPIRY-MONTH X(2) at (6:2)
+ * [app/cbl/COCRDSLC.cbl:L84-90] [app/cbl/COCRDSLC.cbl:L477-482]. The '/' is a
+ * constant of the map [app/bms/COCRDSL.bms:L130-132], shown even when the
+ * stored date is blank.
  */
 function expiryOf(date: string): string {
   return `${date.slice(5, 7)}/${date.slice(0, 4)}`;
 }
 
 type CardFieldsProps = {
-  /** The card as read, or `undefined` while it is being read. */
+  // The card as read, or `undefined` while it is being read.
   card: CardViewResult | undefined;
 };
 
-/** CRDNAME, CRDSTCD and EXPMON/EXPYEAR [app/bms/COCRDSL.bms:L103-138]. */
+// CRDNAME, CRDSTCD and EXPMON/EXPYEAR [app/bms/COCRDSL.bms:L103-138].
 function CardFields({ card }: CardFieldsProps): JSX.Element {
   return (
     <DetailList>
@@ -117,7 +120,7 @@ function CardFields({ card }: CardFieldsProps): JSX.Element {
   );
 }
 
-/** The failure a toast has shown, kept as the screen's message line. */
+// The failure a toast has shown, kept as the screen's message line.
 type ShownError = { error: Error; message: string };
 
 export default function CardViewPage(): JSX.Element {

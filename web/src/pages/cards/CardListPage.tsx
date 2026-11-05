@@ -49,23 +49,21 @@ import {
 type CardSummary = components["schemas"]["CardSummary"];
 type CardListResult = components["schemas"]["Page_CardSummary"];
 
-/** The page a key asks for: `start_key` and `direction` of `GET /cards`. */
+// The page a key asks for: `start_key` and `direction` of `GET /cards`.
 type Cursor = Pick<CardListParams, "start_key" | "direction">;
 
-/** `ACCTSIDI X(11)` and `CARDSIDI X(16)` [app/cpy-bms/COCRDLI.CPY]. */
+// `ACCTSIDI X(11)` and `CARDSIDI X(16)` [app/cpy-bms/COCRDLI.CPY].
 const ACCOUNT_ID_LENGTH = 11;
 const CARD_NUMBER_LENGTH = 16;
 
 const DEFAULT_VALUES: CardListFilterValues = { account_id: "", card_number: "" };
 
-/** The seven rows of a COCRDLI page, the server's default page size. */
+// The seven rows of a COCRDLI page, the server's default page size.
 const PAGE_ROWS = 7;
 
-/**
- * The query of one key press: the filters the schema let through (a blank
- * filter is absent, so it is no filter) and the page asked for. Absent and
- * empty values are left out, so two presses of one request share one key.
- */
+// The query of one key press: the filters the schema let through (a blank
+// filter is absent, so it is no filter) and the page asked for. Absent and
+// empty values are left out, so two presses of one request share one key.
 function toParams(filters: CardListFilterQuery, cursor: Cursor): CardListParams {
   const params: CardListParams = {};
   if (filters.account_id !== undefined) {
@@ -92,13 +90,11 @@ function sameParams(a: CardListParams, b: CardListParams): boolean {
   );
 }
 
-/**
- * The View (S, XCTL COCRDSLC) and Edit (U, XCTL COCRDUPC) actions of one
- * row. Both carry the row's account as `account_id`, the CDEMO-ACCT-ID the
- * COBOL passes with the card (E-55). The accessible names are exactly the
- * function map's; the card number cell describes them, since every row has
- * the same two names.
- */
+// The View (S, XCTL COCRDSLC) and Edit (U, XCTL COCRDUPC) actions of one
+// row. Both carry the row's account as `account_id`, the CDEMO-ACCT-ID the
+// COBOL passes with the card (E-55). The accessible names are exactly the
+// function map's; the card number cell describes them, since every row has
+// the same two names.
 function RowActions({
   card,
   describedBy,
@@ -134,13 +130,11 @@ function RowActions({
   );
 }
 
-/**
- * The COCRDLI columns in screen order ('Account Number', 'Card Number',
- * 'Active'), then the row actions that replace the 'Select' column. Values are
- * shown exactly as the server sent them. Each placeholder is its cell's markup
- * around a value of the column's fixed format: the 11-digit account number,
- * the 16-digit card number, the status letter and the row actions.
- */
+// The COCRDLI columns in screen order ('Account Number', 'Card Number',
+// 'Active'), then the row actions that replace the 'Select' column. Values are
+// shown exactly as the server sent them. Each placeholder is its cell's markup
+// around a value of the column's fixed format: the 11-digit account number,
+// the 16-digit card number, the status letter and the row actions.
 function cardColumns(idPrefix: string): DataTableProps<CardSummary>["columns"] {
   const cardCellId = (index: number): string => `${idPrefix}-card-${index}`;
   return [
@@ -190,11 +184,9 @@ function cardColumns(idPrefix: string): DataTableProps<CardSummary>["columns"] {
   ];
 }
 
-/**
- * One COCRDLI filter field. `field.ref` reaches the Input, through which
- * react-hook-form and applyApiError place the cursor on an errored filter, and
- * the input is described by its error while it shows one.
- */
+// One COCRDLI filter field. `field.ref` reaches the Input, through which
+// react-hook-form and applyApiError place the cursor on an errored filter, and
+// the input is described by its error while it shows one.
 function FilterField({
   control,
   name,

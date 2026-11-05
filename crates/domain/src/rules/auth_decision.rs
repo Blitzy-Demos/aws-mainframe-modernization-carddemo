@@ -638,7 +638,15 @@ pub fn request_read_failure_entry(comp_code: i64, reason: i64) -> ErrorLogEntry 
 /// replies are published in, and carries each character as the ISO 8859-1
 /// byte of the same code point: the code page the repository's EBCDIC data
 /// (CP037) maps to one for one, and the one [`Alnum::as_text`] reads back. An
-/// ASCII body is returned unchanged (E-80).
+/// ASCII body that fits the buffer is returned unchanged (E-80).
+///
+/// Every character of `body` is checked, so a character the conversion cannot
+/// pin halts the request wherever it stands, even past the buffer, before the
+/// size check. Only the first [`REQUEST_BUFFER_LEN`] + 1 converted bytes are
+/// kept: the buffer, and the one byte past it that tells
+/// [`oversize_request_entry`] the message does not fit. Text past that byte is
+/// checked but not kept, so a message the size check rejects allocates at most
+/// 501 bytes however long it is, and a message that fits comes back whole.
 ///
 /// # Errors
 ///
@@ -648,9 +656,15 @@ pub fn request_read_failure_entry(comp_code: i64, reason: i64) -> ErrorLogEntry 
 /// write.
 pub fn convert_request(body: &[u8]) -> Result<Vec<u8>, Unproven> {
     let text = std::str::from_utf8(body).map_err(|_| UNCONVERTED_TEXT)?;
-    text.chars()
-        .map(|character| u8::try_from(character).map_err(|_| UNCONVERTED_TEXT))
-        .collect()
+    let kept = REQUEST_BUFFER_LEN + 1;
+    let mut data = Vec::with_capacity(body.len().min(kept));
+    for character in text.chars() {
+        let byte = u8::try_from(character).map_err(|_| UNCONVERTED_TEXT)?;
+        if data.len() < kept {
+            data.push(byte);
+        }
+    }
+    Ok(data)
 }
 
 /// COPAUA0C 3100-READ-REQUEST-MQ — P-COPAUA0C-002: the outcome of a request
@@ -658,7 +672,9 @@ pub fn convert_request(body: &[u8]) -> Result<Vec<u8>, Unproven> {
 /// [`REQUEST_BUFFER_LEN`], or `None` for one that fits.
 ///
 /// `MQGMO-CONVERT` converts the message into the 500-byte `W01-GET-BUFFER`,
-/// so `data` is the converted text, one byte per character: 500 `É`, 1000
+/// so `data` is the converted text, one byte per character, as
+/// [`convert_request`] keeps it: whole when it fits, cut one byte past the
+/// buffer when it does not, which is all this check reads. 500 `É`, 1000
 /// bytes of UTF-8, fit. Without `MQGMO-ACCEPT-TRUNCATED-MSG` the get fails a
 /// longer message with [`MQCC_WARNING`] and [`MQRC_TRUNCATED_MSG_FAILED`],
 /// which takes the M003 branch: a critical record and the end of the task,
@@ -1814,11 +1830,15 @@ mod tests {
     #[test]
     fn the_get_converts_each_character_to_one_iso_8859_1_byte_and_halts_the_rest() {
         // P-COPAUA0C-002: MQGMO-CONVERT of an MQFMT-STRING request; E-80 for
-        // text the conversion cannot pin.
+        // text the conversion cannot pin, even when it lies past the buffer of
+        // a message too long for it.
         /// A body and the converted text, or the escalation, it gives.
         type Case<'a> = (&'a [u8], Result<&'a [u8], &'static str>);
         let ascii = request_text(FIXTURE_CARD, "100.00", "TXN000000000001");
-        let cases: [Case<'_>; 11] = [
+        let oversize = "N".repeat(1 << 20);
+        let euro_past_the_buffer = format!("{oversize}€");
+        let invalid_past_the_buffer = [oversize.as_bytes(), b"\xC3"].concat();
+        let cases: [Case<'_>; 13] = [
             (ascii.as_bytes(), Ok(ascii.as_bytes())),
             (b"", Ok(b"")),
             ("É".as_bytes(), Ok(b"\xC9")),
@@ -1830,6 +1850,8 @@ mod tests {
             ("\u{100}".as_bytes(), Err("E-80")),
             (b"\xC9", Err("E-80")),
             (b"TXN\xC3", Err("E-80")),
+            (euro_past_the_buffer.as_bytes(), Err("E-80")),
+            (&invalid_past_the_buffer, Err("E-80")),
         ];
         for (body, expected) in cases {
             assert_eq!(
@@ -1845,16 +1867,22 @@ mod tests {
     #[test]
     fn the_500_byte_buffer_counts_converted_characters() {
         // P-COPAUA0C-002: MQGMO-CONVERT puts the converted text into
-        // W01-GET-BUFFER X(500), so 500 'É' (1000 bytes of UTF-8) fit.
+        // W01-GET-BUFFER X(500), so 500 'É' (1000 bytes of UTF-8) fit. A
+        // longer message, however long, keeps the buffer and the one byte past
+        // it that fails the get.
+        let kept = REQUEST_BUFFER_LEN + 1;
         for (character, count, oversize) in [
             ('É', REQUEST_BUFFER_LEN, false),
             ('É', REQUEST_BUFFER_LEN + 1, true),
+            ('É', 1 << 20, true),
             ('N', REQUEST_BUFFER_LEN, false),
             ('N', REQUEST_BUFFER_LEN + 1, true),
+            ('N', 1 << 20, true),
         ] {
             let body = character.to_string().repeat(count);
             let data = convert_request(body.as_bytes()).expect("ISO 8859-1 text");
-            assert_eq!(data.len(), count, "{character} x {count}");
+            assert_eq!(data.len(), count.min(kept), "{character} x {count}");
+            assert!(data.capacity() <= kept, "{character} x {count}");
             let entry = oversize_request_entry(&data);
             assert_eq!(
                 entry.map(|entry| entry.location),

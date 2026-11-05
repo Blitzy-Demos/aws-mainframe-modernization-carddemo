@@ -68,16 +68,16 @@ const LIST_ROUTE = "/admin/transaction-types";
 const KEY_ENTRY_ROUTE = "/admin/transaction-types/new";
 const EDIT_ROUTE_01 = "/admin/transaction-types/01/edit";
 
-/** The API path of the list and the add, under the client's `/api` base. */
+// The API path of the list and the add, under the client's `/api` base.
 const LIST_PATH = "/api/admin/transaction-types";
 
-/** Row 1 of app/data/ASCII/trantype.txt, the type every test finds on file. */
+// Row 1 of app/data/ASCII/trantype.txt, the type every test finds on file.
 const PURCHASE = {
   type_code: "01",
   description: "Purchase",
 } satisfies TranTypeResponse;
 
-/** A code the fixture master does not hold (it holds 01 to 07). */
+// A code the fixture master does not hold (it holds 01 to 07).
 const NEW_CODE = "08";
 const NEW_DESCRIPTION = "Test type";
 const CHANGED_DESCRIPTION = "Retail purchase";
@@ -89,30 +89,28 @@ const STUB_DELETED = "Stub: type deleted";
 const STUB_REJECTED = "Stub: write rejected";
 const STUB_FIELD_REJECTED = "Stub: field rejected";
 
-/** The client's text for a request past its deadline (api/client.ts). */
+// The client's text for a request past its deadline (api/client.ts).
 const DEADLINE_TEXT = "No answer from the server within 30 seconds";
 
-/** One request the page sent, as the stub received it. */
+// One request the page sent, as the stub received it.
 type SentRequest = {
   method: string;
   url: URL;
-  /** The parsed JSON body of a POST or PUT; absent for GET and DELETE. */
+  // The parsed JSON body of a POST or PUT; absent for GET and DELETE.
   body?: unknown;
 };
 
-/** The types on file, changed by the writes the stub accepts. */
+// The types on file, changed by the writes the stub accepts.
 let stored: TranTypeResponse[];
 let sent: SentRequest[];
-/** When set, every POST, PUT and DELETE is answered with this failure. */
+// When set, every POST, PUT and DELETE is answered with this failure.
 let writeFailure: { status: number; body: ErrorBody } | undefined;
-/** When set, every request is answered only once this promise settles. */
+// When set, every request is answered only once this promise settles.
 let gate: Promise<void> | undefined;
-/**
- * When set, every POST, PUT and DELETE gets no answer before the client's
- * deadline: "unapplied" leaves the master as it was, as while the server
- * still waits on a lock; "applied" stores the write first, as when only its
- * answer is lost.
- */
+// When set, every POST, PUT and DELETE gets no answer before the client's
+// deadline: "unapplied" leaves the master as it was, as while the server
+// still waits on a lock; "applied" stores the write first, as when only its
+// answer is lost.
 let unanswered: "unapplied" | "applied" | undefined;
 
 function answer(body: unknown, status: number): Response {
@@ -126,16 +124,14 @@ function notOnFile(): Response {
   );
 }
 
-/** The `{id}` segment of a `/api/admin/transaction-types/{id}` path. */
+// The `{id}` segment of a `/api/admin/transaction-types/{id}` path.
 function typeCodeOf(url: URL): string {
   return decodeURIComponent(url.pathname.slice(LIST_PATH.length + 1));
 }
 
-/**
- * The API over `stored`: the list filtered by `type_code` (404 when nothing
- * matches), the add (201), the update and the delete (200, 404 for a code not
- * on file), each answered with the stored type.
- */
+// The API over `stored`: the list filtered by `type_code` (404 when nothing
+// matches), the add (201), the update and the delete (200, 404 for a code not
+// on file), each answered with the stored type.
 async function serve(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const { method } = request;
@@ -221,12 +217,12 @@ const fetchMock = vi.fn(async (input: Request) => {
   return response;
 });
 
-/** The POST, PUT and DELETE requests sent so far. */
+// The POST, PUT and DELETE requests sent so far.
 function writes(): SentRequest[] {
   return sent.filter((request) => request.method !== "GET");
 }
 
-/** The 400 of a refused write, naming one BMS field of COTRTUP. */
+// The 400 of a refused write, naming one BMS field of COTRTUP.
 function rejectWritesOn(field: TranTypeUpsertField): void {
   writeFailure = {
     status: 400,
@@ -238,7 +234,7 @@ function rejectWritesOn(field: TranTypeUpsertField): void {
   };
 }
 
-/** Holds every request sent from now on until the returned release runs. */
+// Holds every request sent from now on until the returned release runs.
 function holdRequests(): () => void {
   let release = (): void => undefined;
   gate = new Promise<void>((resolve) => {
@@ -264,7 +260,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** The page at `path`, with the list route as the target of Back. */
+// The page at `path`, with the list route as the target of Back.
 function renderAt(path: InitialEntry) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -316,7 +312,7 @@ function inputLabelled(label: string): HTMLInputElement {
   return element;
 }
 
-/** The text of the FieldError the input names as its description. */
+// The text of the FieldError the input names as its description.
 function fieldErrorOf(input: HTMLInputElement): string | null {
   const id = input.getAttribute("aria-describedby");
   const error = id === null ? null : document.getElementById(id);
@@ -329,17 +325,15 @@ function fieldErrorOf(input: HTMLInputElement): string | null {
 
 type User = ReturnType<typeof userEvent.setup>;
 
-/** Looks up `entry` on the key entry and waits for the add of a new code. */
+// Looks up `entry` on the key entry and waits for the add of a new code.
 async function lookUpNewCode(user: User, entry: string): Promise<void> {
   await user.type(inputLabelled("Type code"), entry);
   await user.click(screen.getByRole("button", { name: "Look up" }));
   await screen.findByRole("button", { name: "Add" });
 }
 
-/**
- * Waits until no read is running, then lets the task pass on which TanStack
- * Query hands the last answer to the page, so its effects have seen it.
- */
+// Waits until no read is running, then lets the task pass on which TanStack
+// Query hands the last answer to the page, so its effects have seen it.
 async function readsSettled(queryClient: QueryClient): Promise<void> {
   await waitFor(() => {
     expect(queryClient.isFetching()).toBe(0);
@@ -351,7 +345,7 @@ async function readsSettled(queryClient: QueryClient): Promise<void> {
   });
 }
 
-/** Waits until the edit route shows the type on file for update. */
+// Waits until the edit route shows the type on file for update.
 async function waitForPrefill(description: string): Promise<void> {
   await waitFor(() => {
     const input = inputLabelled("Description");
@@ -368,10 +362,8 @@ function maintenanceForm(): HTMLElement {
   return screen.getByRole("form", { name: "Transaction type" });
 }
 
-/**
- * The form while its request runs: busy, `submit` and every button in
- * `siblings` inert but not disabled, so `submit` keeps the focus.
- */
+// The form while its request runs: busy, `submit` and every button in
+// `siblings` inert but not disabled, so `submit` keeps the focus.
 function expectBusy(submit: string, siblings: readonly string[]): void {
   expect(maintenanceForm().getAttribute("aria-busy")).toBe("true");
   for (const name of [submit, ...siblings]) {
@@ -381,7 +373,7 @@ function expectBusy(submit: string, siblings: readonly string[]): void {
   expect(document.activeElement).toBe(buttonNamed(submit));
 }
 
-/** Every button in `names` live again, and the form no longer busy. */
+// Every button in `names` live again, and the form no longer busy.
 function expectIdle(names: readonly string[]): void {
   expect(maintenanceForm().getAttribute("aria-busy")).toBe("false");
   for (const name of names) {
@@ -550,7 +542,7 @@ describe("a code not on file (COTRTUPC key not found)", () => {
   const EDIT_ROUTE_NEW = `${LIST_ROUTE}/${NEW_CODE}/edit`;
   const STUB_READ_FAILED = "Stub: read failed";
 
-  /** The API, with the list read answered by `read` instead. */
+  // The API, with the list read answered by `read` instead.
   function stubListRead(read: (url: URL) => Response): void {
     vi.stubGlobal(
       "fetch",
@@ -565,7 +557,7 @@ describe("a code not on file (COTRTUPC key not found)", () => {
     );
   }
 
-  /** A 200 page of the types on file, none of them the code asked for. */
+  // A 200 page of the types on file, none of them the code asked for.
   function pageWithoutTheCode(): Response {
     return answer(
       { items: stored, next_key: null, prev_key: null } satisfies TranTypePage,

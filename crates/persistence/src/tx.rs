@@ -298,8 +298,9 @@ impl UnitOfWork {
     ///   unit of work is unusable, or what an abandoned store call left cannot
     ///   be settled; nothing is committed.
     /// - [`PersistenceError::Sqlx`] when the `COMMIT` fails, for example on a
-    ///   deferred constraint or trigger, a serialization failure or a lost
-    ///   connection.
+    ///   deferred constraint or trigger or a serialization failure, which the
+    ///   server answers as a rollback, or on a lost connection, which leaves
+    ///   the outcome unknown: the work may have committed.
     pub async fn commit(mut self) -> Result<(), PersistenceError> {
         let location = Location::caller();
         if let Err(refused) = recover(&mut self.tx, &mut self.statement, location).await {
@@ -737,20 +738,28 @@ async fn discard_pending(conn: &mut PgConnection) {
 }
 
 /// Commits `tx`, the transaction of a [`UnitOfWork`] or of a seed run, and
-/// sends no `ROLLBACK` after a `COMMIT` the server fails.
+/// sends no `ROLLBACK` after a `COMMIT` the server rejects.
 ///
-/// A failed `COMMIT` has already ended the transaction as a rollback, so a
-/// `ROLLBACK` after it would only draw the warning `25P01`, "there is no
-/// transaction in progress". sqlx still counts the transaction open, so a
-/// `BEGIN` and the `ROLLBACK` of that empty transaction bring the connection
-/// back in step with it before it returns to the pool. A failure of either is
-/// logged at `debug`. Once the `COMMIT`, or that `BEGIN` and `ROLLBACK`,
-/// succeeded, dropping `tx` sends nothing.
+/// A `COMMIT` the server rejects, answering it with a database error, has
+/// already ended the transaction as a rollback, so a `ROLLBACK` after it
+/// would only draw the warning `25P01`, "there is no transaction in
+/// progress". sqlx still counts the transaction open, so a `BEGIN` and the
+/// `ROLLBACK` of that empty transaction bring the connection back in step
+/// with it before it returns to the pool. A failure of either is logged at
+/// `debug`. Once the `COMMIT`, or that `BEGIN` and `ROLLBACK`, succeeded,
+/// dropping `tx` sends nothing.
+///
+/// Any other failure, a lost connection or a `COMMIT` whose answer never
+/// arrives, proves no rollback: the server may have committed the work, so
+/// its outcome is unknown and the stored state must be checked before the
+/// work is retried.
 ///
 /// # Errors
 ///
-/// The error of the `COMMIT`, for example on a deferred constraint or
-/// trigger, a serialization failure or a lost connection.
+/// The error of the `COMMIT`: a database error, for example on a deferred
+/// constraint or trigger or a serialization failure, after which the work is
+/// rolled back; or any other error, for example a lost connection, after
+/// which its outcome is unknown.
 pub(crate) async fn commit_transaction(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<(), sqlx::Error> {

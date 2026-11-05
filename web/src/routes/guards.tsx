@@ -67,7 +67,7 @@ function useSessionEndNotice(live: boolean): void {
 }
 
 type GuardProps = {
-  /** The guarded content; omitted when the guard is a layout route. */
+  // The guarded content; omitted when the guard is a layout route.
   children?: ReactNode;
 };
 

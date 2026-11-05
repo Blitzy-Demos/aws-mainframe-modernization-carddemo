@@ -628,7 +628,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     async fn insert_detail(&mut self, detail: NewPendingAuthDetail) -> PortResult<AuthId> {
         let c = DetailColumns::new(&detail)?;
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
-        let result = sqlx::query_scalar!(
+        let result = sqlx::query!(
             r#"INSERT INTO pending_auth_details
                    (pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,
                     pa_auth_orig_date, pa_auth_orig_time, pa_card_num, pa_auth_type,
@@ -672,7 +672,8 @@ impl AuthorizationStore for PgStore<'_, '_> {
             c.fraud_rpt_date
         )
         .fetch_one(&mut *sp)
-        .await;
+        .await
+        .map(|row| row.auth_id);
         settle(sp, result)
             .await
             .map(AuthId::from)
@@ -1111,7 +1112,7 @@ impl PgStore<'_, '_> {
     /// timeout, [`PortError::Unavailable`] on any other failure.
     pub async fn exclude_other_purges(&mut self) -> PortResult<()> {
         let mut sp = savepoint(self.tx, &mut self.ledger).await?;
-        let result = sqlx::query_scalar!(
+        let result = sqlx::query!(
             r#"SELECT 1 AS "locked!" FROM pg_advisory_xact_lock($1)"#,
             PURGE_LOCK_KEY
         )

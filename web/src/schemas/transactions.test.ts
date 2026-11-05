@@ -18,7 +18,7 @@ import {
   transactionAddMessages,
 } from "./transactions";
 
-/** A form every client edit accepts. */
+// A form every client edit accepts.
 const VALID: TransactionAddFormValues = {
   account_id: "00000000001",
   card_number: "",
@@ -36,7 +36,7 @@ const VALID: TransactionAddFormValues = {
   confirm: "Y",
 };
 
-/** Every field blank, the confirmation included. */
+// Every field blank, the confirmation included.
 const ALL_BLANK: TransactionAddFormValues = {
   account_id: "",
   card_number: "",
@@ -183,7 +183,7 @@ describe("transactionAddFormSchema issue order", () => {
   });
 });
 
-/** `[member, map width, can NOT be empty text]` of each CT02 free-text field. */
+// `[member, map width, can NOT be empty text]` of each CT02 free-text field.
 const FREE_TEXT = [
   ["tran_source", 10, transactionAddMessages.sourceCanNotBeEmpty],
   ["tran_desc", 60, transactionAddMessages.descriptionCanNotBeEmpty],
@@ -192,7 +192,7 @@ const FREE_TEXT = [
   ["tran_merchant_zip", 10, transactionAddMessages.merchantZipCanNotBeEmpty],
 ] as const;
 
-/** Every audited COTRN02C text the schema can report. */
+// Every audited COTRN02C text the schema can report.
 const AUDITED: readonly string[] = Object.values(transactionAddMessages);
 
 function issuesOf(values: TransactionAddFormValues): z.ZodIssue[] {
@@ -207,7 +207,7 @@ function issuesAt(
   return issuesOf(values).filter((issue) => issue.path[0] === member);
 }
 
-/** Every printable ASCII character, repeated to `width`. */
+// Every printable ASCII character, repeated to `width`.
 function printableAscii(width: number): string {
   const printable = Array.from({ length: 0x7e - 0x20 + 1 }, (_, index) =>
     String.fromCharCode(0x20 + index),
@@ -215,19 +215,17 @@ function printableAscii(width: number): string {
   return printable.repeat(Math.ceil(width / printable.length)).slice(0, width);
 }
 
-/** The server's published TransactionAddRequest members. */
+// The server's published TransactionAddRequest members.
 const PUBLISHED_ADD = openapi.components.schemas.TransactionAddRequest.properties;
 
-/** Non-blank entries a free-text member of `width` accepts. */
+// Non-blank entries a free-text member of `width` accepts.
 function textEntries(width: number): string[] {
   return [printableAscii(width), "\u007f", "Cafe"];
 }
 
-/**
- * Entries a free-text member of `width` refuses before any COBOL edit:
- * non-ASCII text, then NUL characters beside other text, which COTRN02C would
- * store and PostgreSQL text cannot hold (E-07).
- */
+// Entries a free-text member of `width` refuses before any COBOL edit:
+// non-ASCII text, then NUL characters beside other text, which COTRN02C would
+// store and PostgreSQL text cannot hold (E-07).
 function unstorableEntries(width: number): string[] {
   return [
     "\u00e9",
@@ -245,7 +243,7 @@ function unstorableEntries(width: number): string[] {
   ];
 }
 
-/** Blank entries of a member of `width`: empty, spaces, and NUL characters only (LOW-VALUES). */
+// Blank entries of a member of `width`: empty, spaces, and NUL characters only (LOW-VALUES).
 function blankEntries(width: number): string[] {
   return ["", " ".repeat(width), "\u0000", "\u0000\u0000", "\u0000".repeat(width)];
 }

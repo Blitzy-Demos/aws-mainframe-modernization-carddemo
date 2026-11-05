@@ -157,7 +157,7 @@ function pageShown(
   return onScreen.press && isBoundaryAnswer(page) ? onScreen.page : page;
 }
 
-/** The fields COUSR03 shows before F5=Delete [app/bms/COUSR03.bms:L80-139]. */
+// The fields COUSR03 shows before F5=Delete [app/bms/COUSR03.bms:L80-139].
 function UserToDelete({ user }: { user: User }): JSX.Element {
   return (
     <div className="flex flex-col gap-4">

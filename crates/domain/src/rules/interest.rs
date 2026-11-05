@@ -277,6 +277,8 @@ impl InterestAbend {
     /// `CEE3ABD`, which the job reports as `ABEND 999`.
     pub const ABCODE: u32 = 999;
 
+    /// CBACT04C 9910-DISPLAY-IO-STATUS — P-CBACT04C-189
+    ///
     /// The two status bytes 9910-DISPLAY-IO-STATUS displays for this abend.
     #[must_use]
     pub fn file_status(&self) -> [u8; 2] {

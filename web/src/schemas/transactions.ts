@@ -5,8 +5,11 @@
  * form (`POST /transactions`, COTRN02C, map COTRN02).
  *
  * The server is authoritative. These schemas keep a form from sending what the
- * server rejects with an audited message, and accept everything it accepts.
- * Lengths are the OpenAPI `maxLength` of each member, which equal the BMS field
+ * server rejects with an audited message, and accept what it accepts but for
+ * one BMS-width restriction: a CT01 key longer than the 16 characters of
+ * TRNIDIN, which the 3270 field cannot hold, is refused, while the server moves
+ * it into `TRAN-ID X(16)` (its first 16 bytes) and reads that key. The other
+ * lengths are the OpenAPI `maxLength` of each member, which equal the BMS field
  * widths. An over-length entry has no COBOL path (a 3270 field holds no more
  * than its width) and the server answers it with no message (E-49), so it keeps
  * zod's default text and gets no other issue. A non-ASCII character in a CT02
@@ -90,14 +93,12 @@ type TransactionAddRequest = components["schemas"]["TransactionAddRequest"];
 type TransactionListQuery = NonNullable<
   paths["/transactions"]["get"]["parameters"]["query"]
 >;
-/** The query parameters the CT00 search form sets; paging sets the others. */
+// The query parameters the CT00 search form sets; paging sets the others.
 type TransactionListFilterParams = Pick<TransactionListQuery, "start_key" | "account_id">;
 
-/**
- * The OpenAPI `maxLength` of every `TransactionAddRequest` member, equal to the
- * width of its `COTRN2AI` field [app/cpy-bms/COTRN02.CPY]. PF5 cuts copied
- * values to the same widths.
- */
+// The OpenAPI `maxLength` of every `TransactionAddRequest` member, equal to the
+// width of its `COTRN2AI` field [app/cpy-bms/COTRN02.CPY]. PF5 cuts copied
+// values to the same widths.
 const ADD_WIDTH = {
   account_id: 11,
   card_number: 16,
@@ -115,10 +116,10 @@ const ADD_WIDTH = {
   confirm: 1,
 } as const satisfies Record<keyof TransactionAddRequest, number>;
 
-/** The OpenAPI `maxLength` of the CT00 `account_id` filter, an `ACCT-ID 9(11)`. */
+// The OpenAPI `maxLength` of the CT00 `account_id` filter, an `ACCT-ID 9(11)`.
 const ACCOUNT_FILTER_WIDTH = 11;
 
-/** `TRNIDINI X(16)` of map COTRN01 [app/cpy-bms/COTRN01.CPY]. */
+// `TRNIDINI X(16)` of map COTRN01 [app/cpy-bms/COTRN01.CPY].
 const TRAN_ID_WIDTH = 16;
 
 // `IS NUMERIC` on a space-padded `PIC X(n)` field holds only when all n bytes
@@ -129,34 +130,26 @@ const TRAN_ID = /^\d{16}$/;
 const TYPE_CD = /^\d{2}$/;
 const CATEGORY_CD = /^\d{4}$/;
 const MERCHANT_ID = /^\d{9}$/;
-/**
- * TRNAMTI (1:1) `-` or `+`, (2:8) digits, (10:1) `.`, (11:2) digits
- * [app/cbl/COTRN02C.cbl:L339-348].
- */
+// TRNAMTI (1:1) `-` or `+`, (2:8) digits, (10:1) `.`, (11:2) digits
+// [app/cbl/COTRN02C.cbl:L339-348].
 const AMOUNT = /^[-+]\d{8}\.\d{2}$/;
-/**
- * The confirmations COTRN02C does not reject: `Y`/`y` add, `N`/`n` prompt
- * [app/cbl/COTRN02C.cbl:L169-187].
- */
+// The confirmations COTRN02C does not reject: `Y`/`y` add, `N`/`n` prompt
+// [app/cbl/COTRN02C.cbl:L169-187].
 const CONFIRM = /^[YyNn]$/;
-/**
- * Storable ASCII text, the OpenAPI `pattern` of the CT02 free-text members
- * (TRNSRC, TDESC, MNAME, MCITY, MZIP), which have no class edit: COTRN02C
- * moves them byte for byte into their `PIC X(n)` record fields
- * [app/cbl/COTRN02C.cbl:L450-465], and a 3270 field holds one byte per
- * character. NUL characters are accepted only as the whole entry, the
- * LOW-VALUES COTRN02C answers with its `can NOT be empty` text; beside other
- * text they would be stored, and PostgreSQL text cannot hold them (E-07).
- * The server answers a non-ASCII or mixed-NUL entry with no message (E-49),
- * as it answers an over-length one, so the issue keeps zod's default regex
- * text.
- */
+// Storable ASCII text, the OpenAPI `pattern` of the CT02 free-text members
+// (TRNSRC, TDESC, MNAME, MCITY, MZIP), which have no class edit: COTRN02C
+// moves them byte for byte into their `PIC X(n)` record fields
+// [app/cbl/COTRN02C.cbl:L450-465], and a 3270 field holds one byte per
+// character. NUL characters are accepted only as the whole entry, the
+// LOW-VALUES COTRN02C answers with its `can NOT be empty` text; beside other
+// text they would be stored, and PostgreSQL text cannot hold them (E-07).
+// The server answers a non-ASCII or mixed-NUL entry with no message (E-49),
+// as it answers an over-length one, so the issue keeps zod's default regex
+// text.
 const STORABLE_TEXT = /^(?:\x00+|[\x01-\x7F]*)$/;
 
-/**
- * A format or class edit. Without `message` the edit has no audited text and
- * reports zod's own regex issue.
- */
+// A format or class edit. Without `message` the edit has no audited text and
+// reports zod's own regex issue.
 interface Edit {
   readonly pattern: RegExp;
   readonly message?: string;
@@ -173,13 +166,11 @@ function checkEdit(value: string, edit: Edit, ctx: z.RefinementCtx): void {
   }
 }
 
-/**
- * A single required field edited on its own, the CT01 view key: at most
- * `width` characters, then `emptyMessage` when blank. At most one issue: an
- * over-length value gets only the width issue. The CT02 add form edits its
- * required fields at object level instead, because its issues must follow the
- * audit Order across fields ({@link transactionAddSchema}).
- */
+// A single required field edited on its own, the CT01 view key: at most
+// `width` characters, then `emptyMessage` when blank. At most one issue: an
+// over-length value gets only the width issue. The CT02 add form edits its
+// required fields at object level instead, because its issues must follow the
+// audit Order across fields (`transactionAddSchema`).
 function requiredField(width: number, emptyMessage: string) {
   return z
     .string()
@@ -191,16 +182,14 @@ function requiredField(width: number, emptyMessage: string) {
     });
 }
 
-/** An empty query value is no parameter. */
+// An empty query value is no parameter.
 function omitEmpty(value: string | undefined): string | undefined {
   return value === "" ? undefined : value;
 }
 
-/**
- * An optional query parameter: absent or blank lists without it (the server
- * reads a blank value as absent), anything else must pass `edit`. `""` is sent
- * as no parameter; every other value is sent as entered.
- */
+// An optional query parameter: absent or blank lists without it (the server
+// reads a blank value as absent), anything else must pass `edit`. `""` is sent
+// as no parameter; every other value is sent as entered.
 function optionalParam(edit: Edit, width?: number) {
   const text = width === undefined ? z.string() : z.string().max(width);
   return text
@@ -328,20 +317,20 @@ const transactionAddShape = {
 
 const transactionAddFields = z.object(transactionAddShape);
 
-/** A CT02 field required by VALIDATE-INPUT-DATA-FIELDS, with its empty text. */
+// A CT02 field required by VALIDATE-INPUT-DATA-FIELDS, with its empty text.
 interface AddRequiredField {
   readonly field: TransactionAddKey;
   readonly message: string;
 }
 
-/** A class or format edit of an entered CT02 field, with its audited text. */
+// A class or format edit of an entered CT02 field, with its audited text.
 interface AddFieldEdit {
   readonly field: TransactionAddKey;
   readonly pattern: RegExp;
   readonly message: string;
 }
 
-/** Order 1, VALIDATE-INPUT-KEY-FIELDS: the class test of an entered account ID. */
+// Order 1, VALIDATE-INPUT-KEY-FIELDS: the class test of an entered account ID.
 const ADD_KEY_EDITS = [
   // V-COTRN02C-001, Order 1
   {
@@ -351,10 +340,8 @@ const ADD_KEY_EDITS = [
   },
 ] as const satisfies readonly AddFieldEdit[];
 
-/**
- * Order 3, the blank EVALUATE of VALIDATE-INPUT-DATA-FIELDS
- * [app/cbl/COTRN02C.cbl:L252-317]: the data fields in COTRN02 screen order.
- */
+// Order 3, the blank EVALUATE of VALIDATE-INPUT-DATA-FIELDS
+// [app/cbl/COTRN02C.cbl:L252-317]: the data fields in COTRN02 screen order.
 const ADD_REQUIRED_FIELDS = [
   // V-COTRN02C-008, Order 3
   { field: "tran_type_cd", message: transactionAddMessages.typeCdCanNotBeEmpty },
@@ -380,12 +367,10 @@ const ADD_REQUIRED_FIELDS = [
   { field: "tran_merchant_zip", message: transactionAddMessages.merchantZipCanNotBeEmpty },
 ] as const satisfies readonly AddRequiredField[];
 
-/**
- * Orders 4 to 10, the class and format edits of VALIDATE-INPUT-DATA-FIELDS
- * [app/cbl/COTRN02C.cbl:L322-436], then Order 11, the confirmation edit of
- * PROCESS-ENTER-KEY [app/cbl/COTRN02C.cbl:L182-187]. The CSUTLDTC calendar
- * checks of the dates (Orders 8 and 9) are server-only.
- */
+// Orders 4 to 10, the class and format edits of VALIDATE-INPUT-DATA-FIELDS
+// [app/cbl/COTRN02C.cbl:L322-436], then Order 11, the confirmation edit of
+// PROCESS-ENTER-KEY [app/cbl/COTRN02C.cbl:L182-187]. The CSUTLDTC calendar
+// checks of the dates (Orders 8 and 9) are server-only.
 const ADD_VALUE_EDITS = [
   // V-COTRN02C-019, Order 4
   {
@@ -433,6 +418,11 @@ const ADD_VALUE_EDITS = [
 ] as const satisfies readonly AddFieldEdit[];
 
 /**
+ * COTRN02C PROCESS-ENTER-KEY, VALIDATE-INPUT-KEY-FIELDS,
+ * VALIDATE-INPUT-DATA-FIELDS — P-COTRN02C-004, P-COTRN02C-005, P-COTRN02C-010
+ * to P-COTRN02C-013, P-COTRN02C-016, P-COTRN02C-019; V-COTRN02C-001,
+ * V-COTRN02C-008 to V-COTRN02C-023, V-COTRN02C-026, V-COTRN02C-028.
+ *
  * The COBOL edits of `POST /transactions` in audit (Order, ID) order: the
  * entered account ID's class test, every blank data field, then every class,
  * format and confirmation edit. Each field gets at most one issue, its own
@@ -502,13 +492,12 @@ export const transactionAddSchema = transactionAddFields.superRefine(
   editTransactionAdd,
 ) satisfies z.ZodType<TransactionAddRequest>;
 
-/**
- * VALIDATE-INPUT-KEY-FIELDS [app/cbl/COTRN02C.cbl:L193-230] for a blank account
- * ID. An entered account ID is the key and the card number is then ignored, so
- * the card's numeric edit (V-COTRN02C-002) applies only without one, and with
- * neither entered the account field gets V-COTRN02C-003. An over-length key is
- * left to the width check, which the server answers before any COBOL edit.
- */
+// COTRN02C VALIDATE-INPUT-KEY-FIELDS — P-COTRN02C-006, P-COTRN02C-007
+// [app/cbl/COTRN02C.cbl:L193-230] for a blank account ID. An entered account
+// ID is the key and the card number is then ignored, so the card's numeric
+// edit (V-COTRN02C-002) applies only without one, and with neither entered the
+// account field gets V-COTRN02C-003. An over-length key is left to the width
+// check, which the server answers before any COBOL edit.
 const transactionAddKeyRules = z
   .object({ account_id: z.string(), card_number: z.string() })
   .superRefine(({ account_id, card_number }, ctx) => {
@@ -582,12 +571,14 @@ export type TransactionAddCopiedValues = Omit<
   "account_id" | "card_number" | "confirm"
 >;
 
-/** `MOVE` of a text into a `PIC X(width)` map field: cut at the width. */
+// `MOVE` of a text into a `PIC X(width)` map field: cut at the width.
 function moveText(text: string, width: number): string {
   return text.slice(0, width);
 }
 
 /**
+ * COTRN02C COPY-LAST-TRAN-DATA — P-COTRN02C-026.
+ *
  * `MOVE TRAN-AMT TO WS-TRAN-AMT-E` (`PIC +99999999.99`) [app/cbl/COTRN02C.cbl:L59]
  * [app/cbl/COTRN02C.cbl:L479] of the API's scale-2 decimal string, by string
  * operations: the low-order eight integer digits (the MOVE drops high-order

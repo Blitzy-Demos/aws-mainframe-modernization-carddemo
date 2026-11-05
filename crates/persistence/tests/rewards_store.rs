@@ -192,14 +192,15 @@ async fn seeded(prepared: PreparedSeed) -> (TestStack, Db) {
 
 /// The card the cross-reference maps to `account_id`.
 async fn card_of(db: &Db, account_id: AccountId) -> CardNumber {
-    let card = sqlx::query_scalar!(
+    let card = sqlx::query!(
         "SELECT xref_card_num FROM card_xref WHERE xref_acct_id = $1 \
          ORDER BY xref_card_num LIMIT 1",
         account_id.to_i64()
     )
     .fetch_one(db.pool())
     .await
-    .expect("every fixture account has a card in the cross-reference");
+    .expect("every fixture account has a card in the cross-reference")
+    .xref_card_num;
     CardNumber::from_trimmed(&card).expect("a stored X(16) card number")
 }
 
@@ -284,13 +285,14 @@ fn accrual(
 
 /// The committed `reward_accruals` rows of the transaction row `id`.
 async fn stored_accruals(db: &Db, id: TransactionRowId) -> i64 {
-    sqlx::query_scalar!(
+    sqlx::query!(
         r#"SELECT count(*) AS "count!" FROM reward_accruals WHERE transaction_id = $1"#,
         id.get()
     )
     .fetch_one(db.pool())
     .await
     .expect("the accrual count reads")
+    .count
 }
 
 /// The committed `reward_balances` row of `account_id` as (earned, redeemed,
@@ -917,13 +919,14 @@ fn engine_rollback_and_commit_are_atomic() {
         );
         uow.rollback().await.expect("the unit rolls back");
 
-        let kept = sqlx::query_scalar!(
+        let kept = sqlx::query!(
             r#"SELECT count(*) AS "count!" FROM transactions WHERE transaction_id = $1"#,
             row_id.get()
         )
         .fetch_one(db.pool())
         .await
-        .expect("the transaction count reads");
+        .expect("the transaction count reads")
+        .count;
         assert_eq!(
             kept, 0,
             "the transaction insert rolls back with its accrual"

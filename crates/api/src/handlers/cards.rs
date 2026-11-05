@@ -467,9 +467,10 @@ async fn update(
     let outcome = card_update::update(&mut uow.store(), key, &input).await;
     match outcome {
         Ok(updated) => {
-            // The rewrite stands once committed, so a commit failure is the
-            // only failure that can still undo it; the new token is computed
-            // from the committed record.
+            // The rewrite stands once committed. A `COMMIT` the server
+            // rejects undoes it; one whose answer is lost, its connection
+            // gone, may have committed it, so the card is read again before
+            // a retry. The new token is computed from the committed record.
             uow.commit().await?;
             let version = card_update::record_version(key, &updated.card)?;
             Ok(CardUpdateResponse::from_updated(&updated, &version))

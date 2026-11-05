@@ -33,10 +33,10 @@ import {
 type RewardRuleRequest = components["schemas"]["RewardRuleRequest"];
 type RewardRuleResponse = components["schemas"]["RewardRuleResponse"];
 
-/** Every request-written reward-rule text the schema module can report. */
+// Every request-written reward-rule text the schema module can report.
 const REQUEST_WRITTEN: readonly string[] = Object.values(REWARD_RULE_MESSAGES);
 
-/** A rule every client edit accepts but for its rate, `reward_rate`. */
+// A rule every client edit accepts but for its rate, `reward_rate`.
 function ruleWith(reward_rate: string): RewardRuleFormInput {
   return {
     transaction_type_cd: "01",
@@ -106,13 +106,13 @@ const AMOUNT_FIELDS: readonly AmountField[] = [
   "max_transaction_amount",
 ];
 
-/** The text each amount bound's malformed or out-of-range entry gets. */
+// The text each amount bound's malformed or out-of-range entry gets.
 const AMOUNT_MESSAGES: Record<AmountField, string> = {
   min_transaction_amount: REWARD_RULE_FORM_MESSAGES.minAmountInvalid,
   max_transaction_amount: REWARD_RULE_FORM_MESSAGES.maxAmountInvalid,
 };
 
-/** A rule every client edit accepts but for the amount bound `field`. */
+// A rule every client edit accepts but for the amount bound `field`.
 function ruleWithBound(field: AmountField, value: string): RewardRuleFormInput {
   return { ...ruleWith("1.5"), [field]: value };
 }

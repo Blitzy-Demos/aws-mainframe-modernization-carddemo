@@ -15,6 +15,11 @@
 //! Every abend's stderr is the paragraph's text from its row, the `9910-DISPLAY-IO-STATUS` line
 //! and `ABENDING PROGRAM` of `9999-ABEND-PROGRAM` (P-CBTRN02C-021), and `ABEND` with its
 //! `CEE3ABD` code; the exit code is 16 (AAP 0.5.3.5).
+//!
+//! An `--input` whose records cannot all be read as `CVTRA06Y` records stops the run the same
+//! way, before the main loop and changing nothing, as a setup failure (exit 16) naming the
+//! record: an endless input without line ends, `/dev/zero`, at its first record, and a long file
+//! whose last record does not decode at that record.
 
 pub mod common;
 
@@ -23,7 +28,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use carddemo_audit::{Document, PARITY_COMMON_COLUMNS};
-use common::{Harness, TRANREPT_CLOCK, block_on, expected_value, parity, parity_cell};
+use carddemo_codec::{CodecError, CodecErrorKind, DailyTranLayout, Layout, decode_ascii_file};
+use common::{
+    Harness, TRANREPT_CLOCK, block_on, expected_value, fixture_lines, parity, parity_cell,
+};
 
 /// The exit code of an abend (AAP 0.5.3.5).
 const ABEND_EXIT: i32 = 16;
@@ -62,6 +70,12 @@ const COUNTS_EVENT: &str = r#""message":"end of job counts""#;
 
 /// The `--input` a missing-file case names, under the statement directory.
 const MISSING_INPUT: &str = "DALYTRAN.missing";
+
+/// The prefix of the one stderr line of a setup failure.
+const SETUP_FAILURE: &str = "SETUP FAILURE: ";
+
+/// The copies of the fixture day the long-input case reads: 30 000 records.
+const LONG_INPUT_DAYS: usize = 100;
 
 /// The transaction master missing, and back.
 const HIDE_MASTER: &str = "ALTER VIEW transaction_master RENAME TO transaction_master_offline";
@@ -410,6 +424,72 @@ fn failed_opens_and_first_read_abend_in_cobol_order_and_change_nothing() {
             run_case(&h, &doc, &faults, (step.row, step.status), ABEND_EXIT);
         }
     }
+}
+
+#[test]
+fn inputs_that_do_not_read_as_records_fail_before_any_posting_and_change_nothing() {
+    // P-CBTRN02C-007: every record of DALYTRAN is read, one line at a time, and decoded before
+    // the first one is processed. /dev/zero, which never ends and holds no line end, fails at
+    // its first record once the 352 bytes of a record and a CR LF line end hold no LF; a long
+    // file whose last record does not decode fails at that record. Neither posts a record,
+    // accrues a reward or adds a generation.
+    let h = Harness::new();
+    let day = fixture_lines("dailytran.txt");
+    let mut long_input = Vec::new();
+    for _ in 0..LONG_INPUT_DAYS {
+        for line in &day {
+            long_input.extend_from_slice(line);
+            long_input.push(b'\n');
+        }
+    }
+    // DALYTRAN-AMT of the last record starts at byte 132 of its 350; a letter there is not a
+    // zoned digit.
+    let last_amount = long_input.len() - (DailyTranLayout::LEN + 1) + 132;
+    long_input[last_amount] = b'X';
+    let last_undecodable = decode_ascii_file::<DailyTranLayout>(&long_input)
+        .expect_err("the last record does not decode");
+    assert_eq!(
+        last_undecodable.record,
+        Some(LONG_INPUT_DAYS * day.len()),
+        "{last_undecodable}"
+    );
+    let long_path = h.statement_dir().join("DALYTRAN.last-undecodable");
+    fs::write(&long_path, &long_input)
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", long_path.display()));
+    let endless = CodecError::new(
+        DailyTranLayout::NAME,
+        CodecErrorKind::RecordTooLong {
+            stored_len: DailyTranLayout::LEN + 2,
+        },
+    )
+    .at_record(1);
+    let cases = [
+        ("/dev/zero", PathBuf::from("/dev/zero"), endless),
+        ("a long file", long_path.clone(), last_undecodable),
+    ];
+    for (case, input, refused) in cases {
+        let before = (files(&h), batch_contents(h.batch_dir()));
+        let path = input
+            .to_str()
+            .expect("the test directories have UTF-8 paths");
+        let output = h.run_expect(
+            &["posttran", "--input", path],
+            Some(TRANREPT_CLOCK),
+            ABEND_EXIT,
+        );
+        assert_eq!(
+            lines(&output.stderr),
+            [format!("{SETUP_FAILURE}{refused}")],
+            "{case}"
+        );
+        assert_eq!(
+            (files(&h), batch_contents(h.batch_dir())),
+            before,
+            "{case}: no record is posted and no generation is added"
+        );
+    }
+    fs::remove_file(&long_path)
+        .unwrap_or_else(|error| panic!("cannot remove {}: {error}", long_path.display()));
 }
 
 /// The exit code of the loaded-master escalation row: `reproduced: exit <code>`.
