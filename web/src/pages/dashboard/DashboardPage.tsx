@@ -187,7 +187,7 @@ function OverviewSkeleton(): JSX.Element {
           <Skeleton className="h-8 w-32" />
         </div>
       </div>
-      <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
         <SummaryCardSkeleton />
         <SummaryCardSkeleton />
         <SummaryCardSkeleton />
@@ -337,9 +337,12 @@ function AccountOverview({
       </div>
 
       {/* The four cards fill every row they take: one column at md, two
-          rows of two at lg and one row of four at xl. OverviewSkeleton uses
-          the same grid. */}
-      <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-4">
+          rows of two at lg and xl, and one row of four at 2xl. A short figure
+          is full size in every card; a long one, such as a 16-digit point
+          total, steps down with its card's width (SummaryCard), and keeps its
+          full size two to a row from 1280px up. OverviewSkeleton uses the
+          same grid. */}
+      <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
         <SummaryCard
           title="Current Balance"
           value={account.data.acct_curr_bal}

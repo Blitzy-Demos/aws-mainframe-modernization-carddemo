@@ -36,6 +36,7 @@ import { adminMenu, MENU_SECTION_LABELS, userMenu, type MenuEntry } from "../src
 
 import {
   APP_ROUTES,
+  assertDigits,
   assertFixtureKeys,
   assertMessagesMatchCatalog,
   checkpoint,
@@ -48,6 +49,7 @@ import {
   expectScreen,
   FIXTURE_KEYS,
   functionMap,
+  gotoApp,
   isRequestTo,
   latestTranId,
   mapControl,
@@ -56,13 +58,14 @@ import {
   nameMatcher,
   nextTranId,
   psql,
+  reloadApp,
   repoPath,
   resolveRoute,
   routePattern,
   rowEndpoint,
   rowInput,
   routeScope,
-  seedPendingAuthorization,
+  seedPendingAuthorizations,
   sidebar,
   sidebarLink,
   signIn,
@@ -79,7 +82,7 @@ import {
   type MapRow,
   type Role,
   type RouteParams,
-  type SeededAuthorization,
+  type SeededAuthorizations,
 } from "./fixtures";
 
 // The 21 BMS maps of the carried online programs (AAP 0.9.1).
@@ -525,7 +528,7 @@ async function exercise(
   }
   const check = checkOf(row, control);
   if (check === "signs-off" && role !== null) {
-    await page.goto(control.route);
+    await gotoApp(page, control.route);
     await signOut(page, role);
     return;
   }
@@ -534,7 +537,7 @@ async function exercise(
     await sidebarLink(page, control.name).click();
     await expect(page).toHaveURL(urlPath(control.route));
     await expectScreen(page);
-    await page.goto(menuScreenOf(row));
+    await gotoApp(page, menuScreenOf(row));
     const option = (await menuScreenList(page)).getByRole("link", { name: control.name, exact: true });
     await expect(option).toBeVisible();
     await option.click();
@@ -542,7 +545,7 @@ async function exercise(
     await expectScreen(page);
     return;
   }
-  await page.goto(resolveRoute(nav.start?.(params) ?? control.route, params));
+  await gotoApp(page, resolveRoute(nav.start?.(params) ?? control.route, params));
   if (nav.reveal !== undefined) {
     await nav.reveal(page, params);
   }
@@ -622,13 +625,13 @@ test("ADMIN001 signs on and loads the dashboard", { tag: "@smoke" }, async ({ pa
   // signIn waits for ADMIN001's landing route, /admin.
   await signIn(page, "admin");
   await expectScreen(page);
-  await page.goto("/");
+  await gotoApp(page, "/");
   await expectScreen(page);
   await expect(mapInput(content(page), rowInput("F-COACTVW-001", 0))).toBeEditable();
   const lookup = controlLocator(page, mapControl("F-COACTVW-001"));
   await expect(lookup).toBeVisible();
   // The session lives in sessionStorage, so a reload of the tab keeps it.
-  await page.reload();
+  await reloadApp(page);
   await expect(page).toHaveURL(urlPath("/"));
   await expect(lookup).toBeVisible();
 });
@@ -711,14 +714,14 @@ test.describe("breadcrumb trail", () => {
   ] as const) {
     test(`every crumb of ${route} opens its screen (PF3)`, async ({ page }) => {
       await signIn(page, role);
-      await page.goto(route);
+      await gotoApp(page, route);
       await expect(crumbLinks(page).first()).toBeVisible();
       const targets = await crumbLinks(page).evaluateAll((links) =>
         links.map((link) => new URL(link.getAttribute("href") ?? "", document.baseURI).pathname),
       );
       expect(targets.length, "a nested route has crumbs above it").toBeGreaterThan(0);
       for (const [index, target] of targets.entries()) {
-        await page.goto(route);
+        await gotoApp(page, route);
         await crumbLinks(page).nth(index).click();
         await expect(page, `crumb ${index + 1} of ${route}`).toHaveURL(urlPath(target));
         await expectScreen(page);
@@ -729,19 +732,20 @@ test.describe("breadcrumb trail", () => {
 
 test.describe("with seeded keys", () => {
   let params: NavParams | undefined;
-  let seeded: SeededAuthorization[] = [];
+  let seeded: SeededAuthorizations | undefined;
   let extraRows: Checkpoint | undefined;
   let seededTransaction: Checkpoint | undefined;
 
-  // A TRAN-ID for /transactions/:tranId: the highest of the live master. The
-  // master is empty when no `batch posttran` ran after the seed, or after
-  // `batch tranbkp`, and CT02 then refuses every add (STARTBR NOTFND,
-  // P-COTRN02C-021, E-27), so no API call can supply one. One live purchase
-  // of account 1's card is then written as COTRN02C would store it, with the
-  // first TRAN-ID of an empty file, and afterAll removes it again.
-  async function routeTranId(): Promise<string> {
-    if ((await psql("SELECT count(*) FROM transaction_master")) !== "0") {
-      return latestTranId();
+  // A TRAN-ID for /transactions/:tranId: the highest of the live master,
+  // `latest`, which is "" when the master is empty. It is empty when no
+  // `batch posttran` ran after the seed, or after `batch tranbkp`, and CT02
+  // then refuses every add (STARTBR NOTFND, P-COTRN02C-021, E-27), so no API
+  // call can supply one. One live purchase of account 1's card is then
+  // written as COTRN02C would store it, with the first TRAN-ID of an empty
+  // file, and afterAll removes it again.
+  async function routeTranId(latest: string): Promise<string> {
+    if (latest !== "") {
+      return assertDigits(latest, 16);
     }
     const tranId = await nextTranId();
     seededTransaction = await transactionWriteCheckpoint([FIXTURE_KEYS.account]);
@@ -760,61 +764,70 @@ test.describe("with seeded keys", () => {
   }
 
   test.beforeAll(async () => {
-    // Up to 52 psql fixture calls, each a `docker compose exec` round trip of
-    // up to ~3 s on a loaded host: past the test timeout in
-    // playwright.config.ts that a hook otherwise inherits.
+    // Up to 11 psql fixture calls (6 when the live master holds a
+    // transaction), each a `docker compose exec` round trip of up to ~3 s on
+    // a loaded host. A stalled call reports its error only after its bounds
+    // and its reap (psql() in e2e/fixtures.ts), up to about 140 s: past the
+    // test timeout in playwright.config.ts that a hook otherwise inherits.
     test.setTimeout(240_000);
     // A second page on the user and transaction-type lists: one row more
     // than a page holds, copied from USER0001 (its password hash included)
-    // and numbered down from type 97.
+    // and numbered down from type 97. One statement inserts both and checks
+    // the result; its reads see the tables as they were before its inserts,
+    // so the check adds the rows inserted to the counts read.
     extraRows = await checkpoint([
       { table: "users", where: `user_id LIKE ${sqlLiteral(`${EXTRA_USER_PREFIX}%`)}` },
       { table: "transaction_types", where: EXTRA_TYPE_CODES },
     ]);
-    await psql(
-      `INSERT INTO users (user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type)
-       SELECT ${sqlLiteral(EXTRA_USER_PREFIX)} || lpad(n::text, 2, '0'), 'Nav', 'Probe', u.password_hash, 'U'
-         FROM users u,
-              generate_series(1, greatest(0, ${sqlLiteral(USER_PAGE_ROWS)}::bigint + 1 - (SELECT count(*) FROM users))) AS n
-        WHERE u.user_id = ${sqlLiteral(USERS.user.userId)}`,
-    );
-    await psql(
-      `INSERT INTO transaction_types (tr_type, tr_description)
-       SELECT lpad((98 - n)::text, 2, '0'), 'E2E NAV TYPE ' || n
-         FROM generate_series(1, greatest(0, ${sqlLiteral(TYPE_PAGE_ROWS)}::bigint + 1 - (SELECT count(*) FROM transaction_types))) AS n`,
-    );
     expect(
       await psql(
-        `SELECT (SELECT count(*) FROM users) > ${sqlLiteral(USER_PAGE_ROWS)}::bigint
-            AND (SELECT count(*) FROM transaction_types) > ${sqlLiteral(TYPE_PAGE_ROWS)}::bigint`,
+        `WITH new_users AS (
+         INSERT INTO users (user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type)
+         SELECT ${sqlLiteral(EXTRA_USER_PREFIX)} || lpad(n::text, 2, '0'), 'Nav', 'Probe', u.password_hash, 'U'
+           FROM users u,
+                generate_series(1, greatest(0, ${sqlLiteral(USER_PAGE_ROWS)}::bigint + 1 - (SELECT count(*) FROM users))) AS n
+          WHERE u.user_id = ${sqlLiteral(USERS.user.userId)}
+         RETURNING user_id
+         ), new_types AS (
+         INSERT INTO transaction_types (tr_type, tr_description)
+         SELECT lpad((98 - n)::text, 2, '0'), 'E2E NAV TYPE ' || n
+           FROM generate_series(1, greatest(0, ${sqlLiteral(TYPE_PAGE_ROWS)}::bigint + 1 - (SELECT count(*) FROM transaction_types))) AS n
+         RETURNING tr_type
+         )
+         SELECT (SELECT count(*) FROM users) + (SELECT count(*) FROM new_users) > ${sqlLiteral(USER_PAGE_ROWS)}::bigint
+            AND (SELECT count(*) FROM transaction_types) + (SELECT count(*) FROM new_types)
+                > ${sqlLiteral(TYPE_PAGE_ROWS)}::bigint`,
       ),
       "the user and type lists have a second page",
     ).toBe("t");
     // A second page of account 1's authorizations: older ones first, so the
-    // two the cases name stay the newest under the account.
-    for (let older = 1; older < AUTH_PAGE_ROWS; older += 1) {
-      seeded = [...seeded, await seedPendingAuthorization(FIXTURE_KEYS.account)];
-    }
-    const unreported = await seedPendingAuthorization(FIXTURE_KEYS.account);
-    seeded = [...seeded, unreported];
-    const reported = await seedPendingAuthorization(FIXTURE_KEYS.account, { fraud: "F" });
-    seeded = [...seeded, reported];
+    // two the cases name, one unreported and one reported as fraud, stay the
+    // newest under the account.
+    const older = Array.from({ length: AUTH_PAGE_ROWS - 1 }, (): "" => "");
+    seeded = await seedPendingAuthorizations(FIXTURE_KEYS.account, [...older, "", "F"]);
+    const [unreported, reported] = seeded.authIds.slice(older.length);
+    // The highest TRAN-ID of the live master ("" when it is empty) and the
+    // lowest rule ID, read together.
+    const [latestTran = "", ruleId = ""] = (
+      await psql(
+        `SELECT coalesce((SELECT max(tran_id) FROM transaction_master), '')
+                || '|' || coalesce((SELECT min(rule_id) FROM reward_rules)::text, '')`,
+      )
+    ).split("|");
     params = {
       accountId: FIXTURE_KEYS.account,
       cardNumber: FIXTURE_KEYS.card,
-      tranId: await routeTranId(),
-      authId: unreported.authId,
-      reportedAuthId: reported.authId,
+      tranId: await routeTranId(latestTran),
+      authId: unreported,
+      reportedAuthId: reported,
       userId: USERS.user.userId,
       code: FIXTURE_KEYS.tranType,
-      ruleId: await psql("SELECT min(rule_id) FROM reward_rules"),
+      ruleId,
     };
   });
 
   test.afterAll(async () => {
-    for (const authorization of [...seeded].reverse()) {
-      await authorization.restore();
-    }
+    await seeded?.restore();
     await extraRows?.restore();
     await seededTransaction?.restore();
   });
@@ -829,13 +842,13 @@ test.describe("with seeded keys", () => {
   test.describe("every route", () => {
     test("/login shows the sign-on form when signed out", async ({ page }) => {
       const control = mapControl("F-COSGN00-001");
-      await page.goto("/login");
+      await gotoApp(page, "/login");
       await expect(controlLocator(page, control)).toBeVisible();
     });
 
     for (const route of APP_ROUTES.filter((r) => r.access !== "public")) {
       test(`${route.path} signed out goes to /login`, async ({ page }) => {
-        await page.goto(resolveRoute(route.path, keys()));
+        await gotoApp(page, resolveRoute(route.path, keys()));
         await expect(page).toHaveURL(urlPath("/login"));
       });
 
@@ -843,7 +856,7 @@ test.describe("with seeded keys", () => {
         test(`${route.path} as ${USERS[role].userId}`, async ({ page }) => {
           await signIn(page, role);
           const path = resolveRoute(route.path, keys());
-          await page.goto(path);
+          await gotoApp(page, path);
           if (route.access === "admin" && role === "user") {
             await expect(page).toHaveURL(urlPath("/"));
             await expectMessage(page, MESSAGES.ADMIN_ACCESS_REQUIRED);

@@ -16,16 +16,23 @@
 //
 // Each redirect is a Redirect, which shows the page skeleton until the router
 // has downloaded the destination's page and commits it.
+//
+// Both checks are lib/session.ts's sessionAdmits, the rule the page loaders
+// and the page title apply as well. App.tsx places each guard through
+// guardRoute, which also marks the route's handle with the access the guard
+// requires, so the page title (usePageTitle) never names a screen the guard
+// sends the user away from.
 import { useEffect, type ReactNode } from "react";
-import { Outlet, useLocation } from "react-router";
+import { Outlet, useLocation, type RouteObject } from "react-router";
 import { toast } from "sonner";
 
+import type { AccessHandle, RouteHandle } from "@/components/page-header";
 import { showApiError } from "@/lib/api-errors";
 import {
-  isAdmin,
+  sessionAdmits,
   takeSessionEndCause,
   useSession,
-  type Session,
+  type RouteAccess,
 } from "@/lib/session";
 import { Redirect } from "@/routes/page-fallbacks";
 
@@ -38,17 +45,6 @@ const ADMIN_ACCESS_REQUIRED = "Admin access required";
 // shown instead of adding another, so StrictMode's second effect run and
 // repeated redirects show a single notification.
 const ADMIN_TOAST_ID = "admin-access-required";
-
-// useSession already withholds an expired session; the guard checks expiry
-// itself as well, so a redirect never depends on when the store last looked.
-// An unparsable expires_at counts as expired.
-function isLive(session: Session | null): session is Session {
-  if (session === null) {
-    return false;
-  }
-  const expiresAtMs = Date.parse(session.expires_at);
-  return Number.isFinite(expiresAtMs) && expiresAtMs > Date.now();
-}
 
 // Once the session has ended, shows what ended it, when that was a server
 // answer (the API client's 401), through the application's error display.
@@ -83,7 +79,9 @@ type GuardProps = {
 export function RequireAuth({ children }: GuardProps): ReactNode {
   const session = useSession();
   const location = useLocation();
-  const live = isLive(session);
+  // useSession already withholds an expired session; sessionAdmits checks the
+  // expiry as well, so a redirect never depends on when the store last looked.
+  const live = sessionAdmits(session, "signed-on");
   useSessionEndNotice(live);
 
   if (!live) {
@@ -108,8 +106,8 @@ export function RequireAuth({ children }: GuardProps): ReactNode {
 export function RequireAdmin({ children }: GuardProps): ReactNode {
   const session = useSession();
   const location = useLocation();
-  const live = isLive(session);
-  const admin = live && isAdmin(session);
+  const live = sessionAdmits(session, "signed-on");
+  const admin = sessionAdmits(session, "admin");
   useSessionEndNotice(live);
 
   // Toasting is a side effect, so it runs after the commit, never in render.
@@ -126,4 +124,31 @@ export function RequireAdmin({ children }: GuardProps): ReactNode {
     return <Redirect to="/" replace />;
   }
   return children ?? <Outlet />;
+}
+
+/** The access a guard requires: RequireAuth's, or RequireAdmin's. */
+export type GuardedAccess = Exclude<RouteAccess, "public">;
+
+/** The properties a guard route takes from guardRoute. */
+export type GuardRoute = Pick<RouteObject, "element" | "handle">;
+
+/**
+ * The properties of the layout route that `access` guards, spread into its
+ * route object, so the guard and the record of what it requires are declared
+ * once and together:
+ *
+ * - element: RequireAuth for "signed-on", RequireAdmin for "admin".
+ * - handle: `handle`, the route's own crumb and title when it has them, marked
+ *   with `access` (AccessHandle). usePageTitle stops at the first matched
+ *   route whose access the session lacks, so the document title and the
+ *   shell's announcement never name the screen the guard redirects away from.
+ */
+export function guardRoute(
+  access: GuardedAccess,
+  handle?: RouteHandle,
+): GuardRoute {
+  return {
+    element: access === "admin" ? <RequireAdmin /> : <RequireAuth />,
+    handle: { ...handle, access } satisfies AccessHandle,
+  };
 }

@@ -13,9 +13,12 @@
 //   sources are left out, because they name the stores to assert on them, and
 //   this file holds the tokens. index.css is not scanned: a style sheet cannot
 //   reach a browser store.
-// - A runtime render of the authenticated shell (AppLayout under the providers
-//   of main.tsx) that toggles the sidebar and the theme through their own
-//   controls, then finds no cookie and no localStorage entry.
+// - A runtime render of the authenticated shell (AppLayout under the root
+//   route's AppRoot, as App.tsx nests them, and the providers of main.tsx)
+//   that toggles the sidebar and the theme through their own controls and
+//   fires pagehide, when a page makes its last writes, then finds no cookie,
+//   no localStorage entry, and in sessionStorage exactly the session and the
+//   theme.
 //
 // The file is .ts, so elements are built with createElement rather than JSX.
 import { createElement } from "react";
@@ -26,7 +29,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppLayout } from "@/components/app-layout";
-import { ThemeProvider } from "@/components/theme-provider";
+import { THEME_STORAGE_KEY, ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   clearSession,
@@ -34,6 +37,7 @@ import {
   setSession,
   type Session,
 } from "@/lib/session";
+import { AppRoot } from "@/routes/app-root";
 
 // The persistent-store tokens of AAP 0.4.1: the cookie API and its lifetime
 // attributes, and the two persistent Web Storage and database APIs.
@@ -260,10 +264,18 @@ describe("persistent stores at runtime", () => {
     const router = createMemoryRouter(
       [
         {
-          path: "/",
-          element: createElement(AppLayout),
+          element: createElement(AppRoot),
           children: [
-            { index: true, element: createElement("p", null, "Shell content") },
+            {
+              path: "/",
+              element: createElement(AppLayout),
+              children: [
+                {
+                  index: true,
+                  element: createElement("p", null, "Shell content"),
+                },
+              ],
+            },
           ],
         },
       ],
@@ -308,9 +320,19 @@ describe("persistent stores at runtime", () => {
       expect(document.documentElement.classList.contains("dark")).toBe(true);
     });
 
+    // A page writes what it keeps for its next load at the latest on pagehide.
+    window.dispatchEvent(new Event("pagehide"));
+
     expect(document.cookie).toBe("");
     expect(localStorage.length).toBe(0);
-    // The session store is the one in use.
-    expect(sessionStorage.getItem(SESSION_STORAGE_KEY)).not.toBeNull();
+    // The session store is the one in use, and it holds the session and the
+    // theme alone (AAP 0.4.1), so any third key fails.
+    const sessionKeys = Array.from(
+      { length: sessionStorage.length },
+      (_, index) => sessionStorage.key(index),
+    ).sort();
+    expect(sessionKeys).toEqual(
+      [SESSION_STORAGE_KEY, THEME_STORAGE_KEY].sort(),
+    );
   });
 });

@@ -2,8 +2,9 @@
 // a change of pathname other than the document load moves focus to the page
 // content, unless the new page placed focus on one of its own controls, and
 // the shell's status region announces the title PageHeader shows. The
-// document load and a change of the search string alone do neither, and two
-// consecutive destinations with one title are each announced. While the
+// document load and a change of the search string alone do neither, two
+// consecutive destinations with one title are each announced, and a screen
+// RequireAdmin refuses a regular user is never announced. While the
 // chunk of the page a navigation to another pathname goes to downloads, the
 // page content shows the loading skeleton and is marked busy, until that page
 // renders. A navigation to a page whose chunk has arrived, Back included,
@@ -34,6 +35,7 @@ import { Input } from "@/components/ui/input";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { clearSession, setSession, type Session } from "@/lib/session";
 import { menu, type MenuEntry } from "@/nav/menu";
+import { guardRoute } from "@/routes/guards";
 import {
   lazyPage,
   pageDownloadsInFlight,
@@ -186,6 +188,24 @@ const routes: RouteObject[] = [
         path: "transaction-types/:code/edit",
         element: <PlainPage />,
         handle: TYPE_MAINTENANCE,
+      },
+      {
+        // Under RequireAdmin as App.tsx places it.
+        path: "admin",
+        ...guardRoute("admin", {
+          title: "Admin Menu",
+          crumb: "Administration",
+        }),
+        children: [
+          {
+            path: "users",
+            element: <PlainPage />,
+            handle: {
+              title: "List Users",
+              crumb: "User List",
+            } satisfies RouteHandle,
+          },
+        ],
       },
     ],
   },
@@ -396,6 +416,30 @@ describe("AppLayout route changes", () => {
     expect(statusRegion().childElementCount).toBe(1);
     expect(statusRegion().textContent).toBe(TYPE_MAINTENANCE.title);
     expect(document.activeElement).toBe(pageContent());
+  });
+
+  it("announces only the main menu, never the refused screen, when RequireAdmin sends a regular user back", async () => {
+    const { router } = renderShell("/");
+    await expectPage(SHELL_HANDLE.title);
+    const announced: string[] = [];
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          announced.push(node.textContent ?? "");
+        }
+      }
+    });
+    observer.observe(statusRegion(), { childList: true, subtree: true });
+
+    await act(() => router.navigate("/admin/users"));
+
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe("/");
+    });
+    await expectAnnounced(SHELL_HANDLE.title);
+    observer.disconnect();
+    expect(announced.length).toBeGreaterThan(0);
+    expect(new Set(announced)).toEqual(new Set([SHELL_HANDLE.title]));
   });
 
   it("treats the shell's first render after an in-app navigation, the sign-on landing, as a route change", async () => {

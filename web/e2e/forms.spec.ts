@@ -25,19 +25,22 @@
 //   DELETE), except a write held at `halt`, whose 500 is asserted instead.
 // - Keys this spec creates (a user ID, a type code) are chosen per run so no
 //   seeded row and no row of an interrupted earlier run holds them.
-import type { APIResponse, Locator, Page, Request, Response, Route } from "@playwright/test";
+import type { Locator, Page, Request, Response } from "@playwright/test";
 
 import {
-  apiPath,
   assertDigits,
+  captureResponse,
+  cellUnder,
   checkpoint,
   confirmDialog,
   content,
   controlLocator,
+  dataRows,
   expect,
   expectMessage,
   expectScreen,
   FIXTURE_KEYS,
+  gotoApp,
   isRequestTo,
   latestTranId,
   mapControl,
@@ -59,6 +62,7 @@ import {
   sidebar,
   signInWithKeyboard,
   sqlLiteral,
+  tableByCaption,
   tabTo,
   test,
   transactionWriteCheckpoint,
@@ -300,7 +304,7 @@ async function pagesForwardAndBack(page: Page, nextId: string, previousId: strin
 test.describe("keyboard path", () => {
   test("skip link first, then the sidebar, then the page content", async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto("/");
+    await gotoApp(page, "/");
     // Pages load lazily inside the shell: a Tab pressed while the content is
     // still empty finds nothing after it and wraps back to the skip link.
     await expectScreen(page);
@@ -318,7 +322,7 @@ test.describe("keyboard path", () => {
 
   test("a dialog traps focus and Escape closes it, back on its opener (F-COBIL00-001)", async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-COBIL00-001").route);
+    await gotoApp(page, mapControl("F-COBIL00-001").route);
     await submitFrom(page, input(page, "F-COBIL00-001", 0), FIXTURE_KEYS.account);
     await expectDialogTrapsFocus(page, confirmDialog(page), rowEndpoint("F-COBIL00-002"));
     await expect(input(page, "F-COBIL00-001", 0)).toBeFocused();
@@ -334,7 +338,7 @@ test.describe("sign-on form (F-COSGN00-001)", () => {
   const password = (page: Page): Locator => mapInput(page, rowInput("F-COSGN00-001", 1));
 
   test.beforeEach(async ({ page }) => {
-    await page.goto(mapControl("F-COSGN00-001").route);
+    await gotoApp(page, mapControl("F-COSGN00-001").route);
   });
 
   test("rejects a blank user ID and puts the cursor there (V-COSGN00C-001, USERID)", async ({ page }) => {
@@ -406,7 +410,7 @@ test.describe("sign-on form (F-COSGN00-001)", () => {
 test.describe("account lookup (F-COACTVW-001, F-COACTVW-002, F-COACTUP-001)", () => {
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-COACTVW-001").route);
+    await gotoApp(page, mapControl("F-COACTVW-001").route);
   });
 
   test("rejects an all-zero account number (V-COACTVWC-002, ACCTSID)", async ({ page }) => {
@@ -462,7 +466,7 @@ test.describe("account view key form (F-COACTVW-001, F-COACTVW-002)", () => {
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
     await expectRead(page, FIXTURE_KEYS.account, async () => {
-      await page.goto(viewRoute(FIXTURE_KEYS.account));
+      await gotoApp(page, viewRoute(FIXTURE_KEYS.account));
     });
     await expectAccountShown(page, FIXTURE_KEYS.account, FIXTURE_KEYS.card);
   });
@@ -537,7 +541,7 @@ test.describe("account update (F-COACTUP-002, F-COACTUP-004, F-COACTUP-005, F-CO
 
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(editRoute);
+    await gotoApp(page, editRoute);
     await expect(creditLimit(page)).toBeVisible();
   });
 
@@ -587,7 +591,7 @@ test.describe("account update (F-COACTUP-002, F-COACTUP-004, F-COACTUP-005, F-CO
 test.describe("card list (F-COCRDLI-001, F-COCRDLI-003, F-COCRDLI-004, F-COCRDLI-005)", () => {
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-COCRDLI-001").route);
+    await gotoApp(page, mapControl("F-COCRDLI-001").route);
   });
 
   test("rejects an account filter that is not 11 digits (V-COCRDLIC-001, ACCTSID)", async ({ page }) => {
@@ -628,7 +632,7 @@ test.describe("card update (F-COCRDLI-006, F-COCRDUP-002, F-COCRDUP-004, F-COCRD
 
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-COCRDLI-001").route);
+    await gotoApp(page, mapControl("F-COCRDLI-001").route);
     await submitFrom(page, input(page, "F-COCRDLI-001", 0), FIXTURE_KEYS.account);
     await pressControl(page, rowsWith(page, FIXTURE_KEYS.card).getByRole("link", { name: mapControl("F-COCRDLI-006").name, exact: true }));
     await expect(page).toHaveURL(urlPath(`/cards/${FIXTURE_KEYS.card}/edit`));
@@ -672,7 +676,7 @@ test.describe("card update (F-COCRDLI-006, F-COCRDUP-002, F-COCRDUP-004, F-COCRD
 test.describe("transaction list (F-COTRN00-001, F-COTRN00-003, F-COTRN00-004, F-COTRN00-005, F-COTRN01-002, F-COTRN01-004)", () => {
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-COTRN00-001").route);
+    await gotoApp(page, mapControl("F-COTRN00-001").route);
   });
 
   test("rejects a start key that is not numeric (V-COTRN00C-004, TRNIDIN)", async ({ page }) => {
@@ -738,7 +742,7 @@ test.describe("transaction add (F-COTRN02-001, F-COTRN02-002, F-COTRN02-003, F-C
 
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-COTRN02-001").route);
+    await gotoApp(page, mapControl("F-COTRN02-001").route);
   });
 
   test("rejects an add with neither account nor card (V-COTRN02C-003, ACTIDIN)", async ({ page }) => {
@@ -798,7 +802,7 @@ test.describe("transaction add (F-COTRN02-001, F-COTRN02-002, F-COTRN02-003, F-C
 test.describe("transaction reports (F-CORPT00-001, F-CORPT00-002, F-CORPT00-003, F-CORPT00-004)", () => {
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-CORPT00-001").route);
+    await gotoApp(page, mapControl("F-CORPT00-001").route);
   });
 
   test("rejects a report without a type (V-CORPT00C-001, MONTHLY)", async ({ page }) => {
@@ -866,7 +870,7 @@ test.describe("bill payment (F-COBIL00-001, F-COBIL00-002, F-COBIL00-003, F-COBI
 
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-COBIL00-001").route);
+    await gotoApp(page, mapControl("F-COBIL00-001").route);
   });
 
   test("rejects a blank account ID (V-COBIL00C-001, ACTIDIN)", async ({ page }) => {
@@ -929,7 +933,7 @@ test.describe("pending authorizations (F-COPAU00-001, F-COPAU00-005, F-COPAU01-0
 
   test.beforeEach(async ({ page }) => {
     await signInWithKeyboard(page, "user");
-    await page.goto(mapControl("F-COPAU00-001").route);
+    await gotoApp(page, mapControl("F-COPAU00-001").route);
   });
 
   test("rejects a blank account ID (V-COPAUS0C-001, ACCTID)", async ({ page }) => {
@@ -1006,7 +1010,7 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
 
   // The list started at the new user (F-COUSR00-001), whose row is first.
   async function listFromNewUser(page: Page): Promise<Locator> {
-    await page.goto(mapControl("F-COUSR00-001").route);
+    await gotoApp(page, mapControl("F-COUSR00-001").route);
     await submitFrom(page, input(page, "F-COUSR00-001", 0), NEW_USER_ID);
     const row = rowsWith(page, NEW_USER_ID);
     await expect(row).toHaveCount(1);
@@ -1028,27 +1032,27 @@ test.describe("users (F-COUSR00-001, F-COUSR00-005, F-COUSR00-006, F-COUSR01-001
   }
 
   test("add rejects a blank first name (V-COUSR01C-001, FNAME)", async ({ page }) => {
-    await page.goto(mapControl("F-COUSR01-001").route);
+    await gotoApp(page, mapControl("F-COUSR01-001").route);
     await enterOn(page, "F-COUSR01-001");
     await expectFieldError(page, textbox(page, labels.firstName), MESSAGES.FIRST_NAME_CAN_NOT_BE_EMPTY);
   });
 
   test("add rejects a user ID already on file (V-COUSR01C-006, USERID)", async ({ page }) => {
-    await page.goto(mapControl("F-COUSR01-001").route);
+    await gotoApp(page, mapControl("F-COUSR01-001").route);
     await fillNewUser(page, USERS.admin.userId);
     await page.keyboard.press("Enter");
     await expectFieldError(page, textbox(page, labels.userId), MESSAGES.USER_ID_ALREADY_EXIST);
   });
 
   test("add: Reset clears the form", async ({ page }) => {
-    await page.goto(mapControl("F-COUSR01-001").route);
+    await gotoApp(page, mapControl("F-COUSR01-001").route);
     await typeInto(page, textbox(page, labels.firstName), "Edith");
     await enterOn(page, "F-COUSR01-003");
     await expect(textbox(page, labels.firstName)).toHaveValue("");
   });
 
   test("adds the user", async ({ page }) => {
-    await page.goto(mapControl("F-COUSR01-001").route);
+    await gotoApp(page, mapControl("F-COUSR01-001").route);
     await fillNewUser(page, NEW_USER_ID);
     await expectWrite(page, rowEndpoint("F-COUSR01-001"), () => enterOn(page, "F-COUSR01-001"));
     await expectMessage(page, `${MESSAGES.USER_LABEL}${NEW_USER_ID}${MESSAGES.HAS_BEEN_ADDED}`);
@@ -1174,7 +1178,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
   }
 
   async function addNewType(page: Page, text: string): Promise<void> {
-    await page.goto(mapControl("F-COTRTUP-001").route);
+    await gotoApp(page, mapControl("F-COTRTUP-001").route);
     await submitFrom(page, typeCode(page), newTypeCode);
     await typeInto(page, description(page), text);
     await expectWrite(page, rowEndpoint("F-COTRTUP-003"), () => enterOn(page, "F-COTRTUP-003"));
@@ -1182,7 +1186,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
   }
 
   test("look-up rejects a blank and a non-numeric type code (V-COTRTUPC-001, V-COTRTUPC-002, TRTYPCD)", async ({ page }) => {
-    await page.goto(mapControl("F-COTRTUP-001").route);
+    await gotoApp(page, mapControl("F-COTRTUP-001").route);
     await enterOn(page, "F-COTRTUP-001");
     await expectFieldError(page, typeCode(page), `${MESSAGES.FIELD_TRAN_TYPE_CODE}${MESSAGES.MUST_BE_SUPPLIED}`);
     await submitFrom(page, typeCode(page), "AB");
@@ -1190,7 +1194,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
   });
 
   test("Cancel abandons the add path of a code not on file", async ({ page }) => {
-    await page.goto(mapControl("F-COTRTUP-001").route);
+    await gotoApp(page, mapControl("F-COTRTUP-001").route);
     await submitFrom(page, typeCode(page), newTypeCode);
     await expect(control(page, "F-COTRTUP-003")).toBeVisible();
     await enterOn(page, "F-COTRTUP-015");
@@ -1199,7 +1203,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
   });
 
   test("add rejects a blank description (V-COTRTUPC-017, TRTYDSC)", async ({ page }) => {
-    await page.goto(mapControl("F-COTRTUP-001").route);
+    await gotoApp(page, mapControl("F-COTRTUP-001").route);
     await submitFrom(page, typeCode(page), newTypeCode);
     await expect(control(page, "F-COTRTUP-003")).toBeVisible();
     await typeInto(page, description(page), "");
@@ -1210,7 +1214,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
 
   test("adds the type, then the edit rejects and saves descriptions (V-COTRTUPC-008, TRTYDSC)", async ({ page }) => {
     await addNewType(page, "E2E TEST TYPE");
-    await page.goto(`/admin/transaction-types/${newTypeCode}/edit`);
+    await gotoApp(page, `/admin/transaction-types/${newTypeCode}/edit`);
     await typeInto(page, description(page), "E2E#TYPE");
     await enterOn(page, "F-COTRTUP-002");
     await expectFieldError(
@@ -1225,7 +1229,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
 
   test("edit: the Delete dialog traps focus, Cancel keeps it, Cancel leaves for key entry, Confirm removes it", async ({ page }) => {
     await seedNewType("E2E TEST TYPE TWO");
-    await page.goto(`/admin/transaction-types/${newTypeCode}/edit`);
+    await gotoApp(page, `/admin/transaction-types/${newTypeCode}/edit`);
     await enterOn(page, "F-COTRTUP-006");
     await expectDialogTrapsFocus(page, confirmDialog(page), typeEndpoint("DELETE"));
     await enterOn(page, "F-COTRTUP-006");
@@ -1233,7 +1237,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
     expect(await storedDescription()).not.toBe("<none>");
     await enterOn(page, "F-COTRTUP-014");
     await expect(page).toHaveURL(urlPath(mapControl("F-COTRTUP-014").target ?? "/admin/transaction-types/new"));
-    await page.goto(`/admin/transaction-types/${newTypeCode}/edit`);
+    await gotoApp(page, `/admin/transaction-types/${newTypeCode}/edit`);
     await enterOn(page, "F-COTRTUP-006");
     await expectWrite(page, typeEndpoint("DELETE"), () => answerDialog(page, "F-COTRTUP-007"));
     await expect(page).toHaveURL(urlPath(mapControl("F-COTRTUP-007").target ?? "/admin/transaction-types/new"));
@@ -1242,7 +1246,7 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
 
   test("list: rejects a bad type filter (V-COTRTLIC-001, TRTYPE) and a blank row description (V-COTRTLIC-013), updates the row in place and deletes it", async ({ page }) => {
     await addNewType(page, "E2E LIST TYPE");
-    await page.goto(mapControl("F-COTRTLI-001").route);
+    await gotoApp(page, mapControl("F-COTRTLI-001").route);
     await submitFrom(page, input(page, "F-COTRTLI-001", 0), "AB");
     await expectFieldError(page, input(page, "F-COTRTLI-001", 0), MESSAGES.TYPE_CODE_FILTER_IF_SUPPLIED_MUST_BE_2_DIGIT);
     await submitFrom(page, input(page, "F-COTRTLI-001", 0), newTypeCode);
@@ -1276,14 +1280,81 @@ test.describe("transaction types (F-COTRTUP-001, F-COTRTUP-002, F-COTRTUP-003, F
 // ---------------------------------------------------------------------------
 
 test.describe("rewards account lookup", () => {
+  const screen = REWARD_SCREENS.rewards;
+
+  test.beforeEach(async ({ page }) => {
+    await signInWithKeyboard(page, "user");
+    await gotoApp(page, screen.route);
+  });
+
   test("rejects an all-zero account number", async ({ page }) => {
     // The rewards lookup is new (o8) and has no V-row; it gives the CAVW
     // account edit's text (V-COACTVWC-002) on its account field.
-    await signInWithKeyboard(page, "user");
-    await page.goto(REWARD_SCREENS.rewards.route);
     const account = textbox(page, UNMAPPED_LABELS.rewards.accountId);
     await submitFrom(page, account, "00000000000");
     await expectFieldError(page, account, MESSAGES.ACCOUNT_FILTER_MUST_BE_NON_ZERO_11_DIGIT);
+  });
+
+  test("shows the balance and the newest accrual of an account that has earned points", async ({ page }) => {
+    const accountId = FIXTURE_KEYS.rewardAccount;
+    const key = `${sqlLiteral(accountId)}::bigint`;
+    // The expected figures, as the tables hold them: the account's balance
+    // row and its newest accrual in the history's order (created_at, then
+    // accrual_id, both descending). Created at is not compared: the API
+    // writes it in RFC 3339 and psql in its own timestamptz text.
+    const newest = await psql(
+      `SELECT accrual_id || '|' || transaction_id || '|' || rule_id || '|' || points_earned
+         FROM reward_accruals WHERE account_id = ${key}
+        ORDER BY created_at DESC, accrual_id DESC
+        LIMIT 1`,
+    );
+    expect(newest, `an accrual of account ${accountId}: run \`batch posttran\` after the seed`).toMatch(
+      /^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+$/,
+    );
+    const balance = await psql(
+      `SELECT total_points_earned || '|' || total_points_redeemed || '|' || available_points
+         FROM reward_balances WHERE account_id = ${key}`,
+    );
+    expect(balance, `the reward balance row of account ${accountId}`).toMatch(/^[0-9]+\|[0-9]+\|[0-9]+$/);
+    const [earned = "", redeemed = "", available = ""] = balance.split("|");
+    const [accrualId = "", transactionRow = "", ruleId = "", points = ""] = newest.split("|");
+
+    // Enter in the account field submits the lookup: the balance is read,
+    // then the newest history page.
+    const balanceRead: Endpoint = { method: "GET", path: `/rewards/balance/${accountId}` };
+    const historyRead: Endpoint = { method: "GET", path: `/rewards/history/${accountId}` };
+    const [balanceResponse, historyResponse] = await Promise.all([
+      page.waitForResponse((r) => isRequestTo(r.request(), balanceRead)),
+      page.waitForResponse((r) => isRequestTo(r.request(), historyRead)),
+      submitFrom(page, textbox(page, UNMAPPED_LABELS.rewards.accountId), accountId),
+    ]);
+    expect(balanceResponse.status(), `${balanceRead.method} ${balanceRead.path}`).toBe(200);
+    expect(historyResponse.status(), `${historyRead.method} ${historyRead.path}`).toBe(200);
+    const historyQuery = new URL(historyResponse.url()).searchParams;
+    expect(historyQuery.get("page_size"), "the history page size").toBe(screen.historyPageSize);
+    expect(historyQuery.has("start_key"), "the lookup reads the newest history page").toBe(false);
+
+    for (const [title, value] of [
+      [screen.earned, earned],
+      [screen.redeemed, redeemed],
+      [screen.available, available],
+    ] as const) {
+      const card = content(page).getByRole("group", { name: title, exact: true });
+      await expect(card, `the ${title} card`).toHaveCount(1);
+      await expect(card.getByText(value, { exact: true }), `${title} of account ${accountId}`).toBeVisible();
+      await expect(card.getByText(`Account ${accountId}`, { exact: true })).toBeVisible();
+    }
+
+    const table = tableByCaption(content(page), screen.historyCaption);
+    const first = dataRows(table).first();
+    for (const [column, value] of [
+      ["Accrual ID", accrualId],
+      ["Transaction row", transactionRow],
+      ["Rule ID", ruleId],
+      ["Points earned", points],
+    ] as const) {
+      await expect(await cellUnder(table, first, column), `${column} of the newest accrual`).toHaveText(value);
+    }
   });
 });
 
@@ -1337,7 +1408,7 @@ test.describe("reward rule form", () => {
     page: Page,
     rule: { rate: string; min: string; max: string; from: string; to: string },
   ): Promise<void> {
-    await page.goto(screens.ruleForm.newRoute);
+    await gotoApp(page, screens.ruleForm.newRoute);
     await typeInto(page, textbox(page, labels.typeCode), FIXTURE_KEYS.ruleTestTypeCode);
     await typeInto(page, textbox(page, labels.categoryCode), FIXTURE_KEYS.ruleTestCategoryCode);
     await typeInto(page, textbox(page, labels.rate), rule.rate);
@@ -1364,45 +1435,13 @@ test.describe("reward rule form", () => {
   });
 
   test("creates a valid rule", async ({ page }) => {
-    // The 201 body is read from the copy route.fetch() keeps on the Node side
-    // until the context closes, never from the browser's: Playwright asks
-    // Chromium for that copy only when it is read, and once the form has
-    // navigated to the rule list Chromium may hold it no longer ("No data
-    // found for resource"). The route passes every other method on.
+    // The 201 body is read from the copy captureResponse takes through
+    // route.fetch(), never from the browser's, which Chromium may no longer
+    // hold once the form has navigated to the rule list.
     const write = ruleEndpoint("POST");
-    const writeUrl = urlPath(apiPath(write.path));
-    let resolveFetched: (response: APIResponse) => void = () => undefined;
-    let rejectFetched: (error: Error) => void = () => undefined;
-    const fetched = new Promise<APIResponse>((resolve, reject) => {
-      resolveFetched = resolve;
-      rejectFetched = reject;
-    });
-    const fetchWrite = async (route: Route): Promise<void> => {
-      if (route.request().method() !== write.method) {
-        await route.fallback();
-        return;
-      }
-      let response: APIResponse;
-      try {
-        response = await route.fetch();
-      } catch (error) {
-        rejectFetched(new Error(`${write.method} ${write.path} got no response`, { cause: error }));
-        await route.abort();
-        return;
-      }
-      resolveFetched(response);
-      await route.fulfill({ response });
-    };
-    await page.route(writeUrl, fetchWrite);
-    let created: APIResponse;
-    try {
-      [created] = await Promise.all([
-        fetched,
-        expectWrite(page, write, () => enterRule(page, { rate: "2.5000", min: "", max: "", from: today, to: "" })),
-      ]);
-    } finally {
-      await page.unroute(writeUrl, fetchWrite);
-    }
+    const created = await captureResponse(page, write, () =>
+      expectWrite(page, write, () => enterRule(page, { rate: "2.5000", min: "", max: "", from: today, to: "" })),
+    );
     const ruleId = (await readJson(created, rewardRuleResponseSchema)).rule_id;
     expect(ruleId, "the 201 body carries the new rule_id").toMatch(/^[0-9]+$/);
     await expect(page).toHaveURL(urlPath(screens.ruleList.route));
@@ -1418,7 +1457,7 @@ test.describe("reward rule form", () => {
 
   test("edits the rule's rate", async ({ page }) => {
     const ruleId = await seedRule();
-    await page.goto(`/admin/reward-rules/${ruleId}/edit`);
+    await gotoApp(page, `/admin/reward-rules/${ruleId}/edit`);
     const rate = textbox(page, labels.rate);
     await expect(rate).toHaveValue("2.5000");
     await typeInto(page, rate, "2.7500");
@@ -1429,7 +1468,7 @@ test.describe("reward rule form", () => {
 
   test("soft-deletes the rule from the list; the dialog traps focus first", async ({ page }) => {
     const ruleId = await seedRule();
-    await page.goto(screens.ruleList.route);
+    await gotoApp(page, screens.ruleList.route);
     const row = content(page)
       .getByRole("table", { name: screens.ruleList.caption, exact: true })
       .getByRole("row")

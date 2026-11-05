@@ -15,15 +15,27 @@
 //! the gate, byte for byte, and a report after them answers the same: every
 //! report permit is back once the bodies are read.
 //!
+//! A client that requests a report far larger than the server's and the
+//! sockets' buffers, and then never reads, keeps the one report permit only
+//! until the answer has waited `REPORT_SEND_DEADLINE` for it to take a
+//! chunk. While its connection stays open, the next report answers 200
+//! whole within that deadline and a margin, no session is left idle in its
+//! transaction, and the stalled answer, once read, ends short of its
+//! `Content-Length`.
+//!
 //! Docker must be running; the harness conventions are those of `common`.
 
 pub mod common;
 
+use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use carddemo_api::dto::reports::ReportResponse;
+use carddemo_api::handlers::reports::REPORT_SEND_DEADLINE;
 use carddemo_domain::messages;
 use reqwest::StatusCode;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 
 use common::{Resp, TestApp};
@@ -111,6 +123,56 @@ const READ_DEADLINE: Duration = Duration::from_secs(5);
 /// The pause between two reads of a lock count.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// 80,000 live purchases on the card of [`LIVE_ROWS`], on 2022-05-15, keyed
+/// after its rows: a report of some 15 MB, several times what the server's
+/// write buffer, the two sockets' buffers and the report's channel hold
+/// together, so a client that never reads stalls the answer long before its
+/// end.
+const STALLED_ROWS: &str = "INSERT INTO transaction_master \
+     (tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt, \
+      tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip, \
+      tran_card_num, tran_orig_ts, tran_proc_ts) \
+     SELECT lpad(n::text, 16, '0'), '01', 1, 'POS TERM', 'Stalled report row', \
+      (10 + n % 100)::numeric(11, 2), n, 'Report merchant', 'Report city', '12345', \
+      '9680294154603697', '2022-05-15 12:00:00.000000', '2022-05-15 12:00:00.000000' \
+     FROM generate_series(1001, 81000) AS n";
+
+/// The custom report of May 2022, confirmed: every row of [`STALLED_ROWS`].
+const STALLED_REPORT: &str =
+    "/reports/transactions?report_type=custom&start_date=2022-05-01&end_date=2022-05-31&confirm=Y";
+
+/// The receive buffer the never-reading client asks for, which the kernel
+/// keeps small: what it takes before it stops reading is a few kilobytes.
+const STALLED_RECEIVE_BUFFER: u32 = 4 * 1024;
+
+/// The sessions holding a snapshot between two statements of their
+/// transaction for 2 seconds or more: the stalled report's, once its second
+/// pass waits for the client to take a chunk.
+const STALLED_SESSION: &str = "SELECT count(*)::text FROM pg_stat_activity \
+     WHERE state = 'idle in transaction' AND backend_xmin IS NOT NULL \
+     AND state_change < clock_timestamp() - interval '2 seconds'";
+
+/// The sessions between two statements of an open transaction: none once
+/// every report has rolled back.
+const OPEN_TRANSACTIONS: &str =
+    "SELECT count(*)::text FROM pg_stat_activity WHERE state = 'idle in transaction'";
+
+/// How long the stalled report may take to run its first pass and fill the
+/// buffers in an unoptimised build on a loaded host.
+const STALL_DEADLINE: Duration = Duration::from_secs(120);
+
+/// What the report after the stalled one may take beyond
+/// [`REPORT_SEND_DEADLINE`]. It is sent once the stalled pass has waited 2
+/// seconds of that deadline, so the margin covers its own run, which a
+/// stalled report still holding the permit would never start.
+const FOLLOW_UP_MARGIN: Duration = Duration::from_secs(30);
+
+/// How long reading the rest of the stalled answer may take.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The bytes one read of the stalled connection takes at most.
+const READ_CHUNK: usize = 64 * 1024;
+
 #[test]
 fn queued_reports_wait_only_as_admitted_and_each_answers_whole() {
     let app = TestApp::start_with_clock(CLOCK);
@@ -186,6 +248,58 @@ fn queued_reports_wait_only_as_admitted_and_each_answers_whole() {
     });
 }
 
+#[test]
+fn a_client_that_never_reads_gives_back_the_report_permit_after_the_send_deadline() {
+    let app = TestApp::start_with_clock(CLOCK);
+    carddemo_testkit::block_on(async {
+        app.stack().exec_sql(LIVE_ROWS).await;
+        app.stack().exec_sql(STALLED_ROWS).await;
+        let token = app.user_token().await;
+        let lone = app.get(REPORT, Some(&token)).await;
+        assert_whole_report(&lone);
+
+        let stalled = request_unread(&app, STALLED_REPORT, &token).await;
+        wait_for_count_within(&app, STALLED_SESSION, 1, STALL_DEADLINE).await;
+
+        // The testkit pool admits one report at once, and the stalled report
+        // holds that permit: this one is answered only once it is back.
+        let bound = REPORT_SEND_DEADLINE + FOLLOW_UP_MARGIN;
+        let request = app.client().get(app.url(REPORT)).timeout(bound);
+        let after = common::send(request, Some(&token)).await;
+        assert_eq!(
+            after.0,
+            StatusCode::OK,
+            "the report after the stalled one: {}",
+            after.2
+        );
+        assert!(
+            after.2 == lone.2,
+            "the report after the stalled one differs from the lone report: {}",
+            after.2
+        );
+        assert_eq!(
+            count(&app, OPEN_TRANSACTIONS).await,
+            0,
+            "a session is still idle in its transaction after the stalled report"
+        );
+
+        let answer = tokio::time::timeout(DRAIN_DEADLINE, read_to_end(&stalled))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the stalled answer did not end within {DRAIN_DEADLINE:?} of reading it")
+            });
+        let (status, length, body) = split_response(&answer);
+        assert_eq!(
+            status, "HTTP/1.1 200 OK",
+            "the stalled report's status line"
+        );
+        assert!(
+            body < length,
+            "the stalled answer sent {body} bytes of its Content-Length {length}"
+        );
+    });
+}
+
 /// Asserts that `resp` is the 200 custom report of the [`ROWS`] live rows:
 /// its name, its submission text, and more lines than rows, the headers and
 /// totals around one detail line per row.
@@ -229,7 +343,13 @@ async fn count(app: &TestApp, sql: &str) -> u64 {
 /// Waits until `sql` counts exactly `expected`, panicking when that does not
 /// happen within [`LOCK_DEADLINE`].
 async fn wait_for_count(app: &TestApp, sql: &str, expected: u64) {
-    let until = Instant::now() + LOCK_DEADLINE;
+    wait_for_count_within(app, sql, expected, LOCK_DEADLINE).await;
+}
+
+/// Waits until `sql` counts exactly `expected`, panicking when that does not
+/// happen within `deadline`.
+async fn wait_for_count_within(app: &TestApp, sql: &str, expected: u64, deadline: Duration) {
+    let until = Instant::now() + deadline;
     loop {
         let counted = count(app, sql).await;
         if counted == expected {
@@ -237,10 +357,86 @@ async fn wait_for_count(app: &TestApp, sql: &str, expected: u64) {
         }
         assert!(
             Instant::now() < until,
-            "expected {expected} within {LOCK_DEADLINE:?}, last counted {counted}: {sql}"
+            "expected {expected} within {deadline:?}, last counted {counted}: {sql}"
         );
         pause(POLL_INTERVAL).await;
     }
+}
+
+/// Sends `GET path` with `token` as the bearer token over a connection of
+/// its own, whose receive buffer is [`STALLED_RECEIVE_BUFFER`] bytes, and
+/// returns the connection without reading any of the answer.
+async fn request_unread(app: &TestApp, path: &str, token: &str) -> TcpStream {
+    let base = app.url("");
+    let addr: SocketAddr = base
+        .strip_prefix("http://")
+        .and_then(|host| host.parse().ok())
+        .unwrap_or_else(|| panic!("the test server URL {base} names no socket address"));
+    let socket = TcpSocket::new_v4()
+        .unwrap_or_else(|error| panic!("creating the unread client socket failed: {error}"));
+    socket
+        .set_recv_buffer_size(STALLED_RECEIVE_BUFFER)
+        .unwrap_or_else(|error| panic!("shrinking the unread client's buffer failed: {error}"));
+    let bound = common::CONNECT_TIMEOUT;
+    let stream = tokio::time::timeout(bound, socket.connect(addr))
+        .await
+        .unwrap_or_else(|_| panic!("no connection to {addr} within {bound:?}"))
+        .unwrap_or_else(|error| panic!("connecting the unread client to {addr} failed: {error}"));
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n");
+    let mut unsent = request.as_bytes();
+    while !unsent.is_empty() {
+        stream
+            .writable()
+            .await
+            .unwrap_or_else(|error| panic!("the unread client cannot write: {error}"));
+        match stream.try_write(unsent) {
+            Ok(written) => unsent = &unsent[written..],
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => panic!("sending the unread client's request failed: {error}"),
+        }
+    }
+    stream
+}
+
+/// Every byte `stream` receives until the server ends the connection, by a
+/// close or a reset.
+async fn read_to_end(stream: &TcpStream) -> Vec<u8> {
+    let mut received = Vec::new();
+    let mut buffer = vec![0; READ_CHUNK];
+    loop {
+        stream
+            .readable()
+            .await
+            .unwrap_or_else(|error| panic!("the stalled connection cannot be read: {error}"));
+        match stream.try_read(&mut buffer) {
+            Ok(0) => return received,
+            Ok(read) => received.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => return received,
+            Err(error) => panic!("reading the stalled connection failed: {error}"),
+        }
+    }
+}
+
+/// The status line, the `Content-Length` and the length of the body of
+/// `answer`, one HTTP/1.1 response as received.
+fn split_response(answer: &[u8]) -> (String, usize, usize) {
+    let Some(end) = answer.windows(4).position(|window| window == b"\r\n\r\n") else {
+        panic!(
+            "the stalled answer holds no whole head: {} bytes",
+            answer.len()
+        );
+    };
+    let head = String::from_utf8_lossy(&answer[..end]);
+    let mut lines = head.split("\r\n");
+    let status = lines.next().unwrap_or_default().to_owned();
+    let length = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the stalled answer has no numeric Content-Length: {head}"));
+    (status, length, answer.len() - end - 4)
 }
 
 /// Sleeps for `period` on a blocking thread, leaving the runtime's workers to

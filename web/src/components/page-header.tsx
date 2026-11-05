@@ -16,7 +16,13 @@
 // Tailwind type-scale utilities. Pages render no other h1.
 import { Fragment, type JSX, type ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
-import { Link, useMatches, type To, type UIMatch } from "react-router";
+import {
+  Link,
+  useLocation,
+  useMatches,
+  type To,
+  type UIMatch,
+} from "react-router";
 
 import {
   Breadcrumb,
@@ -27,6 +33,13 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
 import { Button } from "@/components/ui/button";
+import {
+  isRouteAccess,
+  sessionAdmits,
+  useSession,
+  type RouteAccess,
+  type Session,
+} from "@/lib/session";
 
 /**
  * The `handle` of a route that appears in the breadcrumb trail.
@@ -60,6 +73,39 @@ export function isRouteHandle(value: unknown): value is RouteHandle {
   );
 }
 
+/**
+ * The mark a guard route's `handle` carries (routes/guards.tsx guardRoute):
+ * the access its guard requires. It sits beside the route's RouteHandle
+ * fields when the route has a crumb, and alone when it has none.
+ */
+export type AccessHandle = { access: RouteAccess };
+
+/** Whether a route `handle` carries an AccessHandle mark. */
+export function isAccessHandle(value: unknown): value is AccessHandle {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "access" in value &&
+    isRouteAccess(value.access)
+  );
+}
+
+// The matched routes the guards let `session` reach: those above the first
+// route whose AccessHandle the session does not satisfy. That route's guard
+// renders a redirect in place of everything below it, so none of them is the
+// page shown.
+function admittedMatches(
+  matches: readonly UIMatch[],
+  session: Session | null,
+): readonly UIMatch[] {
+  const refused = matches.findIndex(
+    (match) =>
+      isAccessHandle(match.handle) &&
+      !sessionAdmits(session, match.handle.access),
+  );
+  return refused === -1 ? matches : matches.slice(0, refused);
+}
+
 export type PageHeaderProps = {
   /** Overrides the heading taken from the leaf route's handle. */
   title?: string;
@@ -70,6 +116,7 @@ export type PageHeaderProps = {
 
 type Crumb = {
   id: string;
+  /** The route's matched pathname, decoded as react-router matched it. */
   pathname: string;
   handle: RouteHandle;
 };
@@ -90,14 +137,43 @@ function routeCrumbs(matches: readonly UIMatch[]): Crumb[] {
   );
 }
 
+function nonEmptySegments(pathname: string): string[] {
+  return pathname.split("/").filter((segment) => segment !== "");
+}
+
+// The link target of a crumb without `to`: its route's matched pathname as
+// the current URL spells it. A matched pathname is decoded (react-router
+// decodes each URL segment before matching and keeps a decoded "/" as "%2F"),
+// so a link to it would send a key holding a space, "#", "?" or "%" to
+// another route. Decoding maps segments one to one, so the match spans as
+// many leading segments of the location's pathname, which the router keeps
+// as the URL has it; following the link therefore matches the same params.
+// Re-encoding the decoded text instead would turn a kept "%2F" into "%252F".
+// The matched pathname of a route above the page never ends in "/", so
+// neither does the target, whatever trailing slash the current URL has.
+function urlPathPrefix(
+  matchedPathname: string,
+  locationPathname: string,
+): string {
+  const depth = nonEmptySegments(matchedPathname).length;
+  return `/${nonEmptySegments(locationPathname).slice(0, depth).join("/")}`;
+}
+
 /**
  * The heading the matched routes give the current page: the last RouteHandle's
- * `title`, else its `crumb`; undefined when no matched route has a handle.
- * PageHeader renders it as the h1 unless its `title` prop overrides it, and
- * the app shell announces it on every route change.
+ * `title`, else its `crumb`, among the routes the guards let the session
+ * reach; undefined when none of them has a handle. A guard that refuses the
+ * session redirects after the router has committed its matches, so the
+ * routes from it down never title the page: a regular user on /admin/** gets
+ * the shell's title, and a visitor without a session none until /login.
+ * PageHeader renders it as the h1 unless its `title` prop overrides it, the
+ * app shell announces it on every route change, and AppRoot puts it in the
+ * document title.
  */
 export function usePageTitle(): string | undefined {
-  const leaf = routeCrumbs(useMatches()).at(-1)?.handle;
+  const matches = useMatches();
+  const session = useSession();
+  const leaf = routeCrumbs(admittedMatches(matches, session)).at(-1)?.handle;
   return leaf?.title ?? leaf?.crumb;
 }
 
@@ -125,6 +201,7 @@ export function PageHeader({
   actions,
 }: PageHeaderProps): JSX.Element {
   const crumbs = routeCrumbs(useMatches());
+  const locationPathname = useLocation().pathname;
   const pageTitle = usePageTitle();
   const heading = title ?? pageTitle;
   const hasHeading = heading !== undefined && heading !== "";
@@ -145,7 +222,13 @@ export function PageHeader({
                 <Fragment key={id}>
                   <BreadcrumbItem>
                     <BreadcrumbLink asChild>
-                      <Link to={handle.to ?? pathname}>{handle.crumb}</Link>
+                      <Link
+                        to={
+                          handle.to ?? urlPathPrefix(pathname, locationPathname)
+                        }
+                      >
+                        {handle.crumb}
+                      </Link>
                     </BreadcrumbLink>
                   </BreadcrumbItem>
                   <BreadcrumbSeparator />

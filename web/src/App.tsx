@@ -8,7 +8,9 @@
 // - Every other route sits under RequireAuth and the AppLayout shell. The user
 //   functions are open to both user types, because the COBOL programs check
 //   none; /admin/** also sits under RequireAdmin. Both guards only shape the
-//   UI: the server's 401 and 403 decide access.
+//   UI: the server's 401 and 403 decide access. Each guard route comes from
+//   guardRoute, which marks its handle with the access the guard requires, so
+//   the page title stops at a guard the session does not pass.
 // - Each page is loaded through React.lazy, one chunk per route (AAP 0.10.3),
 //   which its route's loader downloads before the router commits the
 //   navigation (routes/lazy-page.tsx). The loaders only download page code and
@@ -34,7 +36,7 @@ import { AppLayout } from "@/components/app-layout";
 import type { RouteHandle } from "@/components/page-header";
 import { MENU_SECTION_LABELS, menu } from "@/nav/menu";
 import { AppRoot } from "@/routes/app-root";
-import { RequireAdmin, RequireAuth } from "@/routes/guards";
+import { guardRoute } from "@/routes/guards";
 import { inShellErrorBoundary, lazyPage, pageRoute } from "@/routes/lazy-page";
 import { PageLoadError, Redirect } from "@/routes/page-fallbacks";
 
@@ -117,7 +119,7 @@ const appRoutes: RouteObject[] = [
     handle: { title: "Sign on", crumb: "Sign on" } satisfies RouteHandle,
   },
   {
-    element: <RequireAuth />,
+    ...guardRoute("signed-on"),
     children: [
       {
         // The shell is pathless, so `to` names the crumb target outright. Its
@@ -267,11 +269,10 @@ const appRoutes: RouteObject[] = [
           {
             // CA00 [app/bms/COADM01.bms:L79]
             path: "admin",
-            element: <RequireAdmin />,
-            handle: {
+            ...guardRoute("admin", {
               title: "Admin Menu",
               crumb: MENU_SECTION_LABELS.admin,
-            } satisfies RouteHandle,
+            }),
             children: [
               { index: true, ...pageRoute(AdminHomePage, "admin") },
               {
@@ -363,7 +364,9 @@ const appRoutes: RouteObject[] = [
   { path: "*", element: <Redirect to="/" replace /> },
 ];
 
-// The root route: AppRoot sets the document title and the scroll position.
+// The root route: AppRoot sets the document title from the routes the guards
+// admit, and keeps each history entry's scroll position in memory, restoring
+// it on Back and Forward and opening every other screen at its top.
 const routes: RouteObject[] = [{ element: <AppRoot />, children: appRoutes }];
 
 const router = createBrowserRouter(routes);

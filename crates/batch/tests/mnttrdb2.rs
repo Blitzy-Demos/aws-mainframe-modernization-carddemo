@@ -28,7 +28,10 @@
 //! Two more runs reach the other ends of the job: the fixture records that do not fail, which
 //! commit every change and end with the return code of a run without failure, and the whole
 //! fixture with a `STOP RUN` commit the server refuses, which persists nothing and ends with
-//! 16. Their job span and events are read as JSON members, one exact value token per key.
+//! 16. Their job span and events are read as JSON members, one exact value token per key. An
+//! `INPFILE` that is missing, or holds a record that cannot be framed after records that change
+//! the master, ends with 16 before any record is treated (P-COBTUPDT-011, E-36). No run leaves a
+//! file in the batch directory, where the job spools its `INPFILE`.
 
 pub mod common;
 
@@ -1247,32 +1250,130 @@ fn maintenance_file_applies_audited_changes() {
     assert_record_events(&String::from_utf8_lossy(&out.stdout));
 }
 
+/// Checks that the batch directory of `h` holds no file: `mnttrdb2` writes no generation, and
+/// the name of its `INPFILE` work file is removed when the file is created, its space freed
+/// once the run is over.
+fn assert_no_work_file(h: &Harness) {
+    let dir = h.batch_dir();
+    let names: Vec<String> = match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| panic!("cannot list {}: {error}", dir.display()))
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect(),
+        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("cannot list {}: {error}", dir.display()),
+    };
+    assert_eq!(
+        names,
+        Vec::<String>::new(),
+        "files left in the batch directory {}",
+        dir.display()
+    );
+}
+
 #[test]
 fn an_input_that_cannot_be_opened_ends_with_16_before_any_change() {
     // P-COBTUPDT-011, E-36: under JCL a missing INPFILE fails allocation and the step never
-    // runs, so the job stops before its unit of work.
+    // runs, so the job stops before its unit of work. An INPFILE holding a record longer than
+    // the 53 bytes of WS-INPUT-REC is a file COBTUPDT cannot open as its FD declares, so the job
+    // stops the same way wherever that record stands: here after records that change the
+    // master when they are applied.
+    let doc = parity();
+    let rules = Cobtupdt::audited(&doc);
+    let seed = Masters::loaded(&doc);
+    let fixture = fixture_records();
+    let mixed = rules.maintain(&seed, &fixture);
+    let changes: Vec<String> = fixture
+        .iter()
+        .zip(&mixed.outcomes)
+        .filter(|&(_, &outcome)| outcome != Outcome::Failed)
+        .map(|(record, _)| record.clone())
+        .collect();
+    assert_ne!(
+        rules.maintain(&seed, &changes).types,
+        seed.types,
+        "the records before the one that cannot be framed change the master when applied"
+    );
+    let number = changes.len() + 1;
+    let dir = InputDir::new();
+    let with_last = |last: String| [changes.as_slice(), &[last]].concat();
+    let over_long = dir.write("over-long.txt", &with_last(format!("{:<54}", "A10")));
+    let unbounded = dir.write("unbounded.txt", &with_last(format!("{:<1000}", "A10")));
+    let missing = fixtures::repo_root().join(MISSING_INPUT);
+    let missing_cause = fs::metadata(&missing)
+        .err()
+        .unwrap_or_else(|| panic!("{} must not exist", missing.display()))
+        .to_string();
+    let cases = [
+        (
+            "a missing file",
+            PathBuf::from(MISSING_INPUT),
+            missing_cause,
+        ),
+        (
+            "a record longer than 53 bytes after records that change the master",
+            over_long,
+            format!("COBTUPDT record {number}: stored length 54 exceeds the record length"),
+        ),
+        (
+            "a line with no LF within 56 bytes after records that change the master",
+            unbounded,
+            format!(
+                "COBTUPDT record {number}: line longer than the 53-byte record length, with no \
+                 line end within its first 56 bytes"
+            ),
+        ),
+    ];
+
     let h = Harness::new();
     let before = type_tables(&h);
+    for (case, path, cause) in cases {
+        let input = path
+            .to_str()
+            .unwrap_or_else(|| panic!("{} is no UTF-8 argument", path.display()));
 
-    let out = h.run_expect(
-        &["mnttrdb2", "--input", MISSING_INPUT],
-        None,
-        SETUP_FAILURE_EXIT,
-    );
+        let out = h.run_expect(&["mnttrdb2", "--input", input], None, SETUP_FAILURE_EXIT);
 
-    assert_eq!(type_tables(&h), before, "no transaction type data changed");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let setup_failure = format!("SETUP FAILURE: INPFILE {MISSING_INPUT}: ");
-    assert!(stderr.starts_with(&setup_failure), "{stderr}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let open_failure = format!(r#""message":"{OPEN_FILE_NOT_OK}""#);
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains(r#""level":"ERROR""#) && line.contains(&open_failure)),
-        "no {OPEN_FILE_NOT_OK:?} event\n--- stdout ---\n{stdout}"
-    );
-    assert!(!stdout.contains(PROCESSING), "a record was read\n{stdout}");
+        assert_eq!(
+            type_tables(&h),
+            before,
+            "{case}: no transaction type data changed"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.lines().collect::<Vec<_>>(),
+            [format!("SETUP FAILURE: INPFILE {input}: {cause}")],
+            "{case}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let open_failure = format!(r#""message":"{OPEN_FILE_NOT_OK}""#);
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.contains(r#""level":"ERROR""#) && line.contains(&open_failure)),
+            "{case}: no {OPEN_FILE_NOT_OK:?} event\n--- stdout ---\n{stdout}"
+        );
+        assert!(
+            !stdout.contains(PROCESSING),
+            "{case}: a record was treated\n{stdout}"
+        );
+        job_span(&stdout).assert_tokens(
+            &[
+                ("job", r#""mnttrdb2""#.to_owned()),
+                ("read", "0".to_owned()),
+                ("posted", "0".to_owned()),
+                ("rejected", "0".to_owned()),
+                ("exit_code", SETUP_FAILURE_EXIT.to_string()),
+            ],
+            &stdout,
+        );
+        assert_no_work_file(&h);
+    }
 }
 
 #[test]
@@ -1336,6 +1437,7 @@ fn a_file_without_failures_commits_every_change_and_ends_with_0() {
         ],
         &stdout,
     );
+    assert_no_work_file(&h);
 }
 
 #[test]
@@ -1397,4 +1499,5 @@ fn a_refused_stop_run_commit_ends_with_16_and_persists_nothing() {
         &stdout,
     );
     assert_record_events(&stdout);
+    assert_no_work_file(&h);
 }

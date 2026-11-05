@@ -23,16 +23,16 @@
 //! 1. A confirmed request waits for a report permit
 //!    (`AppState::admit_report`) before it opens its unit of work, in arrival
 //!    order, never refused and never timed out, holding no pooled
-//!    connection. The response body keeps the permit until it is sent or
-//!    dropped, so at most `report_permits` reports run or send at once, each
-//!    holding one pooled connection and one snapshot, and the other
+//!    connection. The second pass keeps the permit until the answer is sent
+//!    or abandoned, so at most `report_permits` reports run or send at once,
+//!    each holding one pooled connection and one snapshot, and the other
 //!    operations keep the rest of the pool.
 //! 2. The unit of work is one read-only snapshot (`Db::begin_snapshot`), so
 //!    every page and lookup sees the master in the one state the first read
 //!    saw, as one read of the whole selection did; a `TRANBKP`, `COMBTRAN` or
 //!    CT02 commit meanwhile changes nothing the report reads.
 //! 3. The selection is read through `ReportSelection` in pages of
-//!    [`PAGE_ROWS`] records, in the `STEP05R` order, and each page is fed to
+//!    `PAGE_ROWS` records, in the `STEP05R` order, and each page is fed to
 //!    `ReportRun` before the next one is read. Each record's lines are encoded
 //!    as the run writes them: the `ReportJson` head, the lines as
 //!    `ReportLines` array elements, the end-of-input lines and the tail, byte
@@ -45,11 +45,13 @@
 //!    before `CBTRN03C` starts, and a lookup abend. Every 500 is therefore
 //!    answered before any byte of a 200, and the 200 carries that length as
 //!    its `Content-Length`.
-//! 5. The second pass is the response body. The server polls the body for
-//!    its next chunk only once its own bounded write buffer has room, and
-//!    each poll runs the pass until one [`CHUNK_BYTES`] chunk of JSON is
-//!    full. Besides its connection and snapshot, a report therefore holds one
-//!    page of records, the chunk it is filling and what the server's write
+//! 5. The second pass runs on a task of its own and sends the response body
+//!    one [`CHUNK_BYTES`] chunk of JSON at a time, through a channel that
+//!    holds one chunk: it writes the next chunk only once the body has taken
+//!    the one before. The server polls the body for its next chunk only once
+//!    its own bounded write buffer has room. Besides its connection and
+//!    snapshot, a report therefore holds one page of records, the chunk it is
+//!    filling, the one chunk the channel holds and what the server's write
 //!    buffer holds, whatever its size, and a client that reads slowly holds
 //!    the pass back instead of letting the answer pile up. Once the tail is
 //!    written, the unit of work is rolled back before the last chunk is
@@ -63,11 +65,18 @@
 //! incomplete, never a report that looks whole and is cut short. No report
 //! is refused or cut short to fit a limit.
 //!
-//! A client that reads slowly, or not at all, keeps its report's permit and
-//! connection until it has read the answer or disconnected: the API has no
-//! timeout, rate limiting or proxy in front of it. Once the body is dropped,
-//! sent or abandoned, the permit is back, and a unit of work it still holds
-//! rolls back as it drops. A request dropped while it waits for a permit
+//! A client that keeps reading keeps its report, however slowly it reads and
+//! however long the whole answer takes: the answer has no time limit as a
+//! whole, and the API has no rate limiting. A client that stops reading does
+//! not keep the report's permit, connection and snapshot: the server stops
+//! polling the body, so no limit on the body itself would ever be checked,
+//! but the task of the second pass waits at most [`REPORT_SEND_DEADLINE`]
+//! for the body to take each chunk. Once that deadline passes, or once the
+//! body is dropped with its client gone, the pass is abandoned: one event in
+//! the handler span names the bytes sent and the `Content-Length`, the unit
+//! of work is rolled back at once, the permit is back, and the body, once
+//! the server polls it again, ends short of its `Content-Length`, so the
+//! server aborts the answer. A request dropped while it waits for a permit
 //! returns what it holds as it is dropped.
 //!
 //! The report reads only the live master (the view `transaction_master`),
@@ -81,6 +90,7 @@
 //! records are the response body.
 
 use std::mem;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -95,7 +105,8 @@ use carddemo_domain::rules::transaction_report::{
 };
 use carddemo_persistence::tx::UnitOfWork;
 use futures_util::stream;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::time;
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
@@ -129,6 +140,20 @@ const PAGE_ROWS: u16 = 1_000;
 /// The bytes of response JSON in one chunk of a report's body, 64 KiB: every
 /// chunk but the last is exactly this long, and the last is no longer.
 pub const CHUNK_BYTES: usize = 64 * 1024;
+
+/// How long the second pass of a report waits for its response body to take
+/// the chunk before the next one, 30 seconds. The server takes a chunk from
+/// the body as soon as its write buffer has room, so a client that takes
+/// nothing for this long has stopped reading: the pass is then abandoned,
+/// its unit of work rolled back and its report permit returned, and the body
+/// ends short of its `Content-Length`. A client that keeps reading keeps its
+/// report, however long the whole answer takes.
+pub const REPORT_SEND_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The chunks a report's channel holds between its second pass and its
+/// response body: one, so the pass writes a chunk only once the body has
+/// taken the one before it.
+const CHANNEL_CHUNKS: usize = 1;
 
 /// CORPT00C PROCESS-ENTER-KEY / SUBMIT-JOB-TO-INTRDR — P-CORPT00C-002 to
 /// P-CORPT00C-012, P-CORPT00C-014, P-CORPT00C-017, V-CORPT00C-001 to
@@ -227,7 +252,7 @@ async fn respond(state: &AppState, query: ReportQuery, span: &Span) -> Result<Re
     let frame = ReportJson::new(&range, message).map_err(|error| unserializable(&error))?;
 
     // The permit is taken before the unit of work opens, so a queued report
-    // holds no pooled connection, and the response body keeps it.
+    // holds no pooled connection, and the second pass keeps it.
     let admission = state.admit_report().await?;
     let mut uow = state.db().begin_snapshot().await?;
     let mut measured = Measured::default();
@@ -251,15 +276,27 @@ async fn respond(state: &AppState, query: ReportQuery, span: &Span) -> Result<Re
 
 /// The answer of a report: `body`, the second pass, streamed as one
 /// `application/json` body whose `Content-Length` is the length the first
-/// pass measured. Each chunk is written in `span`, the handler span, so the
-/// events of the second pass carry it.
+/// pass measured.
+///
+/// The pass runs on a task of its own in `span`, the handler span, so the
+/// events of the second pass carry it, and sends its chunks to the response
+/// body through a channel of [`CHANNEL_CHUNKS`] chunk. The server polls a
+/// body only while its write buffer has room, so a client that stops reading
+/// leaves the body unpolled; the task still runs, and gives up the pass once
+/// [`REPORT_SEND_DEADLINE`] has passed without the body taking a chunk
+/// ([`ReportBody::send_to`]).
 fn report_response(body: ReportBody, span: Span) -> Response {
-    let length = HeaderValue::from(body.length);
-    let chunks = stream::try_unfold(body, move |body| body.next_chunk().instrument(span.clone()));
+    let length = body.length;
+    let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+    tokio::spawn(body.send_to(sender).instrument(span));
+    let chunks = stream::try_unfold(
+        ReportStream::new(receiver, length),
+        ReportStream::next_chunk,
+    );
     (
         [
             (CONTENT_TYPE, HeaderValue::from_static("application/json")),
-            (CONTENT_LENGTH, length),
+            (CONTENT_LENGTH, HeaderValue::from(length)),
         ],
         Body::from_stream(chunks),
     )
@@ -517,12 +554,14 @@ impl Chunks {
     }
 }
 
-/// The response body of a report: the second pass over the snapshot the
-/// first pass read, sent chunk by chunk as the server polls for them.
+/// The body of a report as its second pass writes it: the pass over the
+/// snapshot the first pass read, run on a task of its own by
+/// [`ReportBody::send_to`], which sends it chunk by chunk to the
+/// [`ReportStream`] the server polls.
 ///
-/// The body owns the unit of work and the report permit. Dropped, sent or
-/// abandoned by a client gone mid-answer, it returns the permit, and a unit
-/// of work it still holds rolls back as it drops.
+/// It owns the unit of work and the report permit. Sent whole, failed or
+/// abandoned, it returns the permit as it drops; an abandoned pass rolls its
+/// unit of work back first, and one that failed rolls it back as it drops.
 struct ReportBody {
     /// The pass and its unit of work, until the pass has put its tail and the
     /// unit of work is rolled back.
@@ -534,7 +573,7 @@ struct ReportBody {
     /// The length of the JSON the first pass measured, the body's
     /// `Content-Length`.
     length: usize,
-    /// The bytes of JSON sent so far.
+    /// The bytes of JSON sent to the response body so far.
     sent: usize,
     /// The `AppState::admit_report` permit, held only to be released when the
     /// body is dropped.
@@ -572,6 +611,72 @@ impl ReportBody {
         }
     }
 
+    /// Runs the second pass and sends its chunks through `sender`, the
+    /// channel of the report's [`ReportStream`], each one written only once
+    /// the channel has room for it.
+    ///
+    /// The room is waited for at most [`REPORT_SEND_DEADLINE`]. When the
+    /// response body has taken no chunk for that long, its client has
+    /// stopped reading; when the channel is closed before every chunk was
+    /// sent to it, the response body was dropped, its client gone. Either way
+    /// the pass is abandoned ([`ReportBody::abandon`]) after one event, which
+    /// names the bytes sent and the `Content-Length`. A pass that fails ends
+    /// here too, its cause logged by [`ReportBody::next_chunk`]. In every
+    /// case but the whole answer, `sender` is dropped short of the
+    /// `Content-Length`, so the response body ends in an error.
+    async fn send_to(mut self, mut sender: mpsc::Sender<Bytes>) {
+        loop {
+            let room = match time::timeout(REPORT_SEND_DEADLINE, sender.reserve_owned()).await {
+                Ok(Ok(room)) => room,
+                Ok(Err(_)) => {
+                    // The server drops the body once it has written the
+                    // `Content-Length`, so a closed channel after the last
+                    // chunk ends a whole answer, with nothing left to abandon.
+                    if self.sent < self.length {
+                        tracing::info!(
+                            sent = self.sent,
+                            content_length = self.length,
+                            "report answer dropped before it was sent whole; the report is abandoned"
+                        );
+                    }
+                    self.abandon().await;
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        deadline_secs = REPORT_SEND_DEADLINE.as_secs(),
+                        sent = self.sent,
+                        content_length = self.length,
+                        "report client took no chunk within the send deadline; the report is abandoned"
+                    );
+                    self.abandon().await;
+                    return;
+                }
+            };
+            match self.next_chunk().await {
+                Ok(Some((chunk, body))) => {
+                    sender = room.send(chunk);
+                    self = body;
+                }
+                Ok(None) | Err(ReportAborted) => return,
+            }
+        }
+    }
+
+    /// Ends a pass whose answer will not be sent whole: a unit of work it
+    /// still holds is rolled back now, not when its connection is next used,
+    /// so its snapshot and connection are released at once, and the permit is
+    /// returned as the body drops, after the rollback. The report only read,
+    /// so a failed rollback is logged and changes nothing; the server rolls
+    /// back a transaction whose session ends.
+    async fn abandon(mut self) {
+        if let Some(Writing { uow, .. }) = self.writing.take()
+            && let Err(error) = uow.rollback().await
+        {
+            tracing::warn!(error = %error, "rollback of an abandoned report failed");
+        }
+    }
+
     /// The next chunk of the body with the body that sends the rest, or
     /// `None` once every byte is sent.
     ///
@@ -581,11 +686,11 @@ impl ReportBody {
     ///
     /// # Errors
     ///
-    /// [`ReportAborted`], the cause logged, which ends the body short of its
-    /// `Content-Length`: every error of [`ReportPass::advance`] and
-    /// [`ReportPass::finish`], a failed rollback, and a pass whose length
-    /// differs from the first pass's. Over the first pass's snapshot only a
-    /// lost connection or a failed rollback can occur.
+    /// [`ReportAborted`], the cause logged, which ends the pass, and so the
+    /// response body short of its `Content-Length`: every error of
+    /// [`ReportPass::advance`] and [`ReportPass::finish`], a failed rollback,
+    /// and a pass whose length differs from the first pass's. Over the first
+    /// pass's snapshot only a lost connection or a failed rollback can occur.
     async fn next_chunk(mut self) -> Result<Option<(Bytes, Self)>, ReportAborted> {
         loop {
             if let Some(chunk) = self.chunks.full() {
@@ -638,10 +743,55 @@ impl ReportBody {
     }
 }
 
-/// The error that ends a report body short of its `Content-Length`. The
-/// server then aborts the answer, so the client never takes a body cut short
-/// for a whole report. The cause was logged where it was found, in the
-/// handler span.
+/// The response body of a report, which the server polls: the chunks its
+/// [`ReportBody`] sends from the task of the second pass, in order.
+///
+/// It holds no permit, connection or snapshot, only the one chunk of the
+/// channel. Dropped before the whole answer was sent, it closes the channel,
+/// and the pass is abandoned at once.
+struct ReportStream {
+    /// The chunks the pass has sent and the body has not yet taken.
+    chunks: mpsc::Receiver<Bytes>,
+    /// The body's `Content-Length`, the length the first pass measured.
+    length: usize,
+    /// The bytes of JSON taken so far.
+    taken: usize,
+}
+
+impl ReportStream {
+    /// The body that takes the chunks of `chunks` up to `length` bytes.
+    fn new(chunks: mpsc::Receiver<Bytes>, length: usize) -> Self {
+        Self {
+            chunks,
+            length,
+            taken: 0,
+        }
+    }
+
+    /// The next chunk the pass sent with the body that takes the rest, or
+    /// `None` once the pass has sent all `length` bytes and ended.
+    ///
+    /// # Errors
+    ///
+    /// [`ReportAborted`] when the pass ended short of `length` bytes: it
+    /// failed or was abandoned, and logged why. The body then ends short of
+    /// its `Content-Length`, never as a report that looks whole.
+    async fn next_chunk(mut self) -> Result<Option<(Bytes, Self)>, ReportAborted> {
+        match self.chunks.recv().await {
+            Some(chunk) => {
+                self.taken = self.taken.saturating_add(chunk.len());
+                Ok(Some((chunk, self)))
+            }
+            None if self.taken == self.length => Ok(None),
+            None => Err(ReportAborted),
+        }
+    }
+}
+
+/// The error that ends a report's second pass, and its response body short
+/// of its `Content-Length`. The server then aborts the answer, so the client
+/// never takes a body cut short for a whole report. The cause was logged
+/// where it was found, in the handler span.
 #[derive(Debug, thiserror::Error)]
 #[error("the report body was aborted; its cause is logged")]
 struct ReportAborted;

@@ -138,8 +138,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use carddemo_codec::layouts::{CodecError, Layout, encode_ascii_lf};
-use carddemo_codec::{Charset, CodecErrorKind};
+use carddemo_codec::layouts::{Charset, CodecError, CodecErrorKind, Layout, encode_ascii_lf};
 use tracing::Dispatch;
 
 /// `LIMIT(5) SCRATCH`: the number of generations each GDG keeps [app/jcl/DEFGDGB.jcl:STEP05]

@@ -45,7 +45,7 @@
 //! spaces, so only `n` of them stay `LOW-VALUES`. The list's start key is
 //! the `USRSEC` key the browse binds as text, and `COUSR00C` reads its NUL
 //! characters as `LOW-VALUES` only when they fill its `X(8)` field, so it is
-//! held to the new user's ID rule ([`check_user_list_start_key`]). The
+//! held to the new user's ID rule (`check_user_list_start_key`). The
 //! password keeps NUL, being stored as its argon2id hash, and so does the one-byte user type,
 //! which is NUL-free or the full-width `LOW-VALUES`. None of these edits has
 //! a `COUSR0nC` path or text, so all are answered alike: 400 `Invalid` on the
@@ -402,7 +402,7 @@ pub(crate) fn check_user_list_start_key(value: &str) -> Result<(), ApiError> {
 /// P-COUSR00C-003, P-COUSR00C-004. The parameters are those of
 /// [`PageQuery`], declared here so that the published `start_key` carries
 /// the `USRIDINI PIC X(8)` width and the pattern that
-/// [`check_user_list_start_key`] holds it to: ASCII, with NUL characters only
+/// `check_user_list_start_key` holds it to: ASCII, with NUL characters only
 /// as the 8 of `LOW-VALUES`. `direction` and `page_size` are
 /// published and read exactly as `PageQuery` declares them, and the query
 /// converts into one, so [`PageQuery::resolve`] gives the browse its

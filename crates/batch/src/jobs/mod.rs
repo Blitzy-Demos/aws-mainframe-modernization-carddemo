@@ -206,7 +206,7 @@ pub(super) fn span_count(count: impl TryInto<i64>) -> i64 {
 /// | `creastmt` | the live transactions read | 0 | 0 |
 /// | `tranrept` | the backup records the sort read | 0 | 0 |
 /// | `cbpaup0j` | the summaries and details read | 0 | 0 |
-/// | `mnttrdb2` | the records read | the types inserted, updated or deleted, 0 when the commit fails | the failed records |
+/// | `mnttrdb2` | the records read | the types inserted, updated or deleted, 0 when the run is not committed | the failed records |
 ///
 /// When the job returns, on every exit path, a failure to open the pool included, the three
 /// counts are recorded on the span once each, as integers like `exit_code`: the totals of the

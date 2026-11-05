@@ -88,9 +88,8 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::iter;
 use std::path::Path;
 
-use carddemo_codec::CodecErrorKind;
 use carddemo_codec::layouts::{
-    Charset, CodecError, DailyTranLayout, DailyTranRecord, Layout, RejectRecord,
+    Charset, CodecError, CodecErrorKind, DailyTranLayout, DailyTranRecord, Layout, RejectRecord,
     RejectRecordLayout, pad,
 };
 use carddemo_domain::clock::{Clock, FixedClock};

@@ -214,7 +214,7 @@ pub(crate) fn bearer_user(headers: &HeaderMap, keys: &JwtKeys) -> Option<AuthUse
 }
 
 /// The user a request's bearer token names when the token verifies, or
-/// `None`: [`bearer_user`] as an extractor that never refuses a request.
+/// `None`: `bearer_user` as an extractor that never refuses a request.
 ///
 /// For the public `POST /auth/logout`, which requires no token and names the
 /// user of one that verifies in its span only. Unlike [`AuthUser`], it reads

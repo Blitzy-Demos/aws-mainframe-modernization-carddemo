@@ -248,7 +248,7 @@ fn parse_start_key(raw: &str) -> Result<AuthId, ApiError> {
 
 /// The page position of `GET /authorizations`: `start_key`, `direction` and
 /// `page_size`, the parameters of the shared
-/// [`PageQuery`](crate::pagination::PageQuery), into which the handler
+/// [`PageQuery`], into which the handler
 /// converts it, so [`PageQuery::resolve`] applies the same defaults.
 ///
 /// COPAUS0C PROCESS-PF7-KEY, PROCESS-PF8-KEY — P-COPAUS0C-010 to

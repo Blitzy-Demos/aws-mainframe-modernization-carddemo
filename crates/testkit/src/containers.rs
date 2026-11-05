@@ -54,6 +54,12 @@
 //! testcontainers' default 60, and each of the stack's own Docker calls, such
 //! as the network's creation and removal, gets 300 seconds instead of bollard's
 //! default 120: a shared, busy Docker daemon can exceed both defaults.
+//! testcontainers' own Docker calls keep bollard's 120 seconds, which it does
+//! not let a caller change. A container start that one of them runs out of is
+//! therefore retried, after a pause of 5 and then 10 seconds, at most three
+//! attempts in all, and before each retry the container of that image the
+//! failed attempt left on the stack network is force-removed. A start that
+//! runs out of its 300 seconds, or fails in any other way, is not retried.
 //!
 //! The public API names only `sqlx::PgPool`, `lapin::Connection` and standard
 //! library types. No testcontainers or `carddemo-persistence` type crosses it,
@@ -83,10 +89,12 @@ use sqlx::{PgPool, Row, ValueRef};
 use testcontainers::bollard::Docker;
 use testcontainers::bollard::container::{ListContainersOptions, RemoveContainerOptions};
 use testcontainers::bollard::errors::Error as DockerError;
+use testcontainers::bollard::models::ContainerSummary;
 use testcontainers::bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
+use testcontainers::core::error::ClientError;
 use testcontainers::core::{AccessMode, IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{ContainerAsync, GenericImage, ImageExt, TestcontainersError};
 use testcontainers_modules::postgres::Postgres;
 use tokio::runtime::{Builder, Handle};
 #[cfg(unix)]
@@ -164,7 +172,20 @@ const RABBITMQ_ERL_ARGS: &str = "+S 2:2";
 /// than a shared, busy Docker daemon can take for that. When the budget runs
 /// out, testcontainers keeps no handle on the container it created, and the
 /// stack network's teardown removes it.
+///
+/// It is the budget of one start attempt. A start that runs out of it is not
+/// retried ([`is_client_timeout`]), because a retry would multiply the bound
+/// that already covers the daemon's slowest start.
 const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The pauses of a test container's start between its attempts, one before
+/// each retry: 5 seconds before the second attempt and 10 before the third,
+/// so a start makes at most three. Only a start that failed on a Docker client
+/// timeout ([`is_client_timeout`]) is retried, by [`start_retrying`]: that
+/// timeout, bollard's 120 seconds in testcontainers' own client, is fixed, and
+/// a daemon that a burst of other work slowed down for one call often answers
+/// the next in time.
+const START_BACKOFF: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(10)];
 
 /// Client timeout of the stack's own Docker API calls: creating and removing
 /// its network, and removing the containers left on it. bollard's default, 120
@@ -191,6 +212,13 @@ const DOCKER_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// [`CONTAINER_START_TIMEOUT`]: 780 seconds in all. Between the two
 /// creations, which a creation that finds no image or no network makes it
 /// retry, testcontainers pulls the image, a download no client timeout bounds.
+///
+/// That bound is per attempt of a start that [`start_retrying`] retries after
+/// a Docker client timeout. Only each attempt is in flight: between attempts,
+/// during the pause and the removal of what the failed attempt left, nothing
+/// is, and an attempt that would begin once the teardown has begun panics
+/// before it creates anything. The teardown therefore waits for one attempt at
+/// most.
 ///
 /// A call that is still polled therefore settles in time, unless it pulls an
 /// image for longer than the rest of the bound. Only such a pull, and a call
@@ -337,10 +365,13 @@ impl TestStack {
     ///
     /// Panics, naming the network, the image, the URL or the error, if Docker is
     /// unavailable, the stack network cannot be created, the container does not
-    /// start and become ready within 300 seconds, its port cannot be looked up,
-    /// the pool cannot connect, or a migration fails. As the panic unwinds,
-    /// every container on the stack network, one whose start failed included,
-    /// is force-removed, then the network.
+    /// start and become ready within 300 seconds, its start fails on a Docker
+    /// client timeout in each of its three attempts, its port cannot be looked
+    /// up, the pool cannot connect, or a migration fails. A failed start's panic
+    /// also gives the number of attempts made: three after client timeouts, one
+    /// after any other error. As the panic unwinds, every container on the stack
+    /// network, one whose start failed included, is force-removed, then the
+    /// network.
     pub async fn postgres() -> Self {
         // Created before any container, so that on a panic the containers,
         // dropped first, are gone when the network is removed.
@@ -385,7 +416,10 @@ impl TestStack {
     /// Panics in every case [`TestStack::postgres`] does, if either mounted
     /// file is missing (checked before any Docker network or container is
     /// created) or its path is not UTF-8, or if the broker does not start and
-    /// become ready within 300 seconds or its AMQP port cannot be looked up.
+    /// become ready within 300 seconds, its start fails on a Docker client
+    /// timeout in each of its three attempts, or its AMQP port cannot be looked
+    /// up. A failed start's panic gives the number of attempts made, as for the
+    /// database.
     pub async fn with_rabbitmq() -> Self {
         let definitions = mount_source(RABBITMQ_DEFINITIONS_SOURCE);
         let conf = mount_source(RABBITMQ_CONF_SOURCE);
@@ -1240,11 +1274,7 @@ fn keeps_containers() -> bool {
 async fn remove_stack_containers(docker: &Docker, name: &str) {
     let (attached, listed) = tokio::join!(
         docker.inspect_network(name, None::<InspectNetworkOptions<&str>>),
-        docker.list_containers(Some(ListContainersOptions {
-            all: true,
-            filters: HashMap::from([("network", vec![name])]),
-            ..ListContainersOptions::default()
-        })),
+        stack_containers(docker, name),
     );
     let mut ids = BTreeSet::new();
     match attached {
@@ -1254,41 +1284,69 @@ async fn remove_stack_containers(docker: &Docker, name: &str) {
         Err(error) => warn_unlisted(name, &error),
     }
     match listed {
-        // Docker's `network` filter also matches a prefix of a network ID, so
-        // only a container that names this network is kept.
-        Ok(containers) => ids.extend(
-            containers
-                .into_iter()
-                .filter(|container| {
-                    container
-                        .network_settings
-                        .as_ref()
-                        .and_then(|settings| settings.networks.as_ref())
-                        .is_some_and(|networks| networks.contains_key(name))
-                })
-                .filter_map(|container| container.id),
-        ),
+        Ok(containers) => ids.extend(containers.into_iter().filter_map(|container| container.id)),
         Err(error) => warn_unlisted(name, &error),
     }
     for id in ids {
-        let removal = docker
-            .remove_container(
-                &id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    ..RemoveContainerOptions::default()
-                }),
-            )
-            .await;
-        match removal {
-            Ok(()) => {}
-            Err(error) if has_status(&error, &[NOT_FOUND, CONFLICT]) => {}
-            Err(error) => report(format_args!(
-                "warning: carddemo-testkit left the Docker container {id} of the network \
-                 {name} behind (remove it with `docker rm -f -v {id}`): {error}"
-            )),
-        }
+        force_remove(docker, &id, name).await;
+    }
+}
+
+/// The containers, in any state, that Docker lists on the stack network
+/// `name`, for [`remove_stack_containers`] and [`remove_failed_start`].
+/// Docker's `network` filter also matches a prefix of a network ID, so only a
+/// container that names this network is kept.
+///
+/// # Errors
+///
+/// Returns the error if the Docker daemon cannot be reached or refuses the
+/// listing.
+async fn stack_containers(
+    docker: &Docker,
+    name: &str,
+) -> Result<Vec<ContainerSummary>, DockerError> {
+    let listed = docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: HashMap::from([("network", vec![name])]),
+            ..ListContainersOptions::default()
+        }))
+        .await?;
+    Ok(listed
+        .into_iter()
+        .filter(|container| {
+            container
+                .network_settings
+                .as_ref()
+                .and_then(|settings| settings.networks.as_ref())
+                .is_some_and(|networks| networks.contains_key(name))
+        })
+        .collect())
+}
+
+/// Force-removes the container `id` of the stack network `name`, with its
+/// anonymous volumes. A container that is already gone, or whose removal is
+/// already in progress, as testcontainers' own drop may have it, counts as
+/// removed. A removal that fails is reported on stderr, with the command that
+/// finishes the job.
+async fn force_remove(docker: &Docker, id: &str, name: &str) {
+    let removal = docker
+        .remove_container(
+            id,
+            Some(RemoveContainerOptions {
+                force: true,
+                v: true,
+                ..RemoveContainerOptions::default()
+            }),
+        )
+        .await;
+    match removal {
+        Ok(()) => {}
+        Err(error) if has_status(&error, &[NOT_FOUND, CONFLICT]) => {}
+        Err(error) => report(format_args!(
+            "warning: carddemo-testkit left the Docker container {id} of the network \
+             {name} behind (remove it with `docker rm -f -v {id}`): {error}"
+        )),
     }
 }
 
@@ -1311,28 +1369,175 @@ fn has_status(error: &DockerError, statuses: &[u16]) -> bool {
     )
 }
 
+/// Whether `error` reports a Docker API call of a testcontainers start that ran
+/// out of its client timeout, bollard's fixed 120 seconds: the lookup or
+/// creation of the network, or the creation, start or inspection of the
+/// container. Such a call failed on the daemon's load rather than on the
+/// request, so [`start_retrying`] retries the start.
+///
+/// A start that ran out of [`CONTAINER_START_TIMEOUT`] is not such a call, and
+/// neither is a Docker error response or any other failure: a retry would
+/// multiply the start budget, or fail again the same way.
+fn is_client_timeout(error: &TestcontainersError) -> bool {
+    matches!(
+        error,
+        TestcontainersError::Client(
+            ClientError::ListNetworks(DockerError::RequestTimeoutError)
+                | ClientError::InspectNetwork(DockerError::RequestTimeoutError)
+                | ClientError::CreateNetwork(DockerError::RequestTimeoutError)
+                | ClientError::CreateContainer(DockerError::RequestTimeoutError)
+                | ClientError::StartContainer(DockerError::RequestTimeoutError)
+                | ClientError::InspectContainer(DockerError::RequestTimeoutError)
+        )
+    )
+}
+
+/// A container start that [`start_retrying`] gave up on.
+struct StartFailure<E> {
+    /// The error of the last attempt.
+    error: E,
+    /// The attempts made, the last one included.
+    attempts: usize,
+}
+
+/// Runs `start`, one attempt of the start of the container `image`, until an
+/// attempt succeeds, fails with an error that `retried` rejects, or fails once
+/// more than `backoff` has pauses, and returns that attempt's outcome.
+///
+/// After each failure that `retried` accepts, short of the last attempt, it
+/// reports the failure on stderr, naming `image` and the attempt, waits that
+/// retry's pause from `backoff`, and runs `cleanup`, which removes what the
+/// failed attempt left behind, before the next attempt. The cleanup runs after
+/// the pause, so it also finds a container that the daemon created late, after
+/// its client had given up on the call. Neither the pause nor the cleanup is
+/// part of an attempt, so a [`ContainerStart`] that `start` holds is in flight
+/// during the attempts only.
+///
+/// # Errors
+///
+/// Returns the last attempt's error and the number of attempts made.
+///
+/// # Panics
+///
+/// Panics, as [`tokio::time::sleep`] does, if a pause runs outside a tokio
+/// runtime whose time driver is enabled.
+async fn start_retrying<T, E, Start, Started, Cleanup, Cleaned>(
+    image: &str,
+    backoff: &[Duration],
+    mut start: Start,
+    retried: impl Fn(&E) -> bool,
+    mut cleanup: Cleanup,
+) -> Result<T, StartFailure<E>>
+where
+    E: Display,
+    Start: FnMut() -> Started,
+    Started: Future<Output = Result<T, E>>,
+    Cleanup: FnMut() -> Cleaned,
+    Cleaned: Future<Output = ()>,
+{
+    let mut pauses = backoff.iter();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let error = match start().await {
+            Ok(started) => return Ok(started),
+            Err(error) => error,
+        };
+        let pause = match pauses.next() {
+            Some(pause) if retried(&error) => *pause,
+            _ => return Err(StartFailure { error, attempts }),
+        };
+        report(format_args!(
+            "warning: carddemo-testkit's start of the {image} test container failed on a \
+             Docker client timeout in attempt {attempts} of {}, so it is retried in \
+             {pause:?}: {error}",
+            backoff.len() + 1
+        ));
+        tokio::time::sleep(pause).await;
+        cleanup().await;
+    }
+}
+
+/// Force-removes, with their anonymous volumes, the containers of `image`
+/// that Docker lists on the stack network `network`, before [`start_retrying`]
+/// retries a start of that image: a timed-out attempt may have left one there,
+/// created and never started, or started and no longer tracked. Only
+/// containers of `image` are touched, because the stack's other container may
+/// be starting on the same network meanwhile, as in
+/// [`TestStack::with_rabbitmq`].
+///
+/// Nothing is removed with `TESTCONTAINERS_COMMAND=keep`, which keeps every
+/// container, or once a signal teardown has begun, which removes the network
+/// with every container on it. A container that is already gone, or whose
+/// removal is already in progress, counts as removed. A lookup or removal that
+/// fails is reported on stderr and the retry still goes ahead. A container that
+/// the daemon creates only after the lookup is left to the stack network's
+/// teardown.
+async fn remove_failed_start(network: &str, image: &str) {
+    if keeps_containers() || signal_teardown_started() {
+        return;
+    }
+    let listed = match docker_client() {
+        Ok(docker) => stack_containers(&docker, network)
+            .await
+            .map(|containers| (docker, containers)),
+        Err(error) => Err(error),
+    };
+    let (docker, containers) = match listed {
+        Ok(listed) => listed,
+        Err(error) => {
+            warn_unlisted(network, &error);
+            return;
+        }
+    };
+    let left = containers
+        .into_iter()
+        .filter(|container| container.image.as_deref() == Some(image))
+        .filter_map(|container| container.id);
+    for id in left {
+        force_remove(&docker, &id, network).await;
+    }
+}
+
 /// Starts the `PostgreSQL` container on `network`, connects a pool and migrates
 /// it, returning the container, the database URL and the pool.
 ///
-/// The testcontainers start is a [`ContainerStart`] in flight until it
-/// returns, so a signal teardown waits for it before its final sweep removes
-/// a container that Docker created after the teardown's first pass. Once that
-/// teardown has begun, the start panics before it creates anything.
+/// The testcontainers start runs through [`start_retrying`], so a start that a
+/// Docker client timeout fails is retried after each pause of
+/// [`START_BACKOFF`], three attempts at most. Each attempt is a
+/// [`ContainerStart`] in flight until it returns, so a signal teardown waits
+/// for it before its final sweep removes a container that Docker created after
+/// the teardown's first pass. Once that teardown has begun, the next attempt
+/// panics before it creates anything.
 async fn start_postgres(network: &str) -> (ContainerAsync<Postgres>, String, PgPool) {
-    let image = Postgres::default()
-        .with_db_name(POSTGRES_DB)
-        .with_user(POSTGRES_USER)
-        .with_password(POSTGRES_PASSWORD)
-        .with_tag(POSTGRES_TAG)
-        .with_network(network)
-        .with_startup_timeout(CONTAINER_START_TIMEOUT);
-    let start = ContainerStart::begin(&format!("{POSTGRES_IMAGE}:{POSTGRES_TAG}"), network);
-    let started = image.start().await;
-    drop(start);
-    let container = started.unwrap_or_else(|error| {
+    let descriptor = format!("{POSTGRES_IMAGE}:{POSTGRES_TAG}");
+    let image = descriptor.as_str();
+    let started = start_retrying(
+        image,
+        &START_BACKOFF,
+        // A request is consumed by its start, so each attempt builds its own.
+        move || async move {
+            let request = Postgres::default()
+                .with_db_name(POSTGRES_DB)
+                .with_user(POSTGRES_USER)
+                .with_password(POSTGRES_PASSWORD)
+                .with_tag(POSTGRES_TAG)
+                .with_network(network)
+                .with_startup_timeout(CONTAINER_START_TIMEOUT);
+            let start = ContainerStart::begin(image, network);
+            let started = request.start().await;
+            drop(start);
+            started
+        },
+        is_client_timeout,
+        move || remove_failed_start(network, image),
+    )
+    .await;
+    let container = started.unwrap_or_else(|failure| {
         panic!(
-            "cannot start the {POSTGRES_IMAGE}:{POSTGRES_TAG} test container \
-             (is the Docker daemon running?): {error}"
+            "cannot start the {image} test container in {} attempt(s) \
+             (is the Docker daemon running?): {}",
+            failure.attempts, failure.error
         )
     });
     let port = container
@@ -1357,33 +1562,50 @@ async fn start_postgres(network: &str) -> (ContainerAsync<Postgres>, String, PgP
 /// Starts the `RabbitMQ` container on `network` with the two repository files
 /// mounted read-only, returning the container and its AMQP URL.
 ///
-/// The testcontainers start is a [`ContainerStart`] in flight until it
-/// returns, as in [`start_postgres`].
+/// The testcontainers start is retried after a Docker client timeout, and each
+/// attempt is a [`ContainerStart`] in flight until it returns, as in
+/// [`start_postgres`].
 async fn start_rabbitmq(
     network: &str,
     definitions: String,
     conf: String,
 ) -> (ContainerAsync<GenericImage>, String) {
-    let image = GenericImage::new(RABBITMQ_IMAGE, RABBITMQ_TAG)
-        .with_exposed_port(AMQP_PORT.tcp())
-        .with_wait_for(WaitFor::message_on_stdout(RABBITMQ_READY))
-        .with_mount(
-            Mount::bind_mount(definitions, RABBITMQ_DEFINITIONS_TARGET)
-                .with_access_mode(AccessMode::ReadOnly),
-        )
-        .with_mount(
-            Mount::bind_mount(conf, RABBITMQ_CONF_TARGET).with_access_mode(AccessMode::ReadOnly),
-        )
-        .with_env_var("RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS", RABBITMQ_ERL_ARGS)
-        .with_network(network)
-        .with_startup_timeout(CONTAINER_START_TIMEOUT);
-    let start = ContainerStart::begin(&format!("{RABBITMQ_IMAGE}:{RABBITMQ_TAG}"), network);
-    let started = image.start().await;
-    drop(start);
-    let container = started.unwrap_or_else(|error| {
+    let descriptor = format!("{RABBITMQ_IMAGE}:{RABBITMQ_TAG}");
+    let image = descriptor.as_str();
+    let (definitions, conf) = (definitions.as_str(), conf.as_str());
+    let started = start_retrying(
+        image,
+        &START_BACKOFF,
+        // A request is consumed by its start, so each attempt builds its own.
+        move || async move {
+            let request = GenericImage::new(RABBITMQ_IMAGE, RABBITMQ_TAG)
+                .with_exposed_port(AMQP_PORT.tcp())
+                .with_wait_for(WaitFor::message_on_stdout(RABBITMQ_READY))
+                .with_mount(
+                    Mount::bind_mount(definitions, RABBITMQ_DEFINITIONS_TARGET)
+                        .with_access_mode(AccessMode::ReadOnly),
+                )
+                .with_mount(
+                    Mount::bind_mount(conf, RABBITMQ_CONF_TARGET)
+                        .with_access_mode(AccessMode::ReadOnly),
+                )
+                .with_env_var("RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS", RABBITMQ_ERL_ARGS)
+                .with_network(network)
+                .with_startup_timeout(CONTAINER_START_TIMEOUT);
+            let start = ContainerStart::begin(image, network);
+            let started = request.start().await;
+            drop(start);
+            started
+        },
+        is_client_timeout,
+        move || remove_failed_start(network, image),
+    )
+    .await;
+    let container = started.unwrap_or_else(|failure| {
         panic!(
-            "cannot start the {RABBITMQ_IMAGE}:{RABBITMQ_TAG} test container \
-             (is the Docker daemon running?): {error}"
+            "cannot start the {image} test container in {} attempt(s) \
+             (is the Docker daemon running?): {}",
+            failure.attempts, failure.error
         )
     });
     let port = container
@@ -1453,15 +1675,15 @@ mod tests {
     use testcontainers::bollard::errors::Error as DockerError;
     use testcontainers::bollard::models::{ContainerStateStatusEnum, HostConfig};
     use testcontainers::bollard::network::InspectNetworkOptions;
-    use testcontainers::core::error::WaitContainerError;
+    use testcontainers::core::error::{ClientError, WaitContainerError};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{GenericImage, ImageExt, TestcontainersError};
 
     use super::{
         AMQP_PORT, CREATIONS_WAIT, ContainerStart, Creation, NETWORK_NAME_PREFIX, NOT_FOUND,
         POSTGRES_IMAGE, POSTGRES_PORT, POSTGRES_TAG, StackNetwork, TESTCONTAINERS_COMMAND,
-        TestStack, create_network, docker_client, has_status, sweep_networks, teardown_network,
-        wait_for_creations,
+        TestStack, create_network, docker_client, has_status, is_client_timeout, start_retrying,
+        sweep_networks, teardown_network, wait_for_creations,
     };
     use crate::block_on;
 
@@ -1523,6 +1745,141 @@ mod tests {
         assert_wait_follows("network creation", creation);
         let start = ContainerStart::begin(&format!("{POSTGRES_IMAGE}:{POSTGRES_TAG}"), &name);
         assert_wait_follows("container start", start);
+    }
+
+    /// testcontainers' error for a call of `kind` that ran out of its Docker
+    /// client timeout, as a busy daemon makes it.
+    fn timed_out(kind: fn(DockerError) -> ClientError) -> TestcontainersError {
+        TestcontainersError::Client(kind(DockerError::RequestTimeoutError))
+    }
+
+    /// testcontainers' error for a container creation that ran out of its
+    /// Docker client timeout, the failure the retry exists for.
+    fn create_timed_out() -> TestcontainersError {
+        timed_out(ClientError::CreateContainer)
+    }
+
+    /// testcontainers' error for a start that ran out of its start budget.
+    fn startup_timed_out() -> TestcontainersError {
+        TestcontainersError::WaitContainer(WaitContainerError::StartupTimeout)
+    }
+
+    #[test]
+    fn only_a_docker_client_timeout_makes_a_start_retry() {
+        let cases = [
+            (
+                "network list timeout",
+                timed_out(ClientError::ListNetworks),
+                true,
+            ),
+            (
+                "network inspection timeout",
+                timed_out(ClientError::InspectNetwork),
+                true,
+            ),
+            (
+                "network creation timeout",
+                timed_out(ClientError::CreateNetwork),
+                true,
+            ),
+            ("container creation timeout", create_timed_out(), true),
+            (
+                "container start timeout",
+                timed_out(ClientError::StartContainer),
+                true,
+            ),
+            (
+                "container inspection timeout",
+                timed_out(ClientError::InspectContainer),
+                true,
+            ),
+            (
+                "container creation refused",
+                TestcontainersError::Client(ClientError::CreateContainer(
+                    DockerError::DockerResponseServerError {
+                        status_code: 500,
+                        message: String::from("the daemon failed the creation"),
+                    },
+                )),
+                false,
+            ),
+            ("start budget run out", startup_timed_out(), false),
+        ];
+        for (case, error, retried) in &cases {
+            assert_eq!(is_client_timeout(error), *retried, "{case}: {error}");
+        }
+    }
+
+    /// A pause of zero before each of the two retries of a fake start, so the
+    /// retry tests run at once.
+    const NO_BACKOFF: [Duration; 2] = [Duration::ZERO; 2];
+
+    /// The error of each attempt of a fake start, by the attempt's number from
+    /// 1, or `None` for an attempt that succeeds.
+    type FakeAttempts = fn(usize) -> Option<TestcontainersError>;
+
+    #[test]
+    fn a_start_is_retried_after_client_timeouts_only_and_at_most_three_times() {
+        // Each case: the attempts' errors; the outcome, the attempt that
+        // succeeded or the attempts made with the last error; and the attempts
+        // made.
+        let cases: [(&str, FakeAttempts, _, usize); 4] = [
+            (
+                "two client timeouts, then a start",
+                |attempt| (attempt < 3).then(create_timed_out),
+                Ok(3),
+                3,
+            ),
+            (
+                "client timeouts only",
+                |_| Some(create_timed_out()),
+                Err((3, create_timed_out().to_string())),
+                3,
+            ),
+            (
+                "a run-out start budget",
+                |_| Some(startup_timed_out()),
+                Err((1, startup_timed_out().to_string())),
+                1,
+            ),
+            (
+                "a client timeout, then a run-out start budget",
+                |attempt| {
+                    Some(if attempt < 2 {
+                        create_timed_out()
+                    } else {
+                        startup_timed_out()
+                    })
+                },
+                Err((2, startup_timed_out().to_string())),
+                2,
+            ),
+        ];
+        for (case, fails, expected, attempts) in cases {
+            let (mut made, mut cleanups) = (0, 0);
+            let outcome = block_on(start_retrying(
+                "fake:retry",
+                &NO_BACKOFF,
+                || {
+                    made += 1;
+                    let attempt = made;
+                    async move { fails(attempt).map_or(Ok(attempt), Err) }
+                },
+                is_client_timeout,
+                || {
+                    cleanups += 1;
+                    async {}
+                },
+            ))
+            .map_err(|failure| (failure.attempts, failure.error.to_string()));
+            assert_eq!(outcome, expected, "{case}");
+            assert_eq!(made, attempts, "{case}: attempts made");
+            assert_eq!(
+                cleanups,
+                attempts - 1,
+                "{case}: a cleanup runs before each retry and at no other time"
+            );
+        }
     }
 
     /// The only host address a stack's containers may publish on. Written out

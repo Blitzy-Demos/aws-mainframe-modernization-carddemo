@@ -222,10 +222,12 @@ fn summary_input(
 ///
 /// # Errors
 ///
-/// Each on `CARDNUM`:
+/// Each on `CARDNUM`, except the 401, the 400 of an `{id}` that is not UTF-8
+/// and the 500 of a failed `USRSEC` read, which carry no field:
 ///
 /// - 400 with no message when `{id}` is not a positive integer, the COBOL
-///   path with no selected key (V-COPAUS1C-001, E-49).
+///   path with no selected key (V-COPAUS1C-001, E-49); with the path
+///   rejection's text when `{id}` is not UTF-8 once percent-decoded.
 /// - 401 without a valid bearer token.
 /// - 404 with no message when no authorization has the identity or no
 ///   summary is found over it (V-COPAUS1C-004, V-COPAUS1C-005).
@@ -235,7 +237,8 @@ fn summary_input(
 ///   and the IMS status when only the summary read fails (V-COPAUS1C-003);
 ///   with ` System error while reading next Auth: Code:` when the next read
 ///   fails (V-COPAUS1C-013); with the scheduling text when the authorization
-///   store cannot be opened (V-COPAUS1C-002).
+///   store cannot be opened (V-COPAUS1C-002); `Unexpected error` when the
+///   signed-on user cannot be read from `USRSEC`.
 #[utoipa::path(
     get,
     path = "/authorizations/{id}",
@@ -318,10 +321,12 @@ async fn read_with_next<S: AuthorizationStore>(
 ///
 /// # Errors
 ///
-/// Each on `CARDNUM`, and nothing is written except by a `COMMIT` whose
-/// answer is lost:
+/// Each on `CARDNUM`, except the 401, the 400 of an `{id}` that is not UTF-8
+/// and the 500 of a failed commit or `USRSEC` read, which carry no field;
+/// nothing is written except by a `COMMIT` whose answer is lost:
 ///
-/// - 400 with no message when `{id}` is not a positive integer.
+/// - 400 with no message when `{id}` is not a positive integer; with the path
+///   rejection's text when `{id}` is not UTF-8 once percent-decoded.
 /// - 401 without a valid bearer token.
 /// - 404 with no message when no authorization has the identity or no
 ///   summary is found over it, the outcome E-53 proposes for a fraud mark
@@ -335,9 +340,10 @@ async fn read_with_next<S: AuthorizationStore>(
 ///   or `COPAUS2C` text when the fraud-table write or the detail replace
 ///   fails, or the scheduling text when the authorization store cannot be
 ///   opened; 500 `Unexpected error` when the cross-reference read or the
-///   commit fails. A `COMMIT` the server rejects writes nothing; one whose
-///   answer is lost, its connection gone, may have toggled the mark, so the
-///   authorization is read again before the mark is retried.
+///   commit fails, or the signed-on user cannot be read from `USRSEC`. A
+///   `COMMIT` the server rejects writes nothing; one whose answer is lost,
+///   its connection gone, may have toggled the mark, so the authorization is
+///   read again before the mark is retried.
 #[utoipa::path(
     put,
     path = "/authorizations/{id}",

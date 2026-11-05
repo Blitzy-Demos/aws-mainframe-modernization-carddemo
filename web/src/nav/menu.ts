@@ -2,8 +2,9 @@
  * The single navigation definition of the SPA: the CM00 main menu (COMEN01C,
  * options from COMEN02Y), the CA00 admin menu (COADM01C, options from
  * COADM02Y) and the two reward entries. The sidebar, the dashboard and admin
- * landing menu lists, and the route table read their options from here; no
- * other module declares a menu option.
+ * landing menu lists, and the route table read their options from here, and
+ * the sidebar reads from menuForUserType which sections a user type sees; no
+ * other module declares a menu option or decides a section's visibility.
  *
  * Labels are the copybook `PIC X(35)` option texts, right-trimmed and without
  * the `NN. ` prefix that BUILD-MENU-OPTIONS prepends on the 3270 screen
@@ -289,7 +290,8 @@ export const adminMenu: readonly MenuEntry[] = [
 /** Every entry, the user section first, each section in COBOL option order. */
 export const menu: readonly MenuEntry[] = [...userMenu, ...adminMenu];
 
-type MenuGroup = {
+/** One sidebar section: its title and its entries in COBOL option order. */
+export type MenuGroup = {
   section: MenuSection;
   label: string;
   entries: readonly MenuEntry[];
@@ -312,17 +314,18 @@ const userGroups: readonly MenuGroup[] = [userGroup];
 const adminGroups: readonly MenuGroup[] = [userGroup, adminGroup];
 
 /**
- * The menu sections a signed-on user sees: "Card management" always, then
- * "Administration" for user type 'A' only. The section decides visibility,
- * not the COBOL option user-type byte: every COMEN02Y option is 'U', so the
- * COMEN01C admin-only rejection [app/cbl/COMEN01C.cbl:L136-143] is never
- * reached and has no counterpart. This shapes the UI only; the API's 403 on
- * `/admin/**` decides access.
+ * The menu sections a signed-on user sees, in sidebar order, and the single
+ * definition of that rule, which the sidebar renders: "Card management"
+ * always, then "Administration" for user type 'A' only. Only that exact code
+ * is an administrator, as `isAdmin` in lib/session.ts reads it, so any other
+ * code, and a missing one, gets the user section alone. The section decides
+ * visibility, not the COBOL option user-type byte: every COMEN02Y option is
+ * 'U', so the COMEN01C admin-only rejection [app/cbl/COMEN01C.cbl:L136-143]
+ * is never reached and has no counterpart. This shapes the UI only; the
+ * API's 403 on `/admin/**` decides access.
  */
-export function menuForUserType(userType: "A" | "U" | null | undefined): readonly {
-  section: MenuSection;
-  label: string;
-  entries: readonly MenuEntry[];
-}[] {
+export function menuForUserType(
+  userType: string | null | undefined,
+): readonly MenuGroup[] {
   return userType === "A" ? adminGroups : userGroups;
 }

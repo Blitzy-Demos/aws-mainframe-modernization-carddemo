@@ -141,9 +141,9 @@ const LOGIN_PATH = "/auth/login" satisfies keyof paths;
 // The session each request was sent by. Every sign-on stores a new session
 // object, which getSession returns until the session is cleared or replaced,
 // so the object itself identifies the sign-on. openapi-fetch hands onResponse
-// the Request object onRequest returned, so the answer is matched to its own
-// request, and an entry goes away with its request. A request sent with no
-// session, or to anywhere but the API, has no entry.
+// and onError the Request object onRequest returned, so the answer is matched
+// to its own request, and an entry goes away with its request. A request sent
+// with no session, or to anywhere but the API, has no entry.
 const sentBySession = new WeakMap<Request, Session>();
 
 // The path segment the Vite proxy forwards to the API, under which every
@@ -181,6 +181,22 @@ function isApiRequest(url: string): boolean {
 // go away with their session or answer.
 const sessionsEndedBy401 = new WeakSet<Session>();
 const sessionEndingAnswers = new WeakSet<Response>();
+
+// The status of each answer whose status line arrived but whose body could
+// not be read in full. fetchWithDeadline then rejects the call with the read's
+// failure, so openapi-fetch hands the middleware that failure in onError and
+// never the answer in onResponse; the entry is how onError knows the answer
+// was a 401. An entry goes away with its request.
+const unreadAnswerStatus = new WeakMap<Request, number>();
+
+// Ends the session that sent a request answered 401, with `cause` as the
+// reason, while that session is still the current one.
+function endSessionBy401(sentBy: Session, cause: ApiError): void {
+  if (getSession() === sentBy) {
+    sessionsEndedBy401.add(sentBy);
+    clearSession(cause);
+  }
+}
 
 // The error body of an answer, read from a copy so that openapi-fetch still
 // reads the original for the caller: the parsed JSON, the raw text when it is
@@ -247,20 +263,30 @@ const authMiddleware: Middleware = {
       return response;
     }
     if (getSession() === sentBy) {
-      const cause = new ApiError(
-        401,
-        toErrorBody(await readErrorBody(response)),
-        true,
+      endSessionBy401(
+        sentBy,
+        new ApiError(401, toErrorBody(await readErrorBody(response)), true),
       );
-      if (getSession() === sentBy) {
-        sessionsEndedBy401.add(sentBy);
-        clearSession(cause);
-      }
     }
     if (sessionsEndedBy401.has(sentBy)) {
       sessionEndingAnswers.add(response);
     }
     return response;
+  },
+  // A 401 whose body could not be read (unreadAnswerStatus) ends the session
+  // as onResponse ends it for any other 401, with a copy of
+  // UNEXPECTED_ERROR_BODY as the cause, since there is no server error body
+  // to show. Nothing is returned, so the call still rejects with the read's
+  // failure, unchanged.
+  onError({ request, schemaPath }) {
+    if (unreadAnswerStatus.get(request) !== 401 || schemaPath === LOGIN_PATH) {
+      return undefined;
+    }
+    const sentBy = sentBySession.get(request);
+    if (sentBy !== undefined) {
+      endSessionBy401(sentBy, new ApiError(401, unexpectedErrorBody(), true));
+    }
+    return undefined;
   },
 };
 
@@ -293,62 +319,29 @@ export class RequestTimeoutError extends Error {
   }
 }
 
-// `body`, passed through unchanged, calling `onEnd` once the body is over
-// for whichever reason comes first: its last chunk has been read; a read of it
-// fails, which errors the stream with that same reason; or its reader cancels
-// it, which passes the cancellation and its reason on to `body`. The stream
-// keeps the default strategy, one chunk read ahead, so its first pull runs
-// before anyone reads it: an empty body that is never read, as openapi-fetch
-// leaves one whose Content-Length is 0, is over at once.
-function passThrough<T>(
-  body: ReadableStream<T>,
-  onEnd: () => void,
-): ReadableStream<T> {
-  const reader = body.getReader();
-  // A read still pending when the reader cancels settles after the stream has
-  // closed, which then takes neither a chunk nor a close.
-  let cancelled = false;
-  return new ReadableStream<T>({
-    async pull(stream) {
-      let chunk: ReadableStreamReadResult<T>;
-      try {
-        chunk = await reader.read();
-      } catch (error: unknown) {
-        onEnd();
-        throw error;
-      }
-      if (chunk.done) {
-        onEnd();
-        if (!cancelled) {
-          stream.close();
-        }
-      } else if (!cancelled) {
-        stream.enqueue(chunk.value);
-      }
-    },
-    cancel(reason: unknown) {
-      cancelled = true;
-      onEnd();
-      return reader.cancel(reason);
-    },
-  });
-}
-
 // Sends one request, bounded by REQUEST_TIMEOUT_MS and by the caller's
 // `signal` option, which openapi-fetch puts on the Request. One controller
 // carries both to the network: the caller's abort rejects with the caller's
 // own reason (an AbortError unless the caller gave one), which query hooks
 // treat as cancellation, and the deadline rejects with a RequestTimeoutError.
 // - The signal goes in fetch's init argument, so the Request the middleware
-//   saw and sees again in onResponse stays the same object. openapi-fetch's
-//   second argument, requestInitExt, is never configured here.
-// - The controller stays armed after the headers arrive, because openapi-fetch
-//   reads the body afterwards and a stalled body is cut off the same way.
-//   Both the deadline and the caller's abort are disarmed once the answer is
+//   saw and sees again in onResponse or onError stays the same object.
+//   openapi-fetch's second argument, requestInitExt, is never configured here.
+// - The body is read here in full before the answer is handed on, and the
+//   answer handed on holds the bytes read, so a stalled body is cut off the
+//   same way as a stalled status line. openapi-fetch reads the body only after
+//   this function resolves, and a browser reports the failure of a body read
+//   through a stream built by script as a generic network TypeError, which
+//   would lose the abort reason. A read that fails once the controller has
+//   aborted rejects with the abort's reason; any other failed read rejects
+//   with the network error itself. Either way the answer's status is recorded
+//   in unreadAnswerStatus, so that a 401 whose body could not be read still
+//   ends the session (authMiddleware's onError).
+// - Both the deadline and the caller's abort are disarmed once the answer is
 //   over: when the call fails, at once when the answer has no body, and
-//   otherwise when its body ends, is cancelled or fails (passThrough). A
-//   finished request therefore holds no timer or listener and is never
-//   aborted afterwards.
+//   otherwise when its body has been read or its read has failed. A finished
+//   request therefore holds no timer or listener and is never aborted
+//   afterwards.
 // - Nothing is retried: a write that timed out may already have been applied,
 //   so the caller sees the rejection and the request is sent exactly once.
 function fetchWithDeadline(request: Request): Promise<Response> {
@@ -374,15 +367,24 @@ function fetchWithDeadline(request: Request): Promise<Response> {
   // The global is looked up on every request rather than once at load, so a
   // test that stubs it after this module loads still intercepts the calls.
   return globalThis.fetch(request, { signal: controller.signal }).then(
-    (response) => {
+    async (response) => {
       if (response.body === null) {
         disarm();
         return response;
       }
+      let bytes: ArrayBuffer;
+      try {
+        bytes = await response.arrayBuffer();
+      } catch (error: unknown) {
+        unreadAnswerStatus.set(request, response.status);
+        throw controller.signal.aborted ? controller.signal.reason : error;
+      } finally {
+        disarm();
+      }
       // Only the status, the status text and the headers carry over to the
       // answer handed back; its url, redirected and type take their defaults,
       // which neither openapi-fetch nor any caller reads.
-      return new Response(passThrough(response.body, disarm), {
+      return new Response(bytes, {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers,

@@ -1086,7 +1086,7 @@ impl PgStore<'_, '_> {
     /// (P-CBPAUP0C-005, P-CBPAUP0C-009).
     ///
     /// The statement takes the transaction-scoped advisory lock
-    /// [`PURGE_LOCK_KEY`] under its own savepoint, as every store statement
+    /// `PURGE_LOCK_KEY` under its own savepoint, as every store statement
     /// does; releasing the savepoint hands the lock to the unit of work, so it
     /// stays held until the unit commits or rolls back. A purge that asks for
     /// it while another holds it waits until that unit ends. The unit of work

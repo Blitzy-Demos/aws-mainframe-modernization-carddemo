@@ -77,8 +77,7 @@ use std::ops::{ControlFlow, Range};
 use std::slice;
 use std::sync::Arc;
 
-use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
-use carddemo_codec::{Charset, Layout};
+use carddemo_codec::layouts::{Charset, Layout, TransactionLayout, TransactionRecord};
 use carddemo_domain::rules::transaction_report::TranId;
 use carddemo_persistence::repos::LoadOutcome;
 use carddemo_persistence::tx::{Db, UnitOfWork};

@@ -109,6 +109,11 @@ type BalancePreviewProps = {
   form: UseFormReturn<PaymentFormValues>;
   // Whether the form still holds the entry this account was reviewed from.
   ownsEntry: () => boolean;
+  // Whether the confirmation dialog is open over the page.
+  dialogOpen: boolean;
+  // Runs a marking of the entry once a closed dialog has left the page, or at
+  // once when none is on it.
+  afterDialogCloses: AfterClose;
 };
 
 // The CURBAL line of COBIL00, "Your current balance is", for the account
@@ -125,27 +130,47 @@ function BalancePreview({
   paying,
   form,
   ownsEntry,
+  dialogOpen,
+  afterDialogCloses,
 }: BalancePreviewProps): JSX.Element | null {
   const account = useAccount(accountId);
   const accountError = account.error;
   // Each failed read is shown once, as a toast and at the account ID, with
   // the cursor placed there. The ref keeps a re-run of the effect (a remount
-  // under StrictMode, say) from showing the same failure twice.
+  // under StrictMode, or the dialog opening or closing) from showing the same
+  // failure twice.
   const shownError = useRef<unknown>(null);
   useEffect(() => {
     if (accountError === null || accountError === shownError.current) {
       return;
     }
     shownError.current = accountError;
-    // A read that fails once the entry was replaced (the reload after a
-    // payment, say) concerns this card's account, not the entry now on the
-    // form, so it is only toasted.
-    if (ownsEntry()) {
-      applyApiError(accountError, form, previewFieldMap);
+    if (dialogOpen) {
+      // A read that fails while the dialog asks (the card's first read) is
+      // only toasted. The modal dialog hides the page from assistive
+      // technology, so the cursor must not move there, and every way out of
+      // the dialog settles the entry itself: Cancel and Escape clear the
+      // screen, a payment's answer blanks the entry or marks it, and the
+      // dialog returns the cursor to the account ID.
+      showApiError(accountError);
+    } else if (ownsEntry()) {
+      // After a Confirm, the reload after the payment can fail while the
+      // closed dialog is still leaving the page, so the marking waits until
+      // it has gone. Whether the form still holds the entry is decided then.
+      afterDialogCloses(() => {
+        if (ownsEntry()) {
+          applyApiError(accountError, form, previewFieldMap);
+        } else {
+          showApiError(accountError);
+        }
+      });
     } else {
+      // A read that fails once the entry was replaced (the reload after a
+      // payment, say) concerns this card's account, not the entry now on the
+      // form, so it is only toasted.
       showApiError(accountError);
     }
-  }, [accountError, form, ownsEntry]);
+  }, [accountError, afterDialogCloses, dialogOpen, form, ownsEntry]);
 
   let balance: string;
   let updating: boolean;
@@ -226,6 +251,20 @@ export default function BillPaymentPage(): JSX.Element {
   // The dialog's action reports through onConfirm and then closes through
   // onOpenChange(false), as Cancel and Escape do; this tells them apart.
   const confirmedRef = useRef(false);
+  // The dialog's afterClose, which reaches the page with a Confirm. One
+  // function serves every opening, so it is kept for the balance card, whose
+  // reload after the payment can fail while the dialog closes. Before the
+  // first Confirm there is none and a move runs at once: the card has then
+  // only been shown under the open dialog, and Cancel or Escape removes it.
+  const afterCloseRef = useRef<AfterClose | null>(null);
+  const afterDialogCloses = useCallback<AfterClose>((move) => {
+    const afterClose = afterCloseRef.current;
+    if (afterClose === null) {
+      move();
+    } else {
+      afterClose(move);
+    }
+  }, []);
   // The request in flight, one at a time, as the 3270 keyboard locks while
   // the task runs. A mutation's isPending only changes with the next render,
   // and handleSubmit runs the schema asynchronously, so two submits in one
@@ -346,6 +385,7 @@ export default function BillPaymentPage(): JSX.Element {
     // Set first, so a press the guard drops still closes the dialog as a
     // Confirm, not as the Cancel that clears the screen.
     confirmedRef.current = true;
+    afterCloseRef.current = afterClose;
     if (reviewed === null || inFlightRef.current !== null) {
       return;
     }
@@ -505,6 +545,8 @@ export default function BillPaymentPage(): JSX.Element {
             paying={payment.isPending}
             form={form}
             ownsEntry={ownsPreviewEntry}
+            dialogOpen={confirmOpen}
+            afterDialogCloses={afterDialogCloses}
           />
         )}
       </div>

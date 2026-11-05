@@ -39,7 +39,8 @@ futures-util = "0.3.34"
 # `net` provides the TcpListener that axum::serve binds.
 # `signal` provides the SIGINT/SIGTERM streams the api drains on before it stops.
 # `sync` provides the semaphores the api admits TRAN-ID writers and argon2 work through.
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+# `time` provides the send deadline of a CR00 report's streamed answer.
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tower = "~0.5.3"
 tower-http = { version = "~0.6.11", features = ["trace", "cors"] }
 

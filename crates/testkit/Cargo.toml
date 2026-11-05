@@ -19,6 +19,6 @@ workspace = true
 carddemo-persistence.workspace = true
 testcontainers.workspace = true
 testcontainers-modules = { workspace = true, features = ["postgres", "rabbitmq"] }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 sqlx.workspace = true
 lapin.workspace = true

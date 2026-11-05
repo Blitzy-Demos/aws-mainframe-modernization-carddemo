@@ -38,8 +38,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{io, mem};
 
-use carddemo_codec::layouts::{TransactionLayout, TransactionRecord, encode_ascii_lf};
-use carddemo_codec::{Charset, Layout};
+use carddemo_codec::layouts::{
+    Charset, Layout, TransactionLayout, TransactionRecord, encode_ascii_lf,
+};
 use carddemo_domain::format::REPORT_RECORD_LEN;
 use carddemo_domain::messages::{
     ABENDING_PROGRAM, END_OF_EXECUTION_OF_PROGRAM_CBTRN03C, ERROR_CLOSING_REPORT_FILE,

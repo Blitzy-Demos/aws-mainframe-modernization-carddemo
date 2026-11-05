@@ -46,15 +46,20 @@
 //! - `AppState::admit_report` admits the CR00 reports. A report holds one
 //!   pooled connection and one database snapshot from the start of its run
 //!   until its streamed answer is sent or abandoned, and besides them one
-//!   page of records, the chunk of JSON it is filling and what the server's
-//!   bounded write buffer holds, whatever its size.
-//!   It therefore takes its permit before it opens its unit of work, and its
-//!   response body keeps the permit: at most `report_permits` reports run or
-//!   send at once, overlapping reports queue here holding no connection, and
-//!   the other operations keep the rest of the pool. A client that reads its
-//!   report slowly, or not at all, keeps the permit and the connection until
-//!   it has read the answer or disconnected, since the API has no timeout,
-//!   rate limiting or proxy.
+//!   page of records, the chunk of JSON it is filling, the one chunk waiting
+//!   for its response body and what the server's bounded write buffer holds,
+//!   whatever its size.
+//!   It therefore takes its permit before it opens its unit of work, and the
+//!   task that writes its answer keeps the permit: at most `report_permits`
+//!   reports run or send at once, overlapping reports queue here holding no
+//!   connection, and the other operations keep the rest of the pool. A
+//!   client that reads its report slowly keeps the permit and the connection
+//!   for as long as it reads. One that stops reading keeps them only until
+//!   its answer has waited
+//!   [`REPORT_SEND_DEADLINE`](crate::handlers::reports::REPORT_SEND_DEADLINE)
+//!   for it to take a chunk: the report is then abandoned, its unit of work
+//!   rolled back and its permit returned, so no client that stops reading
+//!   keeps a permit for good.
 //!
 //! # Time
 //!
@@ -694,8 +699,9 @@ impl AppState {
 
     /// Waits for a report permit, the admission of the module documentation.
     /// A CR00 report takes it before it opens its read-only unit of work, and
-    /// its response body holds it until the body is sent or dropped, so a
-    /// report queued here holds no pooled connection and no snapshot.
+    /// the task that writes its answer holds it until the answer is sent or
+    /// abandoned, so a report queued here holds no pooled connection and no
+    /// snapshot.
     ///
     /// # Errors
     ///

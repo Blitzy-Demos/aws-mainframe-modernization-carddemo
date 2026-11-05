@@ -36,7 +36,13 @@
 //!
 //! - span lines: the spans the directives enable are exported, and no other.
 //!   A span meant to reach the span lines under the default filter must be
-//!   created at INFO level or above, for example with `tracing::info_span!`;
+//!   created at INFO level or above, for example with `tracing::info_span!`.
+//!   Every event the directives enable inside such a span reaches the
+//!   OpenTelemetry layer, which applies to the span what the event changes in
+//!   its line, the `error` status and the `exception.*` attributes. The span
+//!   line carries no event, so the event itself is then dropped from the
+//!   span's data, and a long span, such as a batch job's, holds at most one
+//!   event at a time;
 //! - event lines: the events the directives enable are written, and no other.
 //!   The JSON formatter also keeps, whatever the directives say, every INFO,
 //!   WARN and ERROR span of a workspace library crate (a target starting with
@@ -131,7 +137,7 @@ use tracing_subscriber::fmt::format::{
 use tracing_subscriber::fmt::time::{FormatTime as _, SystemTime};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::fmt::{self, FmtContext, MakeWriter};
-use tracing_subscriber::layer::{Layer as _, SubscriberExt};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
 
@@ -226,6 +232,54 @@ fn is_context_span(metadata: &Metadata<'_>) -> bool {
     metadata.is_span()
         && *metadata.level() <= Level::INFO
         && is_in_workspace_crate(metadata.target())
+}
+
+/// The layer that empties the event list `tracing-opentelemetry` keeps in the
+/// data of a span, right after that layer has applied an event to the span.
+///
+/// `tracing-opentelemetry` turns every event it receives into an OpenTelemetry
+/// event and appends it to the span builder in the `OtelData` of the event's
+/// span, where it stays until the span closes. [`JsonSpanExporter`] writes no
+/// span event and no event count, because the JSON formatter writes each event
+/// as a line of its own, so the list only holds memory for the span's lifetime.
+/// A batch job span lasts the whole job: a job that logs events per record,
+/// such as the `PROCESSING` display and the `database statement failed` event
+/// of each `mnttrdb2` record, would hold them all until it ends.
+///
+/// Everything else an event does to a span line is already in the span
+/// builder when this layer runs: `tracing-opentelemetry` applies it before it
+/// appends the event. That is the `error` status of an ERROR event or of an
+/// event whose `error` field no message precedes, and the `exception.message`
+/// and `exception.stacktrace` attributes of an error value recorded on any
+/// field. Emptying the list therefore leaves every span line as it was, and a
+/// span holds at most one event at a time, however long it lasts.
+///
+/// [`subscriber_with_writer`] composes it after the OpenTelemetry layer under
+/// that layer's own filter (`and_then`, then `with_filter`), so it receives
+/// exactly the events the OpenTelemetry layer receives, in the same filtered
+/// context, and each one after that layer: a `Layered` pair of layers hands an
+/// event to its inner layer, here the OpenTelemetry one, before its outer one
+/// (`Layered::on_event` in `tracing-subscriber` 0.3.23). [`Context::event_span`]
+/// finds the span by the rule `tracing-opentelemetry` attaches an event by: its
+/// explicit parent, else the current span, among the spans the filter enabled.
+#[derive(Debug)]
+struct ReleaseSpanEvents;
+
+impl<S> Layer<S> for ReleaseSpanEvents
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    /// Drops every event held in the `OtelData` of the span `event` was just
+    /// appended to. An event outside every span the filter enabled, or in a
+    /// span without OpenTelemetry data, leaves nothing to drop.
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.event_span(event) else {
+            return;
+        };
+        if let Some(otel) = span.extensions_mut().get_mut::<OtelData>() {
+            otel.builder.events = None;
+        }
+    }
 }
 
 /// Failure to set up or shut down telemetry.
@@ -865,8 +919,14 @@ fn span_trace_ids(otel: &OtelData) -> Option<(TraceId, SpanId)> {
 /// 3. the `tracing-opentelemetry` layer, on a tracer named `service_name` from a
 ///    tracer provider of its own whose simple span processor feeds a
 ///    [`JsonSpanExporter`] on `writer`, with `service_name` as the resource's
-///    `service.name`. Its own filter is a second `EnvFilter` parsed from
-///    `directives`, so the span lines are the spans the directives enable. The
+///    `service.name`, followed by a layer of this module (`ReleaseSpanEvents`)
+///    that, after the OpenTelemetry layer has applied each event to its span,
+///    empties the event list that layer keeps in the span until it closes: the
+///    exporter writes no event, and the event's status and `exception.*`
+///    attributes are in the span by then, so no span holds the events it
+///    contains. The two share one filter, a second `EnvFilter` parsed from
+///    `directives`, so the span lines are the spans the directives enable, and
+///    every event the directives enable reaches the OpenTelemetry layer. The
 ///    provider samples every span (`Sampler::AlwaysOn`) and keeps the SDK's
 ///    default span limits (128 attributes, events and links per span), both
 ///    set explicitly.
@@ -931,6 +991,7 @@ where
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
+                .and_then(ReleaseSpanEvents)
                 .with_filter(span_filter),
         );
     Ok((subscriber, guard))
@@ -1015,7 +1076,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::Value as Json;
+    use tracing_opentelemetry::OtelData;
+    use tracing_subscriber::Registry;
     use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::registry::LookupSpan;
 
     use super::{
         BATCH_BYTES, DROP_REPORT_MESSAGE, MAX_LINE_BYTES, QUEUE_BYTES, QUEUE_LINES, QueuedWriter,
@@ -1196,6 +1260,179 @@ mod tests {
             .filter_map(|line| line["fields"]["message"].as_str())
             .collect();
         assert_eq!(messages, ["inside hidden"], "{lines:?}");
+        Ok(())
+    }
+
+    /// The events the OpenTelemetry layer holds in the data of the current span
+    /// until the span closes, or `None` outside a span it records.
+    fn held_events() -> Option<usize> {
+        tracing::Span::current()
+            .with_subscriber(|(id, dispatch)| {
+                let registry = dispatch.downcast_ref::<Registry>()?;
+                let span = registry.span(id)?;
+                let extensions = span.extensions();
+                let otel = extensions.get::<OtelData>()?;
+                Some(otel.builder.events.as_ref().map_or(0, Vec::len))
+            })
+            .flatten()
+    }
+
+    /// A long span holds no event once the OpenTelemetry layer has applied it,
+    /// whatever kind of event it is, and the JSON formatter still writes one
+    /// line per event. Each kind is emitted `REPEATS` times inside one job
+    /// span, as a batch job emits its per-record events; the `case` field names
+    /// the kind on its event lines.
+    #[test]
+    fn a_span_holds_no_event_once_the_opentelemetry_layer_has_applied_it() -> TestResult {
+        /// Emits one event of a kind, given the kind's name and a record number.
+        type Emit = fn(&str, usize);
+        const REPEATS: usize = 1_000;
+        let kinds: [(&str, Emit); 5] = [
+            ("an INFO event with a message", |case, record| {
+                tracing::info!(case, record, "PROCESSING");
+            }),
+            ("a WARN event with a message", |case, record| {
+                tracing::warn!(case, record, "record failed");
+            }),
+            (
+                "an INFO event with a message and an error field",
+                |case, record| {
+                    tracing::info!(
+                        case,
+                        record,
+                        error = %"duplicate key value violates unique constraint",
+                        "database statement failed"
+                    );
+                },
+            ),
+            ("a WARN event with only an error field", |case, record| {
+                tracing::warn!(case, record, error = %"no answer");
+            }),
+            ("an ERROR event", |case, record| {
+                tracing::error!(case, record, "job failed");
+            }),
+        ];
+        let capture = Capture::default();
+        let (subscriber, guard) = subscriber_with_writer("test-svc", "info", capture.clone())?;
+        let held = tracing::subscriber::with_default(subscriber, || {
+            let job = tracing::info_span!("job");
+            let _entered = job.enter();
+            kinds
+                .iter()
+                .map(|&(case, emit)| {
+                    let holding = (0..REPEATS)
+                        .filter(|&record| {
+                            emit(case, record);
+                            held_events() != Some(0)
+                        })
+                        .count();
+                    (holding, held_events())
+                })
+                .collect::<Vec<_>>()
+        });
+        guard.shutdown()?;
+
+        let lines = capture.json_lines()?;
+        for ((case, _), held) in kinds.iter().zip(held) {
+            assert_eq!(
+                held,
+                (0, Some(0)),
+                "{case}: the events after which the job span held any, and the events it held last"
+            );
+            let written = lines
+                .iter()
+                .filter(|line| line["fields"]["case"] == *case)
+                .count();
+            assert_eq!(written, REPEATS, "{case}: event lines");
+        }
+        Ok(())
+    }
+
+    /// What an event gives the span line of its span. Its status is `error` for
+    /// an ERROR event and, whatever its level, for an event whose `error` field
+    /// no message precedes, the field's text becoming the description; any
+    /// other event leaves it unset. An error value (`dyn Error`) recorded on
+    /// any field adds its text as the span's `exception.message` attribute.
+    #[test]
+    fn events_still_set_the_status_and_exception_of_their_span_line() -> TestResult {
+        /// Emits the event of a case inside the span.
+        type Emit = fn();
+        let cases: [(&str, Emit, Json, Json); 9] = [
+            (
+                "an INFO event",
+                || tracing::info!("posted"),
+                serde_json::json!({ "code": "unset" }),
+                Json::Null,
+            ),
+            (
+                "a WARN event",
+                || tracing::warn!("rejected"),
+                serde_json::json!({ "code": "unset" }),
+                Json::Null,
+            ),
+            (
+                "an ERROR event",
+                || tracing::error!("failed"),
+                serde_json::json!({ "code": "error", "description": "" }),
+                Json::Null,
+            ),
+            (
+                "a WARN event with only an error field",
+                || tracing::warn!(error = %"no answer"),
+                serde_json::json!({ "code": "error", "description": "no answer" }),
+                Json::Null,
+            ),
+            (
+                "an INFO event with only an error field",
+                || tracing::info!(record = 7, error = %"refused"),
+                serde_json::json!({ "code": "error", "description": "refused" }),
+                Json::Null,
+            ),
+            (
+                "a WARN event whose error field precedes its message",
+                || tracing::warn!(error = %"no answer", message = "rollback failed"),
+                serde_json::json!({ "code": "error", "description": "no answer" }),
+                Json::Null,
+            ),
+            (
+                "a WARN event whose message precedes its error field",
+                || tracing::warn!(error = %"no answer", "rollback failed"),
+                serde_json::json!({ "code": "unset" }),
+                Json::Null,
+            ),
+            (
+                "an INFO event with a message and an error field",
+                || tracing::info!(error = %"duplicate key", "database statement failed"),
+                serde_json::json!({ "code": "unset" }),
+                Json::Null,
+            ),
+            (
+                "an INFO event with an error value on another field",
+                || {
+                    let cause = io::Error::other("connection reset");
+                    tracing::info!(cause = &cause as &(dyn Error + 'static), "retrying");
+                },
+                serde_json::json!({ "code": "unset" }),
+                Json::from("connection reset"),
+            ),
+        ];
+        for (case, emit, status, exception) in cases {
+            let capture = Capture::default();
+            let (subscriber, guard) = subscriber_with_writer("test-svc", "info", capture.clone())?;
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info_span!("job").in_scope(emit);
+            });
+            guard.shutdown()?;
+            let lines = capture.json_lines()?;
+            let [line] = span_lines(&lines)[..] else {
+                return Err(format!("{case}: expected exactly one span line: {lines:?}").into());
+            };
+            assert_eq!(line["status"], status, "{case}");
+            assert_eq!(
+                line["attributes"]["exception.message"], exception,
+                "{case}: {line}"
+            );
+        }
         Ok(())
     }
 

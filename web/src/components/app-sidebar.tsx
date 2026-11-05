@@ -9,10 +9,11 @@
 // destinations are the function-map rows' `control=link "<name>"` and
 // `route=` values; nothing about an option is written here.
 //
-// "Card management" shows for every signed-on user, because the COBOL user
-// programs check no user type. "Administration" shows for user type 'A' only.
-// That choice shapes navigation alone: RequireAdmin and the API's 403 decide
-// access.
+// The sections are the groups nav/menu.ts's menuForUserType returns for the
+// session's user type, rendered in its order: "Card management" for every
+// signed-on user, because the COBOL user programs check no user type, then
+// "Administration" for user type 'A' only. That choice shapes navigation
+// alone: RequireAdmin and the API's 403 decide access.
 //
 // One link at most is the current page, the entry whose nav/menu.ts
 // `currentRoutes` pattern matches the location; its link alone carries
@@ -49,12 +50,12 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar";
-import { isAdmin, useSession } from "@/lib/session";
+import { useSession } from "@/lib/session";
 import { cn } from "@/lib/utils";
 import {
-  MENU_SECTION_LABELS,
   adminMenu,
   menu,
+  menuForUserType,
   userMenu,
   type MenuEntry,
   type MenuSection,
@@ -197,18 +198,14 @@ export function AppSidebar(): JSX.Element {
           keeps the groups its direct children while making the sidebar a named
           landmark distinct from the breadcrumb's. */}
       <SidebarContent role="navigation" aria-label="Main">
-        <SidebarNavGroup
-          label={MENU_SECTION_LABELS.user}
-          entries={userMenu}
-          currentId={currentId}
-        />
-        {isAdmin(session) && (
+        {menuForUserType(session?.usr_type).map((group) => (
           <SidebarNavGroup
-            label={MENU_SECTION_LABELS.admin}
-            entries={adminMenu}
+            key={group.section}
+            label={group.label}
+            entries={group.entries}
             currentId={currentId}
           />
-        )}
+        ))}
       </SidebarContent>
     </Sidebar>
   );

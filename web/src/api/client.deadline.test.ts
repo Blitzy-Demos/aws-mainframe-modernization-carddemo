@@ -1,8 +1,9 @@
 // The request deadline and caller cancellation of the typed client
 // (api/client.ts). The network is a stub that treats its signal as the
-// browser does: an abort rejects a pending answer with the abort reason and
-// errors a body still being received with the same reason. Fake timers stand
-// in for the wait to the deadline.
+// browser does: an abort rejects a pending answer with the abort reason, and
+// errors a body still being received either with the same reason or, as a
+// browser may report it, with a generic network TypeError. Fake timers stand
+// in for the wait to the deadline and for a body that arrives over time.
 import type { Middleware } from "openapi-fetch";
 import {
   afterEach,
@@ -49,23 +50,30 @@ function onAbort(
 const stalledHeaders: Network = (_input, init) =>
   new Promise<Response>((_resolve, reject) => onAbort(init?.signal, reject));
 
-// The status line and the start of the body arrive; the rest never does.
-const stalledBody: Network = async (_input, init) => {
-  const body = new ReadableStream<Uint8Array>({
-    start(stream) {
-      stream.enqueue(new TextEncoder().encode('{"acct_id":'));
-      onAbort(init?.signal, (reason) => stream.error(reason));
-    },
-  });
-  return new Response(body, {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-};
+// The status line and the start of the body arrive; the rest never does. The
+// abort errors the body with what `failureOf` makes of the abort reason.
+function stalledBody(failureOf: (reason: unknown) => unknown): Network {
+  return async (_input, init) => {
+    const body = new ReadableStream<Uint8Array>({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode('{"acct_id":'));
+        onAbort(init?.signal, (reason) => stream.error(failureOf(reason)));
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+}
 
 const STALLS = [
   ["no status line", stalledHeaders],
-  ["a body that never ends", stalledBody],
+  ["a body that never ends", stalledBody((reason) => reason)],
+  [
+    "a body that never ends, failed by the abort as a network TypeError",
+    stalledBody(() => new TypeError("Failed to fetch")),
+  ],
 ] as const;
 
 const NETWORK_FAILURE = new TypeError("network error");
@@ -282,17 +290,31 @@ describe("an answer whose body fails mid-stream", () => {
   });
 });
 
-describe("a body its reader cancels", () => {
-  it("disarms the deadline and passes the reason on to the network", async () => {
-    const reason = new Error("Screen left");
-    let cancelledWith: unknown;
+describe("an answer whose body ends some time after its status line", () => {
+  const BODY_END_MS = 5000;
+  let responded = false;
+  const recorder: Middleware = {
+    onResponse() {
+      responded = true;
+      return undefined;
+    },
+  };
+
+  beforeEach(() => {
+    responded = false;
+    api.use(recorder);
+  });
+
+  afterEach(() => {
+    api.eject(recorder);
+  });
+
+  it("reaches the middleware and the caller only once its body has ended", async () => {
     network.mockImplementation(async () => {
       const body = new ReadableStream<Uint8Array>({
         start(stream) {
-          stream.enqueue(new TextEncoder().encode('{"acct_id":'));
-        },
-        cancel(cancelReason: unknown) {
-          cancelledWith = cancelReason;
+          stream.enqueue(new TextEncoder().encode(ACCOUNT_JSON));
+          setTimeout(() => stream.close(), BODY_END_MS);
         },
       });
       return new Response(body, {
@@ -300,20 +322,20 @@ describe("a body its reader cancels", () => {
         headers: { "Content-Type": "application/json" },
       });
     });
-
-    const { data } = await api.GET("/accounts/{id}", {
+    const call = api.GET("/accounts/{id}", {
       params: { path: { id: ACCOUNT_ID } },
-      parseAs: "stream",
     });
-    expect(vi.getTimerCount()).toBe(1);
+    const outcome = track(call);
 
-    await data?.cancel(reason);
+    await vi.advanceTimersByTimeAsync(BODY_END_MS - 1);
+    expect(responded).toBe(false);
+    expect(outcome.settled).toBe(false);
 
-    expect(cancelledWith).toBe(reason);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(responded).toBe(true);
+    expect(unwrap(await call)).toEqual(ACCOUNT_BODY);
     expect(vi.getTimerCount()).toBe(0);
-    const [, init] = network.mock.calls[0];
-    await vi.advanceTimersByTimeAsync(5 * REQUEST_TIMEOUT_MS);
-    expect(init?.signal?.aborted).toBe(false);
+    expect(network).toHaveBeenCalledTimes(1);
   });
 });
 

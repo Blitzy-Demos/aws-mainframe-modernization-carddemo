@@ -33,6 +33,7 @@ import {
   expectScreen,
   FIXTURE_KEYS,
   functionMap,
+  gotoApp,
   mapInput,
   MESSAGES,
   notifications,
@@ -250,10 +251,10 @@ test.describe("UI gate", () => {
     await signIn(page, "user");
     const sent = recordAdminRequests(page);
     for (const path of adminPaths()) {
-      // page.goto loads a fresh document, so the previous route's toast is
+      // gotoApp loads a fresh document, so the previous route's toast is
       // gone and the one asserted here is this route's own; the session
       // survives the reload in sessionStorage.
-      await page.goto(path);
+      await gotoApp(page, path);
       await expect(page, path).toHaveURL(urlPath(USERS.user.landing));
       await expect(adminToast(page), path).toBeVisible();
       await expect(adminToast(page), path).toHaveCount(1);
@@ -275,7 +276,7 @@ test.describe("UI gate", () => {
   test("ADMIN001 reaches every admin route with the Administration section", async ({ page }) => {
     await signIn(page, "admin");
     for (const path of adminPaths()) {
-      await page.goto(path);
+      await gotoApp(page, path);
       await expect(page, path).toHaveURL(urlPath(path));
       await expectScreen(page);
       await expect(sidebar(page).getByText(MENU_SECTION_LABELS.admin, { exact: true }), path).toBeAttached();
@@ -286,7 +287,7 @@ test.describe("UI gate", () => {
   test("a signed-out visit to any user or admin route lands on the sign-on screen without the admin toast", async ({ page }) => {
     // Each test opens a fresh browser context, so this one holds no session.
     for (const path of [...userPaths(), ...adminPaths()]) {
-      await page.goto(path);
+      await gotoApp(page, path);
       await expect(page, path).toHaveURL(urlPath("/login"));
       await expect(signOnUserId(page), path).toBeVisible();
       await expect(page.getByText(shown(MESSAGES.ADMIN_ACCESS_REQUIRED), { exact: true })).toHaveCount(0);
@@ -296,7 +297,7 @@ test.describe("UI gate", () => {
   test("after a sign-on and sign-off, /admin lands on the sign-on screen", async ({ page }) => {
     await signIn(page, "admin");
     await signOut(page, "admin");
-    await page.goto("/admin");
+    await gotoApp(page, "/admin");
     await expect(page).toHaveURL(urlPath("/login"));
     await expect(signOnUserId(page)).toBeVisible();
   });
@@ -323,7 +324,7 @@ test.describe("UI gate", () => {
     const refused = page.waitForResponse(
       (response) => new URL(response.url()).pathname === apiPath("/admin/users"),
     );
-    await page.goto("/admin/users");
+    await gotoApp(page, "/admin/users");
     expect((await refused).status()).toBe(403);
     await expect(
       notifications(page).getByText(shown(MESSAGES.ADMIN_ACCESS_REQUIRED), { exact: true }),

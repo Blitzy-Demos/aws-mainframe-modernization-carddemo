@@ -339,6 +339,9 @@ function MessageCard({ message }: { message: string }): JSX.Element {
   );
 }
 
+// A failed rule-list read the page has toasted, with the text it toasted.
+type ShownLoadError = { error: Error; message: string };
+
 export default function RewardRuleFormPage(): JSX.Element {
   const { ruleId } = useParams();
   const isEdit = ruleId !== undefined;
@@ -357,17 +360,30 @@ export default function RewardRuleFormPage(): JSX.Element {
     [rule],
   );
 
-  // Each failed load is toasted once, also across StrictMode's re-run of
-  // effects, and its text stays on the page after the toast has gone.
-  const [loadError, setLoadError] = useState<string>("");
-  const shownError = useRef<unknown>(null);
+  // The rule list keeps a failed read's error, beside any rules read before
+  // it, while the read this page starts on entry is out, fetching or paused
+  // offline. That read's answer, the rule or a new error, is what the page
+  // reports, so an error counts as this page's failure only once no read is
+  // out. Each such failure is toasted once, also across StrictMode's re-run of
+  // effects, and its toasted text stays on the page after the toast has gone.
+  // The text is kept with the error it belongs to, so the page never shows an
+  // earlier failure's text, or none, for the failure in hand.
   const { isError, error } = ruleQuery;
+  const reading = ruleQuery.fetchStatus !== "idle";
+  const failed = isEdit && ruleId !== "" && isError && !reading ? error : null;
+  const shownError = useRef<unknown>(null);
+  const [loadError, setLoadError] = useState<ShownLoadError | null>(null);
   useEffect(() => {
-    if (isEdit && isError && error !== shownError.current) {
-      shownError.current = error;
-      setLoadError(showApiError(error).message);
+    if (failed === null || failed === shownError.current) {
+      return;
     }
-  }, [isEdit, isError, error]);
+    shownError.current = failed;
+    setLoadError({ error: failed, message: showApiError(failed).message });
+  }, [failed]);
+  const loadErrorText =
+    failed !== null && loadError !== null && loadError.error === failed
+      ? loadError.message
+      : null;
 
   const title = isEdit ? `Edit reward rule ${ruleId}` : "New reward rule";
 
@@ -382,6 +398,18 @@ export default function RewardRuleFormPage(): JSX.Element {
         label={title}
       />
     );
+  } else if (ruleId === "") {
+    // The disabled query would stay pending: no rule has an empty ID.
+    body = <MessageCard message={REWARD_RULE_MESSAGES.notFound} />;
+  } else if (isError) {
+    // A failed read is never answered with the rules read before it: the
+    // skeleton stands while a read is out, then the failure's toasted text.
+    body =
+      loadErrorText === null ? (
+        <FormSkeleton />
+      ) : (
+        <MessageCard message={loadErrorText} />
+      );
   } else if (rule !== undefined) {
     body = (
       <RewardRuleForm
@@ -392,13 +420,8 @@ export default function RewardRuleFormPage(): JSX.Element {
         label={title}
       />
     );
-  } else if (ruleId === "") {
-    // The disabled query would stay pending: no rule has an empty ID.
-    body = <MessageCard message={REWARD_RULE_MESSAGES.notFound} />;
   } else if (ruleQuery.isPending) {
     body = <FormSkeleton />;
-  } else if (isError) {
-    body = <MessageCard message={loadError} />;
   } else {
     body = <MessageCard message={REWARD_RULE_MESSAGES.notFound} />;
   }

@@ -30,7 +30,12 @@ import { AppLayout } from "@/components/app-layout";
 import { PageHeader, type RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { clearSession, setSession, type Session } from "@/lib/session";
+import {
+  clearSession,
+  setSession,
+  type RouteAccess,
+  type Session,
+} from "@/lib/session";
 import { RequireAuth } from "@/routes/guards";
 import {
   inShellErrorBoundary,
@@ -39,7 +44,6 @@ import {
   pageRoute,
   subscribeToPageDownloads,
   useDownloadingPage,
-  type PageAccess,
   type PageModule,
 } from "@/routes/lazy-page";
 import { PageLoadError } from "@/routes/page-fallbacks";
@@ -283,7 +287,7 @@ describe("lazyPage", () => {
 });
 
 describe("pageRoute's loader", () => {
-  it.each<{ access: PageAccess; usrType: string | null; downloads: boolean }>([
+  it.each<{ access: RouteAccess; usrType: string | null; downloads: boolean }>([
     { access: "public", usrType: null, downloads: true },
     { access: "public", usrType: "U", downloads: true },
     { access: "signed-on", usrType: null, downloads: false },

@@ -58,9 +58,9 @@ pub use tran_type::{TranTypeFileRecord, TranTypeLayout};
 pub use transaction::{TransactionLayout, TransactionRecord};
 pub use user_security::{UserSecurityLayout, UserSecurityRecord};
 
-/// The layout trait, character set, error and file framing the records of this
-/// module are encoded with, re-exported from the crate root and
-/// [`crate::framing`], so the persistence seed and the batch jobs read and
+/// The layout trait, character set, error and its kind, and file framing the
+/// records of this module are encoded with, re-exported from the crate root
+/// and [`crate::framing`], so the persistence seed and the batch jobs read and
 /// write a record file through `layouts` alone (AAP 0.7.2).
 pub use crate::framing::{Framed, decode_ascii_file, decode_ascii_lf, encode_ascii_lf, pad};
-pub use crate::{Charset, CodecError, Layout};
+pub use crate::{Charset, CodecError, CodecErrorKind, Layout};

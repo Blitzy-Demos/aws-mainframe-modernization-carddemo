@@ -9,11 +9,16 @@
 // starting values and clears every error, and Back, reached by Tab after Save
 // and Reset, returns to the list; neither writes. An edit route whose rule list
 // fails to load, or lacks the rule, shows the message in an alert with only
-// Back, never an editable form. The page runs with the real API client, query
-// hooks and error helper; only the network is stubbed, through the global the
-// client looks up on every request.
+// Back, never an editable form. An edit route opened over a failed read the
+// rule list already holds reports only its own read of the list: no toast and
+// no form from rules read earlier while that read is out, then its answer.
+// The page runs with the real API client, query hooks and error helper; only
+// the network is stubbed, through the global the client looks up on every
+// request.
+import type { JSX } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -29,6 +34,7 @@ import {
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useRewardRules } from "@/api/queries/reward-rules";
 import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { UNEXPECTED_ERROR } from "@/lib/api-errors";
@@ -785,6 +791,108 @@ describe("RewardRuleFormPage (edit route without a rule)", () => {
     expect(await screen.findByText(LIST_MARKER)).toBeTruthy();
     expect(sentMethods()).toEqual(["GET"]);
   });
+});
+
+// The list route's element for a cache filled before the edit route opens: it
+// observes the rule list as RewardRuleListPage does and shows the state of its
+// read, so a test can wait for that read to settle.
+function RuleListReader(): JSX.Element {
+  const rules = useRewardRules();
+  return <div>{`${LIST_MARKER}: ${rules.status}, ${rules.fetchStatus}`}</div>;
+}
+
+// The answer of read `read` of the rule list: the rule list holding
+// TIMED_RULE, or a 500 whose message names the read, so a toast names the
+// read it reports.
+function listReadAnswer(status: 200 | 500, read: number): Response {
+  return status === 200
+    ? Response.json([TIMED_RULE])
+    : Response.json(
+        {
+          code: "UNEXPECTED",
+          message: `Read ${String(read)} failed`,
+        } satisfies ErrorBody,
+        { status },
+      );
+}
+
+describe("RewardRuleFormPage (edit route over a failed rule-list read)", () => {
+  // Each row is a run of list-route visits over one cache, each visit's read
+  // answering the status given, so the cache holds a failed read alone or
+  // beside the rule list an earlier read returned. The edit route then reads
+  // the list again and reports that read's answer alone: the skeleton while
+  // it is out, with no toast and no form built from the rules read earlier;
+  // then the form with no toast, or the new failure's text in the alert,
+  // toasted once.
+  it.each<{ cached: readonly (200 | 500)[]; reread: 200 | 500 }>([
+    { cached: [500], reread: 200 },
+    { cached: [500], reread: 500 },
+    { cached: [200, 500], reread: 200 },
+    { cached: [200, 500], reread: 500 },
+  ])(
+    "after list reads answering $cached, reports only its own read answering $reread",
+    async ({ cached, reread }) => {
+      const toastError = vi.spyOn(toast, "error");
+      const out = hold();
+      for (const [index, status] of cached.entries()) {
+        fetchMock.mockImplementationOnce(() =>
+          Promise.resolve(listReadAnswer(status, index + 1)),
+        );
+      }
+      const rereadNumber = cached.length + 1;
+      fetchMock.mockImplementationOnce(async () => {
+        await out.held;
+        return listReadAnswer(reread, rereadNumber);
+      });
+      const router = renderPage(LIST_ROUTE, { element: <RuleListReader /> });
+      for (const [index, status] of cached.entries()) {
+        if (index > 0) {
+          // A return to the list route reads the list again.
+          await act(() => router.navigate(NEW_ROUTE));
+          await act(() => router.navigate(LIST_ROUTE));
+        }
+        expect(
+          await screen.findByText(
+            `${LIST_MARKER}: ${status === 200 ? "success" : "error"}, idle`,
+          ),
+        ).toBeTruthy();
+      }
+
+      await act(() => router.navigate(TIMED_RULE_ROUTE));
+
+      await waitFor(() => {
+        expect(sentMethods()).toHaveLength(rereadNumber);
+      });
+      expect(screen.getByText("Loading reward rule")).toBeTruthy();
+      expect(screen.queryByRole("form")).toBeNull();
+      expect(screen.queryAllByRole("textbox")).toEqual([]);
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(toastError).not.toHaveBeenCalled();
+
+      out.release();
+
+      if (reread === 200) {
+        expect(
+          await screen.findByRole("form", {
+            name: `Edit reward rule ${TIMED_RULE.rule_id}`,
+          }),
+        ).toBeTruthy();
+        expect(inputValue("Reward rate")).toBe(TIMED_RULE.reward_rate);
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(toastError).not.toHaveBeenCalled();
+      } else {
+        const message = `Read ${String(rereadNumber)} failed`;
+        await waitFor(() => {
+          expect(screen.getByRole("alert").textContent).toBe(message);
+        });
+        expect(toastError).toHaveBeenCalledTimes(1);
+        expect(toastError).toHaveBeenCalledWith(message);
+        expectNoForm();
+      }
+      expect(screen.queryByText("Loading reward rule")).toBeNull();
+      expect(sentMethods()).toEqual(Array(rereadNumber).fill("GET"));
+    },
+  );
 });
 
 // The list page is a lazy chunk: the router keeps the form on screen until it

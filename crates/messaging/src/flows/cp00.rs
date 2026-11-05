@@ -264,7 +264,7 @@ impl Flow for Cp00Flow {
     ///
     /// The plan fixes the detail, whose key the clock's instant gives, and the
     /// decision the reply carried. Its summary write comes from the read that
-    /// decided the request, so [`Cp00Flow::write`] derives it again on the
+    /// decided the request, so `Cp00Flow::write` derives it again on the
     /// summary its unit of work locks first, which a purge may have changed or
     /// deleted since.
     ///

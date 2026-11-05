@@ -27,7 +27,7 @@ import {
 } from "react";
 import type { RouteObject } from "react-router";
 
-import { getSession, isAdmin } from "@/lib/session";
+import { getSession, sessionAdmits, type RouteAccess } from "@/lib/session";
 import { PageFallback, PageLoadError } from "@/routes/page-fallbacks";
 
 /** A page module: its default export is the page component. */
@@ -121,24 +121,13 @@ export function lazyPage(load: () => Promise<PageModule>): LazyPage {
   return { Component: lazy(preload), preload };
 }
 
-/**
- * The guard a page route sits under in App.tsx: none for "public" (/login),
- * RequireAuth for "signed-on", and RequireAuth with RequireAdmin for "admin".
- */
-export type PageAccess = "public" | "signed-on" | "admin";
-
 // Whether the guards above a page route will render its page for the session
-// the tab holds now, the checks RequireAuth and RequireAdmin make: a live
-// session for every guarded page, an administrator's for the admin pages.
-function guardsAdmit(access: PageAccess): boolean {
-  switch (access) {
-    case "public":
-      return true;
-    case "signed-on":
-      return getSession() !== null;
-    case "admin":
-      return isAdmin(getSession());
-  }
+// the tab holds now: sessionAdmits, the check RequireAuth and RequireAdmin
+// make. `access` names the guards the route sits under in App.tsx: none for
+// "public" (/login), RequireAuth for "signed-on", and RequireAuth with
+// RequireAdmin for "admin".
+function guardsAdmit(access: RouteAccess): boolean {
+  return sessionAdmits(getSession(), access);
 }
 
 /** The properties a page route takes from pageRoute. */
@@ -170,7 +159,7 @@ export type PageRoute = Pick<
  */
 export function pageRoute(
   { Component, preload }: LazyPage,
-  access: PageAccess,
+  access: RouteAccess,
 ): PageRoute {
   return {
     loader: async (): Promise<null> => {

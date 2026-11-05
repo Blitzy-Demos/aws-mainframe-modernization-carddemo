@@ -19,6 +19,9 @@
 // - an answer to the review or to the payment, or a failed balance reload,
 //   that arrives after the entry was replaced is still toasted but neither
 //   blanks nor marks the newer entry;
+// - a failed balance read never marks or focuses ACTIDIN while the dialog
+//   hides the page: one while the dialog asks is only toasted, and one while
+//   it closes after Confirm is shown once it has left;
 // - "Reset" (F4) clears the screen and "Back" (F3) leaves it, sending nothing
 //   (F-COBIL00-005, F-COBIL00-004).
 //
@@ -40,6 +43,7 @@ import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 import { RequestTimeoutError } from "@/api/client";
+import { accountKeys } from "@/api/queries/accounts";
 import type { components } from "@/api/schema";
 import type { RouteHandle } from "@/components/page-header";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -143,6 +147,19 @@ const UNABLE_TO_UPDATE = "Unable to Update Account...";
 // A COBIL00C refusal whose cursor field is ACTIDIN.
 function refusal(code: string, message: string): ErrorBody {
   return { code, message, fields: [{ field: ACTIDIN, message }] };
+}
+
+// V-COACTVWC-005 at ACCTSID: the balance card's `GET /accounts/{id}` finding
+// no account record, the account having gone since the review read it.
+const READ_FAILURE =
+  "Account:00000000001 not found in Acct Master file.Resp:000000013  Reas:0000";
+
+function readFailure(): ErrorBody {
+  return {
+    code: "NOT_FOUND",
+    message: READ_FAILURE,
+    fields: [{ field: "ACCTSID", message: READ_FAILURE }],
+  };
 }
 
 const PAYMENT_HANDLE = {
@@ -331,6 +348,66 @@ async function nextTask(): Promise<void> {
   });
 }
 
+const DIALOG_PARTS =
+  '[data-slot="alert-dialog-content"], [data-slot="alert-dialog-overlay"]';
+const EXIT_ANIMATION = "exit";
+
+// Radix keeps a closing dialog on the page, and the page behind it hidden,
+// until its exit animation ends, and jsdom runs no animation, so the dialog
+// would leave at once. This gives the content and the overlay an exit
+// animation while they are closed, as the generated classes do, and returns
+// the function that ends it.
+function animateDialogExit(): () => void {
+  const computed = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudo) => {
+    const styles = computed(element, pseudo);
+    if (!element.matches(DIALOG_PARTS)) {
+      return styles;
+    }
+    return new Proxy(styles, {
+      get(target, property) {
+        if (property === "animationName") {
+          return element.getAttribute("data-state") === "closed"
+            ? EXIT_ANIMATION
+            : "none";
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  });
+  return () => {
+    act(() => {
+      for (const part of document.querySelectorAll(DIALOG_PARTS)) {
+        const end = new Event("animationend");
+        Object.defineProperty(end, "animationName", { value: EXIT_ANIMATION });
+        part.dispatchEvent(end);
+      }
+    });
+  };
+}
+
+// The dialog content while it is on the page, closing included.
+function dialogContent(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-slot="alert-dialog-content"]');
+}
+
+// Records each focus of `element` made while the confirmation dialog is on
+// the page, its closing animation included. The page is then hidden from
+// assistive technology, so focus moved there would sit inside hidden content
+// (the browser's "Blocked aria-hidden" warning).
+function focusBehindDialog(element: HTMLElement): Mock<() => void> {
+  const focused = vi.fn<() => void>();
+  const focus = element.focus.bind(element);
+  vi.spyOn(element, "focus").mockImplementation((options) => {
+    if (dialogContent() !== null) {
+      focused();
+    }
+    focus(options);
+  });
+  return focused;
+}
+
 beforeEach(() => {
   stubs = {
     account: [200, account],
@@ -453,6 +530,46 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
       expect(screen.queryByRole("group", { name: BALANCE_TITLE })).toBeNull();
       expect(toast.success).not.toHaveBeenCalled();
       expect(toast.error).not.toHaveBeenCalled();
+    },
+  );
+
+  // The balance card's read fails while the dialog asks about the account.
+  // The modal dialog hides the page, and every way out of it settles the
+  // entry, so the failure is only toasted: ACTIDIN is neither marked nor
+  // focused under the dialog, which keeps focus.
+  it.each(DISMISSALS)(
+    "only toasts a balance read failing while the dialog asks, and $how then clears the screen (F-COBIL00-003)",
+    async ({ dismiss }) => {
+      stubs.account = [404, readFailure()];
+      const user = renderPage();
+      const input = accountInput();
+      const focusedBehindDialog = focusBehindDialog(input);
+
+      const dialog = await review(user);
+      await waitFor(() => {
+        expect(toast.error).toHaveBeenCalledWith(READ_FAILURE);
+      });
+      await nextTask();
+      expect(toast.error).toHaveBeenCalledTimes(1);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+      expect(fieldErrorOf(input)).toBeNull();
+      expect(focusedBehindDialog).not.toHaveBeenCalled();
+      expect(requestsOf("GET").map(pathnameOf)).toEqual([ACCOUNT_PATH]);
+
+      await dismiss(user, dialog);
+
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+        expect(document.activeElement).toBe(input);
+      });
+      expect(input.value).toBe("");
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+      expect(fieldErrorOf(input)).toBeNull();
+      expect(screen.queryByRole("group", { name: BALANCE_TITLE })).toBeNull();
+      expect(await bodiesOf(requestsOf("POST"))).toEqual([REVIEW_BODY]);
+      expect(toast.error).toHaveBeenCalledTimes(1);
+      expect(focusedBehindDialog).not.toHaveBeenCalled();
     },
   );
 
@@ -1003,6 +1120,84 @@ describe("BillPaymentPage (CB00, COBIL00)", () => {
     const card = screen.getByRole("group", { name: BALANCE_TITLE });
     expect(within(card).getByText(paid.current_balance)).toBeTruthy();
   });
+
+  // The entry once the closing dialog has left the page: the reviewed one,
+  // blanked by the 201, or one that replaced it before then. Nothing on the
+  // hidden page takes input while the dialog closes, so the replacement is a
+  // change event fired at the input; it shows that the held marking checks
+  // the entry when it runs, not when it was held.
+  const CLOSING_ENTRIES: readonly {
+    entry: string;
+    replace: (input: HTMLInputElement) => void;
+    value: string;
+    error: string | null;
+  }[] = [
+    {
+      entry: "the blanked entry",
+      replace: () => undefined,
+      value: "",
+      error: READ_FAILURE,
+    },
+    {
+      entry: "an account typed over it",
+      replace: (input) => {
+        fireEvent.change(input, { target: { value: NEWER_ACCOUNT } });
+      },
+      value: NEWER_ACCOUNT,
+      error: null,
+    },
+  ];
+
+  it.each(CLOSING_ENTRIES)(
+    "holds a balance reload failing while the dialog closes after Confirm until it has left, then shows it with $entry",
+    async ({ replace, value, error }) => {
+      const endExit = animateDialogExit();
+      const release = hold("pay");
+      const user = renderPage();
+      const input = accountInput();
+      const focusedBehindDialog = focusBehindDialog(input);
+
+      const dialog = await review(user);
+      await findBalanceCard();
+      await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+      expect(dialogContent()?.getAttribute("data-state")).toBe("closed");
+      stubs.account = [404, readFailure()];
+      release([201, paid]);
+
+      // The payment is made and the balance on file read again, which fails
+      // while the closing dialog still hides the page: nothing is shown yet.
+      await waitFor(() => {
+        expect(toast.success).toHaveBeenCalledWith(PAID_MESSAGE);
+        expect(queryClient.getQueryState(accountKeys.detail(ACCOUNT_ID))?.status).toBe("error");
+      });
+      await nextTask();
+      expect(requestsOf("GET").map(pathnameOf)).toEqual([ACCOUNT_PATH, ACCOUNT_PATH]);
+      expect(input.value).toBe("");
+      replace(input);
+      expect(dialogContent()).not.toBeNull();
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(input.getAttribute("aria-invalid")).toBe("false");
+
+      endExit();
+
+      await waitFor(() => {
+        expect(dialogContent()).toBeNull();
+        expect(toast.error).toHaveBeenCalledWith(READ_FAILURE);
+        expect(document.activeElement).toBe(input);
+      });
+      await nextTask();
+      expect(toast.error).toHaveBeenCalledTimes(1);
+      expect(input.value).toBe(value);
+      expect(input.getAttribute("aria-invalid")).toBe(String(error !== null));
+      expect(fieldErrorOf(input)?.textContent ?? null).toBe(error);
+      expect(document.activeElement).toBe(input);
+      expect(focusedBehindDialog).not.toHaveBeenCalled();
+      // The card keeps the balance the 201 answered with.
+      const card = screen.getByRole("group", { name: BALANCE_TITLE });
+      expect(within(card).getByText(paid.current_balance)).toBeTruthy();
+      expect(await bodiesOf(requestsOf("POST"))).toEqual([REVIEW_BODY, PAY_BODY]);
+    },
+  );
 
   it("clears the entry, its error and the balance on Reset and sends nothing (F-COBIL00-005)", async () => {
     stubs.pay = [409, refusal("DUPLICATE", TRAN_ID_EXISTS)];

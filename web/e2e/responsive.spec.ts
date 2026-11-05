@@ -32,6 +32,7 @@ import {
   expect,
   expectScreen,
   FIXTURE_KEYS,
+  gotoApp,
   mapControl,
   mapInput,
   nameMatcher,
@@ -536,7 +537,7 @@ test.describe("app shell", () => {
   });
 
   test("the skip link shows when it takes focus, and Enter moves focus to the page content", async ({ page }) => {
-    await page.goto("/");
+    await gotoApp(page, "/");
     // Tab is pressed only once the screen has rendered, from a document in
     // which nothing has focus yet, so it starts at the top of the page.
     await expectScreen(page);
@@ -586,7 +587,7 @@ test.describe("tables scroll inside their card", () => {
         throw new Error("the known row was not set up");
       }
       await signIn(page, role);
-      await page.goto(route);
+      await gotoApp(page, route);
       const table = tableByCaption(content(page), caption);
       await expectRow(table, column, value);
       // The generated Table's scroll container inside the DataTable card
@@ -615,7 +616,7 @@ test.describe("form columns", () => {
   ] as const) {
     test(`${route} uses one column at md and two at lg`, async ({ page }) => {
       await signIn(page, role);
-      await page.goto(route);
+      await gotoApp(page, route);
       const edges = await inputEdges(page);
       expect(edges.length, "the form holds more than one input").toBeGreaterThan(1);
       const columns = new Set(edges.map((edge) => edge.left));
@@ -703,7 +704,7 @@ test.describe("every route at this viewport", () => {
       if (route.access !== "public") {
         await signIn(page, route.access === "admin" ? "admin" : "user");
       }
-      await page.goto(target);
+      await gotoApp(page, target);
       await expect(page).toHaveURL(urlPath(target));
       // The sign-on screen renders outside the app shell, so its h1 is not
       // inside #main-content.

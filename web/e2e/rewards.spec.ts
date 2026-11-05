@@ -4,7 +4,8 @@
 //   JavaScript number cannot hold) arrives exactly: as the API's decimal
 //   string, in RewardsPage's "Available points" and "Points earned" cards and
 //   in the dashboard's "Reward Points" card, with its rounded neighbour
-//   nowhere. The balance of account 1 is set through `docker compose exec
+//   nowhere. Each of those cards shows the 16 digits on one line, inside the
+//   card. The balance of account 1 is set through `docker compose exec
 //   postgres psql` and restored afterwards; every accrual-producing step uses
 //   the reward account (50) instead, so nothing else moves that balance.
 // - An account that has earned no points (no balance row, no accrual) shows
@@ -35,6 +36,7 @@ import {
   apiPath,
   apiToken,
   bearer,
+  captureResponse,
   cellUnder,
   checkpoint,
   confirmDialog,
@@ -45,6 +47,7 @@ import {
   expect,
   expectMessage,
   FIXTURE_KEYS,
+  gotoApp,
   isRequestTo,
   mapControl,
   mapInput,
@@ -96,14 +99,14 @@ function textbox(page: Page, label: LabelText): Locator {
 
 // RewardsPage for `accountId`: the account lookup, submitted with "Look up".
 async function openRewards(page: Page, accountId: string): Promise<void> {
-  await page.goto(SCREENS.rewards.route);
+  await gotoApp(page, SCREENS.rewards.route);
   await textbox(page, UNMAPPED_LABELS.rewards.accountId).fill(accountId);
   await content(page).getByRole("button", { name: SCREENS.rewards.lookUp, exact: true }).click();
 }
 
 // The dashboard account lookup (F-COACTVW-001) for `accountId`.
 async function lookUpOnDashboard(page: Page, accountId: string): Promise<void> {
-  await page.goto(mapControl("F-COACTVW-001").route);
+  await gotoApp(page, mapControl("F-COACTVW-001").route);
   await mapInput(content(page), rowInput("F-COACTVW-001", 0)).fill(accountId);
   await controlLocator(page, mapControl("F-COACTVW-001")).click();
 }
@@ -122,6 +125,26 @@ async function expectCardValue(page: Page, title: string, value: string, rounded
   if (roundedAway !== undefined) {
     await expect(card).not.toContainText(roundedAway);
   }
+}
+
+// Asserts that the card `title` shows `value` as one number: its text lies on
+// a single line (one line box, however many client rects the range returns
+// for it), and neither the figure nor the card is wider than its box.
+async function expectValueOnOneLine(page: Page, title: string, value: string): Promise<void> {
+  const figure = summaryCard(page, title).getByText(value, { exact: true });
+  await expect(figure).toBeVisible();
+  const layout = await figure.evaluate((element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    const lineTops = new Set(Array.from(range.getClientRects(), (rect) => Math.round(rect.top)));
+    const card = element.closest('[data-slot="card"]');
+    return {
+      lines: lineTops.size,
+      figureOverflow: element.scrollWidth - element.clientWidth,
+      cardOverflow: card === null ? null : card.scrollWidth - card.clientWidth,
+    };
+  });
+  expect(layout, `the "${title}" card's figure ${value}`).toEqual({ lines: 1, figureOverflow: 0, cardOverflow: 0 });
 }
 
 // RewardsPage's history table.
@@ -339,6 +362,8 @@ test.describe("a balance above 2^53", () => {
     await expectCardValue(page, SCREENS.rewards.earned, EXACT_POINTS, ROUNDED_POINTS);
     await expectCardValue(page, SCREENS.rewards.redeemed, "0");
     await expect(content(page)).not.toContainText(ROUNDED_POINTS);
+    await expectValueOnOneLine(page, SCREENS.rewards.available, EXACT_POINTS);
+    await expectValueOnOneLine(page, SCREENS.rewards.earned, EXACT_POINTS);
   });
 
   test("the dashboard's Reward Points card shows it exactly", async ({ page }) => {
@@ -346,6 +371,7 @@ test.describe("a balance above 2^53", () => {
     await lookUpOnDashboard(page, FIXTURE_KEYS.account);
     await expectCardValue(page, SCREENS.dashboardPoints, EXACT_POINTS, ROUNDED_POINTS);
     await expect(content(page)).not.toContainText(ROUNDED_POINTS);
+    await expectValueOnOneLine(page, SCREENS.dashboardPoints, EXACT_POINTS);
   });
 });
 
@@ -478,7 +504,7 @@ test.describe("a CT02 add through the screens", () => {
     const expected = await expectedAccrual(FIXTURE_KEYS.tranType, FIXTURE_KEYS.tranCategory, ADD_AMOUNT);
     const labels = UNMAPPED_LABELS.transactionAdd;
     await signIn(page, "user");
-    await page.goto(mapControl("F-COTRN02-001").route);
+    await gotoApp(page, mapControl("F-COTRN02-001").route);
     for (const [label, value] of [
       [labels.accountId, FIXTURE_KEYS.rewardAccount],
       [labels.cardNumber, FIXTURE_KEYS.rewardCard],
@@ -560,7 +586,7 @@ test.describe("admin reward rules", () => {
     const expected = await rules(request);
     expect(expected.length, "seeded rules").toBeGreaterThan(0);
     await signIn(page, "admin");
-    await page.goto(SCREENS.ruleList.route);
+    await gotoApp(page, SCREENS.ruleList.route);
     await expect(content(page).getByRole("heading", { level: 1 })).toHaveText(SCREENS.ruleList.title);
     const table = ruleTable(page);
     await expect(table.getByRole("columnheader")).toHaveText([...SCREENS.ruleList.columns]);
@@ -615,7 +641,7 @@ test.describe("admin reward rules", () => {
       throw new Error("no reward rule to edit");
     }
     await signIn(page, "admin");
-    await page.goto(`/admin/reward-rules/${rule.rule_id}/edit`);
+    await gotoApp(page, `/admin/reward-rules/${rule.rule_id}/edit`);
     await expect(
       content(page).getByRole("textbox", { name: nameMatcher(UNMAPPED_LABELS.rewardRule.rate) }),
     ).toHaveValue(rule.reward_rate);
@@ -627,7 +653,7 @@ test.describe("admin reward rules", () => {
     // instant the soft delete below stamps as its active_to.
     const today = await processingDate();
     await signIn(page, "admin");
-    await page.goto(SCREENS.ruleList.route);
+    await gotoApp(page, SCREENS.ruleList.route);
     const table = ruleTable(page);
 
     const ruleId = await test.step("New rule: 07/0001 at 2.5000 from today, unbounded and open-ended", async () => {
@@ -638,10 +664,12 @@ test.describe("admin reward rules", () => {
       await textbox(page, labels.categoryCode).fill(FIXTURE_KEYS.ruleTestCategoryCode);
       await textbox(page, labels.rate).fill("2.5000");
       await textbox(page, labels.activeFrom).fill(today);
-      const [created] = await Promise.all([
-        page.waitForResponse((r) => isRequestTo(r.request(), ruleEndpoint("POST"))),
+      // Save navigates to the rule list, after which Chromium may no longer
+      // hold the browser's copy of the 201 body, so the body is read from the
+      // copy captureResponse takes through route.fetch().
+      const created = await captureResponse(page, ruleEndpoint("POST"), () =>
         formButton(page, SCREENS.ruleForm.save).click(),
-      ]);
+      );
       expect(created.status()).toBe(201);
       const rule = await readJson(created, rewardRuleResponseSchema);
       expect(rule).toMatchObject({
@@ -757,7 +785,7 @@ test.describe("admin reward rules", () => {
         }
       });
       await signIn(page, "admin");
-      await page.goto(SCREENS.ruleForm.newRoute);
+      await gotoApp(page, SCREENS.ruleForm.newRoute);
       await expect(content(page).getByRole("heading", { level: 1 })).toHaveText(SCREENS.ruleForm.newTitle);
       await fillRuleForm(page, { ...VALID_RULE, ...invalid.entered });
       await formButton(page, SCREENS.ruleForm.save).click();

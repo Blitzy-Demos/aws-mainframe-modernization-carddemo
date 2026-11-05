@@ -338,6 +338,47 @@ export function isAdmin(session: Session | null): boolean {
   return session?.usr_type === ADMIN_USER_TYPE;
 }
 
+/**
+ * The session a route requires: none ("public", /login), a live one
+ * ("signed-on", the routes under RequireAuth) or a live administrator's
+ * ("admin", the routes under RequireAdmin).
+ */
+export type RouteAccess = "public" | "signed-on" | "admin";
+
+// Every RouteAccess, keyed so that the compiler rejects a missing or an extra
+// member.
+const ROUTE_ACCESS: Readonly<Record<RouteAccess, true>> = {
+  public: true,
+  "signed-on": true,
+  admin: true,
+};
+
+/** Whether `value`, read from untyped data such as a route handle, is a RouteAccess. */
+export function isRouteAccess(value: unknown): value is RouteAccess {
+  return typeof value === "string" && Object.hasOwn(ROUTE_ACCESS, value);
+}
+
+/**
+ * Whether `session` has the access `access` names: the one admission rule of
+ * the route guards (routes/guards.tsx), which the page loaders apply before
+ * they download a page (routes/lazy-page.tsx) and the page title follows
+ * (components/page-header.tsx). A session counts only while it is live. Like
+ * isAdmin, it selects navigation only; the server's 401 and 403 decide access.
+ */
+export function sessionAdmits(
+  session: Session | null,
+  access: RouteAccess,
+): boolean {
+  switch (access) {
+    case "public":
+      return true;
+    case "signed-on":
+      return session !== null && isLive(session);
+    case "admin":
+      return session !== null && isLive(session) && isAdmin(session);
+  }
+}
+
 // Called by React during render, so it must be pure and return the same value
 // until the store changes: the stored object itself, or null once it has
 // expired. Clearing is left to the expiry timer and getSession, because

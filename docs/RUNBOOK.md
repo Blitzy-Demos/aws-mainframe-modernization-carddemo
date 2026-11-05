@@ -39,7 +39,7 @@ Install each tool at the version shown, then run its check. Every version is exa
 | cargo-deny | 0.20.2 | Supply-chain check |
 | cargo-llvm-cov | 0.9.1 | Coverage report |
 
-Rust 1.88.0 is the minimum, not a preference: the patched `time` crate (0.3.47 or later, the fix for RUSTSEC-2026-0009) that `jsonwebtoken`, `printpdf` and `lapin` pull in needs Rust 1.88, so 1.85 to 1.87 cannot build the workspace (escalation E-12).
+Rust 1.88.0 is the minimum, not a preference: the patched `time` crate (0.3.47 or later, the fix for RUSTSEC-2026-0009) that `printpdf` 0.7.0 and its `lopdf` 0.31.0 pull in for `batch creastmt` needs Rust 1.88, so 1.85 to 1.87 cannot build the workspace (escalation E-12).
 
 ### 2.1 Rust
 
@@ -524,7 +524,7 @@ Produce the account statements.
 cargo run --bin batch -- creastmt
 ```
 
-Success: exit 0 and three files under `${CARDDEMO_STATEMENT_DIR}`, replacing the previous ones: `STATEMNT.PS` (80-byte text records), `STATEMNT.HTML` (100-byte records) and `STATEMNT.PS.PDF` (the text records as PDF, one line per record). The statements are batch output only; the web application does not serve them. More than 51 cards or 10 transactions per card stops the run with exit 16 (`CAPACITY STOP`) before any file is written, because the COBOL result is undefined there.
+Success: exit 0 and three files under `${CARDDEMO_STATEMENT_DIR}`, replacing the previous ones: `STATEMNT.PS` (80-byte text records), `STATEMNT.HTML` (100-byte records) and `STATEMNT.PS.PDF` (the text records as PDF, one line per record). The statements are batch output only; the web application does not serve them. More than 51 cards or 10 transactions per card stops the run with exit 16 (`CAPACITY STOP`) before any file is written, because the COBOL result is undefined there. By then the run has already deleted the previous statements: it deletes the three files after it reads the live transaction master and before it loads the transactions, as the JCL's STEP030 runs before STEP040 [app/jcl/CREASTMT.JCL:L66-96]. A capacity stop, the abend on an empty live transaction master (`ERROR READING TRNXFILE` with `RETURN CODE: 10`) or any other abend from that point on therefore exits 16 with no `STATEMNT.PS`, `STATEMNT.HTML` or `STATEMNT.PS.PDF` left under `${CARDDEMO_STATEMENT_DIR}`. Only a failure before the deletion, such as a failed read of the live transaction master or a statement lock held by another job (section 9.6), leaves the previous statements in place. To keep the previous statements, copy them elsewhere before you run `creastmt`.
 
 Report the transactions processed within a date range. The defaults are the `SYMNAMES` dates [app/jcl/TRANREPT.jcl:L43-44].
 
@@ -551,6 +551,8 @@ cargo run --bin batch -- mnttrdb2 --input ./var/mnttrdb2_input.txt
 ```
 
 Success: exit 0, or 4 when some records failed: each failed record is logged and changes nothing, and the others are committed. `--input` has no default, because the JCL reads a dataset the repository does not hold. Only the Db2 master changes, and a `seed` refresh keeps the change; run `seed --only tranextr` to copy it to the processing copies the reports read, and remove the example type again with a `D10` record.
+
+Before it changes anything, `mnttrdb2` reads the whole input and copies its records to a work file under `${CARDDEMO_BATCH_DIR}`, so the input can be of any size. The work file has no name in the directory and is gone when the job ends. `${CARDDEMO_BATCH_DIR}` must be a directory `batch` can keep private, as section 3 describes. If it is not, or if a line of the input is longer than 53 bytes, the job exits 16 and nothing changes.
 
 Copy the Db2 masters `transaction_types` and `transaction_categories` over the processing copies `trantype_file` and `trancatg_file`. This is the TRANEXTR job.
 
@@ -648,6 +650,7 @@ Success: the migration step reports each new migration as applied, `prepare` rew
 | Audit structure check of `docs/parity/` | `cargo test -p carddemo-audit --test audit_structure --locked` | Rust and a C linker |
 | Domain rules, newtype compile-fail cases, reward engine, manifest boundary | `cargo test -p carddemo-domain --locked` | Rust and a C linker |
 | ASCII and EBCDIC codec round trips | `cargo test -p carddemo-codec --locked` | Rust and a C linker |
+| Criterion benchmarks: reward engine and codec throughput | `cargo bench -p carddemo-domain -p carddemo-codec --locked` | Rust and a C linker |
 | JSON log and span output | `cargo test -p carddemo-runtime --locked` | Rust and a C linker |
 | Hygiene scans and Compose tags | `cargo test -p carddemo-testkit --test hygiene --test compose_tags --locked` | Rust and a C linker |
 | Test-stack container helpers, with the hygiene scans and Compose tags | `cargo test -p carddemo-testkit --locked` | Docker: testcontainers starts `postgres:16.15`, and `rabbitmq:3.13.7-management` with `infra/rabbitmq/*` mounted |
@@ -659,6 +662,8 @@ Success: the migration step reports each new migration as applied, `prepare` rew
 | End-to-end | `pnpm --dir web e2e` | The running stack and Chromium (section 11.4) |
 
 The Docker-based suites start and remove their own containers; they do not use the Compose services of section 4. Run each suite from the repository root with the settings loaded (section 3.1).
+
+`cargo test` skips the criterion benchmarks because their bench targets use `harness = false`. `cargo test -p carddemo-domain -p carddemo-codec --benches --locked` runs each benchmark once as a quick check (success: each benchmark prints `Success`), and `cargo bench` takes the measurements and writes criterion's reports under `target/criterion/`.
 
 Run one suite, for example the domain rules:
 

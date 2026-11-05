@@ -29,9 +29,11 @@ import {
   expect,
   test,
   type APIRequestContext,
+  type APIResponse,
   type Locator,
   type Page,
   type Request,
+  type Route,
 } from "@playwright/test";
 import { z } from "zod";
 
@@ -394,43 +396,66 @@ type ScopeSnapshot = {
   rows: string;
 };
 
-// The column list, the primary key and the matching rows of one scope, read
-// in one statement. The rows are a jsonb array, whose text has no newline, so
-// the three fields come back on one line; the rows are last because their
-// text may hold `|`.
-async function snapshotScope(scope: RowScope): Promise<ScopeSnapshot> {
-  if (!IDENTIFIER.test(scope.table)) {
-    throw new Error(`not a table name: ${scope.table}`);
+// The column list, the primary key and the matching rows of every scope, read
+// by one statement in one psql() call, so a checkpoint costs one round trip
+// however many scopes it covers, and every scope is read from one snapshot.
+// Each scope comes back on a line of its own, in scope order, as its 1-based
+// ordinal, columns, key and rows: the rows are a jsonb array, whose text has
+// no newline, and they are last because their text may hold `|`. A missing
+// primary key reads as an empty key field.
+async function snapshotScopes(scopes: readonly RowScope[]): Promise<ScopeSnapshot[]> {
+  for (const scope of scopes) {
+    if (!IDENTIFIER.test(scope.table)) {
+      throw new Error(`not a table name: ${scope.table}`);
+    }
   }
-  const relation = sqlLiteral(`public.${scope.table}`);
+  if (scopes.length === 0) {
+    return [];
+  }
+  const selects = scopes.map((scope, index) => {
+    const relation = sqlLiteral(`public.${scope.table}`);
+    return `SELECT ${index + 1} AS scope_ord,
+              (SELECT string_agg(quote_ident(a.attname), ',' ORDER BY a.attnum)
+                 FROM pg_attribute a
+                WHERE a.attrelid = ${relation}::regclass AND a.attnum > 0 AND NOT a.attisdropped) AS scope_columns,
+              (SELECT string_agg(quote_ident(a.attname), ',' ORDER BY k.ord)
+                 FROM pg_index i
+                 CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                WHERE i.indrelid = ${relation}::regclass AND i.indisprimary) AS scope_key,
+              (SELECT coalesce(jsonb_agg(to_jsonb(t)), '[]'::jsonb)::text
+                 FROM public.${scope.table} t
+                WHERE (${scope.where})) AS scope_rows`;
+  });
   const out = await psql(
-    `SELECT
-       (SELECT string_agg(quote_ident(a.attname), ',' ORDER BY a.attnum)
-          FROM pg_attribute a
-         WHERE a.attrelid = ${relation}::regclass AND a.attnum > 0 AND NOT a.attisdropped)
-     || '|' ||
-       (SELECT string_agg(quote_ident(a.attname), ',' ORDER BY k.ord)
-          FROM pg_index i
-          CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
-          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-         WHERE i.indrelid = ${relation}::regclass AND i.indisprimary)
-     || '|' ||
-       (SELECT coalesce(jsonb_agg(to_jsonb(t)), '[]'::jsonb)::text
-          FROM public.${scope.table} t
-         WHERE (${scope.where}))`,
+    `SELECT scope_ord, scope_columns, scope_key, scope_rows
+       FROM (${selects.join("\n     UNION ALL\n")}) AS scopes
+      ORDER BY scope_ord`,
   );
-  const first = out.indexOf("|");
-  const second = out.indexOf("|", first + 1);
-  if (first <= 0 || second <= first + 1) {
-    throw new Error(`table ${scope.table} has no primary key to restore by`);
+  const lines = out.split("\n");
+  if (lines.length !== scopes.length) {
+    throw new Error(`a checkpoint of ${scopes.length} scopes read ${lines.length} lines`);
   }
-  return {
-    table: scope.table,
-    where: scope.where,
-    columns: out.slice(0, first).split(","),
-    key: out.slice(first + 1, second).split(","),
-    rows: out.slice(second + 1),
-  };
+  return scopes.map((scope, index) => {
+    const line = lines[index];
+    const ordinal = `${index + 1}|`;
+    if (!line.startsWith(ordinal)) {
+      throw new Error(`scope ${index + 1} of a checkpoint (${scope.table}) read ${JSON.stringify(line.slice(0, 80))}`);
+    }
+    const fields = line.slice(ordinal.length);
+    const first = fields.indexOf("|");
+    const second = fields.indexOf("|", first + 1);
+    if (first <= 0 || second <= first + 1) {
+      throw new Error(`table ${scope.table} has no primary key to restore by`);
+    }
+    return {
+      table: scope.table,
+      where: scope.where,
+      columns: fields.slice(0, first).split(","),
+      key: fields.slice(first + 1, second).split(","),
+      rows: fields.slice(second + 1),
+    };
+  });
 }
 
 function restoreSql(snapshots: readonly ScopeSnapshot[]): string {
@@ -470,10 +495,7 @@ function restoreSql(snapshots: readonly ScopeSnapshot[]): string {
  * are not rewound, as after a rolled-back insert.
  */
 export async function checkpoint(scopes: readonly RowScope[]): Promise<Checkpoint> {
-  const snapshots: ScopeSnapshot[] = [];
-  for (const scope of scopes) {
-    snapshots.push(await snapshotScope(scope));
-  }
+  const snapshots = await snapshotScopes(scopes);
   let restored = false;
   let attempt: Promise<void> | undefined;
   // One restore attempt. The psql() calls in flight are read before its own
@@ -1243,18 +1265,30 @@ export type SeededAuthorization = Checkpoint & {
   cardNumber: string;
 };
 
+export type SeededAuthorizations = Checkpoint & {
+  /** The new pending_auth_details identities in the order seeded, each newer than the one before. */
+  authIds: readonly string[];
+  /** The card the authorizations were requested for. */
+  cardNumber: string;
+};
+
 /**
- * Seeds one approved pending authorization for `accountId`, as COPAUA0C
- * stores one: a PAUTSUM0 summary (kept when the account has one) and a
- * PAUTDTL1 detail for the account's cross-referenced card, newest under the
- * account. `fraud` "F" seeds it already reported as fraud. The returned
- * checkpoint restores the account's summaries, details and the card's
- * auth_fraud rows.
+ * Seeds one approved pending authorization for `accountId` per entry of
+ * `fraudFlags`, in order, as COPAUA0C stores them: a PAUTSUM0 summary (kept
+ * when the account has one) and a PAUTDTL1 detail each for the account's
+ * cross-referenced card, each newer than the one before, so the last is
+ * newest under the account. An entry "F" seeds its authorization already
+ * reported as fraud. However many it seeds, it makes three psql() calls: the
+ * card lookup, the checkpoint and one insert. The returned checkpoint
+ * restores the account's summaries, details and the card's auth_fraud rows.
  */
-export async function seedPendingAuthorization(
+export async function seedPendingAuthorizations(
   accountId: string,
-  options: { fraud?: "" | "F" } = {},
-): Promise<SeededAuthorization> {
+  fraudFlags: readonly ("" | "F")[],
+): Promise<SeededAuthorizations> {
+  if (fraudFlags.length === 0) {
+    throw new Error("seedPendingAuthorizations needs at least one authorization to seed");
+  }
   const account = `${sqlLiteral(assertDigits(accountId, 11))}::bigint`;
   const cardNumber = await psql(
     `SELECT xref_card_num FROM card_xref WHERE xref_acct_id = ${account} ORDER BY xref_card_num LIMIT 1`,
@@ -1263,15 +1297,27 @@ export async function seedPendingAuthorization(
     throw new Error(`account ${accountId} has no cross-referenced card`);
   }
   const card = sqlLiteral(cardNumber);
-  const fraud = options.fraud ?? "";
+  // One row per authorization: its 1-based place in the order seeded, its
+  // PA-AUTH-FRAUD and its PA-FRAUD-RPT-DATE.
+  const seeds = fraudFlags
+    .map((fraud, index) => `(${index + 1}, ${sqlLiteral(fraud)}, ${sqlLiteral(fraud === "F" ? "07/01/22" : "")})`)
+    .join(", ");
   const cp = await checkpoint([
     { table: "pending_auth_summaries", where: `pa_acct_id = ${account}` },
     { table: "pending_auth_details", where: `pa_acct_id = ${account}` },
     { table: "auth_fraud", where: `card_num = ${card}` },
   ]);
   try {
-    await psql(
-      `INSERT INTO pending_auth_summaries
+    // PA-AUTH-DATE-9C = 99999 - YYDDD and PA-AUTH-TIME-9C = 999999999 -
+    // HHMMSSmmm [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L874-875]
+    // for 2022-07-01 (YYDDD 22182); each seed takes the next later time of
+    // that day, so the newest seed is first under the account. One statement
+    // writes the summary and the details: the details' foreign-key check runs
+    // when it ends, after the summary insert. The inserts sit in CTEs so psql
+    // prints the new keys alone, in the order seeded, without an INSERT tag.
+    const out = await psql(
+      `WITH summary AS (
+       INSERT INTO pending_auth_summaries
          (pa_acct_id, pa_cust_id, pa_auth_status, pa_account_status, pa_credit_limit,
           pa_cash_limit, pa_credit_balance, pa_cash_balance, pa_approved_auth_cnt,
           pa_declined_auth_cnt, pa_approved_auth_amt, pa_declined_auth_amt)
@@ -1279,18 +1325,13 @@ export async function seedPendingAuthorization(
               a.acct_credit_limit, a.acct_cash_credit_limit, 12.34, 0, 1, 0, 12.34, 0
          FROM card_xref x JOIN accounts a ON a.account_id = x.xref_acct_id
         WHERE x.xref_card_num = ${card}
-       ON CONFLICT (pa_acct_id) DO NOTHING`,
-    );
-    // PA-AUTH-DATE-9C = 99999 - YYDDD and PA-AUTH-TIME-9C = 999999999 -
-    // HHMMSSmmm [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L874-875]
-    // for 2022-07-01 (YYDDD 22182); each seed takes the next later time of
-    // that day, so the newest seed is first under the account. The insert
-    // sits in a CTE so psql prints the new key alone, without the INSERT tag.
-    const authId = await psql(
-      `WITH slot AS (
-         SELECT coalesce(min(pa_auth_time_9c), 999999999 - 120000000 + 1000) - 1000 AS time_9c
+       ON CONFLICT (pa_acct_id) DO NOTHING
+       ), slot AS (
+         SELECT coalesce(min(pa_auth_time_9c), 999999999 - 120000000 + 1000) AS newest_9c
            FROM pending_auth_details
           WHERE pa_acct_id = ${account} AND pa_auth_date_9c = 99999 - 22182
+       ), seed (ord, fraud, fraud_rpt_date) AS (
+         VALUES ${seeds}
        ), inserted AS (
        INSERT INTO pending_auth_details
          (pa_acct_id, pa_auth_date_9c, pa_auth_time_9c, pa_auth_orig_date, pa_auth_orig_time,
@@ -1300,23 +1341,49 @@ export async function seedPendingAuthorization(
           pa_pos_entry_mode, pa_merchant_id, pa_merchant_name, pa_merchant_city,
           pa_merchant_state, pa_merchant_zip, pa_transaction_id, pa_match_status,
           pa_auth_fraud, pa_fraud_rpt_date)
-       SELECT ${account}, 99999 - 22182, slot.time_9c, '220701',
-              lpad(((999999999 - slot.time_9c) / 1000)::text, 6, '0'),
+       SELECT ${account}, 99999 - 22182, slot.newest_9c - 1000 * seed.ord, '220701',
+              lpad(((999999999 - (slot.newest_9c - 1000 * seed.ord)) / 1000)::text, 6, '0'),
               c.card_number, 'POS', substr(c.card_expiraion_date, 6, 2) || substr(c.card_expiraion_date, 3, 2),
               '0100', 'POS', '000001', '00', '0000', 0, 12.34, 12.34, '5411', '840', 1,
               '000000000000001', 'E2E FIXTURE MERCHANT', 'SEATTLE', 'WA', '98101',
-              'E2E000000000001', 'P', ${sqlLiteral(fraud)}, ${sqlLiteral(fraud === "F" ? "07/01/22" : "")}
-         FROM cards c, slot
+              'E2E000000000001', 'P', seed.fraud, seed.fraud_rpt_date
+         FROM cards c, slot, seed
         WHERE c.card_number = ${card}
-       RETURNING auth_id
+        ORDER BY seed.ord
+       RETURNING auth_id, pa_auth_time_9c
        )
-       SELECT auth_id FROM inserted`,
+       SELECT auth_id FROM inserted ORDER BY pa_auth_time_9c DESC`,
     );
-    return { authId: assertDigits(authId), cardNumber, restore: () => cp.restore() };
+    const authIds = out === "" ? [] : out.split("\n");
+    if (authIds.length !== fraudFlags.length) {
+      throw new Error(`seeded ${authIds.length} of ${fraudFlags.length} pending authorizations for account ${accountId}`);
+    }
+    return {
+      authIds: authIds.map((authId) => assertDigits(authId)),
+      cardNumber,
+      restore: () => cp.restore(),
+    };
   } catch (error) {
     await cp.restore();
     throw error;
   }
+}
+
+/**
+ * Seeds one approved pending authorization for `accountId`, as COPAUA0C
+ * stores one: a PAUTSUM0 summary (kept when the account has one) and a
+ * PAUTDTL1 detail for the account's cross-referenced card, newest under the
+ * account. `fraud` "F" seeds it already reported as fraud. The returned
+ * checkpoint restores the account's summaries, details and the card's
+ * auth_fraud rows. It is seedPendingAuthorizations with one entry.
+ */
+export async function seedPendingAuthorization(
+  accountId: string,
+  options: { fraud?: "" | "F" } = {},
+): Promise<SeededAuthorization> {
+  const seeded = await seedPendingAuthorizations(accountId, [options.fraud ?? ""]);
+  const [authId] = seeded.authIds;
+  return { authId, cardNumber: seeded.cardNumber, restore: () => seeded.restore() };
 }
 
 /** The highest TRAN-ID of the live transaction master. */
@@ -1494,6 +1561,55 @@ export async function readJson<T>(
     throw new Error(`the JSON body of ${response.url()} does not match its schema: ${issues}`);
   }
   return decoded.data;
+}
+
+/**
+ * Runs `action`, which makes `page` send one `endpoint` request, and returns
+ * that request's response as `route.fetch()` received it, once `action` has
+ * settled too. Read its body here, never from the browser's response:
+ * Playwright asks Chromium for that body only when it is read, and once the
+ * page has navigated on, as a form does after a save, Chromium may hold it no
+ * longer ("No data found for resource"). The copy route.fetch() returns stays
+ * on the Node side until the context closes. Requests of `endpoint`'s path
+ * with another method pass on unchanged, a request route.fetch() gets no
+ * response for is aborted and fails the call, and the route is removed
+ * before the call returns.
+ */
+export async function captureResponse(
+  page: Page,
+  endpoint: Endpoint,
+  action: () => Promise<unknown>,
+): Promise<APIResponse> {
+  const matches = (url: URL): boolean => matchesEndpoint(url.href, endpoint.path);
+  let resolveFetched: (response: APIResponse) => void = () => undefined;
+  let rejectFetched: (error: Error) => void = () => undefined;
+  const fetched = new Promise<APIResponse>((resolve, reject) => {
+    resolveFetched = resolve;
+    rejectFetched = reject;
+  });
+  const fetchEndpoint = async (route: Route): Promise<void> => {
+    if (route.request().method() !== endpoint.method) {
+      await route.fallback();
+      return;
+    }
+    let response: APIResponse;
+    try {
+      response = await route.fetch();
+    } catch (error) {
+      rejectFetched(new Error(`${endpoint.method} ${endpoint.path} got no response`, { cause: error }));
+      await route.abort();
+      return;
+    }
+    resolveFetched(response);
+    await route.fulfill({ response });
+  };
+  await page.route(matches, fetchEndpoint);
+  try {
+    const [response] = await Promise.all([fetched, action()]);
+    return response;
+  } finally {
+    await page.unroute(matches, fetchEndpoint);
+  }
 }
 
 /** The bearer header of `token`. */
@@ -1910,6 +2026,185 @@ export function userMenuTrigger(page: Page, role: Role): Locator {
   return page.getByRole("button", { name: USERS[role].userId, exact: true });
 }
 
+// Chromium fails every request in flight with net::ERR_NETWORK_CHANGED when
+// the host's network interfaces change, and a Docker daemon that creates and
+// removes networks for other Compose projects and testcontainers changes them
+// many times a minute. A load that loses /src/main.tsx (render-blocking in
+// index.html) or any module of its graph leaves #root empty: the SPA never
+// boots, and the test times out on its first locator through no fault of the
+// code under test. gotoApp and reloadApp therefore load the document again
+// when, and only when, Chromium reported that error during the load, in at
+// most APP_LOAD_ATTEMPTS loads, and record each such load as a
+// "network-changed" annotation of the test that names the resources lost.
+//
+// This cannot hide a parity failure. A reload only repeats a document load
+// the browser broke while the SPA started, and the test's own steps and
+// assertions all run once, after the one load that booted with no request
+// lost. Any other navigation error is rethrown unchanged, a SPA that does not
+// boot for any other reason fails the test with the resources still pending
+// and those that failed, and no test is retried (playwright.config.ts keeps
+// retries at 0).
+const NETWORK_CHANGED = "net::ERR_NETWORK_CHANGED";
+
+// The loads one gotoApp or reloadApp call makes at most: the first and two
+// more.
+const APP_LOAD_ATTEMPTS = 3;
+
+// How long a load may take to boot once its navigation has resolved: the
+// expect timeout playwright.config.ts sets.
+const APP_BOOT_TIMEOUT_MS = 15_000;
+
+// The boot check polls every APP_BOOT_POLL_MS, and takes the module graph as
+// loaded once no document, script or style sheet request has started or
+// ended for APP_SETTLE_MS: a module's imports are requested only after it has
+// been fetched and parsed, so for a moment between the two none is pending.
+const APP_BOOT_POLL_MS = 50;
+const APP_SETTLE_MS = 100;
+
+// The resource types that carry the SPA's code. fetch and XHR are left out:
+// they are the pages' API reads, which some specs hold with page.route.
+const APP_CODE_RESOURCES: ReadonlySet<string> = new Set(["document", "script", "stylesheet"]);
+
+// `items` joined for an error or annotation text, "none" when empty.
+function listed(items: readonly string[]): string {
+  return items.length === 0 ? "none" : items.join(", ");
+}
+
+// Whether the SPA has rendered into #root. A navigation that replaces the
+// document while the check runs reads as not yet: the next poll reads the new
+// document.
+async function appMounted(page: Page): Promise<boolean> {
+  try {
+    return await page.evaluate(() => (document.getElementById("root")?.childElementCount ?? 0) > 0);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("Execution context was destroyed")) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+// One load of `url` by `navigate`. Once the load has settled it resolves with
+// the URLs Chromium failed with net::ERR_NETWORK_CHANGED during it, none when
+// the SPA booted: #root rendered and no document, script or style sheet
+// request of the load pending. Any other navigation error is rethrown as it
+// is, and a SPA that has not booted within APP_BOOT_TIMEOUT_MS of the
+// navigation with no such failure throws.
+async function loadOnce(page: Page, url: string, navigate: () => Promise<unknown>): Promise<string[]> {
+  const aborted = new Set<string>();
+  const pending = new Set<Request>();
+  const failed: string[] = [];
+  let lastActivity = Date.now();
+  const onRequest = (request: Request): void => {
+    if (APP_CODE_RESOURCES.has(request.resourceType())) {
+      pending.add(request);
+      lastActivity = Date.now();
+    }
+  };
+  const onFinished = (request: Request): void => {
+    if (pending.delete(request)) {
+      lastActivity = Date.now();
+    }
+  };
+  const onFailed = (request: Request): void => {
+    const errorText = request.failure()?.errorText ?? "no error text";
+    if (errorText === NETWORK_CHANGED) {
+      aborted.add(request.url());
+    } else if (pending.has(request)) {
+      failed.push(`${request.url()} (${errorText})`);
+    }
+    onFinished(request);
+  };
+  page.on("request", onRequest);
+  page.on("requestfinished", onFinished);
+  page.on("requestfailed", onFailed);
+  try {
+    try {
+      await navigate();
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes(NETWORK_CHANGED)) {
+        throw error;
+      }
+      // The document itself was lost, and the tab holds Chromium's error page.
+      aborted.add(url);
+    }
+    const deadline = Date.now() + APP_BOOT_TIMEOUT_MS;
+    for (;;) {
+      if (pending.size === 0 && Date.now() - lastActivity >= APP_SETTLE_MS) {
+        if (aborted.size > 0) {
+          return [...aborted];
+        }
+        if (await appMounted(page)) {
+          return [];
+        }
+      }
+      if (Date.now() >= deadline) {
+        break;
+      }
+      await delay(APP_BOOT_POLL_MS);
+    }
+    if (aborted.size > 0) {
+      return [...aborted];
+    }
+    const root = (await appMounted(page)) ? "rendered" : "empty";
+    throw new Error(
+      `the SPA did not boot within ${APP_BOOT_TIMEOUT_MS} ms of loading ${url}: #root ${root}, ` +
+        `pending ${listed([...pending].map((request) => request.url()))}, failed ${listed(failed)}`,
+    );
+  } finally {
+    page.off("request", onRequest);
+    page.off("requestfinished", onFinished);
+    page.off("requestfailed", onFailed);
+  }
+}
+
+// Loads `url` by `navigate` (given the 1-based number of the load) until the
+// SPA boots with no request lost to net::ERR_NETWORK_CHANGED, at most
+// APP_LOAD_ATTEMPTS times, annotating the test with every load that lost one.
+async function loadApp(page: Page, url: string, navigate: (attempt: number) => Promise<unknown>): Promise<void> {
+  for (let attempt = 1; attempt <= APP_LOAD_ATTEMPTS; attempt += 1) {
+    const aborted = await loadOnce(page, url, () => navigate(attempt));
+    if (aborted.length === 0) {
+      return;
+    }
+    const last = attempt === APP_LOAD_ATTEMPTS;
+    test.info().annotations.push({
+      type: "network-changed",
+      description:
+        `load ${attempt} of ${APP_LOAD_ATTEMPTS} of ${url}: Chromium failed ${listed(aborted)} with ${NETWORK_CHANGED}` +
+        (last ? "" : "; loading it again"),
+    });
+    if (last) {
+      throw new Error(
+        `${url} did not load in ${APP_LOAD_ATTEMPTS} attempts: on the last one Chromium failed ` +
+          `${listed(aborted)} with ${NETWORK_CHANGED}`,
+      );
+    }
+  }
+}
+
+/**
+ * Opens `url` like `page.goto` (relative to the base URL) and waits until the
+ * SPA has booted there. A load that loses a request to
+ * net::ERR_NETWORK_CHANGED is made again, a bounded number of times, and
+ * recorded as a test annotation (see above). Every spec opens a document
+ * through this helper or reloadApp.
+ */
+export async function gotoApp(page: Page, url: string): Promise<void> {
+  await loadApp(page, url, () => page.goto(url));
+}
+
+/**
+ * Reloads the page like `page.reload` and waits until the SPA has booted
+ * again, as gotoApp does for a new URL. A load after a lost one opens the
+ * same URL with `page.goto`, which loads it whatever document the lost load
+ * left in the tab.
+ */
+export async function reloadApp(page: Page): Promise<void> {
+  const url = page.url();
+  await loadApp(page, url, (attempt) => (attempt === 1 ? page.reload() : page.goto(url)));
+}
+
 // The F-COSGN00-001 sign-on control: its route, the user-ID textbox, the
 // password input and the submit button.
 function signOnForm(page: Page): { route: string; userId: Locator; password: Locator; submit: Locator } {
@@ -1931,7 +2226,7 @@ function signOnForm(page: Page): { route: string; userId: Locator; password: Loc
 export async function signIn(page: Page, role: Role): Promise<void> {
   const user = USERS[role];
   const form = signOnForm(page);
-  await page.goto(form.route);
+  await gotoApp(page, form.route);
   await form.userId.fill(user.userId);
   await form.password.fill(user.password);
   await form.submit.click();
@@ -2033,7 +2328,7 @@ export async function pressControl(page: Page, control: Locator): Promise<void> 
 export async function signInWithKeyboard(page: Page, role: Role): Promise<void> {
   const user = USERS[role];
   const form = signOnForm(page);
-  await page.goto(form.route);
+  await gotoApp(page, form.route);
   await typeInto(page, form.userId, user.userId);
   await typeInto(page, form.password, user.password);
   await page.keyboard.press("Enter");
