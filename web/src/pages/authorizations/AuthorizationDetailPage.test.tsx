@@ -552,6 +552,69 @@ describe("AuthorizationDetailPage (CPVD, COPAU01) read status", () => {
   });
 });
 
+/** The card's content: the skeleton's while the record is read, then the record's. */
+function cardContent(): Element {
+  const content = document.querySelector("[data-slot='card'] [data-slot='card-content']");
+  if (content === null) {
+    throw new Error("no card is shown");
+  }
+  return content;
+}
+
+/** The classes that set the height of `element`'s line. */
+function heightClasses(element: Element): string[] {
+  return Array.from(element.classList).filter((name) => /^(my|h|min-h)-/.test(name));
+}
+
+/** Each field of a skeleton grid as the height classes of its caption and value bars. */
+function fieldBars(grid: Element): string[][][] {
+  return Array.from(grid.children, (field) => Array.from(field.children, heightClasses));
+}
+
+/** A field's caption bar in its 20px text-sm line and value bar in its 24px text-base line. */
+const FIELD_BARS = [
+  ["my-0.5", "h-4"],
+  ["my-0.5", "h-5"],
+];
+
+describe("AuthorizationDetailPage (CPVD, COPAU01) skeleton", () => {
+  // While the record is read, the card holds each field read: a caption bar
+  // centred in the text-sm line (20px) and a value bar in the text-base line
+  // (24px), 48px with the gap, as tall as a field read, whose value is held to
+  // that line (min-h-6) even when blank. The merchant fields sit under a title
+  // bar as high as the title's leading-none line (h-4). jsdom lays nothing
+  // out, so the classes that set the heights are what is compared.
+  it("holds each field's caption and value lines and the merchant title while the record is read", async () => {
+    const held = holdResponse();
+    answer = (request) =>
+      isDetailRead(request, NEWEST.auth_id) ? held.reply : readStore(request);
+    renderAt(NEWEST_ROUTE);
+
+    const skeleton = await waitFor(cardContent);
+    expect(skeleton.closest("[data-slot='card']")?.getAttribute("aria-hidden")).toBe("true");
+    const [fields, separator, merchant] = Array.from(skeleton.children);
+    expect(skeleton.children).toHaveLength(3);
+    expect(separator.getAttribute("data-slot")).toBe("separator");
+    const [merchantTitle, merchantFields] = Array.from(merchant.children);
+    expect(merchant.children).toHaveLength(2);
+    expect(heightClasses(merchantTitle)).toEqual(["h-4"]);
+    for (const grid of [fields, merchantFields]) {
+      expect(fieldBars(grid)).toEqual(Array.from(grid.children, () => FIELD_BARS));
+    }
+    const placeholders = [fields.children.length, merchantFields.children.length];
+
+    // A blank value among them: its line is held all the same.
+    held.send(jsonResponse(200, { ...NEWEST, pa_merchant_name: "" }));
+    await screen.findByRole("heading", { level: 2, name: "Merchant Details" });
+    const lists = Array.from(cardContent().querySelectorAll("dl"));
+    expect(lists.map((list) => list.children.length)).toEqual(placeholders);
+    for (const value of cardContent().querySelectorAll("dd")) {
+      expect(heightClasses(value)).toEqual(["min-h-6"]);
+    }
+    expect(toastError).not.toHaveBeenCalled();
+  });
+});
+
 /** The detail route of `authId`, from the summary of account 1, as the router receives it. */
 function routeOf(authId: string): string {
   return `/authorizations/${encodeURIComponent(authId)}?account_id=${ACCOUNT_1}`;

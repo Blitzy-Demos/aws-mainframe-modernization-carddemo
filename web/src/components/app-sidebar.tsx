@@ -14,6 +14,10 @@
 // That choice shapes navigation alone: RequireAdmin and the API's 403 decide
 // access.
 //
+// One link at most is the current page, the entry whose nav/menu.ts
+// `currentRoutes` pattern matches the location; its link alone carries
+// aria-current="page" and the generated active style.
+//
 // The sidebar collapses to an icon rail (AAP 0.5.4.4, driven by app-layout's
 // open state). Each link keeps its label span in the DOM there, so its
 // accessible name stays the label while the generated styles hide the text
@@ -29,7 +33,7 @@ import {
   type RefObject,
 } from "react";
 import { WalletCards } from "lucide-react";
-import { Link, NavLink, useLocation, useResolvedPath } from "react-router";
+import { Link, matchRoutes, useLocation } from "react-router";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -50,22 +54,29 @@ import { cn } from "@/lib/utils";
 import {
   MENU_SECTION_LABELS,
   adminMenu,
+  menu,
   userMenu,
   type MenuEntry,
   type MenuSection,
 } from "@/nav/menu";
 
-// NavLink's own `end` test, so the highlight (`isActive`) and NavLink's
-// aria-current="page" always agree: the location's pathname equals the
-// resolved target, compared case-insensitively as NavLink does by default.
-// useMatch is not used: its `end` pattern also accepts trailing slashes
-// ("/cards/") and matches the decoded pathname, where NavLink marks no current
-// page. The menu routes are plain ASCII paths, which the router's location
-// encoding leaves unchanged.
-function useIsCurrentRoute(route: string): boolean {
-  const target = useResolvedPath(route).pathname;
+// Each nav/menu.ts `currentRoutes` pattern as a route of its own, carrying the
+// entry that owns it. Built once, as the menu is static.
+type CurrentRoute = { path: string; entry: MenuEntry };
+
+const CURRENT_ROUTES: CurrentRoute[] = menu.flatMap((entry) =>
+  entry.currentRoutes.map((path) => ({ path, entry })),
+);
+
+// The id of the entry that is the current page at the location, or null on a
+// route no entry owns, such as the /admin landing. matchRoutes ranks the
+// patterns as the router ranks App.tsx's route table, so the static
+// /transactions/new picks Transaction Add rather than Transaction View's
+// /transactions/:tranId, and like the router it ignores case and a trailing
+// slash. Read once for the whole sidebar, so no two links can both be current.
+function useCurrentEntryId(): string | null {
   const { pathname } = useLocation();
-  return pathname.toLowerCase() === target.toLowerCase();
+  return matchRoutes(CURRENT_ROUTES, pathname)?.at(-1)?.route.entry.id ?? null;
 }
 
 // Whether the element's text overflows its box, measured again whenever the
@@ -92,9 +103,11 @@ function useIsClipped(ref: RefObject<HTMLElement | null>): boolean {
   return clipped;
 }
 
-// Several options share a route (Account View and Account Update both open
-// the dashboard lookup, E-61), so more than one entry can be current at once,
-// each with its own aria-current.
+// `active` is the sidebar's one current-page decision, so the generated
+// highlight (data-active) and aria-current="page" always agree. The link is a
+// Link, not a NavLink: NavLink would set aria-current from its own target,
+// which several options share (Account View and Account Update both open the
+// dashboard lookup, E-61).
 //
 // The generated tooltip shows only in the icon rail. In the expanded sidebar
 // the generated `truncate` style cuts the longest option texts, such as
@@ -103,8 +116,13 @@ function useIsClipped(ref: RefObject<HTMLElement | null>): boolean {
 // tooltip there, so the full option text stays readable without restyling
 // the generated button. `hidden` overrides the generated condition, which
 // SidebarMenuButton spreads the tooltip props over.
-function SidebarNavItem({ entry }: { entry: MenuEntry }): JSX.Element {
-  const active = useIsCurrentRoute(entry.route);
+function SidebarNavItem({
+  entry,
+  active,
+}: {
+  entry: MenuEntry;
+  active: boolean;
+}): JSX.Element {
   const labelRef = useRef<HTMLSpanElement>(null);
   const clipped = useIsClipped(labelRef);
   const { isMobile, state } = useSidebar();
@@ -119,10 +137,10 @@ function SidebarNavItem({ entry }: { entry: MenuEntry }): JSX.Element {
           hidden: isMobile || (state !== "collapsed" && !clipped),
         }}
       >
-        <NavLink to={entry.route} end>
+        <Link to={entry.route} aria-current={active ? "page" : undefined}>
           <entry.icon aria-hidden="true" />
           <span ref={labelRef}>{entry.label}</span>
-        </NavLink>
+        </Link>
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
@@ -134,9 +152,11 @@ function SidebarNavItem({ entry }: { entry: MenuEntry }): JSX.Element {
 function SidebarNavGroup({
   label,
   entries,
+  currentId,
 }: {
   label: string;
   entries: readonly MenuEntry[];
+  currentId: string | null;
 }): JSX.Element {
   const labelId = useId();
 
@@ -146,7 +166,11 @@ function SidebarNavGroup({
       <SidebarGroupContent>
         <SidebarMenu aria-labelledby={labelId}>
           {entries.map((entry) => (
-            <SidebarNavItem key={entry.id} entry={entry} />
+            <SidebarNavItem
+              key={entry.id}
+              entry={entry}
+              active={entry.id === currentId}
+            />
           ))}
         </SidebarMenu>
       </SidebarGroupContent>
@@ -156,6 +180,7 @@ function SidebarNavGroup({
 
 export function AppSidebar(): JSX.Element {
   const session = useSession();
+  const currentId = useCurrentEntryId();
 
   return (
     <Sidebar collapsible="icon">
@@ -172,11 +197,16 @@ export function AppSidebar(): JSX.Element {
           keeps the groups its direct children while making the sidebar a named
           landmark distinct from the breadcrumb's. */}
       <SidebarContent role="navigation" aria-label="Main">
-        <SidebarNavGroup label={MENU_SECTION_LABELS.user} entries={userMenu} />
+        <SidebarNavGroup
+          label={MENU_SECTION_LABELS.user}
+          entries={userMenu}
+          currentId={currentId}
+        />
         {isAdmin(session) && (
           <SidebarNavGroup
             label={MENU_SECTION_LABELS.admin}
             entries={adminMenu}
+            currentId={currentId}
           />
         )}
       </SidebarContent>

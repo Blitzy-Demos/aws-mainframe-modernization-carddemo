@@ -5,12 +5,15 @@
 // answers at TRNIDIN reaches the user as a toast, as the field's error and as
 // the cursor on the field, the COBOL `MOVE -1 TO TRNIDINL`; and Next (PF8,
 // F-COTRN00-004) browses forward from the page's `next_key`, with the "View"
-// row action (selector S, F-COTRN00-005) linking each row to its TRAN-ID.
+// row action (selector S, F-COTRN00-005) linking each row to its TRAN-ID; a
+// return to the list shows the page read before at once, not busy, while it
+// is read again.
 //
 // The network is the global the API client looks up on every request, stubbed
 // per test, and the assertions read the Request objects it received.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -57,6 +60,15 @@ const TRAN_ID_NOT_NUMERIC = "Tran ID must be Numeric ...";
 
 /** COTRN00C's end-of-master text (V-COTRN00C-007), byte for byte. */
 const BOTTOM_REACHED = "You have reached the bottom of the page...";
+
+/** PROCESS-PF7-KEY on the first page (V-COTRN00C-009), byte for byte. */
+const ALREADY_AT_TOP = "You are already at the top of the page...";
+
+/** STARTBR NOTFND (V-COTRN00C-005, V-COTRN00C-010), byte for byte. */
+const AT_TOP = "You are at the top of the page...";
+
+/** The V-COTRN00C-005 example: a key above every TRAN-ID of the master. */
+const NO_MATCH_KEY = "9999999999999999";
 
 /** The V-COTRN00C-004 example: 16 characters, the last not a digit. */
 const NOT_NUMERIC_KEY = "000000000068358X";
@@ -146,6 +158,37 @@ const SECOND_PAGE: TransactionPage = {
   message: BOTTOM_REACHED,
 };
 
+/**
+ * ENTER from the first key typed in TRNIDIN: the first page's rows, and, as
+ * from every typed key, the first key shown as the PF7 start key, since the
+ * server cannot tell that no record precedes it.
+ */
+const TYPED_KEY_PAGE: TransactionPage = { ...FIRST_PAGE, prev_key: FIRST_KEY };
+
+/**
+ * PF7 from the first key, which no record precedes: PROCESS-PF7-KEY on the
+ * first page reads nothing, and the page from the key stays reachable
+ * forward.
+ */
+const ALREADY_AT_TOP_PAGE: TransactionPage = {
+  items: [],
+  next_key: FIRST_KEY,
+  prev_key: null,
+  message: ALREADY_AT_TOP,
+};
+
+/**
+ * STARTBR NOTFND: no record at or after the start key. ENTER from a key above
+ * the highest gets it, and so does PF8 once the records from its key on are
+ * gone, as after `batch tranbkp` empties the live master between two reads.
+ */
+const NOT_FOUND_PAGE: TransactionPage = {
+  items: [],
+  next_key: null,
+  prev_key: null,
+  message: AT_TOP,
+};
+
 /** V-COTRN00C-004's answer: status 400, the cursor on TRNIDIN. */
 const START_KEY_ERROR: ListErrorBody = {
   code: "INVALID",
@@ -232,6 +275,23 @@ function fieldError(input: HTMLElement): HTMLElement {
   return error;
 }
 
+/** Every toast created so far, for toastsSince. */
+function toastHistory(): unknown[] {
+  return [...toast.getHistory()];
+}
+
+/** The toasts created with the text `title` since `before`, a toastHistory(). */
+function toastsSince(before: readonly unknown[], title: string): number {
+  return toast
+    .getHistory()
+    .filter(
+      (created) =>
+        !before.includes(created) &&
+        "title" in created &&
+        created.title === title,
+    ).length;
+}
+
 /** The "View" row actions, in row order. */
 function viewLinks(): HTMLElement[] {
   return within(screen.getByRole("table")).getAllByRole("link", { name: "View" });
@@ -246,6 +306,7 @@ function viewLinks(): HTMLElement[] {
 async function renderPage(): Promise<{
   user: UserEvent;
   startKeyInput: HTMLInputElement;
+  router: ReturnType<typeof createMemoryRouter>;
 }> {
   queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -287,6 +348,7 @@ async function renderPage(): Promise<{
     startKeyInput: screen.getByRole<HTMLInputElement>("textbox", {
       name: "Transaction ID",
     }),
+    router,
   };
 }
 
@@ -426,6 +488,185 @@ describe("TransactionListPage (CT00, COTRN00)", () => {
       screen.getByRole("button", { name: "Next" }).getAttribute("aria-disabled"),
     ).toBe("true");
     expect(toastError).not.toHaveBeenCalled();
+  });
+
+  // F-COTRN00-003 and F-COTRN00-004 after a search from a typed key, whose
+  // page offers PF7 from its first key. COTRN00C sends PF7 on the first page
+  // without ERASE (P-COTRN00C-009, P-COTRN00C-018), and a PF8 whose STARTBR
+  // finds no record blanks no row (P-COTRN00C-016), so a key answered with no
+  // rows keeps the ten rows and both keys, and its text is toasted. Every
+  // press reads the file again and shows the text again. ENTER erases the
+  // screen: a search that finds nothing then shows its text in place of the
+  // rows (E-27).
+  it.each([
+    {
+      control: "Previous",
+      direction: "backward",
+      startKey: FIRST_KEY,
+      boundary: ALREADY_AT_TOP_PAGE,
+      text: ALREADY_AT_TOP,
+    },
+    {
+      control: "Next",
+      direction: "forward",
+      startKey: LAST_KEY_OF_FIRST_PAGE,
+      boundary: NOT_FOUND_PAGE,
+      text: AT_TOP,
+    },
+  ] as const)(
+    "$control after a typed-key Search answered with no rows keeps the rows and toasts its text for every press",
+    async ({ control, direction, startKey, boundary, text }) => {
+      answer = (request) => {
+        const query = queryOf(request);
+        const key = query.get("start_key");
+        const sentDirection = query.get("direction") ?? "forward";
+        if (new URL(request.url).pathname === LIST_PATH) {
+          if (key === startKey && sentDirection === direction) {
+            return jsonResponse(200, boundary);
+          }
+          if (key === FIRST_KEY && sentDirection === "forward") {
+            return jsonResponse(200, TYPED_KEY_PAGE);
+          }
+          if (key === NO_MATCH_KEY && sentDirection === "forward") {
+            return jsonResponse(200, NOT_FOUND_PAGE);
+          }
+        }
+        return browse(request);
+      };
+      const { user, startKeyInput } = await renderPage();
+      await user.type(startKeyInput, `${FIRST_KEY}{Enter}`);
+      await waitFor(() => {
+        expect(
+          screen
+            .getByRole("button", { name: "Previous" })
+            .getAttribute("aria-disabled"),
+        ).toBeNull();
+      });
+      expect(listRequests()).toHaveLength(2);
+      const before = toastHistory();
+
+      for (const press of [1, 2]) {
+        const pressed = screen.getByRole("button", { name: control });
+        await user.click(pressed);
+
+        await waitFor(() => {
+          expect(toastsSince(before, text)).toBe(press);
+        });
+        expect(listRequests()).toHaveLength(2 + press);
+        const sent = queryOf(listRequests()[1 + press]);
+        expect(sent.get("direction")).toBe(direction);
+        expect(sent.get("start_key")).toBe(startKey);
+        const table = screen.getByRole("table");
+        expect(within(table).getAllByRole("row")).toHaveLength(
+          TYPED_KEY_PAGE.items.length + 1,
+        );
+        for (const row of TYPED_KEY_PAGE.items) {
+          expect(within(table).getByText(row.tran_id).textContent).toBe(
+            row.tran_id,
+          );
+        }
+        expect(viewLinks()).toHaveLength(TYPED_KEY_PAGE.items.length);
+        expect(within(table).queryByText(text)).toBeNull();
+        expect(table.hasAttribute("aria-busy")).toBe(false);
+        for (const paging of ["Previous", "Next"]) {
+          expect(
+            screen
+              .getByRole("button", { name: paging })
+              .getAttribute("aria-disabled"),
+          ).toBeNull();
+        }
+        expect(document.activeElement).toBe(pressed);
+      }
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(listRequests()).toHaveLength(4);
+      expect(toastsSince(before, text)).toBe(2);
+
+      const beforeSearch = toastHistory();
+      await user.clear(startKeyInput);
+      await user.type(startKeyInput, `${NO_MATCH_KEY}{Enter}`);
+
+      const table = screen.getByRole("table");
+      expect((await within(table).findByText(AT_TOP)).textContent).toBe(AT_TOP);
+      expect(within(table).queryByText(FIRST_KEY)).toBeNull();
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(toastsSince(beforeSearch, AT_TOP)).toBe(0);
+      expect(listRequests()).toHaveLength(5);
+      expect(toastError).not.toHaveBeenCalled();
+    },
+  );
+
+  // V-COTRN00C-005 and E-27: ENTER from a key no record is at or after reads
+  // no rows. ENTER sends its screen with ERASE, so the text stands in place
+  // of the rows, which the table's status region announces, and is not
+  // toasted as well.
+  it("a typed-key Search that finds nothing shows its text in place of the rows", async () => {
+    answer = (request) =>
+      new URL(request.url).pathname === LIST_PATH &&
+      queryOf(request).get("start_key") === NO_MATCH_KEY
+        ? jsonResponse(200, NOT_FOUND_PAGE)
+        : browse(request);
+    const { user, startKeyInput } = await renderPage();
+    const before = toastHistory();
+
+    await user.type(startKeyInput, `${NO_MATCH_KEY}{Enter}`);
+
+    const table = screen.getByRole("table");
+    expect((await within(table).findByText(AT_TOP)).textContent).toBe(AT_TOP);
+    expect(within(table).queryByText(FIRST_KEY)).toBeNull();
+    expect(within(table).queryAllByRole("link", { name: "View" })).toEqual([]);
+    await waitFor(() => {
+      expect(queryClient.isFetching()).toBe(0);
+    });
+    expect(toastsSince(before, AT_TOP)).toBe(0);
+    const [, search] = listRequests();
+    expect(queryOf(search).get("start_key")).toBe(NO_MATCH_KEY);
+    expect(listRequests()).toHaveLength(2);
+    // The empty page offers no key, so both controls are disabled.
+    for (const paging of ["Previous", "Next"]) {
+      expect(
+        screen.getByRole("button", { name: paging }).getAttribute("aria-disabled"),
+      ).toBe("true");
+    }
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("shows the page read before at once, not busy, when the list is opened again", async () => {
+    const { user, router } = await renderPage();
+    await user.click(viewLinks()[0]);
+    await screen.findByText("detail");
+
+    // The read the return starts is held, so only the cached page can show.
+    const held = deferred<void>();
+    answer = async (request) => {
+      await held.promise;
+      return browse(request);
+    };
+    await act(async () => {
+      await router.navigate("/transactions");
+    });
+
+    const table = screen.getByRole("table");
+    await waitFor(() => {
+      expect(listRequests()).toHaveLength(2);
+    });
+    expect(within(table).getByText(FIRST_KEY).tagName).toBe("SPAN");
+    expect(viewLinks()).toHaveLength(10);
+    expect(table.hasAttribute("aria-busy")).toBe(false);
+    expect(table.querySelector('[data-slot="skeleton"]')).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Next" }).hasAttribute("aria-disabled"),
+    ).toBe(false);
+
+    held.resolve();
+    await waitFor(() => {
+      expect(queryClient.isFetching()).toBe(0);
+    });
+    expect(table.hasAttribute("aria-busy")).toBe(false);
+    expect(viewLinks()).toHaveLength(10);
   });
 
   // A TRAN-DESC X(100) at its full length without a space breaks anywhere and

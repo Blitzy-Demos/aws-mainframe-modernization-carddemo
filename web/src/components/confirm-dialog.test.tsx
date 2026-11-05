@@ -3,19 +3,26 @@
 // until the dialog has left the page and then stands, or runs at once once
 // the dialog has gone; a move that places no focus, Cancel and Escape return
 // focus to the opener; a press of the overlay leaves the open dialog holding
-// focus; the content is a modal alertdialog; and through the closing
-// animation the pressed action keeps focus, ignores further presses and holds
-// back a move handed over meanwhile.
+// focus; the content is a modal alertdialog; through the closing animation
+// the pressed action keeps focus, ignores further presses and holds back a
+// move handed over meanwhile; and where the opener leaves the document (a
+// row's Delete whose record the confirmed request deleted), focus goes to the
+// nearest focusable ancestor the opener had (the data table), whether the
+// deleted row leaves before the dialog has closed or after focus has returned
+// to its Delete, with or without a move handed over, and never to another
+// record's control.
 //
 // jsdom runs no CSS animation, so Radix removes the content as soon as the
 // dialog closes, and its close autofocus follows on the next task. The
 // closing tests give the dialog an exit animation of their own.
+import type { ColumnDef } from "@tanstack/react-table";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState, type JSX } from "react";
+import { useCallback, useMemo, useState, type JSX } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ConfirmDialog, type AfterClose } from "@/components/confirm-dialog";
+import { DataTable } from "@/components/data-table";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -340,4 +347,281 @@ describe("ConfirmDialog while closing", () => {
     await nextTask();
     expect(document.activeElement).toBe(field());
   });
+});
+
+interface Row {
+  id: string;
+  name: string;
+}
+
+const ROWS: Row[] = [
+  { id: "QADEL01", name: "FIRST" },
+  { id: "QADEL02", name: "SECOND" },
+  { id: "QADEL03", name: "THIRD" },
+];
+
+// When the deleted row leaves the list: in the same update as the dialog's
+// close (the request answered before the close completed), or later, by the
+// test, once focus has returned to the opener.
+type Answer = "before close" | "after close";
+
+// Where the rows' Delete buttons live: the data table, or a plain list with
+// no focusable ancestor.
+type Container = "table" | "list";
+
+function rowId(row: Row): string {
+  return row.id;
+}
+
+function noPage(): void {
+  // The rows fit one page: neither paging control is ever enabled.
+}
+
+function DeleteList({
+  answer,
+  container,
+  deleted,
+  handsMove,
+}: {
+  answer: Answer;
+  container: Container;
+  deleted: string | null;
+  // Whether the answer also hands afterClose a focus move that places none.
+  handsMove: boolean;
+}): JSX.Element {
+  const [target, setTarget] = useState<Row | null>(null);
+  const [open, setOpen] = useState(false);
+  const [answered, setAnswered] = useState<string | null>(null);
+  const rows = ROWS.filter((row) => row.id !== deleted && row.id !== answered);
+  // Stable across renders, as a page's are: a new cell function would
+  // remount its cells, and with them the opener, on every render.
+  const deleteButton = useCallback(
+    (row: Row) => (
+      <Button
+        type="button"
+        variant="link"
+        onClick={() => {
+          setTarget(row);
+          setOpen(true);
+        }}
+      >
+        {`Delete ${row.name}`}
+      </Button>
+    ),
+    [],
+  );
+  const columns = useMemo<ColumnDef<Row>[]>(
+    () => [
+      { accessorKey: "id", header: "User ID" },
+      {
+        id: "actions",
+        header: "Actions",
+        cell: ({ row }) => deleteButton(row.original),
+      },
+    ],
+    [deleteButton],
+  );
+  return (
+    <>
+      {container === "table" ? (
+        <DataTable
+          columns={columns}
+          data={rows}
+          getRowId={rowId}
+          onPrevious={noPage}
+          onNext={noPage}
+          caption="Users"
+        />
+      ) : (
+        <ul>
+          {rows.map((row) => (
+            <li key={row.id}>{deleteButton(row)}</li>
+          ))}
+        </ul>
+      )}
+      <ConfirmDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="Delete User"
+        description={target === null ? "" : `${target.id} will be deleted.`}
+        confirmLabel="Confirm"
+        onConfirm={(afterClose) => {
+          if (answer === "before close" && target !== null) {
+            setAnswered(target.id);
+          }
+          if (handsMove) {
+            // An outcome that names no field: its move leaves the cursor.
+            afterClose(() => undefined);
+          }
+        }}
+      />
+    </>
+  );
+}
+
+describe("ConfirmDialog with an opener that leaves the document", () => {
+  it.each<{
+    answer: Answer;
+    container: Container;
+    handsMove: boolean;
+    target: "table" | "body";
+  }>([
+    {
+      answer: "before close",
+      container: "table",
+      handsMove: false,
+      target: "table",
+    },
+    {
+      answer: "after close",
+      container: "table",
+      handsMove: false,
+      target: "table",
+    },
+    {
+      answer: "before close",
+      container: "list",
+      handsMove: false,
+      target: "body",
+    },
+    {
+      answer: "before close",
+      container: "table",
+      handsMove: true,
+      target: "table",
+    },
+    {
+      answer: "before close",
+      container: "list",
+      handsMove: true,
+      target: "body",
+    },
+  ])(
+    "focuses the $target when the row leaves $answer ($container, move handed over: $handsMove)",
+    async ({ answer, container, handsMove, target }) => {
+      const user = userEvent.setup();
+      const view = render(
+        <DeleteList
+          answer={answer}
+          container={container}
+          deleted={null}
+          handsMove={handsMove}
+        />,
+      );
+      const rowDelete = screen.getByRole("button", { name: "Delete SECOND" });
+
+      rowDelete.focus();
+      await user.keyboard("{Enter}");
+      const dialog = await screen.findByRole("alertdialog");
+      expect(dialog.textContent).toContain("QADEL02 will be deleted.");
+      // The open dialog leaves the opener in place.
+      expect(rowDelete.isConnected).toBe(true);
+      await user.click(screen.getByRole("button", { name: "Confirm" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+
+      if (answer === "after close") {
+        // The dialog has handed focus back to the Delete, still shown.
+        await waitFor(() => {
+          expect(document.activeElement).toBe(rowDelete);
+        });
+        view.rerender(
+          <DeleteList
+            answer={answer}
+            container={container}
+            deleted="QADEL02"
+            handsMove={handsMove}
+          />,
+        );
+      }
+
+      expect(rowDelete.isConnected).toBe(false);
+      const expected =
+        target === "table" ? screen.getByRole("table") : document.body;
+      await waitFor(() => {
+        expect(document.activeElement).toBe(expected);
+      });
+      // Still there once the dialog's own focus handling has run.
+      await nextTask();
+      await nextTask();
+      expect(document.activeElement).toBe(expected);
+      // Never the control of another record that took the row's place.
+      expect(screen.getByRole("button", { name: "Delete THIRD" })).not.toBe(
+        document.activeElement,
+      );
+    },
+  );
+
+  // The page's own focus stands over the opener's ancestor, whether the page
+  // placed it itself as the close ran or handed the move to afterClose.
+  it.each<{
+    how: string;
+    move: (afterClose: AfterClose, focus: () => void) => void;
+  }>([
+    {
+      how: "by itself",
+      move: (_afterClose, focus) => {
+        setTimeout(focus, 0);
+      },
+    },
+    {
+      how: "through afterClose",
+      move: (afterClose, focus) => {
+        afterClose(focus);
+      },
+    },
+  ])(
+    "keeps the focus the page moved $how while the dialog closed",
+    async ({ move }) => {
+      const user = userEvent.setup();
+      function MovesFocus(): JSX.Element {
+        const [open, setOpen] = useState(false);
+        const [gone, setGone] = useState(false);
+        return (
+          <>
+            <label htmlFor="field">User ID</label>
+            <input id="field" />
+            <div tabIndex={-1}>
+              {gone ? null : (
+                <Button type="button" onClick={() => setOpen(true)}>
+                  Delete
+                </Button>
+              )}
+            </div>
+            <ConfirmDialog
+              open={open}
+              onOpenChange={setOpen}
+              title="Delete User"
+              description="QADEL01 will be deleted."
+              confirmLabel="Confirm"
+              onConfirm={(afterClose) => {
+                setGone(true);
+                // An error's field, focused by the page.
+                move(afterClose, () => {
+                  document.getElementById("field")?.focus();
+                });
+              }}
+            />
+          </>
+        );
+      }
+      render(<MovesFocus />);
+
+      await user.click(screen.getByRole("button", { name: "Delete" }));
+      await screen.findByRole("alertdialog");
+      await user.click(screen.getByRole("button", { name: "Confirm" }));
+
+      const userIdField = screen.getByLabelText("User ID");
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+        expect(document.activeElement).toBe(userIdField);
+      });
+      // Still there once the dialog's own focus handling has run.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+      expect(document.activeElement).toBe(userIdField);
+    },
+  );
 });

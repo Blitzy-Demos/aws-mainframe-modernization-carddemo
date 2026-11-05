@@ -4,12 +4,21 @@
 // whichever key was pressed, and takes the listed cards and paging keys off
 // the screen, its text standing in their place; and a 400 the server
 // answers at ACCTSID reaches the user as a toast, as the filter's field error
-// and as the cursor on the filter, the COBOL `MOVE -1 TO ACCTSIDL`.
+// and as the cursor on the filter, the COBOL `MOVE -1 TO ACCTSIDL`. A return
+// to the list shows the page read before at once, not busy, while it is read
+// again.
 //
 // The network is the global fetch the API client looks up on every request,
 // stubbed per test, and the assertions read the Request objects it received.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { toast } from "sonner";
@@ -102,11 +111,16 @@ function queryOf(request: Request): URLSearchParams {
   return new URL(request.url).searchParams;
 }
 
-/** The cell texts of the card table's body rows, top to bottom. */
+/**
+ * The cell texts of the card table's shown body rows, top to bottom, without
+ * the filler rows, hidden from assistive technology, that pad a short page.
+ */
 function cardRows(): string[][] {
   const table = screen.getByRole("table", { name: "Credit cards" });
-  return Array.from(table.querySelectorAll("tbody tr"), (row) =>
-    Array.from(row.querySelectorAll("td"), (cell) => cell.textContent ?? ""),
+  return Array.from(
+    table.querySelectorAll("tbody tr:not([aria-hidden='true'])"),
+    (row) =>
+      Array.from(row.querySelectorAll("td"), (cell) => cell.textContent ?? ""),
   );
 }
 
@@ -132,6 +146,8 @@ function fieldError(input: HTMLElement): HTMLElement {
 async function renderPage(): Promise<{
   user: UserEvent;
   accountInput: HTMLInputElement;
+  router: ReturnType<typeof createMemoryRouter>;
+  queryClient: QueryClient;
 }> {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -173,6 +189,8 @@ async function renderPage(): Promise<{
   return {
     user,
     accountInput: screen.getByLabelText<HTMLInputElement>("Account number"),
+    router,
+    queryClient,
   };
 }
 
@@ -267,14 +285,17 @@ describe("CardListPage (CCLI, COCRDLI)", () => {
       const error = await waitFor(() => fieldError(input));
       expect(error.textContent).toBe(message);
       // The filter's text stands in place of the rows, and no paging key is
-      // offered under it.
+      // offered under it: both controls stay shown, disabled.
       await waitFor(() => {
         expect(cardRows()).toEqual([[message]]);
       });
       expect(screen.queryByText(FIRST_CARD)).toBeNull();
       expect(screen.queryByRole("link", { name: "View" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+      for (const name of ["Previous", "Next"]) {
+        expect(
+          screen.getByRole("button", { name }).getAttribute("aria-disabled"),
+        ).toBe("true");
+      }
       expect(cardListRequests()).toHaveLength(1);
 
       await user.clear(input);
@@ -331,6 +352,34 @@ describe("CardListPage (CCLI, COCRDLI)", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(accountInput);
     });
+  });
+
+  it("shows the page read before at once, not busy, when the list is opened again", async () => {
+    const { user, router, queryClient } = await renderPage();
+    await user.click(screen.getByRole("link", { name: "View" }));
+    await screen.findByText("view");
+
+    // The read the return starts is held, so only the cached page can show.
+    const held = deferred<Response>();
+    fetchMock.mockImplementation(() => held.promise);
+    await act(async () => {
+      await router.navigate("/cards");
+    });
+
+    const table = screen.getByRole("table");
+    await waitFor(() => {
+      expect(cardListRequests()).toHaveLength(2);
+    });
+    expect(within(table).getByText(FIRST_CARD).tagName).toBe("SPAN");
+    expect(table.hasAttribute("aria-busy")).toBe(false);
+    expect(table.querySelector('[data-slot="skeleton"]')).toBeNull();
+
+    held.resolve(jsonResponse(PAGE));
+    await waitFor(() => {
+      expect(queryClient.isFetching()).toBe(0);
+    });
+    expect(table.hasAttribute("aria-busy")).toBe(false);
+    expect(within(table).getByText(FIRST_CARD).tagName).toBe("SPAN");
   });
 
   // The Active column's flag as a badge carrying its letter: N, the inactive

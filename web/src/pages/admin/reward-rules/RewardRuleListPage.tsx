@@ -124,6 +124,10 @@ function endAligned(text: string): JSX.Element {
   return <div className="text-end tabular-nums">{text}</div>;
 }
 
+// Each placeholder is its cell's markup around a value as wide as the
+// column's on the seeded first window: the seed rules' identifiers, codes and
+// scale-4 rate, unbounded amounts, a start shown as its UTC date, no end, the
+// status badge and the row actions.
 function ruleColumns(
   onDelete: (rule: RewardRuleResponse) => void,
 ): RuleColumns {
@@ -132,46 +136,55 @@ function ruleColumns(
       accessorKey: "rule_id",
       header: "Rule ID",
       cell: ({ row }) => row.original.rule_id,
+      meta: { placeholder: "00" },
     },
     {
       accessorKey: "transaction_type_cd",
       header: "Type",
       cell: ({ row }) => row.original.transaction_type_cd,
+      meta: { placeholder: "00" },
     },
     {
       accessorKey: "transaction_category_cd",
       header: "Category",
       cell: ({ row }) => row.original.transaction_category_cd,
+      meta: { placeholder: "0000" },
     },
     {
       accessorKey: "reward_rate",
       header: () => endAligned("Rate"),
       cell: ({ row }) => endAligned(row.original.reward_rate),
+      meta: { placeholder: endAligned("0.0000") },
     },
     {
       accessorKey: "min_transaction_amount",
       header: () => endAligned("Min amount"),
       cell: ({ row }) => endAligned(orNone(row.original.min_transaction_amount)),
+      meta: { placeholder: endAligned(NONE) },
     },
     {
       accessorKey: "max_transaction_amount",
       header: () => endAligned("Max amount"),
       cell: ({ row }) => endAligned(orNone(row.original.max_transaction_amount)),
+      meta: { placeholder: endAligned(NONE) },
     },
     {
       accessorKey: "active_from",
       header: "Active from",
       cell: ({ row }) => instantCell(row.original.active_from),
+      meta: { placeholder: instantCell("0000-00-00T00:00:00Z") },
     },
     {
       accessorKey: "active_to",
       header: "Active to",
       cell: ({ row }) => instantCell(row.original.active_to),
+      meta: { placeholder: instantCell(null) },
     },
     {
       id: "status",
       header: "Status",
       cell: ({ row }) => statusBadge(row.original.status),
+      meta: { placeholder: statusBadge("active") },
     },
     {
       id: ACTIONS_COLUMN,
@@ -207,6 +220,18 @@ function ruleColumns(
             </Button>
           </div>
         );
+      },
+      meta: {
+        placeholder: (
+          <div className="flex items-center gap-2">
+            <Button variant="link" asChild>
+              <span>Edit</span>
+            </Button>
+            <Button variant="link" asChild>
+              <span>Delete</span>
+            </Button>
+          </div>
+        ),
       },
     },
   ];
@@ -326,6 +351,8 @@ export default function RewardRuleListPage(): JSX.Element {
         emptyMessage={loadFailed ? LOAD_FAILED : undefined}
         caption="Reward rules"
         loading={loading}
+        pageSize={WINDOW_SIZE}
+        rowHeight="default"
         pinnedEndColumn={ACTIONS_COLUMN}
       />
     ),

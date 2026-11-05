@@ -3,7 +3,12 @@
 // content, unless the new page placed focus on one of its own controls, and
 // the shell's status region announces the title PageHeader shows. The
 // document load and a change of the search string alone do neither, and two
-// consecutive destinations with one title are each announced.
+// consecutive destinations with one title are each announced. While the
+// chunk of the page a navigation to another pathname goes to downloads, the
+// page content shows the loading skeleton and is marked busy, until that page
+// renders. A navigation to a page whose chunk has arrived, Back included,
+// keeps the current page in place instead, and a change of the search string
+// alone shows neither, even while a loader runs for it and a chunk downloads.
 //
 // The shell renders under the providers of main.tsx (without the Toaster),
 // StrictMode included, so its mount effect runs twice as in development.
@@ -13,8 +18,10 @@ import userEvent from "@testing-library/user-event";
 import { StrictMode, useEffect, useRef, type JSX } from "react";
 import {
   createMemoryRouter,
+  NavigationType,
   RouterProvider,
   useNavigate,
+  useNavigation,
   type RouteObject,
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -27,6 +34,13 @@ import { Input } from "@/components/ui/input";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { clearSession, setSession, type Session } from "@/lib/session";
 import { menu, type MenuEntry } from "@/nav/menu";
+import {
+  lazyPage,
+  pageDownloadsInFlight,
+  pageRoute,
+  type LazyPage,
+  type PageModule,
+} from "@/routes/lazy-page";
 
 type Router = ReturnType<typeof createMemoryRouter>;
 type User = ReturnType<typeof userEvent.setup>;
@@ -177,8 +191,13 @@ const routes: RouteObject[] = [
   },
 ];
 
-function renderShell(initialPath: string): { router: Router; user: User } {
-  const router = createMemoryRouter(routes, { initialEntries: [initialPath] });
+function renderShell(
+  initialPath: string,
+  routeTable: RouteObject[] = routes,
+): { router: Router; user: User } {
+  const router = createMemoryRouter(routeTable, {
+    initialEntries: [initialPath],
+  });
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -231,27 +250,27 @@ async function expectAnnounced(title: string): Promise<void> {
   });
 }
 
+// A regular user, so the user menu renders and the sidebar holds the user
+// section only.
+beforeEach(() => {
+  const session: Session = {
+    token: "test-token",
+    user_id: "USER0001",
+    usr_type: "U",
+    landing: "/",
+    expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+  };
+  setSession(session);
+});
+
+// setup.ts clears sessionStorage; session.ts also keeps the session in a
+// module variable with an expiry timer, which only clearSession resets.
+afterEach(() => {
+  clearSession();
+  document.documentElement.className = "";
+});
+
 describe("AppLayout route changes", () => {
-  // A regular user, so the user menu renders and the sidebar holds the user
-  // section only.
-  beforeEach(() => {
-    const session: Session = {
-      token: "test-token",
-      user_id: "USER0001",
-      usr_type: "U",
-      landing: "/",
-      expires_at: new Date(Date.now() + 3_600_000).toISOString(),
-    };
-    setSession(session);
-  });
-
-  // setup.ts clears sessionStorage; session.ts also keeps the session in a
-  // module variable with an expiry timer, which only clearSession resets.
-  afterEach(() => {
-    clearSession();
-    document.documentElement.className = "";
-  });
-
   it("leaves focus on the body and the status region empty on the document load", async () => {
     const { user } = renderShell("/");
     await expectPage(SHELL_HANDLE.title);
@@ -387,5 +406,280 @@ describe("AppLayout route changes", () => {
     await expectAnnounced(SHELL_HANDLE.title);
     expect(statusRegion().childElementCount).toBe(1);
     expect(document.activeElement).toBe(pageContent());
+  });
+});
+
+// A page module import the test settles, as the browser settles the download
+// of a page's chunk.
+type PendingImport = {
+  promise: Promise<PageModule>;
+  resolve: (module: PageModule) => void;
+};
+
+function pendingImport(): PendingImport {
+  let resolve: (module: PageModule) => void = () => undefined;
+  const promise = new Promise<PageModule>((onResolve) => {
+    resolve = onResolve;
+  });
+  return { promise, resolve };
+}
+
+const BILL_PAYMENT_MODULE: PageModule = { default: PlainPage };
+
+// Route loaders the test settles, the way a loader waits on data. Each run of
+// the loader waits on its own.
+type PendingLoads = {
+  loader: () => Promise<null>;
+  /** Settles the latest run, inside act so that its render commits. */
+  finishLatest: () => Promise<void>;
+  /** The number of runs the router has started. */
+  count: () => number;
+};
+
+function pendingLoads(): PendingLoads {
+  const settlers: (() => void)[] = [];
+  return {
+    loader: () =>
+      new Promise<null>((resolve) => {
+        settlers.push(() => {
+          resolve(null);
+        });
+      }),
+    finishLatest: () =>
+      act(async () => {
+        const settle = settlers.at(-1);
+        if (settle === undefined) {
+          throw new Error("No route loader has run");
+        }
+        settle();
+      }),
+    count: () => settlers.length,
+  };
+}
+
+// The router's navigation state as the rendered page last saw it, so a test
+// knows the loading state has been rendered.
+function NavigationStateProbe(): JSX.Element {
+  return <p>Navigation {useNavigation().state}</p>;
+}
+
+// The shell with two pages whose loading the test settles: Bill Payment, a
+// lazy page route and a direct child of the shell as it is in App.tsx, whose
+// loader downloads `billPayment`, and the transaction list, whose loader is
+// one of `loads` and also runs on a change of its search string
+// (react-router's default shouldRevalidate).
+function loadingRoutes(
+  billPayment: LazyPage,
+  loads: PendingLoads,
+): RouteObject[] {
+  return [
+    {
+      path: "/",
+      element: <AppLayout />,
+      handle: SHELL_HANDLE,
+      children: [
+        { index: true, element: <PlainPage /> },
+        {
+          path: BILL_PAYMENT.route,
+          ...pageRoute(billPayment, "signed-on"),
+          handle: {
+            title: "Bill Payment",
+            crumb: BILL_PAYMENT.label,
+          } satisfies RouteHandle,
+        },
+        {
+          path: TRANSACTION_LIST.route,
+          loader: loads.loader,
+          element: (
+            <>
+              <PlainPage />
+              <NavigationStateProbe />
+            </>
+          ),
+          handle: {
+            title: "List Transactions",
+            crumb: TRANSACTION_LIST.label,
+          } satisfies RouteHandle,
+        },
+      ],
+    },
+  ];
+}
+
+// The page skeleton inside the page content, or null.
+function contentSkeleton(): HTMLElement | null {
+  return within(pageContent()).queryByRole("status", { name: "Loading" });
+}
+
+// The text of every h1 added to the document from now until `stop`, which
+// returns them in the order they were added.
+function observeAddedHeadings(): { stop: () => string[] } {
+  const added: string[] = [];
+  const collect = (records: MutationRecord[]): void => {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node instanceof Element) {
+          const headings = node.matches("h1")
+            ? [node]
+            : Array.from(node.querySelectorAll("h1"));
+          added.push(...headings.map((heading) => heading.textContent));
+        }
+      }
+    }
+  };
+  const observer = new MutationObserver(collect);
+  observer.observe(document.body, { childList: true, subtree: true });
+  return {
+    stop: () => {
+      collect(observer.takeRecords());
+      observer.disconnect();
+      return added;
+    },
+  };
+}
+
+describe("AppLayout while the next page loads", () => {
+  it("shows the loading skeleton in the busy page content while the next page's chunk downloads, until that page renders", async () => {
+    const chunk = pendingImport();
+    const { user } = renderShell(
+      "/",
+      loadingRoutes(
+        lazyPage(() => chunk.promise),
+        pendingLoads(),
+      ),
+    );
+    await expectPage(SHELL_HANDLE.title);
+    expect(pageContent().hasAttribute("aria-busy")).toBe(false);
+
+    await user.click(sidebarLink(BILL_PAYMENT.label));
+
+    await waitFor(() => {
+      expect(contentSkeleton()).not.toBeNull();
+    });
+    expect(pageContent().getAttribute("aria-busy")).toBe("true");
+    expect(screen.queryByRole("heading", { level: 1 })).toBeNull();
+    // The shell around the content stays in place.
+    expect(sidebarLink(BILL_PAYMENT.label)).toBeDefined();
+    expect(pageDownloadsInFlight()).toBe(1);
+    const headings = observeAddedHeadings();
+
+    // Settled outside act, so React schedules the renders as in the browser,
+    // where the download settles before the router commits the page.
+    chunk.resolve(BILL_PAYMENT_MODULE);
+
+    await expectAnnounced("Bill Payment");
+    // The skeleton held from the download's end until the page rendered: the
+    // main menu did not come back in between.
+    expect(headings.stop()).toEqual(["Bill Payment"]);
+    expect(contentSkeleton()).toBeNull();
+    expect(pageContent().hasAttribute("aria-busy")).toBe(false);
+    expect(pageDownloadsInFlight()).toBe(0);
+  });
+
+  it.each([
+    {
+      trigger: "a link to it",
+      action: NavigationType.Push,
+      go: (router: Router): Promise<void> =>
+        router.navigate(BILL_PAYMENT.route),
+    },
+    {
+      trigger: "Back",
+      action: NavigationType.Pop,
+      go: (router: Router): Promise<void> => router.navigate(-1),
+    },
+  ])(
+    "keeps the current page in place, with no skeleton and no busy state, on a navigation through $trigger to a page whose chunk has arrived",
+    async ({ action, go }) => {
+      const chunk = pendingImport();
+      const loads = pendingLoads();
+      const { router } = renderShell(
+        "/",
+        loadingRoutes(
+          lazyPage(() => chunk.promise),
+          loads,
+        ),
+      );
+      await expectPage(SHELL_HANDLE.title);
+      act(() => {
+        void router.navigate(BILL_PAYMENT.route);
+      });
+      await act(async () => {
+        chunk.resolve(BILL_PAYMENT_MODULE);
+      });
+      await expectPage("Bill Payment");
+      act(() => {
+        void router.navigate(TRANSACTION_LIST.route);
+      });
+      await loads.finishLatest();
+      await expectPage("List Transactions");
+      const headings = observeAddedHeadings();
+
+      act(() => {
+        void go(router);
+      });
+
+      // The router is loading Bill Payment, and the transaction list stands.
+      expect(screen.getByText("Navigation loading")).toBeDefined();
+      expect(contentSkeleton()).toBeNull();
+      expect(pageContent().hasAttribute("aria-busy")).toBe(false);
+      expect(
+        screen.getByRole("heading", { level: 1, name: "List Transactions" }),
+      ).toBeDefined();
+
+      await expectAnnounced("Bill Payment");
+      expect(router.state.historyAction).toBe(action);
+      expect(headings.stop()).toEqual(["Bill Payment"]);
+      expect(contentSkeleton()).toBeNull();
+      expect(pageDownloadsInFlight()).toBe(0);
+    },
+  );
+
+  it("shows no skeleton while a loader runs for a change of the search string alone, even while a page's chunk downloads", async () => {
+    const chunk = pendingImport();
+    const loads = pendingLoads();
+    const { router } = renderShell(
+      "/",
+      loadingRoutes(
+        lazyPage(() => chunk.promise),
+        loads,
+      ),
+    );
+    await expectPage(SHELL_HANDLE.title);
+    act(() => {
+      void router.navigate(TRANSACTION_LIST.route);
+    });
+    await loads.finishLatest();
+    await expectPage("List Transactions");
+    // A navigation to Bill Payment starts the download of its chunk, and the
+    // change of the search string below interrupts it.
+    act(() => {
+      void router.navigate(BILL_PAYMENT.route);
+    });
+    await waitFor(() => {
+      expect(contentSkeleton()).not.toBeNull();
+    });
+
+    act(() => {
+      void router.navigate(`${TRANSACTION_LIST.route}?account_id=00000000011`);
+    });
+
+    await screen.findByText("Navigation loading");
+    expect(pageDownloadsInFlight()).toBe(1);
+    expect(loads.count()).toBe(2);
+    expect(contentSkeleton()).toBeNull();
+    expect(pageContent().hasAttribute("aria-busy")).toBe(false);
+    expect(
+      screen.getByRole("heading", { level: 1, name: "List Transactions" }),
+    ).toBeDefined();
+
+    await loads.finishLatest();
+
+    await screen.findByText("Navigation idle");
+    expect(router.state.location.search).toBe("?account_id=00000000011");
+    await act(async () => {
+      chunk.resolve(BILL_PAYMENT_MODULE);
+    });
+    expect(pageDownloadsInFlight()).toBe(0);
   });
 });

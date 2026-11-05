@@ -6,16 +6,19 @@
 //   number would read as 9007199254740992 (o8);
 // - an unknown account is reported by one toast and leaves the form usable;
 // - an account that has earned no points shows the zero balance and the
-//   empty-history text, and a failed history read is reported by one toast
-//   and shows no history rows or page controls;
+//   empty-history text over both page controls, disabled, and a failed
+//   history read is reported by one toast and shows no history rows or page
+//   controls;
 // - the history pages forward with Next and back with Previous, both reached
 //   and pressed from the keyboard;
 // - a repeated lookup of the same account keeps the history table loading
 //   until its new answer arrives, from the newest page or a later one, while
 //   a page Previous brings back from the cache keeps its rows as it is reread;
-// - a lookup shows skeletons, never a figure or row the cache or the previous
-//   account holds, until its own answers arrive, and Look up pressed again
-//   while the balance is read requests no history of an empty account;
+// - a lookup shows skeletons, never a figure the cache holds or a row the
+//   previous account holds, until its own answers arrive (rows the cache
+//   holds for the account looked up stay shown busy, never as its result),
+//   and Look up pressed again while the balance is read requests no history
+//   of an empty account;
 // - an entry rejected after a lookup takes its balance and history off the
 //   screen;
 // - the page's status region announces each balance lookup, a repeated one
@@ -334,11 +337,16 @@ function summaryCard(title: string): HTMLElement {
   return screen.getByRole("group", { name: title });
 }
 
-/** The cell texts of the history table's body rows, top to bottom. */
+/**
+ * The cell texts of the history table's data rows, top to bottom, without
+ * the filler rows, hidden from assistive technology, that pad a short page.
+ */
 function historyRows(): string[][] {
   const table = screen.getByRole("table", { name: "Reward history" });
-  return Array.from(table.querySelectorAll("tbody tr"), (row) =>
-    Array.from(row.querySelectorAll("td"), (cell) => cell.textContent ?? ""),
+  return Array.from(
+    table.querySelectorAll("tbody tr:not([aria-hidden='true'])"),
+    (row) =>
+      Array.from(row.querySelectorAll("td"), (cell) => cell.textContent ?? ""),
   );
 }
 
@@ -445,17 +453,26 @@ function recordBusy(element: HTMLElement): Array<string | null> {
   return states;
 }
 
-// Asserts DataTable's loading state on the history table holding `heldRows`
-// rows: busy, one skeleton row per held row (so its height holds) with no
-// row content, both page controls disabled and no result announced.
-function expectHistoryLoading(table: HTMLElement, heldRows: number): void {
+// The 10 rows of a history page, which the table keeps room for.
+const HISTORY_PAGE_ROWS = 10;
+
+// Asserts DataTable's loading state on the history table holding the `held`
+// rows: busy, the held rows still shown, dimmed and ignoring the pointer,
+// over hidden filler rows without content that keep a full page's height,
+// both page controls disabled and no result announced.
+function expectHistoryLoading(table: HTMLElement, held: string[][]): void {
   expect(table.getAttribute("aria-busy")).toBe("true");
+  expect(historyRows()).toEqual(held);
   const rows = Array.from(table.querySelectorAll("tbody tr"));
-  expect(rows).toHaveLength(heldRows);
-  rows.forEach((row) => {
-    expect(row.getAttribute("aria-hidden")).toBe("true");
-    expect(row.querySelector('[data-slot="skeleton"]')).not.toBeNull();
-    expect(row.textContent).toBe("");
+  expect(rows).toHaveLength(HISTORY_PAGE_ROWS);
+  rows.forEach((row, index) => {
+    if (index < held.length) {
+      expect(row.className).toContain("pointer-events-none");
+      expect(row.className).toContain("opacity-50");
+    } else {
+      expect(row.getAttribute("aria-hidden")).toBe("true");
+      expect(row.textContent).toBe("");
+    }
   });
   expect(isDisabled(pageControl("Previous"))).toBe(true);
   expect(isDisabled(pageControl("Next"))).toBe(true);
@@ -697,7 +714,7 @@ describe("RewardsPage", () => {
       await waitFor(() => {
         expect(lookupStatus().textContent).toBe(BALANCE_LOADING);
       });
-      expectHistoryLoading(table, PAGE_ONE.items.length);
+      expectHistoryLoading(table, rowsOf(PAGE_ONE));
 
       // and still once the balance has answered and been announced, while the
       // newest page is read again.
@@ -708,7 +725,7 @@ describe("RewardsPage", () => {
       await waitFor(() => {
         expect(lookupStatus().textContent).toBe(BALANCE_LOADED);
       });
-      expectHistoryLoading(table, PAGE_ONE.items.length);
+      expectHistoryLoading(table, rowsOf(PAGE_ONE));
 
       heldHistory.resolve();
 
@@ -790,9 +807,10 @@ describe("RewardsPage", () => {
       expect(lookupStatus().textContent).toBe(BALANCE_LOADING);
     });
     expectBalanceLoading();
+    // The rows the cache holds stay shown busy, never as the lookup's result.
     expectHistoryLoading(
       screen.getByRole("table", { name: "Reward history" }),
-      PAGE_ONE.items.length,
+      rowsOf(PAGE_ONE),
     );
     expect(screen.queryByText(BEYOND_DOUBLE)).toBeNull();
 
@@ -829,9 +847,10 @@ describe("RewardsPage", () => {
     for (const title of ["Points earned", "Points redeemed", "Available points"]) {
       expect(within(summaryCard(title)).getByText("0")).toBeDefined();
     }
-    // An empty history has neither key, so no page control is offered.
-    expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+    // An empty history has neither key, so both page controls stay shown,
+    // disabled.
+    expect(isDisabled(pageControl("Previous"))).toBe(true);
+    expect(isDisabled(pageControl("Next"))).toBe(true);
     await waitFor(() => {
       expect(historyStatus().textContent).toBe(
         `Reward history: ${EMPTY_HISTORY}`,
@@ -990,7 +1009,8 @@ describe("RewardsPage", () => {
     expect(requestedPaths()).toHaveLength(2);
 
     // The account again, now a new lookup whose earlier balance and rows
-    // the cache holds: neither is shown before the held answers arrive.
+    // the cache holds: the balance is not shown, and the rows stay shown
+    // only busy, before the held answers arrive.
     balances.set(ACCOUNT, { status: 200, body: balanceRereadBody });
     histories.set(historyKey(ACCOUNT), { status: 200, body: PAGE_ONE_REREAD });
     const heldBalance = deferred<void>();
@@ -1006,7 +1026,7 @@ describe("RewardsPage", () => {
     expectBalanceLoading();
     expectHistoryLoading(
       screen.getByRole("table", { name: "Reward history" }),
-      PAGE_ONE.items.length,
+      rowsOf(PAGE_ONE),
     );
     expect(screen.queryByText(BEYOND_DOUBLE)).toBeNull();
 

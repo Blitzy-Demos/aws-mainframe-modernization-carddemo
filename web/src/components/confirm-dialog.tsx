@@ -5,11 +5,15 @@
 // render this component and never compose AlertDialog themselves.
 //
 // The dialog is controlled and has no trigger: the page opens it from its own
-// Button, and focus returns to that button on close. The action only reports
-// the choice through onConfirm, after which Radix closes the dialog through
-// onOpenChange(false); the page then sends its request (with `confirm: "Y"`
-// where the resource carries a confirmation) and shows the outcome through
-// lib/api-errors. Cancel and Escape stand for the COBOL `N`:
+// Button, and focus returns to that button on close unless the page has
+// moved it while the dialog closed (an error's field, say). A button that has
+// left the document by then, such as the Delete of a deleted record's row,
+// hands focus to its nearest focusable ancestor still in the document (the
+// data table), never to another record's button. The action only
+// reports the choice through onConfirm, after which Radix closes the dialog
+// through onOpenChange(false); the page then sends its request (with
+// `confirm: "Y"` where the resource carries a confirmation) and shows the
+// outcome through lib/api-errors. Cancel and Escape stand for the COBOL `N`:
 // onOpenChange(false) without onConfirm.
 //
 // While the dialog is on the page, its closing animation included, Radix
@@ -20,7 +24,8 @@
 // field of a cleared form) is handed to it and runs once the dialog has left
 // the page, or at once when it already has. The focus that move places
 // stands instead of the opener's; a move that places none, such as an error
-// naming no field, leaves focus to the opener.
+// naming no field, leaves focus to the opener or, once the opener has left
+// the document, to its nearest focusable ancestor still in it.
 //
 // Keyboard, Escape and outside-click handling is the Radix AlertDialog's own
 // and is not overridden: focus is trapped inside, Cancel takes focus on open,
@@ -84,6 +89,35 @@ export type ConfirmDialogProps = {
   pending?: boolean;
 };
 
+// The ancestors of an element that can take focus (a tabindex, such as the
+// data table's or the main region's -1), nearest first.
+function focusableAncestors(element: HTMLElement): HTMLElement[] {
+  const found: HTMLElement[] = [];
+  for (
+    let node = element.parentElement;
+    node !== null;
+    node = node.parentElement
+  ) {
+    if (node.hasAttribute("tabindex")) {
+      found.push(node);
+    }
+  }
+  return found;
+}
+
+// Where focus returns on close: the opener while it is in the document, else
+// the nearest of the ancestors recorded at open that still is, else none (the
+// Radix default stands). Read when focus is returned, not at close, because
+// a page's focus move may remove the opener's row in between.
+function returnTarget(
+  opener: HTMLElement | null,
+  ancestors: readonly HTMLElement[],
+): HTMLElement | undefined {
+  return opener?.isConnected
+    ? opener
+    : ancestors.find((ancestor) => ancestor.isConnected);
+}
+
 export function ConfirmDialog({
   open,
   onOpenChange,
@@ -99,8 +133,12 @@ export function ConfirmDialog({
   // of the page. The element focused when the dialog opens (the page's own
   // button) is kept and refocused instead, the way the focus scope restores
   // it. An opener that has left the document, such as the row of a deleted
-  // record, keeps the Radix default.
+  // record, cannot be: its focusable ancestors are recorded at open, because
+  // a removed element no longer reaches them, and the nearest one still in
+  // the document takes focus. Only with none left does the Radix default
+  // stand.
   const openerRef = useRef<HTMLElement | null>(null);
+  const openerAncestorsRef = useRef<HTMLElement[]>([]);
 
   // Whether the content is on the page, and the page behind it hidden: from
   // the content's open autofocus to its close autofocus, which Radix fires
@@ -131,10 +169,13 @@ export function ConfirmDialog({
         aria-busy={pending}
         onOpenAutoFocus={(event) => {
           presentRef.current = true;
-          openerRef.current =
+          const opener =
             document.activeElement instanceof HTMLElement
               ? document.activeElement
               : null;
+          openerRef.current = opener;
+          openerAncestorsRef.current =
+            opener === null ? [] : focusableAncestors(opener);
           // Cancel takes focus on open. Opened while pending, Cancel is
           // disabled and cannot, which would leave focus on the body outside
           // the trapped dialog; the content takes it instead, as the Radix
@@ -146,7 +187,9 @@ export function ConfirmDialog({
         }}
         onCloseAutoFocus={(event) => {
           const opener = openerRef.current;
+          const ancestors = openerAncestorsRef.current;
           openerRef.current = null;
+          openerAncestorsRef.current = [];
           presentRef.current = false;
           // This runs once the close animation has removed the content and
           // the page is visible again. A request the action sent may have
@@ -156,7 +199,8 @@ export function ConfirmDialog({
           // move may focus on a later task (react-hook-form's setFocus does,
           // on its own timer), so whether one placed focus is read on the
           // task after theirs: with focus still on the body, where the
-          // removed dialog left it, the opener takes it.
+          // removed dialog left it, the opener takes it or, once its row has
+          // gone, its nearest focusable ancestor still in the document.
           const moves = queuedMovesRef.current.splice(0);
           if (moves.length > 0) {
             event.preventDefault();
@@ -167,11 +211,12 @@ export function ConfirmDialog({
             } finally {
               setTimeout(() => {
                 const placed = document.activeElement;
+                const returned = returnTarget(opener, ancestors);
                 if (
                   (placed === null || placed === document.body) &&
-                  opener?.isConnected
+                  returned !== undefined
                 ) {
-                  opener.focus({ preventScroll: true });
+                  returned.focus({ preventScroll: true });
                 }
               }, 0);
             }
@@ -179,7 +224,9 @@ export function ConfirmDialog({
           }
           // With no move handed over, focus the page placed itself on one of
           // its own controls stands. Focus on the body was still in the
-          // removed dialog, and only then is the opener refocused.
+          // removed dialog, and only then is the opener refocused or, once
+          // its row has gone, its nearest focusable ancestor still in the
+          // document.
           const active = document.activeElement;
           if (
             active instanceof HTMLElement &&
@@ -189,9 +236,10 @@ export function ConfirmDialog({
             event.preventDefault();
             return;
           }
-          if (opener?.isConnected) {
+          const target = returnTarget(opener, ancestors);
+          if (target !== undefined) {
             event.preventDefault();
-            opener.focus({ preventScroll: true });
+            target.focus({ preventScroll: true });
           }
         }}
         onBlur={(event) => {

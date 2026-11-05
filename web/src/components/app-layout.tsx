@@ -15,6 +15,15 @@
 //   a form's first field, the field an error names), and a visually hidden
 //   status region announces the new page's title. A change of the search
 //   string alone does neither.
+// - While the router downloads the next page's chunk (routes/lazy-page.tsx),
+//   the page content shows the loading skeleton and is marked busy, so a
+//   navigation never leaves the previous page standing without a cue. The
+//   skeleton shows once a page's chunk is downloading while the router loads
+//   another pathname, and stays until the router commits the next page or
+//   stops loading another pathname. A navigation to a page whose chunk has
+//   arrived, a Back to a visited page among them, shows none and keeps the
+//   previous page until the next one renders. A change of the search string
+//   alone, an update within the page, shows none either.
 // - The user menu replaces PF3 on COMEN01 and COADM01 ('F3=Exit'
 //   [app/bms/COMEN01.bms:L162] [app/bms/COADM01.bms:L162]), which returns to
 //   the sign-on screen [app/cbl/COMEN01C.cbl:L96-98], and the sign-on screen's
@@ -40,6 +49,7 @@ import {
   Outlet,
   useLocation,
   useNavigate,
+  useNavigation,
   useNavigationType,
 } from "react-router";
 
@@ -64,6 +74,8 @@ import {
 } from "@/components/ui/sidebar";
 import { showApiError, showSuccess } from "@/lib/api-errors";
 import { clearSession, isAdmin, useSession, type Session } from "@/lib/session";
+import { useDownloadingPage } from "@/routes/lazy-page";
+import { PageFallback } from "@/routes/page-fallbacks";
 
 // The id of the page content, the target of the skip link.
 const MAIN_CONTENT_ID = "main-content";
@@ -92,6 +104,57 @@ function useExpandedSidebarState(): [boolean, (open: boolean) => void] {
   }, []);
 
   return [open, setOpen];
+}
+
+// Whether the page content shows the skeleton for another screen the router
+// is loading. A navigation to a different pathname waits for its page's
+// chunk before it commits, and until then the location is still the current
+// page's. The skeleton shows once a page's chunk is downloading
+// (useDownloadingPage) while the router loads another pathname, and stays
+// until the router no longer does: the download settles a moment before the
+// router commits the next page, and the current page must not mount again in
+// between. A navigation to a page whose chunk has arrived, a Back to a
+// visited page among them, downloads nothing, so the current page stays until
+// the next one renders. A navigation that changes the search string alone
+// runs no page loader, and its pathname is the current one.
+function useLoadingAnotherPage(): boolean {
+  const navigation = useNavigation();
+  const { pathname } = useLocation();
+  const downloading = useDownloadingPage();
+  const [shown, setShown] = useState(false);
+  const loadingAnotherPathname =
+    navigation.state === "loading" && navigation.location.pathname !== pathname;
+  const show = loadingAnotherPathname && (downloading || shown);
+  // `shown` remembers whether the skeleton showed in the last render, so it
+  // holds once shown; React renders the component again at once on a change.
+  if (show !== shown) {
+    setShown(show);
+  }
+  return show;
+}
+
+// The page content: the matched page, or the loading skeleton, marked busy,
+// while the router loads another page whose chunk downloads. Only this part
+// of the shell reads the router's navigation state and the page downloads, so
+// AppLayout, and the sidebar with it, does not re-render when a download
+// starts, and the next page renders as soon as its chunk has arrived.
+function PageContent({
+  mainRef,
+}: {
+  mainRef: RefObject<HTMLElement | null>;
+}): JSX.Element {
+  const loadingAnotherPage = useLoadingAnotherPage();
+  return (
+    <SidebarInset
+      ref={mainRef}
+      id={MAIN_CONTENT_ID}
+      tabIndex={-1}
+      aria-busy={loadingAnotherPage || undefined}
+      className="gap-4 p-4 outline-none lg:p-6"
+    >
+      {loadingAnotherPage ? <PageFallback /> : <Outlet />}
+    </SidebarInset>
+  );
 }
 
 // The user type as the COUSR01 screen spells its codes, 'User Type: ' with
@@ -272,14 +335,7 @@ export function AppLayout(): JSX.Element {
               {session !== null && <UserMenu session={session} />}
             </div>
           </header>
-          <SidebarInset
-            ref={mainRef}
-            id={MAIN_CONTENT_ID}
-            tabIndex={-1}
-            className="gap-4 p-4 outline-none lg:p-6"
-          >
-            <Outlet />
-          </SidebarInset>
+          <PageContent mainRef={mainRef} />
         </div>
       </SidebarProvider>
       <RouteChangeAnnouncer mainRef={mainRef} />

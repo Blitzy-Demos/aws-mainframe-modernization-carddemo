@@ -10,6 +10,10 @@
  * [app/cbl/COMEN01C.cbl:L269-272] [app/cbl/COADM01C.cbl:L236-239]. Entries keep
  * the COBOL option order. Each route is the `route=` destination of the
  * option's row in docs/parity/function-map.md.
+ *
+ * Which entry the sidebar marks as the current page is decided by each
+ * entry's `currentRoutes`, not by its link target: several options share a
+ * link target (E-61), while a route has at most one current item.
  */
 import type { LucideIcon } from "lucide-react";
 import {
@@ -40,7 +44,22 @@ export type MenuEntry = {
   id: string;
   label: string;
   program: string | null;
+  /** The link target, which E-61 lets several options share. */
   route: string;
+  /**
+   * The route patterns, in the path syntax of App.tsx's route table, on which
+   * this entry is the sidebar's current item: the routes of the option's own
+   * screen, and the detail and edit routes reached from it that no other
+   * option opens. Each pattern belongs to one entry at most. Of options
+   * sharing a link target, the first in option order owns the target
+   * (Account View `/`, Credit Card List `/cards`, Transaction List
+   * `/transactions`, User List `/admin/users`); the others own only the
+   * routes that carry their key. The sidebar marks the entry whose pattern
+   * the router ranks first for the location, so the static
+   * `/transactions/new` outranks `/transactions/:tranId`. A route no pattern
+   * names, such as the `/admin` landing, has no current item.
+   */
+  currentRoutes: readonly string[];
   section: MenuSection;
   icon: LucideIcon;
 };
@@ -65,6 +84,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Account View",
     program: "COACTVWC",
     route: "/",
+    currentRoutes: ["/", "/accounts/:accountId"],
     section: "user",
     icon: Eye,
   },
@@ -74,6 +94,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Account Update",
     program: "COACTUPC",
     route: "/",
+    currentRoutes: ["/accounts/:accountId/edit"],
     section: "user",
     icon: Pencil,
   },
@@ -83,6 +104,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Credit Card List",
     program: "COCRDLIC",
     route: "/cards",
+    currentRoutes: ["/cards"],
     section: "user",
     icon: CreditCard,
   },
@@ -92,6 +114,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Credit Card View",
     program: "COCRDSLC",
     route: "/cards",
+    currentRoutes: ["/cards/:cardNumber"],
     section: "user",
     icon: Search,
   },
@@ -101,6 +124,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Credit Card Update",
     program: "COCRDUPC",
     route: "/cards",
+    currentRoutes: ["/cards/:cardNumber/edit"],
     section: "user",
     icon: SquarePen,
   },
@@ -110,6 +134,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Transaction List",
     program: "COTRN00C",
     route: "/transactions",
+    currentRoutes: ["/transactions"],
     section: "user",
     icon: List,
   },
@@ -119,6 +144,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Transaction View",
     program: "COTRN01C",
     route: "/transactions",
+    currentRoutes: ["/transactions/:tranId"],
     section: "user",
     icon: Receipt,
   },
@@ -131,6 +157,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Transaction Add",
     program: "COTRN02C",
     route: "/transactions/new",
+    currentRoutes: ["/transactions/new"],
     section: "user",
     icon: Plus,
   },
@@ -140,6 +167,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Transaction Reports",
     program: "CORPT00C",
     route: "/reports/transactions",
+    currentRoutes: ["/reports/transactions"],
     section: "user",
     icon: ChartBar,
   },
@@ -149,6 +177,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Bill Payment",
     program: "COBIL00C",
     route: "/payments",
+    currentRoutes: ["/payments"],
     section: "user",
     icon: Wallet,
   },
@@ -158,6 +187,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Pending Authorization View",
     program: "COPAUS0C",
     route: "/authorizations",
+    currentRoutes: ["/authorizations", "/authorizations/:authId"],
     section: "user",
     icon: ShieldAlert,
   },
@@ -167,6 +197,7 @@ export const userMenu: readonly MenuEntry[] = [
     label: "Rewards",
     program: null,
     route: "/rewards",
+    currentRoutes: ["/rewards"],
     section: "user",
     icon: Gift,
   },
@@ -185,6 +216,7 @@ export const adminMenu: readonly MenuEntry[] = [
     label: "User List (Security)",
     program: "COUSR00C",
     route: "/admin/users",
+    currentRoutes: ["/admin/users"],
     section: "admin",
     icon: Users,
   },
@@ -194,6 +226,7 @@ export const adminMenu: readonly MenuEntry[] = [
     label: "User Add (Security)",
     program: "COUSR01C",
     route: "/admin/users/new",
+    currentRoutes: ["/admin/users/new"],
     section: "admin",
     icon: UserPlus,
   },
@@ -203,15 +236,21 @@ export const adminMenu: readonly MenuEntry[] = [
     label: "User Update (Security)",
     program: "COUSR02C",
     route: "/admin/users",
+    currentRoutes: ["/admin/users/:userId/edit"],
     section: "admin",
     icon: UserCog,
   },
-  /** Option 4 [app/cpy/COADM02Y.cpy:L41-44], F-COADM01-004. */
+  /**
+   * Option 4 [app/cpy/COADM02Y.cpy:L41-44], F-COADM01-004. The delete is a
+   * confirm dialog on the user list (E-58), whose route User List owns, so
+   * no route makes this entry current.
+   */
   {
     id: "COADM02Y-04",
     label: "User Delete (Security)",
     program: "COUSR03C",
     route: "/admin/users",
+    currentRoutes: [],
     section: "admin",
     icon: UserMinus,
   },
@@ -221,6 +260,7 @@ export const adminMenu: readonly MenuEntry[] = [
     label: "Transaction Type List/Update (Db2)",
     program: "COTRTLIC",
     route: "/admin/transaction-types",
+    currentRoutes: ["/admin/transaction-types"],
     section: "admin",
     icon: Tags,
   },
@@ -230,6 +270,7 @@ export const adminMenu: readonly MenuEntry[] = [
     label: "Transaction Type Maintenance (Db2)",
     program: "COTRTUPC",
     route: "/admin/transaction-types/new",
+    currentRoutes: ["/admin/transaction-types/new", "/admin/transaction-types/:code/edit"],
     section: "admin",
     icon: Settings,
   },
@@ -239,6 +280,7 @@ export const adminMenu: readonly MenuEntry[] = [
     label: "Reward Rules",
     program: null,
     route: "/admin/reward-rules",
+    currentRoutes: ["/admin/reward-rules", "/admin/reward-rules/new", "/admin/reward-rules/:ruleId/edit"],
     section: "admin",
     icon: Award,
   },

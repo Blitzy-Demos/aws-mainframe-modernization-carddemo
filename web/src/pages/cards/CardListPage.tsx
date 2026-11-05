@@ -58,6 +58,9 @@ const CARD_NUMBER_LENGTH = 16;
 
 const DEFAULT_VALUES: CardListFilterValues = { account_id: "", card_number: "" };
 
+/** The seven rows of a COCRDLI page, the server's default page size. */
+const PAGE_ROWS = 7;
+
 /**
  * The query of one key press: the filters the schema let through (a blank
  * filter is absent, so it is no filter) and the page asked for. Absent and
@@ -106,9 +109,9 @@ function RowActions({
   const pathname = `/cards/${encodeURIComponent(card.card_number)}`;
   const search = `?account_id=${encodeURIComponent(card.account_id)}`;
   // BLITZY [LAYOUT]: the link buttons take the height of the cell's text line
-  // (overrode the default h-9 px-4), so a row is as tall as the skeleton rows
-  // DataTable shows while a page loads, and paging moves neither the table
-  // nor the scroll position.
+  // (overrode the default h-9 px-4), so a row is as tall as the skeleton and
+  // filler rows DataTable reserves a full page with at its default text row
+  // height, and paging moves neither the table nor the scroll position.
   // BLITZY [A11Y]: each link is therefore a 20px-high target, below the 24px
   // WCAG 2.2 minimum; the gap and cell padding keep neighbouring targets
   // apart. Flagged for designer review.
@@ -134,18 +137,25 @@ function RowActions({
 /**
  * The COCRDLI columns in screen order ('Account Number', 'Card Number',
  * 'Active'), then the row actions that replace the 'Select' column. Values are
- * shown exactly as the server sent them.
+ * shown exactly as the server sent them. Each placeholder is its cell's markup
+ * around a value of the column's fixed format: the 11-digit account number,
+ * the 16-digit card number, the status letter and the row actions.
  */
 function cardColumns(idPrefix: string): DataTableProps<CardSummary>["columns"] {
   const cardCellId = (index: number): string => `${idPrefix}-card-${index}`;
   return [
-    { accessorKey: "account_id", header: "Account Number" },
+    {
+      accessorKey: "account_id",
+      header: "Account Number",
+      meta: { placeholder: "00000000000" },
+    },
     {
       accessorKey: "card_number",
       header: "Card Number",
       cell: ({ row }) => (
         <span id={cardCellId(row.index)}>{row.original.card_number}</span>
       ),
+      meta: { placeholder: <span>0000000000000000</span> },
     },
     {
       accessorKey: "card_active_status",
@@ -156,6 +166,7 @@ function cardColumns(idPrefix: string): DataTableProps<CardSummary>["columns"] {
       cell: ({ row }) => (
         <FlagBadge value={row.original.card_active_status} className="py-0" />
       ),
+      meta: { placeholder: <FlagBadge value="N" className="py-0" /> },
     },
     {
       id: "actions",
@@ -163,6 +174,18 @@ function cardColumns(idPrefix: string): DataTableProps<CardSummary>["columns"] {
       cell: ({ row }) => (
         <RowActions card={row.original} describedBy={cardCellId(row.index)} />
       ),
+      meta: {
+        placeholder: (
+          <div className="flex items-center gap-4">
+            <Button variant="link" asChild className="h-auto p-0">
+              <span>View</span>
+            </Button>
+            <Button variant="link" asChild className="h-auto p-0">
+              <span>Edit</span>
+            </Button>
+          </div>
+        ),
+      },
     },
   ];
 }
@@ -329,6 +352,19 @@ export default function CardListPage(): JSX.Element {
     emptyMessage = failureText;
   }
 
+  // The table waits for the read that is out: the first one, a page loading
+  // behind the one kept on screen, or a re-read of a request whose last read
+  // failed, since that failure's text does not answer it. A page already
+  // read stays shown, not busy, while it is read again: from the cache on a
+  // return to the list, or after a key pressed again with the same request.
+  // A rejected key press waits for no read: its text stands in place of the
+  // rows whatever read is still out.
+  const tableLoading =
+    !rejected &&
+    (query.isPending ||
+      query.isPlaceholderData ||
+      (isError && query.fetchStatus !== "idle"));
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
@@ -391,7 +427,8 @@ export default function CardListPage(): JSX.Element {
         }}
         emptyMessage={emptyMessage}
         caption="Credit cards"
-        loading={!rejected && query.isFetching}
+        loading={tableLoading}
+        pageSize={PAGE_ROWS}
       />
     </div>
   );

@@ -67,17 +67,36 @@ const FIRST_PAGE_KEY = "first";
 const STATUS_ANNOUNCE_DELAY_MS = 150;
 
 // Every cell renders the API string as sent: the default accessor cell shows
-// the value itself, with no date parsing or locale formatting.
+// the value itself, with no date parsing or locale formatting. Each
+// placeholder is a value as wide as the column's on a seeded history page:
+// identifiers and points of the seeded accruals' digit counts, and the RFC
+// 3339 `created_at` with its microseconds.
 //
 // `transaction_id` is the accrued transaction's row identity, not its 16-digit
 // TRAN-ID, which the transaction screens label "Transaction ID"; its column is
 // headed "Transaction row" so that the two are not read as one key.
 const columns: DataTableProps<RewardAccrual>["columns"] = [
-  { accessorKey: "accrual_id", header: "Accrual ID" },
-  { accessorKey: "transaction_id", header: "Transaction row" },
-  { accessorKey: "rule_id", header: "Rule ID" },
-  { accessorKey: "points_earned", header: "Points earned" },
-  { accessorKey: "created_at", header: "Created at" },
+  {
+    accessorKey: "accrual_id",
+    header: "Accrual ID",
+    meta: { placeholder: "000" },
+  },
+  {
+    accessorKey: "transaction_id",
+    header: "Transaction row",
+    meta: { placeholder: "000" },
+  },
+  { accessorKey: "rule_id", header: "Rule ID", meta: { placeholder: "0" } },
+  {
+    accessorKey: "points_earned",
+    header: "Points earned",
+    meta: { placeholder: "00" },
+  },
+  {
+    accessorKey: "created_at",
+    header: "Created at",
+    meta: { placeholder: "0000-00-00T00:00:00.000000Z" },
+  },
 ];
 
 export default function RewardsPage(): JSX.Element {
@@ -334,6 +353,7 @@ export default function RewardsPage(): JSX.Element {
               emptyMessage="No reward points have been earned on this account."
               caption="Reward history"
               loading={historyLoading}
+              pageSize={HISTORY_PAGE_SIZE}
             />
           )}
         </>

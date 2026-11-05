@@ -8,8 +8,8 @@
 //   postgres psql` and restored afterwards; every accrual-producing step uses
 //   the reward account (50) instead, so nothing else moves that balance.
 // - An account that has earned no points (no balance row, no accrual) shows
-//   "0" in each balance card and the empty-history text, with no paging
-//   control.
+//   "0" in each balance card and the empty-history text, with Previous and
+//   Next both rendered and disabled.
 // - The reward history pages newest first, HISTORY_PAGE_SIZE rows at a time:
 //   Next shows the next page and Previous returns to the first, where it is
 //   disabled. The spec tops the account's history up through CT02 adds when
@@ -372,9 +372,14 @@ test("RewardsPage shows the zero balance and the empty history of an account tha
     await expectCardValue(page, title, "0");
   }
   await expect(dataRows(history(page))).toHaveText([SCREENS.rewards.emptyHistory]);
-  // An empty history has neither key, so no paging control is offered.
-  await expect(pagingControl(page, "Previous")).toHaveCount(0);
-  await expect(pagingControl(page, "Next")).toHaveCount(0);
+  // An empty history has neither key, yet both paging controls are offered,
+  // as on every list: each is rendered once and disabled (aria-disabled).
+  for (const name of ["Previous", "Next"] as const) {
+    const control = pagingControl(page, name);
+    await expect(control, `${name} on an empty history`).toHaveCount(1);
+    await expect(control, `${name} on an empty history`).toBeDisabled();
+    await expect(control, `${name} on an empty history`).toHaveAttribute("aria-disabled", "true");
+  }
 });
 
 test.describe("reward history pagination", () => {

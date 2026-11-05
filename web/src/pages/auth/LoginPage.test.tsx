@@ -4,7 +4,8 @@
 // server's message on the field it names, moves the cursor there from the
 // Sign on button, keeps both values and lets the next attempt be sent. A
 // second press while a sign-on is out sends nothing, and the page stays busy
-// until the landing route replaces it.
+// until the landing route replaces it (or a navigation keeps the screen at
+// another location).
 //
 // The network is the global the API client looks up on every request, stubbed
 // per test; openapi-fetch hands it the Request it built. No Toaster is
@@ -47,13 +48,19 @@ const WRONG_PASSWORD = "Wrong Password. Try again ...";
 // page needs a data router, as App.tsx gives it. The two landing routes stand
 // in for the menus COSGN00C transfers to [app/cbl/COSGN00C.cbl:L230-240].
 // With `holdUserHome`, `/` is a lazy route that loads only once it settles,
-// so the sign-on page stays on screen meanwhile, as it does while App.tsx
-// loads a landing page's chunk.
-function renderLogin(options: { holdUserHome?: Promise<void> } = {}) {
+// and with `userHomeLoader` it has that loader, as App.tsx's page loaders
+// download a landing page's chunk; either way the sign-on page stays on
+// screen meanwhile.
+function renderLogin(
+  options: {
+    holdUserHome?: Promise<void>;
+    userHomeLoader?: () => Promise<null>;
+  } = {},
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  const { holdUserHome } = options;
+  const { holdUserHome, userHomeLoader } = options;
   const userHome = <p>User home</p>;
   const routes: RouteObject[] = [
     {
@@ -62,7 +69,7 @@ function renderLogin(options: { holdUserHome?: Promise<void> } = {}) {
       handle: { title: "Sign on", crumb: "Sign on" } satisfies RouteHandle,
     },
     holdUserHome === undefined
-      ? { path: "/", element: userHome }
+      ? { path: "/", loader: userHomeLoader, element: userHome }
       : {
           path: "/",
           lazy: async () => {
@@ -78,7 +85,7 @@ function renderLogin(options: { holdUserHome?: Promise<void> } = {}) {
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  return { router };
+  return { router, queryClient };
 }
 
 // A promise and the function that settles it, for an answer a test holds.
@@ -175,6 +182,88 @@ describe("LoginPage (CC00 sign-on)", () => {
       user_id: "User0001",
       password: "passWord",
     });
+  });
+
+  it("keeps the form busy until the router has loaded the landing route", async () => {
+    stubFetch(200, USER_SIGN_ON);
+    let finishLanding: () => void = () => undefined;
+    const user = userEvent.setup();
+    const { router, queryClient } = renderLogin({
+      userHomeLoader: () =>
+        new Promise<null>((resolve) => {
+          finishLanding = () => {
+            resolve(null);
+          };
+        }),
+    });
+
+    await user.type(inputByLabel("User ID"), "USER0001");
+    await user.type(inputByLabel("Password"), "PASSWORD");
+    // Every change of the button's disabled state from the submit on, so a
+    // render that enables it between the answer and the landing shows.
+    const signOn = screen.getByRole("button", { name: "Sign on" });
+    const disabledStates: boolean[] = [];
+    const observer = new MutationObserver(() => {
+      disabledStates.push(signOn.hasAttribute("disabled"));
+    });
+    observer.observe(signOn, { attributeFilter: ["disabled"] });
+
+    await user.keyboard("{Enter}");
+
+    // The sign-on has succeeded and its render has committed; the router is
+    // still loading the landing route.
+    await vi.waitFor(() => {
+      expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+        "success",
+      );
+    });
+    await act(async () => undefined);
+    observer.disconnect();
+    expect(router.state.navigation.state).toBe("loading");
+    expect(signOn.hasAttribute("disabled")).toBe(true);
+    expect(disabledStates).toEqual([true]);
+    expect(
+      screen
+        .getByRole("form", { name: "Sign on to CardDemo" })
+        .getAttribute("aria-busy"),
+    ).toBe("true");
+
+    await act(async () => {
+      finishLanding();
+    });
+
+    await screen.findByText("User home");
+    expect(router.state.location.pathname).toBe("/");
+  });
+
+  it("ends the busy state when a navigation keeps the sign-on screen at another location", async () => {
+    stubFetch(200, USER_SIGN_ON);
+    const user = userEvent.setup();
+    // A landing route that never finishes loading, so only the second
+    // navigation decides what the screen shows.
+    const { router, queryClient } = renderLogin({
+      userHomeLoader: () => new Promise<null>(() => undefined),
+    });
+    await user.type(inputByLabel("User ID"), "USER0001");
+    await user.type(inputByLabel("Password"), "PASSWORD{Enter}");
+    await vi.waitFor(() => {
+      expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+        "success",
+      );
+    });
+    await act(async () => undefined);
+    const signOn = screen.getByRole("button", { name: "Sign on" });
+    expect(signOn.hasAttribute("disabled")).toBe(true);
+
+    await act(() => router.navigate("/login"));
+
+    expect(router.state.location.pathname).toBe("/login");
+    expect(signOn.hasAttribute("disabled")).toBe(false);
+    expect(
+      screen
+        .getByRole("form", { name: "Sign on to CardDemo" })
+        .getAttribute("aria-busy"),
+    ).toBe("false");
   });
 
   it("rejects an empty user ID without sending anything", async () => {

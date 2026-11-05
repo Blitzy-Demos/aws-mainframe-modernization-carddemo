@@ -20,7 +20,8 @@
 // The texts COTRN00C shows come from the server and reach the user only
 // through lib/api-errors.ts: an error as a toast and a TRNIDIN field error,
 // and the page-boundary text of a 200 page as a neutral toast, or in place of
-// the rows when the page is empty.
+// the rows when an ENTER finds none. A PF7 or PF8 answered with no rows keeps
+// the page shown and toasts its text (pageShown).
 import { useEffect, useId, useMemo, useRef, useState, type JSX } from "react";
 import { Link } from "react-router";
 import { Controller, useForm } from "react-hook-form";
@@ -63,6 +64,9 @@ const DATE_LENGTH = 10;
 /** Shown in place of the rows of an empty page that carries no text. */
 const NO_TRANSACTIONS = "No transactions found";
 
+/** The ten rows of a COTRN00 page, the server's default page size. */
+const PAGE_ROWS = 10;
+
 const DEFAULT_VALUES: TransactionListFilterValues = { start_key: "" };
 
 /**
@@ -93,11 +97,69 @@ function emptyPageText(message: string | null | undefined): string {
 }
 
 /**
+ * An answer with no rows, only its page-boundary text: for PF7 from a page
+ * nothing precedes, 'You are already at the top of the page...'
+ * (V-COTRN00C-009); for a key no record is at or after any more, the STARTBR
+ * NOTFND text 'You are at the top of the page...' (V-COTRN00C-005,
+ * V-COTRN00C-010).
+ */
+function isBoundaryAnswer(page: TransactionPage): boolean {
+  return (
+    page.items.length === 0 &&
+    typeof page.message === "string" &&
+    page.message.trim() !== ""
+  );
+}
+
+/**
+ * What the table showed when the user last pressed a key: the page, the
+ * query's answer it was shown for, and whether the key is PF7 or PF8 rather
+ * than ENTER.
+ */
+type OnScreen = {
+  answer: TransactionPage | undefined;
+  page: TransactionPage | undefined;
+  press: boolean;
+};
+
+/**
+ * The page the table shows for the query's answer `page`.
+ *
+ * COTRN00C answers PF7 on the first page and PF8 without a next page with
+ * SEND-ERASE-NO, so the rows on screen stay and only the message line is
+ * written (P-COTRN00C-009, P-COTRN00C-010, P-COTRN00C-018)
+ * [app/cbl/COTRN00C.cbl:L247-251] [app/cbl/COTRN00C.cbl:L269-273], and a PF7
+ * or PF8 browse whose STARTBR finds no record blanks no row (P-COTRN00C-016).
+ * The API answers such a key with a page that has no rows and carries the
+ * text (E-54), so that answer to a press keeps the page that was on screen,
+ * with its keys, which Previous and Next page from. The empty page of an
+ * ENTER, a search that finds nothing or the empty master, stands in the
+ * table (E-27). While a new page loads, a page kept stays in place of the
+ * empty answer the query holds over it.
+ */
+function pageShown(
+  page: TransactionPage | undefined,
+  onScreen: OnScreen,
+  loadingNext: boolean,
+): TransactionPage | undefined {
+  if (page === undefined || onScreen.page === undefined) {
+    return page;
+  }
+  if (loadingNext) {
+    return page === onScreen.answer ? onScreen.page : page;
+  }
+  return onScreen.press && isBoundaryAnswer(page) ? onScreen.page : page;
+}
+
+/**
  * The COTRN00 columns in screen order ('Transaction ID', 'Date',
  * 'Description', 'Amount'), then the row action that replaces the 'Sel'
  * column. Values are shown exactly as the server sent them: the date is the
  * first ten characters of the timestamp text, never parsed, and the amount is
- * the decimal string as received.
+ * the decimal string as received. Each placeholder is its cell's markup
+ * around a value as wide as the column's on a first page: the 16-digit
+ * TRAN-ID, a `YYYY-MM-DD` date, a description and an amount as wide as the
+ * widest the seeded first page shows, and the row action.
  */
 function transactionColumns(
   idPrefix: string,
@@ -112,6 +174,9 @@ function transactionColumns(
           {row.original.tran_id}
         </span>
       ),
+      meta: {
+        placeholder: <span className="tabular-nums">0000000000000000</span>,
+      },
     },
     {
       id: "tran_orig_date",
@@ -121,6 +186,7 @@ function transactionColumns(
           {row.original.tran_orig_ts.slice(0, DATE_LENGTH)}
         </span>
       ),
+      meta: { placeholder: <span className="tabular-nums">0000-00-00</span> },
     },
     {
       accessorKey: "tran_desc",
@@ -129,8 +195,8 @@ function transactionColumns(
       // cell's whitespace-nowrap), so a TRAN-DESC X(100) without spaces no
       // longer sets the column's minimum width: the column takes the width the
       // other columns leave, and Amount and View stay inside the card. It is
-      // clamped to one line, so a row stays as tall as the skeleton rows, and
-      // the title gives the full text the clamp hides.
+      // clamped to one line, so a row stays as tall as the skeleton and filler
+      // rows, and the title gives the full text the clamp hides.
       cell: ({ row }) => (
         <span
           title={row.original.tran_desc}
@@ -139,6 +205,13 @@ function transactionColumns(
           {row.original.tran_desc}
         </span>
       ),
+      meta: {
+        placeholder: (
+          <span className="line-clamp-1 whitespace-normal wrap-anywhere">
+            Return item at Merchant, Jones and Company
+          </span>
+        ),
+      },
     },
     {
       accessorKey: "tran_amt",
@@ -148,6 +221,11 @@ function transactionColumns(
           {row.original.tran_amt}
         </span>
       ),
+      meta: {
+        placeholder: (
+          <span className="block text-end tabular-nums">-999.99</span>
+        ),
+      },
     },
     {
       id: "actions",
@@ -159,8 +237,9 @@ function transactionColumns(
       // cell describes it, since every row has the same name.
       // BLITZY [LAYOUT]: the link button takes the height of the cell's text
       // line (overrode the default h-9 px-4), so a row is as tall as the
-      // skeleton rows DataTable shows while a page loads, and paging moves
-      // neither the table nor the scroll position.
+      // skeleton and filler rows DataTable reserves a full page with at its
+      // default text row height, and paging moves neither the table nor the
+      // scroll position.
       // BLITZY [A11Y]: the link is therefore a 20px-high target, below the
       // 24px WCAG 2.2 minimum; the cell padding keeps neighbouring targets
       // apart. Flagged for designer review.
@@ -175,6 +254,13 @@ function transactionColumns(
           </Link>
         </Button>
       ),
+      meta: {
+        placeholder: (
+          <Button variant="link" asChild className="h-auto p-0">
+            <span>View</span>
+          </Button>
+        ),
+      },
     },
   ];
 }
@@ -198,6 +284,17 @@ export default function TransactionListPage(): JSX.Element {
   const query = useTransactions(params);
   const page = query.isError ? undefined : query.data;
 
+  // The page the table shows (pageShown): the answer, or the page kept on
+  // screen in its place after a PF7 or PF8 that found no page. `kept` tells
+  // the two apart.
+  const [onScreen, setOnScreen] = useState<OnScreen>({
+    answer: undefined,
+    page: undefined,
+    press: false,
+  });
+  const shownPage = pageShown(page, onScreen, query.isPlaceholderData);
+  const kept = shownPage !== page;
+
   // Whether the next page received answers a key press, whose page text is
   // then shown once. A page a cached result is refreshed with answers none.
   const announceRef = useRef(true);
@@ -207,9 +304,12 @@ export default function TransactionListPage(): JSX.Element {
     undefined,
   );
 
-  const send = (cursor: Cursor): void => {
+  // Sends a key press, `press` for PF7 and PF8, noting what the table shows
+  // so that an answer with no rows to a press leaves it there.
+  const send = (cursor: Cursor, press: boolean): void => {
     const next = toParams(cursor);
     announceRef.current = true;
+    setOnScreen({ answer: page, page: shownPage, press });
     if (sameParams(next, params)) {
       void query.refetch();
     } else {
@@ -221,7 +321,7 @@ export default function TransactionListPage(): JSX.Element {
   // forward default. A key the schema rejects sends nothing and shows its
   // FieldError with focus on TRNIDIN.
   const onSubmit = (values: TransactionListFilterQuery): void => {
-    send({ start_key: values.start_key });
+    send({ start_key: values.start_key }, false);
   };
 
   // Each page received is handled once, StrictMode's repeated effects and
@@ -242,11 +342,13 @@ export default function TransactionListPage(): JSX.Element {
     }
     announceRef.current = false;
     // An empty page shows its text in place of the rows instead, which the
-    // table's status region announces.
-    if (data.items.length > 0) {
+    // table's status region announces. The empty answer to a PF7 or PF8
+    // leaves the page shown (pageShown), so its text is toasted, once for each
+    // press, the message line COTRN00C rewrites (P-COTRN00C-018).
+    if (data.items.length > 0 || kept) {
       showMessage(data.message);
     }
-  }, [data, dataUpdatedAt, isPlaceholderData, isSuccess]);
+  }, [data, dataUpdatedAt, isPlaceholderData, isSuccess, kept]);
 
   // Each failed read is shown once: every failure is a new error object. The
   // message also stands in place of the rows, since no page arrived.
@@ -262,8 +364,19 @@ export default function TransactionListPage(): JSX.Element {
     );
   }, [error, isError, form]);
 
-  const prevKey = page?.prev_key;
-  const nextKey = page?.next_key;
+  // The table waits for the read that is out: the first one, a page loading
+  // behind the one kept on screen, or a re-read of a request whose last read
+  // failed, since that failure's text does not answer it. A page already
+  // read stays shown, not busy, while it is read again: from the cache on a
+  // return to the list, or after a key pressed again with the same request.
+  const tableLoading =
+    query.isPending ||
+    query.isPlaceholderData ||
+    (query.isError && query.fetchStatus !== "idle");
+
+  // PF7 and PF8 page from the keys of the page shown, a kept page's included.
+  const prevKey = shownPage?.prev_key;
+  const nextKey = shownPage?.next_key;
 
   return (
     <div className="flex flex-col gap-6">
@@ -319,22 +432,25 @@ export default function TransactionListPage(): JSX.Element {
       </Card>
       <DataTable<TransactionResponse>
         columns={columns}
-        data={page?.items ?? []}
+        data={shownPage?.items ?? []}
         prevKey={prevKey}
         nextKey={nextKey}
         onPrevious={() => {
           if (typeof prevKey === "string") {
-            send({ start_key: prevKey, direction: "backward" });
+            send({ start_key: prevKey, direction: "backward" }, true);
           }
         }}
         onNext={() => {
           if (typeof nextKey === "string") {
-            send({ start_key: nextKey, direction: "forward" });
+            send({ start_key: nextKey, direction: "forward" }, true);
           }
         }}
-        emptyMessage={query.isError ? failureText : emptyPageText(page?.message)}
+        emptyMessage={
+          query.isError ? failureText : emptyPageText(shownPage?.message)
+        }
         caption="Transactions"
-        loading={query.isFetching}
+        loading={tableLoading}
+        pageSize={PAGE_ROWS}
       />
     </div>
   );

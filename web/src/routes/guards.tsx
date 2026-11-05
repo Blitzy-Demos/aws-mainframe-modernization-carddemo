@@ -13,8 +13,11 @@
 //
 // The landing after sign-on is not chosen here: LoginPage navigates to the
 // login response's `landing`, the counterpart of COSGN00C's XCTL split.
+//
+// Each redirect is a Redirect, which shows the page skeleton until the router
+// has downloaded the destination's page and commits it.
 import { useEffect, type ReactNode } from "react";
-import { Navigate, Outlet, useLocation } from "react-router";
+import { Outlet, useLocation } from "react-router";
 import { toast } from "sonner";
 
 import { showApiError } from "@/lib/api-errors";
@@ -24,6 +27,7 @@ import {
   useSession,
   type Session,
 } from "@/lib/session";
+import { Redirect } from "@/routes/page-fallbacks";
 
 // Byte-identical to ADMIN_ACCESS_REQUIRED in crates/domain/src/messages.rs, the
 // `message` of the server's 403. It takes the place of COMEN01C's menu text
@@ -83,7 +87,7 @@ export function RequireAuth({ children }: GuardProps): ReactNode {
   useSessionEndNotice(live);
 
   if (!live) {
-    return <Navigate to="/login" replace state={{ from: location }} />;
+    return <Redirect to="/login" replace state={{ from: location }} />;
   }
   return children ?? <Outlet />;
 }
@@ -116,10 +120,10 @@ export function RequireAdmin({ children }: GuardProps): ReactNode {
   }, [live, admin]);
 
   if (!live) {
-    return <Navigate to="/login" replace state={{ from: location }} />;
+    return <Redirect to="/login" replace state={{ from: location }} />;
   }
   if (!admin) {
-    return <Navigate to="/" replace />;
+    return <Redirect to="/" replace />;
   }
   return children ?? <Outlet />;
 }

@@ -146,7 +146,9 @@ function TransactionFields({ transaction }: TransactionFieldsProps): JSX.Element
       {SCREEN_FIELDS.map(({ bms, caption, field, tabular }) => (
         <DetailItem key={bms} caption={caption}>
           {transaction === undefined ? (
-            <Skeleton aria-hidden="true" className="h-5 w-40" />
+            // Centred in the 24px line box of the value's text-base, so the
+            // field keeps the height it takes once read.
+            <Skeleton aria-hidden="true" className="my-0.5 h-5 w-40" />
           ) : (
             <span className={tabular ? "tabular-nums" : undefined}>
               {transaction[field]}

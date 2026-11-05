@@ -224,10 +224,12 @@ describe("CPVS ENTER with an account ID that passes the edits", () => {
     expect(screen.getByText("Immanuel M Kessler").tagName).toBe("SPAN");
     expect(screen.getByText(AUTHORIZATION.pa_transaction_id).tagName).toBe("SPAN");
 
-    // The account stays in the URL, so a reload and Back return to it.
+    // The account stays in the URL, so a reload and Back return to it. The
+    // change is an update within the page, which keeps the scroll position.
     expect(new URLSearchParams(router.state.location.search).get("account_id")).toBe(
       ACCOUNT_1,
     );
+    expect(router.state.preventScrollReset).toBe(true);
     expect(accountField().getAttribute("aria-invalid")).toBe("false");
     expect(screen.queryByRole("alert")).toBeNull();
     expect(toastError).not.toHaveBeenCalled();
@@ -424,6 +426,21 @@ function bodyRows(): HTMLTableRowElement[] {
   return Array.from(list().querySelectorAll<HTMLTableRowElement>("tbody tr"));
 }
 
+/**
+ * A row's text outside the invisible column placeholders a skeleton row's
+ * cells hold to take their columns' widths: what the row shows.
+ */
+function shownText(row: HTMLTableRowElement): string {
+  const texts = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  let shown = "";
+  for (let node = texts.nextNode(); node !== null; node = texts.nextNode()) {
+    if (node.parentElement?.closest(".invisible") === null) {
+      shown += node.textContent ?? "";
+    }
+  }
+  return shown;
+}
+
 /** The list's polite status region, which announces each completed page. */
 function listStatus(): HTMLElement {
   const card = list().closest<HTMLElement>('[data-slot="card"]');
@@ -462,6 +479,9 @@ async function press(user: ReturnType<typeof userEvent.setup>, control: Press): 
 /** Longer than the delay after which DataTable announces a completed page. */
 const ANNOUNCE_WAIT_MS = 200;
 
+/** The five rows of a COPAU00 list page, which the table keeps room for. */
+const PAGE_ROWS = 5;
+
 /** Lets `ms` pass on the real clock. */
 async function elapse(ms: number): Promise<void> {
   await act(async () => {
@@ -480,8 +500,11 @@ async function expectSettledOn(page: AuthSummaryResponse): Promise<void> {
     expect(listStatus().textContent).toBe(`Pending authorizations: ${page.items.length} rows`),
   );
   expect(list().hasAttribute("aria-busy")).toBe(false);
+  // The page's rows, then hidden filler rows up to a full page.
   expect(bodyRows().map((row) => row.getAttribute("aria-hidden"))).toEqual(
-    page.items.map(() => null),
+    Array.from({ length: PAGE_ROWS }, (_, index) =>
+      index < page.items.length ? null : "true",
+    ),
   );
   expect(pagingControl("Previous").getAttribute("aria-disabled")).toBe(
     page.prev_key === null ? "true" : null,
@@ -493,22 +516,36 @@ async function expectSettledOn(page: AuthSummaryResponse): Promise<void> {
 
 /**
  * The list while a read is in flight, checked again after the announcement
- * delay has passed: busy, `skeletonRows` Skeleton rows without content in
- * place of any held row, Previous and Next disabled, and the status empty.
+ * delay has passed: busy, a full page of rows, Previous and Next disabled,
+ * and the status empty. With no page `held`, every row is a Skeleton row
+ * showing no content; with one, its rows stay shown, dimmed and ignoring the
+ * pointer, over hidden filler rows without content, and no other page's rows
+ * are shown.
  */
-async function expectBusy(skeletonRows: number): Promise<void> {
+async function expectBusy(held: AuthSummaryResponse | null): Promise<void> {
   await waitFor(() => expect(list().getAttribute("aria-busy")).toBe("true"));
   await elapse(ANNOUNCE_WAIT_MS);
   expect(list().getAttribute("aria-busy")).toBe("true");
   const rows = bodyRows();
-  expect(rows).toHaveLength(skeletonRows);
-  for (const row of rows) {
-    expect(row.getAttribute("aria-hidden")).toBe("true");
-    expect(row.textContent).toBe("");
-    expect(row.querySelector('[data-slot="skeleton"]')).not.toBeNull();
-  }
+  expect(rows).toHaveLength(PAGE_ROWS);
+  const heldItems = held?.items ?? [];
+  rows.forEach((row, index) => {
+    const item = heldItems.at(index);
+    if (item === undefined) {
+      expect(row.getAttribute("aria-hidden")).toBe("true");
+      expect(shownText(row)).toBe("");
+      expect(row.querySelector('[data-slot="skeleton"]') !== null).toBe(held === null);
+    } else {
+      expect(row.hasAttribute("aria-hidden")).toBe(false);
+      expect(within(row).getByText(item.pa_transaction_id).tagName).toBe("SPAN");
+      expect(row.className).toContain("pointer-events-none");
+      expect(row.className).toContain("opacity-50");
+    }
+  });
   for (const item of [...firstPage.items, ...secondPage.items]) {
-    expect(screen.queryByText(item.pa_transaction_id)).toBeNull();
+    if (!heldItems.includes(item)) {
+      expect(screen.queryByText(item.pa_transaction_id)).toBeNull();
+    }
   }
   expect(pagingControl("Previous").getAttribute("aria-disabled")).toBe("true");
   expect(pagingControl("Next").getAttribute("aria-disabled")).toBe("true");
@@ -528,8 +565,8 @@ describe("CPVS while a read of the list is in flight", () => {
     /** The cursor of the held request. */
     startKey: string | null;
     direction: string | null;
-    /** The rows held while it is in flight: none (5 Skeleton rows), the page left, or the cached page. */
-    skeletonRows: number;
+    /** The page held, busy, while it is in flight: none (5 Skeleton rows), the page left, or the cached page. */
+    shown: AuthSummaryResponse | null;
     /** Whether the account header is already shown, from an earlier read. */
     header: boolean;
   }>([
@@ -539,7 +576,7 @@ describe("CPVS while a read of the list is in flight", () => {
       held: "Enter",
       startKey: null,
       direction: null,
-      skeletonRows: 5,
+      shown: null,
       header: false,
     },
     {
@@ -548,7 +585,7 @@ describe("CPVS while a read of the list is in flight", () => {
       held: "Next",
       startKey: "3",
       direction: "forward",
-      skeletonRows: firstPage.items.length,
+      shown: firstPage,
       header: true,
     },
     {
@@ -557,7 +594,7 @@ describe("CPVS while a read of the list is in flight", () => {
       held: "Search",
       startKey: null,
       direction: null,
-      skeletonRows: firstPage.items.length,
+      shown: firstPage,
       header: true,
     },
     {
@@ -566,12 +603,12 @@ describe("CPVS while a read of the list is in flight", () => {
       held: "Next",
       startKey: "3",
       direction: "forward",
-      skeletonRows: secondPage.items.length,
+      shown: secondPage,
       header: true,
     },
   ])(
     "shows $read as loading until its answer arrives",
-    async ({ before, held, startKey, direction, skeletonRows, header }) => {
+    async ({ before, held, startKey, direction, shown, header }) => {
       const { fetchMock, holdNextRead } = stubPages();
       const user = userEvent.setup();
       renderPage();
@@ -583,7 +620,7 @@ describe("CPVS while a read of the list is in flight", () => {
       const release = holdNextRead();
       await press(user, held);
 
-      await expectBusy(skeletonRows);
+      await expectBusy(shown);
       expect(fetchMock).toHaveBeenCalledTimes(before.length + 1);
       const query = new URL(lastRequest(fetchMock).url).searchParams;
       expect(query.get("account_id")).toBe(ACCOUNT_1);
@@ -619,7 +656,7 @@ describe("CPVS while a read of the list is in flight", () => {
     await press(user, "Next");
 
     // The read is paused before its request: the page left is held, unsent.
-    await expectBusy(firstPage.items.length);
+    await expectBusy(firstPage);
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     act(() => {
@@ -735,7 +772,7 @@ describe("CPVS when a read again of a page already shown fails", () => {
       });
       await press(user, "Search");
 
-      await expectBusy(firstPage.items.length);
+      await expectBusy(heldHeader ? firstPage : null);
       expect(screen.queryByRole("heading", { name: `Account ${ACCOUNT_1}` }) !== null).toBe(
         heldHeader,
       );

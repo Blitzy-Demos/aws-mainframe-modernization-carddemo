@@ -107,6 +107,16 @@ const TOP_PAGE = {
   message: TOP_OF_PAGE,
 } satisfies UserPage;
 
+// STARTBR NOTFND (V-COUSR00C-003): no user at or after the start key, the
+// answer to a search from ZZZZZZZZ, or to PF8 once the next user is gone.
+const AT_TOP_OF_PAGE = "You are at the top of the page...";
+const NOT_FOUND_PAGE = {
+  items: [],
+  next_key: null,
+  prev_key: null,
+  message: AT_TOP_OF_PAGE,
+} satisfies UserPage;
+
 // V-COUSR00C-005: a forward page that reaches the end of the user file shows
 // its rows with this text.
 const BOTTOM_OF_PAGE = "You have reached the bottom of the page...";
@@ -298,7 +308,24 @@ function listQueries(): URLSearchParams[] {
 // cannot wrap, and a Toaster mounted again shows the toasts an earlier one
 // left open, so the screen cannot tell a new toast from an old one. Toasts are
 // therefore counted in toast.getHistory(), sonner's record of each toast
-// raised, against the ids it held before.
+// raised, against a copy of it taken before the test acts: its toasts
+// (toastHistory) or their ids (raisedToastIds).
+function toastHistory(): unknown[] {
+  return [...toast.getHistory()];
+}
+
+// The toasts created with the text `title` since `before`, a toastHistory().
+function toastsSince(before: readonly unknown[], title: string): number {
+  return toast
+    .getHistory()
+    .filter(
+      (created) =>
+        !before.includes(created) &&
+        "title" in created &&
+        created.title === title,
+    ).length;
+}
+
 type ToastId = ReturnType<typeof toast>;
 
 function raisedToastIds(): Set<ToastId> {
@@ -472,7 +499,8 @@ describe("UserListPage CU00 browse", () => {
   );
 
   // F-COUSR00-004 and F-COUSR00-003: PF8 and PF7 pass the page's keys back
-  // unchanged with their direction.
+  // unchanged with their direction. The answer shows: the next page's rows,
+  // or the top-of-page text of PF7 on the first page.
   it.each([
     {
       control: "Next",
@@ -494,13 +522,90 @@ describe("UserListPage CU00 browse", () => {
 
       await user.click(screen.getByRole("button", { name: control }));
 
-      expect(
-        (await within(usersTable()).findByText(shows)).textContent,
-      ).toBe(shows);
+      expect((await screen.findByText(shows)).textContent).toBe(shows);
       const browse = listQueries().at(-1);
       expect(browse?.get("direction")).toBe(direction);
       expect(browse?.get("start_key")).toBe(startKey);
       expect(listQueries()).toHaveLength(2);
+    },
+  );
+
+  // F-COUSR00-003 and F-COUSR00-004: COUSR00C sends PF7 on the first page and
+  // PF8 without a next page without ERASE (P-COUSR00C-004, P-COUSR00C-005,
+  // P-COUSR00C-013), so a key answered with no rows keeps the rows and both
+  // keys, and its text is toasted. Every press reads the file again and shows
+  // the text again. ENTER erases the screen: a search that finds no user shows
+  // its text in place of the rows.
+  it.each([
+    {
+      control: "Previous",
+      direction: "backward",
+      startKey: FIRST_PAGE.prev_key,
+      boundary: TOP_PAGE,
+    },
+    {
+      control: "Next",
+      direction: "forward",
+      startKey: FIRST_PAGE.next_key,
+      boundary: NOT_FOUND_PAGE,
+    },
+  ])(
+    "$control answered with no rows keeps the page and toasts its text for every press",
+    async ({ control, direction, startKey, boundary }) => {
+      answer(
+        `GET ${LIST_PATH}?direction=${direction}&start_key=${startKey}`,
+        200,
+        boundary,
+      );
+      answer(`GET ${LIST_PATH}?start_key=ZZZZZZZZ`, 200, NOT_FOUND_PAGE);
+      const { user } = renderPage();
+      await firstPageShown();
+      const before = toastHistory();
+
+      for (const press of [1, 2]) {
+        await user.click(screen.getByRole("button", { name: control }));
+
+        await waitFor(() => {
+          expect(toastsSince(before, boundary.message)).toBe(press);
+        });
+        expect(listQueries()).toHaveLength(1 + press);
+        const browse = listQueries().at(-1);
+        expect(browse?.get("direction")).toBe(direction);
+        expect(browse?.get("start_key")).toBe(startKey);
+        const table = usersTable();
+        expect(within(table).getAllByRole("row")).toHaveLength(
+          FIRST_PAGE.items.length + 1,
+        );
+        for (const shown of FIRST_PAGE.items) {
+          expect(within(table).getByText(shown.user_id).textContent).toBe(
+            shown.user_id,
+          );
+        }
+        expect(within(table).queryByText(boundary.message)).toBeNull();
+        for (const paging of ["Previous", "Next"]) {
+          expect(
+            screen
+              .getByRole("button", { name: paging })
+              .getAttribute("aria-disabled"),
+          ).toBeNull();
+        }
+        expect(document.activeElement).not.toBe(document.body);
+      }
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(listQueries()).toHaveLength(3);
+      expect(toastsSince(before, boundary.message)).toBe(2);
+
+      const beforeSearch = toastHistory();
+      await user.type(startKeyInput(), "ZZZZZZZZ{Enter}");
+
+      expect(
+        (await within(usersTable()).findByText(AT_TOP_OF_PAGE)).textContent,
+      ).toBe(AT_TOP_OF_PAGE);
+      expect(toastsSince(beforeSearch, AT_TOP_OF_PAGE)).toBe(0);
+      expect(listQueries()).toHaveLength(4);
+      expect(toastError).not.toHaveBeenCalled();
     },
   );
 
@@ -714,6 +819,56 @@ describe("UserListPage CU03 delete", () => {
     });
     expect(sentTo("DELETE", `${LIST_PATH}/USER0001`)).toEqual([]);
     expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
+  // The delete's re-read of a page kept after PF7 on the first page reads
+  // that page again, so the deleted row leaves the rows shown; the re-read
+  // toasts no page text.
+  it("a delete from the page kept after Previous re-reads that page", async () => {
+    const { user } = renderPage();
+    await firstPageShown();
+    const before = toastHistory();
+    await user.click(screen.getByRole("button", { name: "Previous" }));
+    await waitFor(() => {
+      expect(toastsSince(before, TOP_OF_PAGE)).toBe(1);
+    });
+
+    answer(`GET ${LIST_PATH}`, 200, AFTER_DELETE_PAGE);
+    await user.click(
+      screen.getByRole("button", {
+        name: "Delete",
+        description: USER0001.user_id,
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Delete User",
+    });
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => {
+      expect(toastSuccess).toHaveBeenCalledWith(DELETED.message);
+    });
+    await waitFor(() => {
+      expect(within(usersTable()).queryByText(USER0001.user_id)).toBeNull();
+    });
+    const table = usersTable();
+    for (const shown of AFTER_DELETE_PAGE.items) {
+      expect(within(table).getByText(shown.user_id).textContent).toBe(
+        shown.user_id,
+      );
+    }
+    await waitFor(() => {
+      expect(queryClient.isFetching()).toBe(0);
+    });
+    const last = sent().at(-1);
+    expect(last === undefined ? null : requestKey(last)).toBe(
+      `GET ${LIST_PATH}`,
+    );
+    expect(toastsSince(before, TOP_OF_PAGE)).toBe(1);
+    expect(
+      screen.getByRole("button", { name: "Next" }).getAttribute("aria-disabled"),
+    ).toBe("true");
+    expect(toastError).not.toHaveBeenCalled();
   });
 
   // P-COUSR03C-005 for an admin who deletes their own account. The DELETE

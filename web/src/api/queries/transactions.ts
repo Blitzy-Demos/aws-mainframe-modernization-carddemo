@@ -186,6 +186,9 @@ export function useTransactions(params: TransactionListParams = {}) {
   });
 }
 
+/** The rows of the dashboard's most recent transactions, its one page. */
+export const RECENT_TRANSACTION_ROWS = 5;
+
 /**
  * The dashboard's five most recent transactions of `accountId`: the
  * highest-keyed page of the account read backward from the end of the file.
@@ -196,7 +199,7 @@ export function useRecentTransactions(accountId: string) {
   const params: TransactionListParams = {
     account_id: accountId,
     direction: "backward",
-    page_size: 5,
+    page_size: RECENT_TRANSACTION_ROWS,
   };
   return useQuery({
     queryKey: transactionKeys.list(params),

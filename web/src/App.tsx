@@ -9,8 +9,12 @@
 //   functions are open to both user types, because the COBOL programs check
 //   none; /admin/** also sits under RequireAdmin. Both guards only shape the
 //   UI: the server's 401 and 403 decide access.
-// - Each page is loaded through React.lazy, one chunk per route (AAP 0.10.3).
-//   Data is fetched by the pages' TanStack Query hooks, never by route loaders.
+// - Each page is loaded through React.lazy, one chunk per route (AAP 0.10.3),
+//   which its route's loader downloads before the router commits the
+//   navigation (routes/lazy-page.tsx). The loaders only download page code and
+//   fetch no data: data is fetched by the pages' TanStack Query hooks.
+// - A page that cannot be loaded or rendered shows PageLoadError: inside the
+//   shell for the signed-on routes, as a page of its own for /login.
 //
 // Breadcrumbs (the PF3 replacement, AAP 0.5.4.4): PageHeader builds the trail
 // from the RouteHandle of every matched route, the last crumb being the page
@@ -19,67 +23,68 @@
 // page it sits on. Crumbs are the COMEN02Y and COADM02Y option texts that
 // nav/menu.ts holds; titles are the BMS screen titles. Pages that render their
 // map title themselves pass the same text to PageHeader.
-import {
-  lazy,
-  Suspense,
-  type ComponentType,
-  type JSX,
-  type LazyExoticComponent,
-} from "react";
+import type { JSX } from "react";
 import {
   createBrowserRouter,
-  Navigate,
   RouterProvider,
   type RouteObject,
 } from "react-router";
 
 import { AppLayout } from "@/components/app-layout";
 import type { RouteHandle } from "@/components/page-header";
-import { Skeleton } from "@/components/ui/skeleton";
 import { MENU_SECTION_LABELS, menu } from "@/nav/menu";
+import { AppRoot } from "@/routes/app-root";
 import { RequireAdmin, RequireAuth } from "@/routes/guards";
+import { inShellErrorBoundary, lazyPage, pageRoute } from "@/routes/lazy-page";
+import { PageLoadError, Redirect } from "@/routes/page-fallbacks";
 
-const LoginPage = lazy(() => import("@/pages/auth/LoginPage"));
-const DashboardPage = lazy(() => import("@/pages/dashboard/DashboardPage"));
-const AdminHomePage = lazy(() => import("@/pages/admin/AdminHomePage"));
-const AccountViewPage = lazy(() => import("@/pages/accounts/AccountViewPage"));
-const AccountEditPage = lazy(() => import("@/pages/accounts/AccountEditPage"));
-const CardListPage = lazy(() => import("@/pages/cards/CardListPage"));
-const CardViewPage = lazy(() => import("@/pages/cards/CardViewPage"));
-const CardEditPage = lazy(() => import("@/pages/cards/CardEditPage"));
-const TransactionListPage = lazy(
+const LoginPage = lazyPage(() => import("@/pages/auth/LoginPage"));
+const DashboardPage = lazyPage(() => import("@/pages/dashboard/DashboardPage"));
+const AdminHomePage = lazyPage(() => import("@/pages/admin/AdminHomePage"));
+const AccountViewPage = lazyPage(
+  () => import("@/pages/accounts/AccountViewPage"),
+);
+const AccountEditPage = lazyPage(
+  () => import("@/pages/accounts/AccountEditPage"),
+);
+const CardListPage = lazyPage(() => import("@/pages/cards/CardListPage"));
+const CardViewPage = lazyPage(() => import("@/pages/cards/CardViewPage"));
+const CardEditPage = lazyPage(() => import("@/pages/cards/CardEditPage"));
+const TransactionListPage = lazyPage(
   () => import("@/pages/transactions/TransactionListPage"),
 );
-const TransactionViewPage = lazy(
+const TransactionViewPage = lazyPage(
   () => import("@/pages/transactions/TransactionViewPage"),
 );
-const TransactionAddPage = lazy(
+const TransactionAddPage = lazyPage(
   () => import("@/pages/transactions/TransactionAddPage"),
 );
-const TransactionReportPage = lazy(
+const TransactionReportPage = lazyPage(
   () => import("@/pages/reports/TransactionReportPage"),
 );
-const BillPaymentPage = lazy(() => import("@/pages/payments/BillPaymentPage"));
-const AuthorizationSummaryPage = lazy(
+const BillPaymentPage = lazyPage(
+  () => import("@/pages/payments/BillPaymentPage"),
+);
+const AuthorizationSummaryPage = lazyPage(
   () => import("@/pages/authorizations/AuthorizationSummaryPage"),
 );
-const AuthorizationDetailPage = lazy(
+const AuthorizationDetailPage = lazyPage(
   () => import("@/pages/authorizations/AuthorizationDetailPage"),
 );
-const RewardsPage = lazy(() => import("@/pages/rewards/RewardsPage"));
-const UserListPage = lazy(() => import("@/pages/admin/users/UserListPage"));
-const UserAddPage = lazy(() => import("@/pages/admin/users/UserAddPage"));
-const UserEditPage = lazy(() => import("@/pages/admin/users/UserEditPage"));
-const TranTypeListPage = lazy(
+const RewardsPage = lazyPage(() => import("@/pages/rewards/RewardsPage"));
+const UserListPage = lazyPage(() => import("@/pages/admin/users/UserListPage"));
+const UserAddPage = lazyPage(() => import("@/pages/admin/users/UserAddPage"));
+const UserEditPage = lazyPage(() => import("@/pages/admin/users/UserEditPage"));
+const TranTypeListPage = lazyPage(
   () => import("@/pages/admin/transaction-types/TranTypeListPage"),
 );
-const TranTypeFormPage = lazy(
+const TranTypeFormPage = lazyPage(
   () => import("@/pages/admin/transaction-types/TranTypeFormPage"),
 );
-const RewardRuleListPage = lazy(
+const RewardRuleListPage = lazyPage(
   () => import("@/pages/admin/reward-rules/RewardRuleListPage"),
 );
-const RewardRuleFormPage = lazy(
+const RewardRuleFormPage = lazyPage(
   () => import("@/pages/admin/reward-rules/RewardRuleFormPage"),
 );
 
@@ -98,40 +103,17 @@ function menuLabel(id: string): string {
   return label;
 }
 
-// Shown while a page's chunk loads: the outline of a heading and its content.
-function PageFallback(): JSX.Element {
-  return (
-    <div
-      role="status"
-      aria-busy="true"
-      aria-label="Loading"
-      className="flex flex-col gap-4"
-    >
-      <Skeleton className="h-8 w-48" />
-      <Skeleton className="h-4 w-72" />
-      <Skeleton className="h-32 w-full" />
-    </div>
-  );
-}
-
-// The route element of a lazy page, inside its own Suspense boundary.
-function page(Component: LazyExoticComponent<ComponentType>): JSX.Element {
-  return (
-    <Suspense fallback={<PageFallback />}>
-      <Component />
-    </Suspense>
-  );
-}
-
 const transactionTypeMaintenance = {
   title: "Maintain Transaction Type",
   crumb: menuLabel("COADM02Y-06"),
 } satisfies RouteHandle;
 
-const routes: RouteObject[] = [
+const appRoutes: RouteObject[] = [
   {
     path: "/login",
-    element: page(LoginPage),
+    ...pageRoute(LoginPage, "public"),
+    // Outside the shell, so the error panel is a page of its own.
+    errorElement: <PageLoadError standalone />,
     handle: { title: "Sign on", crumb: "Sign on" } satisfies RouteHandle,
   },
   {
@@ -146,8 +128,11 @@ const routes: RouteObject[] = [
           crumb: "Home",
           to: "/",
         } satisfies RouteHandle,
-        children: [
-          { index: true, element: page(DashboardPage) },
+        // Every child sits in one pathless route whose errorElement renders in
+        // the shell's page content, so a page that fails to load or render
+        // leaves the sidebar and header in place.
+        children: inShellErrorBoundary([
+          { index: true, ...pageRoute(DashboardPage, "signed-on") },
           {
             // CAVW; the account number is entered on the dashboard (E-61).
             path: "accounts/:accountId",
@@ -156,11 +141,11 @@ const routes: RouteObject[] = [
               crumb: menuLabel("COMEN02Y-01"),
             } satisfies RouteHandle,
             children: [
-              { index: true, element: page(AccountViewPage) },
+              { index: true, ...pageRoute(AccountViewPage, "signed-on") },
               {
                 // CAUP
                 path: "edit",
-                element: page(AccountEditPage),
+                ...pageRoute(AccountEditPage, "signed-on"),
                 handle: {
                   title: "Update Account",
                   crumb: menuLabel("COMEN02Y-02"),
@@ -180,11 +165,11 @@ const routes: RouteObject[] = [
               crumb: menuLabel("COMEN02Y-03"),
             } satisfies RouteHandle,
             children: [
-              { index: true, element: page(CardListPage) },
+              { index: true, ...pageRoute(CardListPage, "signed-on") },
               {
                 // CCDL
                 path: ":cardNumber",
-                element: page(CardViewPage),
+                ...pageRoute(CardViewPage, "signed-on"),
                 handle: {
                   title: "View Credit Card Detail",
                   crumb: menuLabel("COMEN02Y-04"),
@@ -193,7 +178,7 @@ const routes: RouteObject[] = [
               {
                 // CCUP
                 path: ":cardNumber/edit",
-                element: page(CardEditPage),
+                ...pageRoute(CardEditPage, "signed-on"),
                 handle: {
                   title: "Update Credit Card Details",
                   crumb: menuLabel("COMEN02Y-05"),
@@ -209,11 +194,11 @@ const routes: RouteObject[] = [
               crumb: menuLabel("COMEN02Y-06"),
             } satisfies RouteHandle,
             children: [
-              { index: true, element: page(TransactionListPage) },
+              { index: true, ...pageRoute(TransactionListPage, "signed-on") },
               {
                 // CT02; the static segment outranks :tranId.
                 path: "new",
-                element: page(TransactionAddPage),
+                ...pageRoute(TransactionAddPage, "signed-on"),
                 handle: {
                   title: "Add Transaction",
                   crumb: menuLabel("COMEN02Y-08"),
@@ -222,7 +207,7 @@ const routes: RouteObject[] = [
               {
                 // CT01
                 path: ":tranId",
-                element: page(TransactionViewPage),
+                ...pageRoute(TransactionViewPage, "signed-on"),
                 handle: {
                   title: "View Transaction",
                   crumb: menuLabel("COMEN02Y-07"),
@@ -233,7 +218,7 @@ const routes: RouteObject[] = [
           {
             // CR00
             path: "reports/transactions",
-            element: page(TransactionReportPage),
+            ...pageRoute(TransactionReportPage, "signed-on"),
             handle: {
               title: "Transaction Reports",
               crumb: menuLabel("COMEN02Y-09"),
@@ -242,7 +227,7 @@ const routes: RouteObject[] = [
           {
             // CB00
             path: "payments",
-            element: page(BillPaymentPage),
+            ...pageRoute(BillPaymentPage, "signed-on"),
             handle: {
               title: "Bill Payment",
               crumb: menuLabel("COMEN02Y-10"),
@@ -256,11 +241,14 @@ const routes: RouteObject[] = [
               crumb: menuLabel("COMEN02Y-11"),
             } satisfies RouteHandle,
             children: [
-              { index: true, element: page(AuthorizationSummaryPage) },
+              {
+                index: true,
+                ...pageRoute(AuthorizationSummaryPage, "signed-on"),
+              },
               {
                 // CPVD; no menu option opens it, so its crumb is the map title.
                 path: ":authId",
-                element: page(AuthorizationDetailPage),
+                ...pageRoute(AuthorizationDetailPage, "signed-on"),
                 handle: {
                   title: "View Authorization Details",
                   crumb: "View Authorization Details",
@@ -270,7 +258,7 @@ const routes: RouteObject[] = [
           },
           {
             path: "rewards",
-            element: page(RewardsPage),
+            ...pageRoute(RewardsPage, "signed-on"),
             handle: {
               title: "Rewards",
               crumb: menuLabel("REWARDS"),
@@ -285,7 +273,7 @@ const routes: RouteObject[] = [
               crumb: MENU_SECTION_LABELS.admin,
             } satisfies RouteHandle,
             children: [
-              { index: true, element: page(AdminHomePage) },
+              { index: true, ...pageRoute(AdminHomePage, "admin") },
               {
                 // CU00, with the CU03 delete dialog on the list.
                 path: "users",
@@ -294,11 +282,11 @@ const routes: RouteObject[] = [
                   crumb: menuLabel("COADM02Y-01"),
                 } satisfies RouteHandle,
                 children: [
-                  { index: true, element: page(UserListPage) },
+                  { index: true, ...pageRoute(UserListPage, "admin") },
                   {
                     // CU01
                     path: "new",
-                    element: page(UserAddPage),
+                    ...pageRoute(UserAddPage, "admin"),
                     handle: {
                       title: "Add User",
                       crumb: menuLabel("COADM02Y-02"),
@@ -307,7 +295,7 @@ const routes: RouteObject[] = [
                   {
                     // CU02
                     path: ":userId/edit",
-                    element: page(UserEditPage),
+                    ...pageRoute(UserEditPage, "admin"),
                     handle: {
                       title: "Update User",
                       crumb: menuLabel("COADM02Y-03"),
@@ -323,17 +311,17 @@ const routes: RouteObject[] = [
                   crumb: menuLabel("COADM02Y-05"),
                 } satisfies RouteHandle,
                 children: [
-                  { index: true, element: page(TranTypeListPage) },
+                  { index: true, ...pageRoute(TranTypeListPage, "admin") },
                   {
                     // CTTU key entry and add
                     path: "new",
-                    element: page(TranTypeFormPage),
+                    ...pageRoute(TranTypeFormPage, "admin"),
                     handle: transactionTypeMaintenance,
                   },
                   {
                     // CTTU update and delete
                     path: ":code/edit",
-                    element: page(TranTypeFormPage),
+                    ...pageRoute(TranTypeFormPage, "admin"),
                     handle: transactionTypeMaintenance,
                   },
                 ],
@@ -345,10 +333,10 @@ const routes: RouteObject[] = [
                   crumb: menuLabel("REWARD-RULES"),
                 } satisfies RouteHandle,
                 children: [
-                  { index: true, element: page(RewardRuleListPage) },
+                  { index: true, ...pageRoute(RewardRuleListPage, "admin") },
                   {
                     path: "new",
-                    element: page(RewardRuleFormPage),
+                    ...pageRoute(RewardRuleFormPage, "admin"),
                     handle: {
                       title: "New reward rule",
                       crumb: "New reward rule",
@@ -356,7 +344,7 @@ const routes: RouteObject[] = [
                   },
                   {
                     path: ":ruleId/edit",
-                    element: page(RewardRuleFormPage),
+                    ...pageRoute(RewardRuleFormPage, "admin"),
                     handle: {
                       title: "Edit reward rule",
                       crumb: "Edit reward rule",
@@ -366,14 +354,17 @@ const routes: RouteObject[] = [
               },
             ],
           },
-        ],
+        ]),
       },
     ],
   },
   // An unknown path goes to the main menu, and RequireAuth sends a visitor
   // without a session on to /login.
-  { path: "*", element: <Navigate to="/" replace /> },
+  { path: "*", element: <Redirect to="/" replace /> },
 ];
+
+// The root route: AppRoot sets the document title and the scroll position.
+const routes: RouteObject[] = [{ element: <AppRoot />, children: appRoutes }];
 
 const router = createBrowserRouter(routes);
 

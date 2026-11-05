@@ -23,6 +23,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type JSX,
@@ -80,6 +81,9 @@ const DESCRIPTION_WIDTH = "w-112 lg:w-125 xl:w-144";
 
 /** One array for every page without rows, so the table sees one empty result. */
 const NO_ROWS: TranType[] = [];
+
+/** The seven rows of a COTRTLI page, the server's default page size. */
+const PAGE_ROWS = 7;
 
 // The notes under the error of a write that got no usable answer: the server
 // may have carried it out, so the user checks before sending it again.
@@ -320,8 +324,10 @@ function RowActionsCell({ tranType, rowIndex }: RowCellProps): JSX.Element {
   // pressed Edit leaves focus on it. Either way the Edit, with the margin its
   // focus ring takes, is scrolled into the visible part of the table, which
   // scrolls inside its card. A row closed because another one opened leaves
-  // focus in the newly opened input.
-  useEffect(() => {
+  // focus in the newly opened input. A layout effect, so it runs before the
+  // data table's own, which would otherwise find the removed Save's focus on
+  // the body and hand it to the table.
+  useLayoutEffect(() => {
     const edit = editRef.current;
     const active = document.activeElement;
     if (
@@ -379,10 +385,17 @@ function MountSignal({
   return null;
 }
 
-// The table keys its rows by position, so a page change hands the same row
-// elements to other types. The cells are keyed by type code instead: a row's
-// buttons and form never carry over to another type, so the focus the confirm
+// The table keys its rows by type code, the Db2 key, and so do the cells: a
+// row's buttons and form never carry over to another type when a delete or a
+// page change moves other types into its place, so the focus the confirm
 // dialog returns to its opener cannot land on another type's Delete.
+function tranTypeRowId(tranType: TranType): string {
+  return tranType.type_code;
+}
+
+// Each placeholder is its cell's markup around a value of the column's
+// format: the two-digit type code, a description in the description's one
+// fixed width (DESCRIPTION_WIDTH), and the row actions.
 const columns: DataTableProps<TranType>["columns"] = [
   {
     accessorKey: "type_code",
@@ -394,6 +407,7 @@ const columns: DataTableProps<TranType>["columns"] = [
         rowIndex={row.index}
       />
     ),
+    meta: { placeholder: <span className="font-mono">00</span> },
   },
   {
     accessorKey: "description",
@@ -405,6 +419,15 @@ const columns: DataTableProps<TranType>["columns"] = [
         rowIndex={row.index}
       />
     ),
+    meta: {
+      placeholder: (
+        <span
+          className={`block whitespace-normal wrap-break-word ${DESCRIPTION_WIDTH}`}
+        >
+          AUTHORIZATION
+        </span>
+      ),
+    },
   },
   {
     id: "actions",
@@ -416,6 +439,18 @@ const columns: DataTableProps<TranType>["columns"] = [
         rowIndex={row.index}
       />
     ),
+    meta: {
+      placeholder: (
+        <div className="flex items-center gap-2">
+          <Button variant="link" asChild>
+            <span>Edit</span>
+          </Button>
+          <Button variant="link" asChild>
+            <span>Delete</span>
+          </Button>
+        </div>
+      ),
+    },
   },
 ];
 
@@ -661,6 +696,7 @@ export default function TranTypeListPage(): JSX.Element {
       <RowActionsContext value={rowActions}>
         <DataTable<TranType>
           columns={columns}
+          getRowId={tranTypeRowId}
           data={items}
           prevKey={page?.prev_key}
           nextKey={page?.next_key}
@@ -669,6 +705,8 @@ export default function TranTypeListPage(): JSX.Element {
           emptyMessage={page?.message}
           caption="Transaction types"
           loading={list.isPending || list.isPlaceholderData}
+          pageSize={PAGE_ROWS}
+          rowHeight="default"
         />
       </RowActionsContext>
 

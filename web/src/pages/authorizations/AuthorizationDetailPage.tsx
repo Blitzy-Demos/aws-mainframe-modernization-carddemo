@@ -223,6 +223,11 @@ const MERCHANT_FIELDS: ReadonlyArray<DetailField> = [
 /** One column at `md`, two at `lg` (AAP 0.5.4.4). */
 const FIELD_GRID = "grid grid-cols-1 gap-x-6 gap-y-2 lg:grid-cols-2";
 
+/**
+ * The fields as captions and values. Each value is at least one text line
+ * high (`min-h-6`, the line height of its `text-base`), so a blank value
+ * takes the height of a shown one and of its skeleton.
+ */
 function DetailList({
   fields,
   detail,
@@ -238,7 +243,7 @@ function DetailList({
         return (
           <div key={field.bms} className="flex min-w-0 flex-col gap-1">
             <dt className="text-sm text-muted-foreground">{field.label}</dt>
-            <dd className="min-h-5 font-medium break-words tabular-nums">
+            <dd className="min-h-6 font-medium break-words tabular-nums">
               {badge === null ? value : <Badge variant={badge}>{value}</Badge>}
             </dd>
           </div>
@@ -269,8 +274,33 @@ function AuthorizationCard({ detail }: { detail: AuthDetail }): JSX.Element {
 }
 
 /**
- * Skeleton blocks in place of the card's fields while the record is read,
- * hidden from assistive technology: the page's status announces the read.
+ * The fields' places while the record is read. Each caption and each value
+ * is a skeleton centred in its line box, the 20px of the caption's text-sm
+ * (h-4 with my-0.5) and the 24px of the value's text-base (h-5 with my-0.5),
+ * so every field takes the height it takes once read.
+ */
+function FieldSkeletons({
+  fields,
+}: {
+  fields: ReadonlyArray<DetailField>;
+}): JSX.Element {
+  return (
+    <div className={FIELD_GRID}>
+      {fields.map((field) => (
+        <div key={field.bms} className="flex flex-col gap-1">
+          <Skeleton className="my-0.5 h-4 w-24" />
+          <Skeleton className="my-0.5 h-5 w-full" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The card while the record is read, hidden from assistive technology: the
+ * page's status announces the read. The titles are skeletons as high as
+ * their `leading-none` lines (h-4), and the merchant fields sit under theirs
+ * as in the card read, so nothing moves when the record arrives.
  */
 function AuthorizationSkeleton(): JSX.Element {
   return (
@@ -279,16 +309,11 @@ function AuthorizationSkeleton(): JSX.Element {
         <Skeleton className="h-4 w-32" />
       </CardHeader>
       <CardContent className="flex flex-col gap-6">
-        <div className={FIELD_GRID}>
-          {AUTHORIZATION_FIELDS.map((field) => (
-            <Skeleton key={field.bms} className="h-11 w-full" />
-          ))}
-        </div>
+        <FieldSkeletons fields={AUTHORIZATION_FIELDS} />
         <Separator />
-        <div className={FIELD_GRID}>
-          {MERCHANT_FIELDS.map((field) => (
-            <Skeleton key={field.bms} className="h-11 w-full" />
-          ))}
+        <div className="flex flex-col gap-4">
+          <Skeleton className="h-4 w-36" />
+          <FieldSkeletons fields={MERCHANT_FIELDS} />
         </div>
       </CardContent>
     </Card>

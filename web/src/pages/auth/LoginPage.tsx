@@ -5,7 +5,8 @@
 //   button, sends POST /auth/login once loginSchema accepts the values. One
 //   sign-on is out at a time: a second Enter or click before the answer sends
 //   nothing, and the form stays busy until the landing route replaces the
-//   page or the server rejects the sign-on.
+//   page, the server rejects the sign-on, or a navigation keeps this screen
+//   at another location.
 // - The user ID and password are sent exactly as typed, and the server
 //   normalizes them: like COSGN00C [app/cbl/COSGN00C.cbl:L132-136], it
 //   upper-cases and pads both before it reads the user and verifies the
@@ -30,7 +31,7 @@ import {
   type JSX,
 } from "react";
 import { Controller, useForm } from "react-hook-form";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { LoaderCircle } from "lucide-react";
 
@@ -102,6 +103,7 @@ const SIGN_ON_FIELDS: readonly SignOnField[] = [
 export default function LoginPage(): JSX.Element {
   const navigate = useNavigate();
   const login = useLoginMutation();
+  const location = useLocation();
   const form = useForm<LoginFormValues>({
     resolver: zodResolver(loginSchema),
     defaultValues: DEFAULT_VALUES,
@@ -112,24 +114,33 @@ export default function LoginPage(): JSX.Element {
   // One sign-on at a time. The ref closes the gap before the busy state
   // re-renders, so a second Enter or click sends nothing. `signingOn` keeps
   // the form busy after the mutation settles: on a success the page stays on
-  // screen while the router loads the landing route, so neither is cleared
-  // and the page leaves the screen still busy. A failure clears both, so the
-  // corrected values can be sent.
+  // screen while the router downloads the landing page, so neither is
+  // cleared and the page leaves the screen still busy. A failure clears both,
+  // so the corrected values can be sent.
   const inFlight = useRef(false);
   const [signingOn, setSigningOn] = useState(false);
-  const busy = signingOn || login.isPending;
+  // The location key this screen had when its sign-on succeeded. The
+  // location changes only in the router's commit of the landing, so the form
+  // stays busy until then; a navigation that keeps this screen at another
+  // location instead interrupts the landing and releases the form.
+  const [signedOnAt, setSignedOnAt] = useState<string | null>(null);
+  const landingInterrupted =
+    signedOnAt !== null && signedOnAt !== location.key;
+  const busy = login.isPending || (signingOn && !landingInterrupted);
 
   // handleSubmit calls this only for values loginSchema accepts, so input
   // the server would reject on its blank or length edits is never sent.
   // useLoginMutation has stored the session before onSuccess runs.
   const onSubmit = (values: LoginFormValues): void => {
-    if (inFlight.current) {
+    if (inFlight.current && !landingInterrupted) {
       return;
     }
     inFlight.current = true;
     setSigningOn(true);
+    setSignedOnAt(null);
     login.mutate(values, {
       onSuccess: (response) => {
+        setSignedOnAt(location.key);
         void navigate(response.landing, { replace: true });
       },
       onError: (error) => {
@@ -212,11 +223,7 @@ export default function LoginPage(): JSX.Element {
                     }}
                   />
                 ))}
-                <Button
-                  type="submit"
-                  className="w-full"
-                  disabled={busy}
-                >
+                <Button type="submit" className="w-full" disabled={busy}>
                   {busy ? (
                     <LoaderCircle
                       aria-hidden="true"

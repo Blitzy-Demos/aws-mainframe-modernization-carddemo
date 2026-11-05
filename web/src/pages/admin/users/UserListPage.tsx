@@ -41,6 +41,7 @@ import {
   type User,
   type UserListParams,
 } from "@/api/queries/admin-users";
+import type { components } from "@/api/schema";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { DataTable, type DataTableProps } from "@/components/data-table";
 import { BackLink, PageHeader } from "@/components/page-header";
@@ -83,6 +84,16 @@ const LIST_ROUTE = "/admin/users";
 // The admin menu, COADM01C, where PF3 leads [app/cbl/COUSR00C.cbl:L125-127].
 const ADMIN_ROUTE = "/admin";
 
+// The 10 rows of a COUSR0A page, the server's default page size.
+const PAGE_ROWS = 10;
+
+// The table keys each row by its user ID, the USRSEC record key, so a row's
+// Edit and Delete stay with their user when a delete moves the next user into
+// its place.
+function userRowId(user: User): string {
+  return user.user_id;
+}
+
 // One request of the browse: the key a page starts from and the direction.
 // No page size is sent, so every page holds the 10 rows of the COUSR0A screen.
 type Cursor = Pick<UserListParams, "start_key" | "direction">;
@@ -96,6 +107,54 @@ function searchCursor(startKey: string | undefined): Cursor {
 
 function sameCursor(a: Cursor, b: Cursor): boolean {
   return a.start_key === b.start_key && a.direction === b.direction;
+}
+
+// One page of the browse as `GET /admin/users` answers it.
+type UserPage = components["schemas"]["Page_UserSummary"];
+
+// An answer with no rows, only its page-boundary text: for PF7 on the first
+// page 'You are already at the top of the page...' (P-COUSR00C-004).
+function isBoundaryAnswer(page: UserPage): boolean {
+  return (
+    page.items.length === 0 &&
+    typeof page.message === "string" &&
+    page.message.trim().length > 0
+  );
+}
+
+// What the table showed when the user last asked for a browse: the page, the
+// query's answer it was shown for, the cursor that read the page, and whether
+// the browse is a PF7 or PF8 press rather than an ENTER.
+type OnScreen = {
+  answer: UserPage | undefined;
+  page: UserPage | undefined;
+  cursor: Cursor;
+  press: boolean;
+};
+
+// The page the table shows for the query's answer `page`.
+//
+// COUSR00C answers PF7 on the first page and PF8 without a next page with
+// SEND-ERASE-NO: the rows on screen stay, and only the header and the message
+// line are written (P-COUSR00C-004, P-COUSR00C-005, P-COUSR00C-013)
+// [app/cbl/COUSR00C.cbl:L250-254] [app/cbl/COUSR00C.cbl:L272-276]. The API
+// answers such a key with a page that has no rows and carries the text (E-54),
+// so such an answer to a press keeps the page that was on screen, with its
+// keys. ENTER sends its screen with ERASE, so the empty page of a search that
+// finds no user stands in the table. While a new browse loads, a page kept
+// stays in place of the empty answer the query holds over it.
+function pageShown(
+  page: UserPage | undefined,
+  onScreen: OnScreen,
+  loadingNext: boolean,
+): UserPage | undefined {
+  if (page === undefined || onScreen.page === undefined) {
+    return page;
+  }
+  if (loadingNext) {
+    return page === onScreen.answer ? onScreen.page : page;
+  }
+  return onScreen.press && isBoundaryAnswer(page) ? onScreen.page : page;
 }
 
 /** The fields COUSR03 shows before F5=Delete [app/bms/COUSR03.bms:L80-139]. */
@@ -151,16 +210,32 @@ export default function UserListPage(): JSX.Element {
   // the table in their place.
   const page = usersQuery.isError ? undefined : usersQuery.data;
 
+  // The page the table shows (pageShown): the answer, or the page kept on
+  // screen in its place after a PF7 or PF8 that found no page. `kept` tells
+  // the two apart, and `shownCursor` is the cursor that read the page shown.
+  const [onScreen, setOnScreen] = useState<OnScreen>({
+    answer: undefined,
+    page: undefined,
+    cursor: {},
+    press: false,
+  });
+  const shown = pageShown(page, onScreen, usersQuery.isPlaceholderData);
+  const kept = shown !== page;
+  const shownCursor = kept ? onScreen.cursor : cursor;
+
   // Counts the browses the user asked for (first entry, ENTER, PF7, PF8), so a
   // page's text is shown for the answer to a browse and not again when the
   // list is re-read after a delete.
   const browseCount = useRef(1);
 
-  // ENTER re-reads the file whatever the screen shows, so a search from the
-  // key already shown is a new read, not the cached page.
-  const onSearch = (values: UserListFilterValues): void => {
+  // Starts a browse the user asked for, noting what the table shows. ENTER
+  // re-reads the file whatever the screen shows, and so does every PF7 and
+  // PF8, so a browse from the cursor already read is a new read, not the
+  // cached page: Previous pressed again on the first page asks the server
+  // again and shows its text again.
+  const browse = (next: Cursor, press: boolean): void => {
     browseCount.current += 1;
-    const next = searchCursor(values.start_key);
+    setOnScreen({ answer: page, page: shown, cursor: shownCursor, press });
     if (sameCursor(next, cursor)) {
       void usersQuery.refetch();
     } else {
@@ -168,19 +243,21 @@ export default function UserListPage(): JSX.Element {
     }
   };
 
+  const onSearch = (values: UserListFilterValues): void => {
+    browse(searchCursor(values.start_key), false);
+  };
+
   // PF7 browses back from the first key shown, PF8 forward from the key the
   // page found after its last row. The table calls these only while the key
   // is present.
   const onPrevious = (): void => {
-    if (page?.prev_key) {
-      browseCount.current += 1;
-      setCursor({ start_key: page.prev_key, direction: "backward" });
+    if (shown?.prev_key) {
+      browse({ start_key: shown.prev_key, direction: "backward" }, true);
     }
   };
   const onNext = (): void => {
-    if (page?.next_key) {
-      browseCount.current += 1;
-      setCursor({ start_key: page.next_key, direction: "forward" });
+    if (shown?.next_key) {
+      browse({ start_key: shown.next_key, direction: "forward" }, true);
     }
   };
 
@@ -222,8 +299,11 @@ export default function UserListPage(): JSX.Element {
   // re-read the user did not ask for, such as the one after a delete, shows
   // nothing, and a failed read leaves no page to show. An empty page shows its
   // text in place of the rows, and its status region announces it, so it is
-  // not toasted as well. dataUpdatedAt marks every answer, including a
-  // repeated search whose page equals the one shown.
+  // not toasted as well; the empty answer to a PF7 or PF8 leaves the page
+  // shown instead (pageShown), so its text is toasted, once for each press,
+  // the message line COUSR00C rewrites (P-COUSR00C-013). dataUpdatedAt marks
+  // every answer, including a repeated search or key whose page equals the
+  // one shown.
   const answeredBrowse = useRef(0);
   const { dataUpdatedAt, isPlaceholderData } = usersQuery;
   useEffect(() => {
@@ -236,10 +316,10 @@ export default function UserListPage(): JSX.Element {
       return;
     }
     answeredBrowse.current = browseCount.current;
-    if (page.items.length > 0) {
+    if (page.items.length > 0 || kept) {
       showMessage(page.message);
     }
-  }, [page, dataUpdatedAt, isPlaceholderData, reading]);
+  }, [page, dataUpdatedAt, isPlaceholderData, reading, kept]);
 
   // The table waits for the read that is out: the first one, a page loading
   // behind the one kept on screen, or a re-read of a browse whose last read
@@ -297,23 +377,42 @@ export default function UserListPage(): JSX.Element {
   // settles on the delete's answer without waiting for that refresh, so the
   // outcome is shown before the refresh answers.
   //
+  // That re-read answers no PF7 or PF8, so an empty page it finds is shown as
+  // it is. A page kept on screen after such a key is not the one the query
+  // re-reads, which is the key's empty answer, so once the delete has
+  // answered, the kept page is read again from its own cursor, unless the
+  // user has browsed meanwhile.
+  //
   // An admin who deletes their own account ends their session with it: the
   // server answers every later request of that token 401, because its `sub`
   // names no stored user. The session is therefore ended here, once the text
   // is shown, and without a cause, so RequireAuth sends the admin to sign on
   // with no session-end notice and the delete's text is the only toast. The
   // refresh already out then belongs to an ended session, and api/client.ts
-  // ends no session for its 401; the unmounted page shows nothing for it.
+  // ends no session for its 401; the unmounted page shows nothing for it and
+  // reads no kept page again.
   const onConfirmDelete = (): void => {
     if (dialogUser === null) {
       return;
     }
     setDialogOpen(false);
+    const keptPage = kept
+      ? { answer: page, page: shown, cursor: shownCursor }
+      : null;
+    const browseAtConfirm = browseCount.current;
+    if (keptPage === null) {
+      setOnScreen((current) => ({ ...current, press: false }));
+    }
     deleteMutation.mutate(dialogUser.user_id, {
       onSuccess: (response, deletedId) => {
         showSuccess(response.message);
         if (getSession()?.user_id === deletedId) {
           clearSession();
+          return;
+        }
+        if (keptPage !== null && browseCount.current === browseAtConfirm) {
+          setOnScreen({ ...keptPage, press: false });
+          setCursor(keptPage.cursor);
         }
       },
       onError: (error) => {
@@ -335,6 +434,10 @@ export default function UserListPage(): JSX.Element {
   // its cells, and the focused Edit or Delete would lose focus. They
   // therefore depend on nothing but the stable id prefix and the stable state
   // setter.
+  //
+  // Each placeholder is its cell's markup around a value as wide as the
+  // column's on the seeded first page: a user ID and names as wide as its
+  // widest, the type letter and the row actions.
   const columns = useMemo<DataTableProps<User>["columns"]>(
     () => [
       {
@@ -345,15 +448,25 @@ export default function UserListPage(): JSX.Element {
             {row.original.user_id}
           </span>
         ),
+        meta: { placeholder: <span>ADMIN000</span> },
       },
-      { accessorKey: "first_name", header: "First Name" },
-      { accessorKey: "last_name", header: "Last Name" },
+      {
+        accessorKey: "first_name",
+        header: "First Name",
+        meta: { placeholder: "FIRSTNAME" },
+      },
+      {
+        accessorKey: "last_name",
+        header: "Last Name",
+        meta: { placeholder: "MACDONALD" },
+      },
       {
         accessorKey: "usr_type",
         header: "Type",
         cell: ({ row }) => (
           <Badge variant="secondary">{row.original.usr_type}</Badge>
         ),
+        meta: { placeholder: <Badge variant="secondary">U</Badge> },
       },
       {
         id: "actions",
@@ -384,6 +497,18 @@ export default function UserListPage(): JSX.Element {
               </Button>
             </div>
           );
+        },
+        meta: {
+          placeholder: (
+            <div className="flex items-center gap-2">
+              <Button variant="link" asChild>
+                <span>Edit</span>
+              </Button>
+              <Button variant="link" asChild>
+                <span>Delete</span>
+              </Button>
+            </div>
+          ),
         },
       },
     ],
@@ -448,14 +573,17 @@ export default function UserListPage(): JSX.Element {
 
       <DataTable<User>
         columns={columns}
-        data={page?.items ?? []}
-        prevKey={page?.prev_key}
-        nextKey={page?.next_key}
+        getRowId={userRowId}
+        data={shown?.items ?? []}
+        prevKey={shown?.prev_key}
+        nextKey={shown?.next_key}
         onPrevious={onPrevious}
         onNext={onNext}
         caption="Users, in user ID order"
-        emptyMessage={usersQuery.isError ? listErrorText : page?.message}
+        emptyMessage={usersQuery.isError ? listErrorText : shown?.message}
         loading={tableLoading}
+        pageSize={PAGE_ROWS}
+        rowHeight="default"
       />
 
       {dialogUser === null ? null : (

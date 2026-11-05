@@ -42,7 +42,10 @@ import { Link } from "react-router";
 import type { components } from "@/api/schema";
 import { useAccount } from "@/api/queries/accounts";
 import { useRewardBalance } from "@/api/queries/rewards";
-import { useRecentTransactions } from "@/api/queries/transactions";
+import {
+  RECENT_TRANSACTION_ROWS,
+  useRecentTransactions,
+} from "@/api/queries/transactions";
 import { MenuOptionList } from "@/components/app-sidebar";
 import { DataTable, type DataTableProps } from "@/components/data-table";
 import { PageHeader } from "@/components/page-header";
@@ -109,7 +112,10 @@ const STATUS_ANNOUNCE_DELAY_MS = 150;
 
 // Every cell renders the API string as sent. The date is the first ten
 // characters of the TRAN-ORIG-TS text, `YYYY-MM-DD`, cut as text and never
-// parsed as a date.
+// parsed as a date. Each placeholder is its cell's markup around a value as
+// wide as the column's: the 16-digit TRAN-ID link, a `YYYY-MM-DD` date, and a
+// description and an amount as wide as the widest of a seeded account's
+// recent transactions.
 const transactionColumns: DataTableProps<TransactionResponse>["columns"] = [
   {
     accessorKey: "tran_id",
@@ -121,19 +127,32 @@ const transactionColumns: DataTableProps<TransactionResponse>["columns"] = [
         </Link>
       </Button>
     ),
+    meta: {
+      placeholder: (
+        <Button variant="link" asChild className="h-auto p-0">
+          <span>0000000000000000</span>
+        </Button>
+      ),
+    },
   },
   {
     id: "tran_orig_date",
     header: "Date",
     accessorFn: (row) => row.tran_orig_ts.slice(0, 10),
+    meta: { placeholder: "0000-00-00" },
   },
-  { accessorKey: "tran_desc", header: "Description" },
+  {
+    accessorKey: "tran_desc",
+    header: "Description",
+    meta: { placeholder: "Purchase at Merchant, Inc and Company" },
+  },
   {
     accessorKey: "tran_amt",
     header: "Amount",
     cell: ({ row }) => (
       <span className="tabular-nums">{row.original.tran_amt}</span>
     ),
+    meta: { placeholder: <span className="tabular-nums">-999.99</span> },
   },
 ];
 
@@ -189,6 +208,7 @@ function OverviewSkeleton(): JSX.Element {
         onNext={() => undefined}
         caption={TRANSACTIONS_CAPTION}
         loading
+        pageSize={RECENT_TRANSACTION_ROWS}
       />
     </div>
   );
@@ -359,6 +379,7 @@ function AccountOverview({
           emptyMessage="No transactions on file for this account."
           caption={TRANSACTIONS_CAPTION}
           loading={transactions.isPending}
+          pageSize={RECENT_TRANSACTION_ROWS}
         />
       )}
     </section>

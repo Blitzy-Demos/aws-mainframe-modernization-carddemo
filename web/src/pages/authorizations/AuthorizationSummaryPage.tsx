@@ -64,6 +64,9 @@ const FIRST_PAGE: Cursor = {};
 /** The rows of the table while the first page of an account loads. */
 const NO_ITEMS: AuthSummaryItem[] = [];
 
+/** The five rows of a COPAU00 list page, the server's default page size. */
+const PAGE_ROWS = 5;
+
 /** `ACCTIDI PIC X(11)` (COPAU00.cpy:L60). */
 const ACCOUNT_ID_LENGTH = 11;
 
@@ -324,7 +327,17 @@ function AccountHeader({ summary }: { summary: AuthSummary }): JSX.Element {
   );
 }
 
-/** The header card while the first page of an account loads; the table's busy state announces the wait. */
+/** The screen lines of an entry: one per COPAU00 output field it shows. */
+function screenLineCount(field: HeaderField): number {
+  return field.bms.split(" ").length;
+}
+
+/**
+ * The header card while the first page of an account loads; the table's busy
+ * state announces the wait. Each caption and each value line is a skeleton
+ * centred in the 20px line box of the header's text-sm (h-4 with my-0.5), so
+ * every entry takes the height it takes once read.
+ */
 function AccountHeaderSkeleton(): JSX.Element {
   return (
     <Card aria-hidden="true">
@@ -335,8 +348,12 @@ function AccountHeaderSkeleton(): JSX.Element {
         <div className={HEADER_GRID}>
           {HEADER_FIELDS.map((field) => (
             <div key={field.bms} className="flex flex-col gap-1">
-              <Skeleton className="h-4 w-24" />
-              <Skeleton className="h-5 w-full" />
+              <Skeleton className="my-0.5 h-4 w-24" />
+              <div className="flex flex-col">
+                {Array.from({ length: screenLineCount(field) }, (_, line) => (
+                  <Skeleton key={line} className="my-0.5 h-4 w-full" />
+                ))}
+              </div>
             </div>
           ))}
         </div>
@@ -363,7 +380,11 @@ function approvalVariant(approved: string): BadgeVariant {
  * The COPAU00 list columns in BMS order, then the row action that replaces
  * the `S` selector. Each "View" link keeps the exact name of F-COPAU00-005
  * and is described by its row's transaction ID, so links are told apart
- * without changing their name.
+ * without changing their name. Each placeholder is its cell's markup around a
+ * value of the column's display format: a 15-position alphanumeric
+ * transaction ID (letters, then digits), `MM/DD/YY`, `HH:MM:SS`, the type, the
+ * A/D and match-status letters, an amount as wide as the widest of the seeded
+ * amounts, and the row action.
  */
 function authorizationColumns(detailSearch: string, idPrefix: string): AuthColumns {
   const transactionIdOf = (authId: string): string => `${idPrefix}-tran-${authId}`;
@@ -376,6 +397,7 @@ function authorizationColumns(detailSearch: string, idPrefix: string): AuthColum
           {row.original.pa_transaction_id}
         </span>
       ),
+      meta: { placeholder: <span className="tabular-nums">AA0000000000000</span> },
     },
     {
       id: "date",
@@ -383,6 +405,7 @@ function authorizationColumns(detailSearch: string, idPrefix: string): AuthColum
       cell: ({ row }) => (
         <span className="tabular-nums">{screenDate(row.original.pa_auth_orig_date)}</span>
       ),
+      meta: { placeholder: <span className="tabular-nums">00/00/00</span> },
     },
     {
       id: "time",
@@ -390,18 +413,33 @@ function authorizationColumns(detailSearch: string, idPrefix: string): AuthColum
       cell: ({ row }) => (
         <span className="tabular-nums">{screenTime(row.original.pa_auth_orig_time)}</span>
       ),
+      meta: { placeholder: <span className="tabular-nums">00:00:00</span> },
     },
-    { accessorKey: "pa_auth_type", header: "Type" },
+    { accessorKey: "pa_auth_type", header: "Type", meta: { placeholder: "POS" } },
     {
       accessorKey: "approved",
       header: () => <abbr title="Approved or declined">A/D</abbr>,
+      // BLITZY [LAYOUT]: the badge drops its block padding (overrode the
+      // default py-0.5) to fit the cell's text line, like the View link, so a
+      // row is as tall as DataTable's skeleton and filler rows at its default
+      // text row height.
       cell: ({ row }) => (
-        <Badge variant={approvalVariant(row.original.approved)}>{row.original.approved}</Badge>
+        <Badge variant={approvalVariant(row.original.approved)} className="py-0">
+          {row.original.approved}
+        </Badge>
       ),
+      meta: {
+        placeholder: (
+          <Badge variant={approvalVariant("A")} className="py-0">
+            A
+          </Badge>
+        ),
+      },
     },
     {
       accessorKey: "pa_match_status",
       header: () => <abbr title="Match status">STS</abbr>,
+      meta: { placeholder: "P" },
     },
     {
       accessorKey: "pa_approved_amt",
@@ -411,14 +449,17 @@ function authorizationColumns(detailSearch: string, idPrefix: string): AuthColum
           {editedAmount(row.original.pa_approved_amt, AMOUNT_12_INTEGER_DIGITS)}
         </span>
       ),
+      meta: {
+        placeholder: <span className="block text-right tabular-nums">-999.99</span>,
+      },
     },
     {
       id: "view",
       header: "Actions",
       // BLITZY [LAYOUT]: the link button takes the height of the cell's text
       // line (overrode the default h-9 px-4), as the row links of the other
-      // data tables do, so a row is as tall as its text and badges rather
-      // than the 36px button.
+      // data tables do, so a row is as tall as its text rather than the 36px
+      // button.
       // BLITZY [A11Y]: the link is therefore a 20px-high target, below the
       // 24px WCAG 2.2 minimum; the cell padding keeps neighbouring targets
       // apart. Flagged for designer review.
@@ -435,6 +476,13 @@ function authorizationColumns(detailSearch: string, idPrefix: string): AuthColum
           </Link>
         </Button>
       ),
+      meta: {
+        placeholder: (
+          <Button asChild variant="link" className="h-auto p-0">
+            <span>View</span>
+          </Button>
+        ),
+      },
     },
   ];
 }
@@ -558,16 +606,18 @@ function AuthorizationResults({
           onNext={ignorePageRequest}
           caption="Pending authorizations"
           loading
+          pageSize={PAGE_ROWS}
         />
       </>
     );
   }
 
   // The list is busy while any read of the page shown is outstanding, so held
-  // rows are never presented as its result: a new page held over the previous
-  // one (placeholder data, kept too while that read waits offline), a
-  // same-account Search reading the first page again, or a page already read,
-  // shown from the cache and read again when Previous or Next returns to it.
+  // rows are shown busy, never presented as its result: a new page held over
+  // the previous one (placeholder data, kept too while that read waits
+  // offline), a same-account Search reading the first page again, or a page
+  // already read, shown from the cache and read again when Previous or Next
+  // returns to it.
   const reading = isFetching || isPlaceholderData;
   const prevKey = current.prev_key;
   const nextKey = current.next_key;
@@ -592,6 +642,7 @@ function AuthorizationResults({
         emptyMessage={current.message}
         caption="Pending authorizations"
         loading={reading}
+        pageSize={PAGE_ROWS}
       />
     </>
   );
@@ -634,7 +685,11 @@ export default function AuthorizationSummaryPage(): JSX.Element {
     if (values.account_id === accountParam) {
       setSearch((count) => count + 1);
     } else {
-      setSearchParams({ account_id: values.account_id });
+      // An update within the page, so the scroll position stays (AppRoot).
+      setSearchParams(
+        { account_id: values.account_id },
+        { preventScrollReset: true },
+      );
     }
   };
 
