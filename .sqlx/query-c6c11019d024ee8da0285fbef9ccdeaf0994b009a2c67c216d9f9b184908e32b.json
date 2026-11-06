@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM customers",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "c6c11019d024ee8da0285fbef9ccdeaf0994b009a2c67c216d9f9b184908e32b"
+}

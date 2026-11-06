@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT accrual_id, account_id, transaction_id, rule_id, points_earned, created_at FROM reward_accruals WHERE account_id = $1 AND (created_at, accrual_id) <= (SELECT created_at, accrual_id FROM reward_accruals WHERE accrual_id = $2 AND account_id = $1) ORDER BY created_at DESC, accrual_id DESC LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "accrual_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "rule_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "points_earned",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ae740921146a44eb21e9b66402d1ae6691e7edd3d2f929b56a6a2d6fa64d95e0"
+}

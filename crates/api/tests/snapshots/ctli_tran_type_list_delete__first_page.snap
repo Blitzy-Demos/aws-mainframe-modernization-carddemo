@@ -1,0 +1,22 @@
+---
+source: crates/api/tests/ctli_tran_type_list_delete.rs
+expression: page
+snapshot_kind: text
+---
+items:
+  - description: PURCHASE
+    type_code: "01"
+  - description: PAYMENT
+    type_code: "02"
+  - description: CREDIT
+    type_code: "03"
+  - description: AUTHORIZATION
+    type_code: "04"
+  - description: REFUND
+    type_code: "05"
+  - description: REVERAL
+    type_code: "06"
+  - description: ADJUSTMENT
+    type_code: "07"
+next_key: ~
+prev_key: ~

@@ -1,0 +1,39 @@
+[package]
+name = "carddemo-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "ASCII and EBCDIC (CP037) record codecs for the CardDemo copybook layouts"
+
+# The library target is declared rather than discovered, so this manifest
+# loads even before src/lib.rs exists: Cargo loads every workspace member to
+# run any one package, and the std-only audit structure check runs ahead of
+# this crate's sources. The library is not benchmarked: `cargo bench` passes
+# its arguments to every bench target, and the library's libtest harness
+# rejects criterion's flags, so only the criterion bench below runs.
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[lints]
+workspace = true
+
+# The codec is pure byte translation: no database, runtime or other adapter
+# crate may appear here (crates/testkit/tests/hygiene.rs scans this manifest).
+[dependencies]
+carddemo-domain.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+insta = { workspace = true, features = ["yaml"] }
+proptest.workspace = true
+
+# The bench path is declared for the same reason as the [lib] path: Cargo
+# fails to load a manifest whose inferred bench file is missing.
+[[bench]]
+name = "codec"
+path = "benches/codec.rs"
+harness = false

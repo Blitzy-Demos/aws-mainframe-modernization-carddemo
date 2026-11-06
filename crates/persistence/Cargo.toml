@@ -1,0 +1,38 @@
+[package]
+name = "carddemo-persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "PostgreSQL adapters, unit of work, TRAN-ID allocation, migrator and seed for CardDemo"
+# The build script re-runs when the root migrations directory changes, so the migrator
+# embedded by sqlx::migrate! always carries the current SQL files.
+build = "build.rs"
+
+# The library target is declared rather than discovered, so this manifest loads even
+# before src/lib.rs exists: Cargo loads every workspace member to run any one package,
+# and the std-only audit structure check runs ahead of this crate's sources.
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Versions and base features live in the root [workspace.dependencies]. The workspace sqlx
+# entry already turns default features off and enables runtime-tokio, postgres, macros,
+# chrono, rust_decimal and migrate, so this crate adds none. sqlx runs on the async
+# runtime of the calling binary; this crate starts no runtime of its own.
+[dependencies]
+carddemo-domain.workspace = true
+carddemo-codec.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Intended dev-only cycle (persistence -> testkit -> persistence). The testkit public API
+# exposes no persistence type, so integration tests never meet two copies of one.
+[dev-dependencies]
+carddemo-testkit.workspace = true

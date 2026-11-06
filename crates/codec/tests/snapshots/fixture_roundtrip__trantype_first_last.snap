@@ -1,0 +1,25 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    TranTypeFileRecord {
+        tran_type: TranTypeRecord {
+            tran_type: TranTypeCode(
+                Alnum<2>("01"),
+            ),
+            tran_type_desc: Alnum<50>("Purchase                                          "),
+        },
+        filler: Alnum<8>("00000000"),
+    },
+    TranTypeFileRecord {
+        tran_type: TranTypeRecord {
+            tran_type: TranTypeCode(
+                Alnum<2>("07"),
+            ),
+            tran_type_desc: Alnum<50>("Adjustment                                        "),
+        },
+        filler: Alnum<8>("00000000"),
+    },
+)

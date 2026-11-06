@@ -1,0 +1,24 @@
+# Dev-only test support: migrated PostgreSQL and RabbitMQ containers on the
+# Compose image tags, fixture paths, and the hygiene and Compose-tag tests.
+# It is listed only under [dev-dependencies] of carddemo-persistence,
+# carddemo-api, carddemo-batch and carddemo-messaging. carddemo-persistence is
+# a normal dependency here, which makes persistence -> testkit -> persistence a
+# dev-dependency cycle that Cargo permits.
+[package]
+name = "carddemo-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+carddemo-persistence.workspace = true
+testcontainers.workspace = true
+testcontainers-modules = { workspace = true, features = ["postgres", "rabbitmq"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+sqlx.workspace = true
+lapin.workspace = true

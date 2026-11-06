@@ -1,0 +1,49 @@
+---
+source: crates/api/tests/cu00_user_list.rs
+expression: page
+snapshot_kind: text
+---
+items:
+  - first_name: MARGARET
+    last_name: GOLD
+    user_id: ADMIN001
+    usr_type: A
+  - first_name: RUSSELL
+    last_name: RUSSELL
+    user_id: ADMIN002
+    usr_type: A
+  - first_name: RAYMOND
+    last_name: WHITMORE
+    user_id: ADMIN003
+    usr_type: A
+  - first_name: EMMANUEL
+    last_name: CASGRAIN
+    user_id: ADMIN004
+    usr_type: A
+  - first_name: GRANVILLE
+    last_name: LACHAPELLE
+    user_id: ADMIN005
+    usr_type: A
+  - first_name: LAWRENCE
+    last_name: THOMAS
+    user_id: USER0001
+    usr_type: U
+  - first_name: AJITH
+    last_name: KUMAR
+    user_id: USER0002
+    usr_type: U
+  - first_name: LAURITZ
+    last_name: ALME
+    user_id: USER0003
+    usr_type: U
+  - first_name: AVERARDO
+    last_name: MAZZI
+    user_id: USER0004
+    usr_type: U
+  - first_name: LEE
+    last_name: TING
+    user_id: USER0005
+    usr_type: U
+message: You have reached the bottom of the page...
+next_key: ~
+prev_key: ADMIN001

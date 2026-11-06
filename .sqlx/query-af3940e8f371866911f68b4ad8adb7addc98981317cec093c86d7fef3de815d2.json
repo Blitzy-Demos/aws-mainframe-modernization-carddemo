@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO users (user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type)\n           VALUES ('TEMP0001', 'TEMPORARY', 'USER', $1, 'U')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "af3940e8f371866911f68b4ad8adb7addc98981317cec093c86d7fef3de815d2"
+}

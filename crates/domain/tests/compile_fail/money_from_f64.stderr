@@ -1,0 +1,5 @@
+error[E0277]: the trait bound `Money<10>: From<f64>` is not satisfied
+  --> tests/compile_fail/money_from_f64.rs:13:14
+   |
+13 |     let _ = <Money<10> as From<f64>>::from(1.5_f64);
+   |              ^^^^^^^^^ the trait `From<f64>` is not implemented for `Money<10>`

@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM trantype_file",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "60417d49ccb19505c704c3d0ad906d9bcbdebfb3974ae5eec7ef795af1032433"
+}

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(1) AS \"count!\"\n                         FROM transaction_types\n                        WHERE tr_type = $1::text\n                          AND rpad(tr_type, 2) COLLATE \"C\" < rpad($2::text, 2)\n                          AND ($3::text IS NULL OR tr_description LIKE $3::text ESCAPE '')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a73d2b8c7964e6a0c35dff528d6af99d0b83f67b9ac2b598b448f631193e384c"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE reward_balances SET available_points = available_points + 1 WHERE account_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0ee6cd1858c65d77cd7a6dffd94e9e2dd3a3cee23c0c4f9051d6f6d14cde3351"
+}

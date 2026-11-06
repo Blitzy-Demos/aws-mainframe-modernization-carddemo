@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n               (SELECT tr_description FROM transaction_types WHERE tr_type = '01')\n                   AS \"master_type_01?\",\n               (SELECT tr_description FROM transaction_types WHERE tr_type = '06')\n                   AS \"master_type_06?\",\n               (SELECT trc_cat_data FROM transaction_categories\n                 WHERE trc_type_code = '01' AND trc_type_category = '0001')\n                   AS \"master_category_0001?\",\n               (SELECT tran_type_desc FROM trantype_file WHERE tran_type = '01')\n                   AS \"file_type_01?\",\n               (SELECT tran_type_desc FROM trantype_file WHERE tran_type = '06')\n                   AS \"file_type_06?\",\n               (SELECT tran_cat_type_desc FROM trancatg_file\n                 WHERE tran_type_cd = '01' AND tran_cat_cd = 1)\n                   AS \"file_category_0001?\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "master_type_01?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "master_type_06?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "master_category_0001?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "file_type_01?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "file_type_06?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "file_category_0001?",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "597e447d8776843bde12aa3f74cdc5924e9f8d243339989bd24ae983b22f2c85"
+}

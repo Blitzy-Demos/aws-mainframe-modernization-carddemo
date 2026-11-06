@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE transactions SET in_master = TRUE\nWHERE NOT in_master\n  AND transaction_id = (\n      SELECT transaction_id FROM transactions\n      WHERE NOT in_master\n        AND tran_id = $1 AND tran_type_cd = $2 AND tran_cat_cd = $3\n        AND tran_source = $4 AND tran_desc = $5 AND tran_amt = $6\n        AND tran_merchant_id = $7 AND tran_merchant_name = $8\n        AND tran_merchant_city = $9 AND tran_merchant_zip = $10\n        AND tran_card_num = $11 AND tran_orig_ts = $12 AND tran_proc_ts = $13\n      ORDER BY transaction_id\n      LIMIT 1)\nRETURNING transaction_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "transaction_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int4",
+        "Text",
+        "Text",
+        "Numeric",
+        "Int4",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6cf5f44d954805dd898c1cbb6a899b8cf489285eccc26f877ba317c287793aef"
+}

@@ -1,0 +1,38 @@
+# AMQP adapter: the CDRD, CDRA and CP00 consumers on RabbitMQ, plus the `mq` binary.
+# Every version, feature set and internal path comes from the root [workspace.dependencies],
+# so no entry here adds features or defaults; database access goes only through carddemo-persistence.
+[package]
+name = "carddemo-messaging"
+description = "CardDemo RabbitMQ consumers (CDRD, CDRA, CP00)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mq"
+path = "src/bin/mq.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carddemo-domain.workspace = true
+carddemo-persistence.workspace = true
+carddemo-runtime.workspace = true
+lapin.workspace = true
+tokio-executor-trait.workspace = true
+tokio-reactor-trait.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+# carddemo-testkit is test support: dev-only, as hygiene.rs asserts. carddemo-audit is a
+# dev-dependency of api and batch only, so tests/common/mod.rs includes its std-only
+# parser by source instead of naming the package here.
+[dev-dependencies]
+carddemo-codec.workspace = true
+carddemo-testkit.workspace = true

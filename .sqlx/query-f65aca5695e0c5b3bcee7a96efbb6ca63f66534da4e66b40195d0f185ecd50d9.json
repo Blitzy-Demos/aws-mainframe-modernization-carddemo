@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (\n               SELECT 1 FROM transaction_categories\n                WHERE trc_type_category !~ '^[0-9]{4}$') AS \"found!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "found!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f65aca5695e0c5b3bcee7a96efbb6ca63f66534da4e66b40195d0f185ecd50d9"
+}

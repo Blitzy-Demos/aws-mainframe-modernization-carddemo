@@ -1,0 +1,45 @@
+[package]
+name = "carddemo-domain"
+description = "CardDemo business core: copybook newtypes, ported COBOL rules, reward engine, port traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The library target is declared rather than discovered, so this manifest
+# loads even before src/lib.rs exists: Cargo loads every workspace member to
+# run any one package, and the std-only audit structure check runs ahead of
+# this crate's sources. The library is not benchmarked: `cargo bench` passes
+# its arguments to every bench target, and the library's libtest harness
+# rejects criterion's flags, so only the criterion bench below runs.
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[lints]
+workspace = true
+
+# The domain stays pure: no runtime, database, HTTP, AMQP, serialization, PDF
+# or other carddemo crate may appear in any dependency table here, including
+# dev-dependencies. tests/manifest_boundary.rs enforces this. Versions live in
+# the root [workspace.dependencies]; this manifest adds features only.
+[dependencies]
+argon2.workspace = true
+chrono.workspace = true
+password-hash = { workspace = true, features = ["getrandom"] }
+rust_decimal.workspace = true
+rust_decimal_macros.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+trybuild.workspace = true
+
+# The bench path is declared for the same reason as the [lib] path: Cargo
+# fails to load a manifest whose inferred bench file is missing.
+[[bench]]
+name = "reward_engine"
+path = "benches/reward_engine.rs"
+harness = false

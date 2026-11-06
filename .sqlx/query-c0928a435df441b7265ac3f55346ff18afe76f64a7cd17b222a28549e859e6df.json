@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    table_name::text AS \"table_name!\",\n    column_name::text AS \"column_name!\",\n    udt_name::text AS \"udt_name!\"\nFROM information_schema.columns\nWHERE table_schema = 'public'\n  AND (data_type IN ('real', 'double precision') OR udt_name IN ('_float4', '_float8'))\nORDER BY 1, 2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "table_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "column_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "udt_name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "c0928a435df441b7265ac3f55346ff18afe76f64a7cd17b222a28549e859e6df"
+}

@@ -1,0 +1,122 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM accounts t) AS \"accounts!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM cards t) AS \"cards!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM card_xref t) AS \"card_xref!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM customers t) AS \"customers!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM disclosure_groups t) AS \"disclosure_groups!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM transaction_category_balances t) AS \"transaction_category_balances!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM transaction_types t) AS \"transaction_types!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM trantype_file t) AS \"trantype_file!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM transaction_categories t) AS \"transaction_categories!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM trancatg_file t) AS \"trancatg_file!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM users t) AS \"users!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM reward_rules t) AS \"reward_rules!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM reward_accruals t) AS \"reward_accruals!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM reward_balances t) AS \"reward_balances!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM transactions t) AS \"transactions!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM pending_auth_summaries t) AS \"pending_auth_summaries!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM pending_auth_details t) AS \"pending_auth_details!\",\n               (SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), ''))\n                  FROM auth_fraud t) AS \"auth_fraud!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "accounts!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "cards!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "card_xref!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "customers!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "disclosure_groups!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "transaction_category_balances!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "transaction_types!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "trantype_file!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "transaction_categories!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "trancatg_file!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "users!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "reward_rules!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "reward_accruals!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "reward_balances!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "transactions!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "pending_auth_summaries!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "pending_auth_details!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "auth_fraud!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "bf0b7570cec3deccf8ffcb068b9a9cf44ee3b7d206982aeb547b91587f0a658d"
+}

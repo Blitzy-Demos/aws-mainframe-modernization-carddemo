@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO reward_accruals (account_id, transaction_id, rule_id, points_earned, created_at)\n           VALUES (1, $1, 1, 10, $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f1b2d1e32ecf9b50450ac77a32e3645df30fd4e3057adcfea9b4b2a480b872f2"
+}

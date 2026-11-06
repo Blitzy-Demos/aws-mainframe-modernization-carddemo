@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO customers (\n                   customer_id, cust_first_name, cust_middle_name, cust_last_name,\n                   cust_addr_line_1, cust_addr_line_2, cust_addr_line_3,\n                   cust_addr_state_cd, cust_addr_country_cd, cust_addr_zip,\n                   cust_phone_num_1, cust_phone_num_2, cust_ssn, cust_govt_issued_id,\n                   cust_dob_yyyy_mm_dd, cust_eft_account_id, cust_pri_card_holder_ind,\n                   cust_fico_credit_score)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n                       $15, $16, $17, $18)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0a1d430b02a178335547e5181ed43b172b9dcc7c4de19ef29b76656828e9e6fe"
+}

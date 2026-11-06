@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "TRUNCATE reward_accruals, reward_balances, reward_rules RESTART IDENTITY",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "bbb79e22cfc51cbb3a4766d6f93e190d1be934f395abd3bcb0e73da7163ec80c"
+}

@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT card_number AS num, card_acct_id AS acct_id, card_cvv_cd AS cvv_cd,\n                    card_embossed_name AS embossed_name,\n                    card_expiraion_date AS expiraion_date,\n                    card_active_status AS active_status\n               FROM cards\n              WHERE card_number = $1\n                FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "num",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "cvv_cd",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "embossed_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "expiraion_date",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "active_status",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a0ef84364982a8f1a05c069a888b9c00bcfd475bd1d9c0be5248298f65f83688"
+}

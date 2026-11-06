@@ -1,0 +1,14 @@
+# std only: the pre-code structure check `cargo test -p carddemo-audit --test audit_structure`
+# must compile this package alone, so no dependency table of any kind is declared here,
+# not even an empty one (crates/testkit/tests/hygiene.rs rejects the headers).
+[package]
+name = "carddemo-audit"
+description = "Std-only parser and structure check for the CardDemo parity audit tables"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

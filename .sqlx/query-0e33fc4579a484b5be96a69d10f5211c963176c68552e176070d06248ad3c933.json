@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO reward_rules (\n               transaction_type_cd, transaction_category_cd, reward_rate, active_from)\n           VALUES ('02', 1, 2.5000, $1)\n           RETURNING rule_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rule_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0e33fc4579a484b5be96a69d10f5211c963176c68552e176070d06248ad3c933"
+}

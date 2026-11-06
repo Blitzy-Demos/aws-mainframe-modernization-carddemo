@@ -1,0 +1,58 @@
+diff --git a/dist/chunk-utils.js b/dist/chunk-utils.js
+index 3916d3851d452b5a7d4c9ff01fedc4f2ddf22aa2..652dcdec4ff0880037bb11a4875df317852f6b4d 100644
+--- a/dist/chunk-utils.js
++++ b/dist/chunk-utils.js
+@@ -2,13 +2,17 @@ const postfixRE = /[?#].*$/;
+ function cleanUrl(url) {
+ 	return url.replace(postfixRE, "");
+ }
++// The module URL and every export name are written as JSON string literals, and
++// each named export goes through a string-named export specifier, so neither a
++// URL nor an export name can change the generated code (GHSA-qxg6-89mg-rqv8,
++// backport of @vitest/mocker 4.1.12).
+ function createManualModuleSource(moduleUrl, exports, globalAccessor = "\"__vitest_mocker__\"") {
+-	const source = `const module = globalThis[${globalAccessor}].getFactoryModule("${moduleUrl}");`;
+-	const keys = exports.map((name) => {
++	const source = `const module = globalThis[${globalAccessor}].getFactoryModule(${JSON.stringify(moduleUrl)});`;
++	const keys = exports.map((name, index) => {
+ 		if (name === "default") {
+ 			return `export default module["default"];`;
+ 		}
+-		return `export const ${name} = module["${name}"];`;
++		return `const __${index} = module[${JSON.stringify(name)}];\nexport { __${index} as ${JSON.stringify(name)} };`;
+ 	}).join("\n");
+ 	return `${source}\n${keys}`;
+ }
+diff --git a/dist/node.js b/dist/node.js
+index f7dad3e28e1cef9420b076c4a8886c2f98166bae..55bb45094d0e929c31a36ea46aedf2987364f517 100644
+--- a/dist/node.js
++++ b/dist/node.js
+@@ -1,7 +1,7 @@
+ import { a as cleanUrl, c as createManualModuleSource } from './chunk-utils.js';
+ import MagicString from 'magic-string';
+ import { walk } from 'estree-walker';
+-import { createFilter } from 'vite';
++import { createFilter, isFileLoadingAllowed } from 'vite';
+ import { readFile } from 'node:fs/promises';
+ import { join } from 'node:path/posix';
+ import { M as MockerRegistry, a as ManualMockedModule } from './chunk-registry.js';
+@@ -1090,7 +1090,18 @@ function interceptorPlugin(options = {}) {
+ 				} else {
+ 					if (event.type === "redirect") {
+ 						const redirectUrl = new URL(event.redirect);
+-						event.redirect = join(server.config.root, redirectUrl.pathname);
++						// Backslashes become separators before the join, so a Windows
++						// `..\` cannot slip past it; the redirect is then read by the
++						// `load` hook above, so it must stay inside the dev server's
++						// file-serving allowlist, and a target outside it is answered
++						// without being registered (GHSA-82fw-gwwq-j7x9, backport of
++						// @vitest/mocker 4.1.11 and 4.1.12).
++						const redirect = join(server.config.root, redirectUrl.pathname.replace(/\\/g, "/"));
++						if (!isFileLoadingAllowed(server.config, redirect)) {
++							server.ws.send("vitest:interceptor:register:result");
++							return;
++						}
++						event.redirect = redirect;
+ 					}
+ 					registry.register(event);
+ 				}

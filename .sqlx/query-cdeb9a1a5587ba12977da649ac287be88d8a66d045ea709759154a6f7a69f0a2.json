@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT customer_id, cust_first_name, cust_middle_name, cust_last_name, cust_addr_line_1, cust_addr_line_2, cust_addr_line_3, cust_addr_state_cd, cust_addr_country_cd, cust_addr_zip, cust_phone_num_1, cust_phone_num_2, cust_ssn, cust_govt_issued_id, cust_dob_yyyy_mm_dd, cust_eft_account_id, cust_pri_card_holder_ind, cust_fico_credit_score FROM customers WHERE customer_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "customer_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "cust_first_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "cust_middle_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "cust_last_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "cust_addr_line_1",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "cust_addr_line_2",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "cust_addr_line_3",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "cust_addr_state_cd",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "cust_addr_country_cd",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "cust_addr_zip",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "cust_phone_num_1",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "cust_phone_num_2",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "cust_ssn",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "cust_govt_issued_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "cust_dob_yyyy_mm_dd",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 15,
+        "name": "cust_eft_account_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 16,
+        "name": "cust_pri_card_holder_ind",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 17,
+        "name": "cust_fico_credit_score",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "cdeb9a1a5587ba12977da649ac287be88d8a66d045ea709759154a6f7a69f0a2"
+}

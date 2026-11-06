@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT xref_card_num AS card_num,\n                              xref_cust_id  AS cust_id,\n                              xref_acct_id  AS acct_id\n                         FROM card_xref\n                        ORDER BY xref_card_num COLLATE \"C\"\n                        LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "card_num",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "cust_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "acct_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c4604f7944e201cc0b4e8961d9e9d8c7474878e2d463a4bb6da699888ea5f7bd"
+}

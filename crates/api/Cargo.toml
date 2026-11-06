@@ -1,0 +1,54 @@
+[package]
+name = "carddemo-api"
+description = "CardDemo REST API: axum handlers over the domain rules, with the utoipa OpenAPI document"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "api"
+path = "src/bin/api.rs"
+
+[[bin]]
+name = "openapi"
+path = "src/bin/openapi.rs"
+
+# The database is reached only through carddemo-persistence; this crate names no
+# database driver, so the crate-graph boundary in crates/testkit/tests/hygiene.rs holds.
+[dependencies]
+carddemo-domain.workspace = true
+carddemo-persistence.workspace = true
+carddemo-runtime.workspace = true
+
+axum.workspace = true
+# The CR00 report body is streamed: axum's `Body::from_stream` takes a futures
+# `TryStream`, a trait neither axum nor tokio re-exports.
+futures-util.workspace = true
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+utoipa-axum.workspace = true
+validator.workspace = true
+
+# Money, rates and points cross the API as decimal strings, matching the utoipa
+# `decimal` schema; a JSON number would lose precision in the browser.
+rust_decimal = { workspace = true, features = ["serde-with-str"] }
+chrono = { workspace = true, features = ["serde"] }
+
+# carddemo-testkit and carddemo-audit are test support: dev-only, as hygiene.rs asserts.
+[dev-dependencies]
+carddemo-audit.workspace = true
+carddemo-testkit.workspace = true
+insta.workspace = true
+reqwest.workspace = true

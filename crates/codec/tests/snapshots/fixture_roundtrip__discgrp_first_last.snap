@@ -1,0 +1,51 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    DisclosureGroupRecord {
+        group: DisclosureGroup {
+            key: DisclosureGroupKey {
+                dis_acct_group_id: AccountGroupId(
+                    Alnum<10>("A000000000"),
+                ),
+                dis_tran_type_cd: TranTypeCode(
+                    Alnum<2>("01"),
+                ),
+                dis_tran_cat_cd: TranCategoryCode(
+                    1,
+                ),
+            },
+            dis_int_rate: InterestRate(
+                15.00,
+            ),
+        },
+        filler: Alnum<28>("0000000000000000000000000000"),
+        preserved: PreservedFields(
+            [],
+        ),
+    },
+    DisclosureGroupRecord {
+        group: DisclosureGroup {
+            key: DisclosureGroupKey {
+                dis_acct_group_id: AccountGroupId(
+                    Alnum<10>("ZEROAPR   "),
+                ),
+                dis_tran_type_cd: TranTypeCode(
+                    Alnum<2>("07"),
+                ),
+                dis_tran_cat_cd: TranCategoryCode(
+                    1,
+                ),
+            },
+            dis_int_rate: InterestRate(
+                0.00,
+            ),
+        },
+        filler: Alnum<28>("0000000000000000000000000000"),
+        preserved: PreservedFields(
+            [],
+        ),
+    },
+)

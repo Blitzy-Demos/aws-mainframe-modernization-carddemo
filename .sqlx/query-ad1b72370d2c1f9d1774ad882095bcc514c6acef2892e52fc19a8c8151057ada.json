@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO trantype_file (tran_type, tran_type_desc)\n           SELECT tr_type, rtrim(tr_description)\n             FROM transaction_types\n            ORDER BY tr_type COLLATE \"C\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "ad1b72370d2c1f9d1774ad882095bcc514c6acef2892e52fc19a8c8151057ada"
+}

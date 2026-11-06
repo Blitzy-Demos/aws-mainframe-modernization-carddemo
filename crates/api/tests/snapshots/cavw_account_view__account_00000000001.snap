@@ -1,0 +1,35 @@
+---
+source: crates/api/tests/cavw_account_view.rs
+expression: body
+snapshot_kind: text
+---
+account_id: "00000000001"
+acct_active_status: Y
+acct_cash_credit_limit: "1020.00"
+acct_credit_limit: "2020.00"
+acct_curr_bal: "194.00"
+acct_curr_cyc_credit: "0.00"
+acct_curr_cyc_debit: "0.00"
+acct_expiraion_date: 2025-05-20
+acct_group_id: ""
+acct_open_date: 2014-11-20
+acct_reissue_date: 2025-05-20
+card_number: "9680294154603697"
+cust_addr_country_cd: USA
+cust_addr_line_1: 618 Deshaun Route
+cust_addr_line_2: Apt. 802
+cust_addr_line_3: Altenwerthshire
+cust_addr_state_cd: NC
+cust_addr_zip: "12546"
+cust_dob_yyyy_mm_dd: 1961-06-08
+cust_eft_account_id: "0053581756"
+cust_fico_credit_score: "274"
+cust_first_name: Immanuel
+cust_govt_issued_id: "00000000000049368437"
+cust_last_name: Kessler
+cust_middle_name: Madeline
+cust_phone_num_1: (908)119-8310
+cust_phone_num_2: (373)693-8684
+cust_pri_card_holder_ind: Y
+cust_ssn: "020973888"
+customer_id: "000000001"

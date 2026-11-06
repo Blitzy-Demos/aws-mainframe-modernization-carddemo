@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO card_xref (xref_card_num, xref_cust_id, xref_acct_id)\n               VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5d97d0b31526f48fa23302f2c2313c27ae3d97af25262b08b7b7ae8c9768b263"
+}

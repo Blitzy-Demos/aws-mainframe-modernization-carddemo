@@ -1,0 +1,50 @@
+# Supply-chain policy for the CardDemo Rust workspace, checked by cargo-deny 0.20.2
+# with `cargo deny check` at the repository root.
+
+# Default graph: every workspace member, every target, and dev-dependencies too.
+# Nothing is pruned, so the dev-only testcontainers path below is checked as well.
+[graph]
+
+[advisories]
+yanked = "deny"
+# Vulnerability advisories fail the check by default. The only exceptions are the
+# two `ignore` entries below, each with its reason (escalation E-11).
+# Unmaintained advisories fail only for direct dependencies of workspace crates.
+# The transitive unmaintained crates this scope excludes (escalation E-11) are
+# instant, paste, proc-macro-error2, rustls-pemfile and ttf-parser, each reached
+# only through a pinned package.
+unmaintained = "workspace"
+# Supply-chain exceptions forced by the pinned stack (escalation E-11, awaiting
+# the user's acceptance). These are not Rust lint suppressions.
+ignore = [
+    { id = "RUSTSEC-2026-0187", reason = "lopdf 0.31 unbounded recursion on nested objects, fixed in 0.42. lopdf 0.31 is forced by printpdf 0.7, and it parses only PDFs this program writes: the statement renderer reads back its own output and the statement test reads the rendered file (E-11)" },
+    { id = "RUSTSEC-2025-0111", reason = "tokio-tar PAX header handling, no fixed release. Dev-only, through testcontainers 0.23 (E-11)" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+# Both native TLS stacks stay out of the graph: lapin, jsonwebtoken and reqwest are
+# declared without default features, and sqlx carries no TLS feature.
+deny = [
+    { crate = "openssl-sys" },
+    { crate = "native-tls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

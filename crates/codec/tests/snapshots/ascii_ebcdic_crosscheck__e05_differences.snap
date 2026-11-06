@@ -1,0 +1,21 @@
+---
+source: crates/codec/tests/ascii_ebcdic_crosscheck.rs
+expression: differences
+snapshot_kind: text
+---
+[
+    Difference {
+        file: "acctdata.txt",
+        record: 49,
+        field: "ACCT-ADDR-ZIP",
+        ascii: "A000000000",
+        ebcdic: "ZEROAPR   ",
+    },
+    Difference {
+        file: "discgrp.txt",
+        record: 34,
+        field: "DIS-INT-RATE",
+        ascii: "00000{",
+        ebcdic: "00150{",
+    },
+]

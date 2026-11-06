@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO transactions (\n    tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt, tran_merchant_id,\n    tran_merchant_name, tran_merchant_city, tran_merchant_zip, tran_card_num, tran_orig_ts,\n    tran_proc_ts)\nVALUES ($1, '01', 1, 'POS TERM', 'Purchase at Abshire-Lowe', 50.47, 800000000,\n    'Abshire-Lowe', 'North Enoshaven', '72112', '4859452612877065',\n    '2022-06-10 19:27:53.000000', '2022-07-01-12.00.00.000000')\nRETURNING transaction_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "transaction_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "dcc228b30dd3dd6d610e5797736559f376e260e5478a6e0b62d7f808a05cb872"
+}

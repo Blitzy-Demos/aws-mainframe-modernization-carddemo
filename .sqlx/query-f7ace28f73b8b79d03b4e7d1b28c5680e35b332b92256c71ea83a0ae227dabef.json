@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n               (SELECT count(*) FROM accounts) AS \"accounts!\",\n               (SELECT count(*) FROM cards) AS \"cards!\",\n               (SELECT count(*) FROM card_xref) AS \"card_xref!\",\n               (SELECT count(*) FROM customers) AS \"customers!\",\n               (SELECT count(*) FROM disclosure_groups) AS \"disclosure_groups!\",\n               (SELECT count(*) FROM transaction_category_balances)\n                   AS \"transaction_category_balances!\",\n               (SELECT count(*) FROM transaction_types) AS \"transaction_types!\",\n               (SELECT count(*) FROM trantype_file) AS \"trantype_file!\",\n               (SELECT count(*) FROM transaction_categories) AS \"transaction_categories!\",\n               (SELECT count(*) FROM trancatg_file) AS \"trancatg_file!\",\n               (SELECT count(*) FROM users) AS \"users!\",\n               (SELECT count(*) FROM reward_rules) AS \"reward_rules!\",\n               (SELECT count(*) FROM reward_accruals) AS \"reward_accruals!\",\n               (SELECT count(*) FROM reward_balances) AS \"reward_balances!\",\n               (SELECT count(*) FROM transactions) AS \"transactions!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "accounts!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "cards!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "card_xref!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "customers!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "disclosure_groups!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "transaction_category_balances!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "transaction_types!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "trantype_file!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "transaction_categories!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "trancatg_file!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "users!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "reward_rules!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "reward_accruals!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "reward_balances!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 14,
+        "name": "transactions!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "f7ace28f73b8b79d03b4e7d1b28c5680e35b332b92256c71ea83a0ae227dabef"
+}

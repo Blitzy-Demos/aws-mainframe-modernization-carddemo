@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal\n                       FROM transaction_category_balances\n                       WHERE (trancat_acct_id, rpad(trancat_type_cd, 2) COLLATE \"C\", trancat_cd)\n                             > ($1, rpad($2, 2) COLLATE \"C\", $3)\n                       ORDER BY trancat_acct_id, rpad(trancat_type_cd, 2) COLLATE \"C\", trancat_cd\n                       LIMIT $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "trancat_acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "trancat_type_cd",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "trancat_cd",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "tran_cat_bal",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "6d4ef4c0aa0a2b48330d81d8944e911c15cc86e1d1f86e3b22c427151baced26"
+}

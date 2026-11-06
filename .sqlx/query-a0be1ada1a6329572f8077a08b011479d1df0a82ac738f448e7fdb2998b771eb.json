@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO disclosure_groups (\n                   dis_acct_group_id, dis_tran_type_cd, dis_tran_cat_cd, dis_int_rate)\n               VALUES ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a0be1ada1a6329572f8077a08b011479d1df0a82ac738f448e7fdb2998b771eb"
+}

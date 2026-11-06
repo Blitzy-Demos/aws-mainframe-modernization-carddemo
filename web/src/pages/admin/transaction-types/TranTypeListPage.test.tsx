@@ -1,0 +1,1022 @@
+// FN tests of the CTLI list page (TranTypeListPage.tsx, COTRTLIC map COTRTLI):
+// each control the function map names (F-COTRTLI-001, -006, -007, -008,
+// -009) sends its request for valid input, sends nothing for input the
+// schema module rejects, and shows a server rejection through lib/api-errors
+// (toast, field error, focus). The inline update sends one PUT per Save, a
+// double click included, and keeps its Save focused while the PUT runs. An
+// inline update without an answer before the client's deadline is sent once,
+// toasted with a note that it may have been saved, and the list is read
+// again. The API is stubbed at the global the client sends through; every
+// body is typed against the generated OpenAPI schemas.
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { createMemoryRouter, RouterProvider } from "react-router";
+import { toast } from "sonner";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { RequestTimeoutError } from "@/api/client";
+import type { components } from "@/api/schema";
+import { ThemeProvider } from "@/components/theme-provider";
+import { Toaster } from "@/components/ui/sonner";
+import {
+  tranTypeInlineEditSchema,
+  tranTypeListFilterSchema,
+} from "@/schemas/transaction-types";
+
+import TranTypeListPage from "./TranTypeListPage";
+
+type Schemas = components["schemas"];
+
+const ROUTE = "/admin/transaction-types";
+const API_PATH = `/api${ROUTE}`;
+
+// app/data/ASCII/trantype.txt rows 1 and 2.
+const PURCHASE = {
+  type_code: "01",
+  description: "Purchase",
+} satisfies Schemas["TranTypeResponse"];
+
+const PAYMENT = {
+  type_code: "02",
+  description: "Payment",
+} satisfies Schemas["TranTypeResponse"];
+
+const LIST_PAGE = {
+  items: [PURCHASE, PAYMENT],
+  next_key: null,
+  prev_key: null,
+} satisfies Schemas["Page_TranTypeResponse"];
+
+const FILTERED_PAGE = {
+  items: [PURCHASE],
+  next_key: null,
+  prev_key: null,
+} satisfies Schemas["Page_TranTypeResponse"];
+
+// Placeholder texts: the page shows whatever the server sends.
+const UPDATE_ANSWER = {
+  message: "Stub update message",
+  // A stored change: the info line repeats the message.
+  info: "Stub update message",
+  transaction_type: { type_code: "01", description: "Retail purchase" },
+} satisfies Schemas["TranTypeMessageResponse"];
+
+const DELETE_ANSWER = {
+  message: "Stub delete message",
+  transaction_type: null,
+} satisfies Schemas["TranTypeMessageResponse"];
+
+const TRTYPE: Schemas["TranTypeListField"] = "TRTYPE";
+
+const FILTER_REJECTION_TEXT = "Stub filter rejection";
+
+const FILTER_REJECTION = {
+  code: "INVALID",
+  message: FILTER_REJECTION_TEXT,
+  fields: [{ field: TRTYPE, message: FILTER_REJECTION_TEXT }],
+} satisfies Schemas["ErrorBody"];
+
+const ROW_REJECTION = {
+  code: "INVALID",
+  message: "Stub row rejection",
+} satisfies Schemas["ErrorBody"];
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// The server's answers when a test sets no other: the filtered page for a
+// type filter, the full page otherwise, and the commit texts of the writes.
+function defaultRespond(request: Request): Response {
+  const url = new URL(request.url);
+  switch (request.method) {
+    case "GET":
+      return json(
+        url.searchParams.has("type_code") ? FILTERED_PAGE : LIST_PAGE,
+      );
+    case "PUT":
+      return json(UPDATE_ANSWER);
+    case "DELETE":
+      return json(DELETE_ANSWER);
+    default:
+      return json({ code: "UNEXPECTED", message: "Unexpected error" }, 500);
+  }
+}
+
+let respond: (request: Request) => Response | Promise<Response> =
+  defaultRespond;
+
+// The client hands the global its Request and an init carrying only the
+// deadline signal, so the Request alone describes the call.
+const fetchMock = vi.fn(async (input: Request) => respond(input));
+
+function requests(method: string): Request[] {
+  return fetchMock.mock.calls
+    .map(([request]) => request)
+    .filter((request) => request.method === method);
+}
+
+function renderPage() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+  const router = createMemoryRouter(
+    [
+      {
+        path: ROUTE,
+        element: <TranTypeListPage />,
+        handle: { crumb: "Transaction Types", title: "Transaction Types" },
+      },
+    ],
+    { initialEntries: [ROUTE] },
+  );
+  render(
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+        <Toaster />
+      </QueryClientProvider>
+    </ThemeProvider>,
+  );
+  return { user: userEvent.setup() };
+}
+
+// The page after its first list request has answered.
+async function renderLoadedPage() {
+  const view = renderPage();
+  await screen.findByText(PURCHASE.description);
+  return view;
+}
+
+function filterForm(): HTMLElement {
+  return screen.getByRole("search", { name: "Transaction type filters" });
+}
+
+function typeFilter(): HTMLElement {
+  return screen.getByRole("textbox", { name: "Type filter" });
+}
+
+function rowButton(name: "Edit" | "Delete", typeCode: string): HTMLElement {
+  return screen.getByRole("button", { name, description: typeCode });
+}
+
+function rowDescription(): HTMLElement {
+  return screen.getByRole("textbox", { name: "Description" });
+}
+
+function rowForm(): HTMLElement {
+  const form = rowDescription().closest("form");
+  if (form === null) {
+    throw new Error("the row description is outside a form");
+  }
+  return form;
+}
+
+// The first issue message the schema gives for `values`.
+function schemaMessage(
+  schema: typeof tranTypeListFilterSchema | typeof tranTypeInlineEditSchema,
+  values: Record<string, string>,
+): string {
+  const result = schema.safeParse(values);
+  if (result.success) {
+    throw new Error(`the schema accepts ${JSON.stringify(values)}`);
+  }
+  const [issue] = result.error.issues;
+  if (issue === undefined) {
+    throw new Error("the schema rejected without an issue");
+  }
+  return issue.message;
+}
+
+beforeEach(() => {
+  respond = defaultRespond;
+  fetchMock.mockClear();
+  vi.stubGlobal("fetch", fetchMock);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("TranTypeListPage filters (F-COTRTLI-001)", () => {
+  it("lists the first page without filters", async () => {
+    await renderLoadedPage();
+
+    const [initial] = requests("GET");
+    if (initial === undefined) {
+      throw new Error("no list request was sent");
+    }
+    const url = new URL(initial.url);
+    expect(url.pathname).toBe(API_PATH);
+    expect([...url.searchParams.keys()]).toEqual([]);
+    // One row, with its own Edit, per listed type.
+    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(2);
+  });
+
+  it("sends a valid type filter on Enter and shows the filtered page", async () => {
+    const { user } = await renderLoadedPage();
+
+    await user.type(typeFilter(), "01{Enter}");
+
+    await waitFor(() => {
+      const filtered = requests("GET").filter(
+        (request) =>
+          new URL(request.url).searchParams.get("type_code") === "01",
+      );
+      expect(filtered).toHaveLength(1);
+    });
+    const [request] = requests("GET").slice(-1);
+    if (request === undefined) {
+      throw new Error("no filtered list request was sent");
+    }
+    const url = new URL(request.url);
+    expect(url.pathname).toBe(API_PATH);
+    // A blank description filter is left out of the query.
+    expect(url.searchParams.has("description")).toBe(false);
+    await waitFor(() => {
+      expect(screen.queryByText(PAYMENT.description)).toBeNull();
+    });
+  });
+
+  it("sends no request for a type filter the schema rejects", async () => {
+    const { user } = await renderLoadedPage();
+    const expected = schemaMessage(tranTypeListFilterSchema, {
+      type_code: "0A",
+    });
+
+    await user.type(typeFilter(), "0A{Enter}");
+
+    const alert = await within(filterForm()).findByRole("alert");
+    expect(alert.textContent).toBe(expected);
+    expect(typeFilter().getAttribute("aria-invalid")).toBe("true");
+    expect(
+      requests("GET").some((request) =>
+        new URL(request.url).searchParams.has("type_code"),
+      ),
+    ).toBe(false);
+  });
+
+  it("maps a 400 on TRTYPE to the field, toasts it and focuses the field", async () => {
+    const errorSpy = vi.spyOn(toast, "error");
+    // The rejection is held back until focus has left the field, so the
+    // focus asserted afterwards is the one the error placed.
+    let answer = (): void => undefined;
+    const answered = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    respond = async (request) => {
+      if (
+        request.method === "GET" &&
+        new URL(request.url).searchParams.has("type_code")
+      ) {
+        await answered;
+        return json(FILTER_REJECTION, 400);
+      }
+      return defaultRespond(request);
+    };
+    const { user } = await renderLoadedPage();
+
+    await user.type(typeFilter(), "01");
+    const search = screen.getByRole("button", { name: "Search" });
+    await user.click(search);
+    expect(document.activeElement).toBe(search);
+    answer();
+
+    const alert = await within(filterForm()).findByRole("alert");
+    expect(alert.textContent).toBe(FILTER_REJECTION_TEXT);
+    expect(errorSpy).toHaveBeenCalledWith(FILTER_REJECTION_TEXT);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(typeFilter());
+    });
+  });
+});
+
+describe("TranTypeListPage inline update (F-COTRTLI-006, F-COTRTLI-007)", () => {
+  it("sends the new description with origin=list and toasts the answer", async () => {
+    const successSpy = vi.spyOn(toast, "success");
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    const description = rowDescription();
+    expect(document.activeElement).toBe(description);
+    await user.clear(description);
+    await user.type(description, "Retail purchase");
+    await user.click(within(rowForm()).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(requests("PUT")).toHaveLength(1);
+    });
+    const [request] = requests("PUT");
+    if (request === undefined) {
+      throw new Error("no update request was sent");
+    }
+    const url = new URL(request.url);
+    expect(url.pathname).toBe(`${API_PATH}/${PURCHASE.type_code}`);
+    expect(url.searchParams.get("origin")).toBe("list");
+    expect(await request.clone().json()).toEqual({
+      description: "Retail purchase",
+    });
+    await waitFor(() => {
+      expect(successSpy).toHaveBeenCalledWith(UPDATE_ANSWER.message);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    });
+  });
+
+  it("sends no request for a blank description and shows the field error", async () => {
+    const { user } = await renderLoadedPage();
+    const expected = schemaMessage(tranTypeInlineEditSchema, {
+      description: "",
+    });
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    await user.clear(rowDescription());
+    await user.click(within(rowForm()).getByRole("button", { name: "Save" }));
+
+    const alert = await within(rowForm()).findByRole("alert");
+    expect(alert.textContent).toBe(expected);
+    expect(requests("PUT")).toHaveLength(0);
+  });
+
+  it("toasts a rejected update and keeps the row open", async () => {
+    const errorSpy = vi.spyOn(toast, "error");
+    respond = (request) =>
+      request.method === "PUT"
+        ? json(ROW_REJECTION, 400)
+        : defaultRespond(request);
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    await user.click(within(rowForm()).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(errorSpy).toHaveBeenCalledWith(ROW_REJECTION.message);
+    });
+    expect(requests("PUT")).toHaveLength(1);
+    // The inline update names no BMS field, so only the toast carries the text.
+    expect(within(rowForm()).queryByRole("alert")).toBeNull();
+  });
+
+  // jsdom lays nothing out, so the width the columns keep is asserted on the
+  // utilities that size the description in either state.
+  it("sizes the description alike shown and open, so the columns keep their widths", async () => {
+    const { user } = await renderLoadedPage();
+    const widthClasses = (element: Element): string[] =>
+      [...element.classList]
+        .filter((name) => /^(?:[a-z0-9]+:)*(?:min-|max-)?w-/.test(name))
+        .sort();
+    const shown = widthClasses(screen.getByText(PURCHASE.description));
+    expect(shown).not.toEqual([]);
+    // A description longer than the width wraps inside it.
+    expect(screen.getByText(PAYMENT.description).classList).toContain(
+      "whitespace-normal",
+    );
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+
+    expect(widthClasses(rowForm())).toEqual(shown);
+    expect(widthClasses(screen.getByText(PAYMENT.description))).toEqual(shown);
+  });
+
+  it("opens the description with the cursor at its start", async () => {
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+
+    const description = rowDescription();
+    if (!(description instanceof HTMLInputElement)) {
+      throw new Error("the row description is not an input");
+    }
+    expect(document.activeElement).toBe(description);
+    expect([description.selectionStart, description.selectionEnd]).toEqual([
+      0, 0,
+    ]);
+  });
+
+  // The table scrolls inside its card, so the Edit that takes focus back is
+  // scrolled into the visible part of it.
+  it.each([
+    {
+      how: "a second press of its Edit",
+      close: (user: ReturnType<typeof userEvent.setup>) =>
+        user.click(rowButton("Edit", PURCHASE.type_code)),
+    },
+    {
+      how: "a save",
+      close: (user: ReturnType<typeof userEvent.setup>) =>
+        user.click(within(rowForm()).getByRole("button", { name: "Save" })),
+    },
+  ])(
+    "returns focus to the row's Edit, scrolled into view, after $how",
+    async ({ close }) => {
+      const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+      const { user } = await renderLoadedPage();
+      const edit = rowButton("Edit", PURCHASE.type_code);
+      await user.click(edit);
+      expect(edit.getAttribute("aria-pressed")).toBe("true");
+      scrollSpy.mockClear();
+
+      await close(user);
+
+      await waitFor(() => {
+        expect(edit.getAttribute("aria-pressed")).toBe("false");
+      });
+      expect(document.activeElement).toBe(edit);
+      expect(scrollSpy.mock.contexts).toContain(edit);
+      expect(scrollSpy).toHaveBeenCalledWith({
+        block: "nearest",
+        inline: "nearest",
+      });
+    },
+  );
+
+  it("leaves focus in the newly opened row when another row's Edit closes the open one", async () => {
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+    const { user } = await renderLoadedPage();
+    const first = rowButton("Edit", PURCHASE.type_code);
+    await user.click(first);
+    scrollSpy.mockClear();
+
+    await user.click(rowButton("Edit", PAYMENT.type_code));
+
+    expect(first.getAttribute("aria-pressed")).toBe("false");
+    expect(document.activeElement).toBe(rowDescription());
+    expect(rowDescription()).toHaveProperty("value", PAYMENT.description);
+    expect(scrollSpy.mock.contexts).not.toContain(first);
+  });
+
+  // The toasts are read from the Toaster as their type and text. Each case
+  // has texts of its own, so a toast an earlier test left open is not read.
+  it.each([
+    {
+      answer: "a stored change once, as a success",
+      message: "Stub stored change",
+      info: "Stub stored change",
+      toasts: [["success", "Stub stored change"]],
+    },
+    {
+      answer: "a no-change message as a notice and its info line as a success",
+      message: "Stub no-change notice",
+      info: "Stub stored info",
+      toasts: [
+        [null, "Stub no-change notice"],
+        ["success", "Stub stored info"],
+      ],
+    },
+  ])("toasts $answer", async ({ message, info, toasts }) => {
+    const successSpy = vi.spyOn(toast, "success");
+    respond = (request) =>
+      request.method === "PUT"
+        ? json({
+            ...UPDATE_ANSWER,
+            message,
+            info,
+          } satisfies Schemas["TranTypeMessageResponse"])
+        : defaultRespond(request);
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    await user.click(within(rowForm()).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      const shown = Array.from(
+        document.querySelectorAll<HTMLElement>("[data-sonner-toast]"),
+      )
+        .map((element) => [
+          element.getAttribute("data-type"),
+          element.textContent ?? "",
+        ])
+        .filter(([, text]) => text === message || text === info);
+      expect(shown).toHaveLength(toasts.length);
+      expect(shown).toEqual(expect.arrayContaining(toasts));
+    });
+    expect(successSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // Two clicks before the row re-renders send one PUT, and its answer is
+  // the one shown.
+  it("sends one PUT for a double click on the row's Save", async () => {
+    const successSpy = vi.spyOn(toast, "success");
+    const errorSpy = vi.spyOn(toast, "error");
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    const save = within(rowForm()).getByRole("button", { name: "Save" });
+    fireEvent.click(save);
+    fireEvent.click(save);
+
+    await waitFor(() => {
+      expect(successSpy).toHaveBeenCalledWith(UPDATE_ANSWER.message);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    });
+    expect(requests("PUT")).toHaveLength(1);
+    expect(successSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps the row's Save focused and its form busy while the update runs, then returns focus to Edit", async () => {
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    respond = async (request) => {
+      if (request.method === "PUT") {
+        await held;
+      }
+      return defaultRespond(request);
+    };
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    const save = within(rowForm()).getByRole("button", { name: "Save" });
+    await user.click(save);
+    await waitFor(() => {
+      expect(save.getAttribute("aria-disabled")).toBe("true");
+    });
+    // Inert but not disabled: a disabled button would hand focus to the body.
+    expect(save.hasAttribute("disabled")).toBe(false);
+    expect(document.activeElement).toBe(save);
+    expect(rowForm().getAttribute("aria-busy")).toBe("true");
+    await user.keyboard("{Enter}");
+    await user.click(save);
+    expect(requests("PUT")).toHaveLength(1);
+
+    release();
+    await waitFor(() => {
+      expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    });
+    // The saved row closes with its Save, and focus lands on its Edit.
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        rowButton("Edit", PURCHASE.type_code),
+      );
+    });
+    expect(requests("PUT")).toHaveLength(1);
+  });
+
+  // The server may still store the description after the client gave up, so
+  // the toast says so, the PUT is not sent again, the row stays open with
+  // what was typed, and the list is read again.
+  it("toasts an update past the deadline as possibly saved, sends it once and reads the list again", async () => {
+    const errorSpy = vi.spyOn(toast, "error");
+    respond = async (request) => {
+      if (request.method === "PUT") {
+        throw new RequestTimeoutError();
+      }
+      return defaultRespond(request);
+    };
+    const { user } = await renderLoadedPage();
+    const reads = requests("GET").length;
+
+    await user.click(rowButton("Edit", PURCHASE.type_code));
+    await user.clear(rowDescription());
+    await user.type(rowDescription(), "Retail purchase");
+    await user.click(within(rowForm()).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(errorSpy).toHaveBeenCalledWith(
+        "No answer from the server within 30 seconds",
+        {
+          description:
+            "The description may have been saved. Check the type before saving it again.",
+          duration: Infinity,
+        },
+      );
+    });
+    await waitFor(() => {
+      expect(requests("GET")).toHaveLength(reads + 1);
+    });
+    expect(requests("PUT")).toHaveLength(1);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(rowDescription()).toHaveProperty("value", "Retail purchase");
+  });
+});
+
+describe("TranTypeListPage delete (F-COTRTLI-008, F-COTRTLI-009)", () => {
+  it("deletes the row once confirmed and toasts the answer", async () => {
+    const successSpy = vi.spyOn(toast, "success");
+    const { user } = await renderLoadedPage();
+
+    await user.click(rowButton("Delete", PAYMENT.type_code));
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Delete transaction type",
+    });
+    expect(requests("DELETE")).toHaveLength(0);
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => {
+      expect(requests("DELETE")).toHaveLength(1);
+    });
+    const [request] = requests("DELETE");
+    if (request === undefined) {
+      throw new Error("no delete request was sent");
+    }
+    const url = new URL(request.url);
+    expect(url.pathname).toBe(`${API_PATH}/${PAYMENT.type_code}`);
+    // Without `origin` the server applies the COTRTLIC row delete.
+    expect(url.searchParams.has("origin")).toBe(false);
+    await waitFor(() => {
+      expect(successSpy).toHaveBeenCalledWith(DELETE_ANSWER.message);
+    });
+  });
+});
+
+// Types `.` and `..`, which MNTTRDB2 can store and a URL drops as dot
+// segments: their row actions address the key segments `~.` and `~..`
+// (lib/key-segment.ts), each with the origin of its program.
+describe("TranTypeListPage dot-segment type codes (F-COTRTLI-006 to F-COTRTLI-009)", () => {
+  const DOT_TYPE = {
+    type_code: ".",
+    description: "DOT TYPE",
+  } satisfies Schemas["TranTypeResponse"];
+
+  const DOTS_TYPE = {
+    type_code: "..",
+    description: "DOTS TYPE",
+  } satisfies Schemas["TranTypeResponse"];
+
+  const DOT_TYPES_PAGE = {
+    items: [DOT_TYPE, DOTS_TYPE, PURCHASE],
+    next_key: null,
+    prev_key: null,
+  } satisfies Schemas["Page_TranTypeResponse"];
+
+  function respondWithDotTypes(request: Request): Response {
+    return request.method === "GET"
+      ? json(DOT_TYPES_PAGE)
+      : defaultRespond(request);
+  }
+
+  it("updates the type '.' inline with PUT ~.?origin=list", async () => {
+    respond = respondWithDotTypes;
+    const { user } = renderPage();
+    await screen.findByText(DOT_TYPE.description);
+
+    await user.click(rowButton("Edit", DOT_TYPE.type_code));
+    await user.clear(rowDescription());
+    await user.type(rowDescription(), "DOT RENAMED");
+    await user.click(within(rowForm()).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(requests("PUT")).toHaveLength(1);
+    });
+    const [request] = requests("PUT");
+    if (request === undefined) {
+      throw new Error("no update request was sent");
+    }
+    const url = new URL(request.url);
+    expect(url.pathname).toBe(`${API_PATH}/~.`);
+    expect([...url.searchParams]).toEqual([["origin", "list"]]);
+    expect(await request.clone().json()).toEqual({
+      description: "DOT RENAMED",
+    });
+  });
+
+  it("deletes the type '..' with DELETE ~.. and no origin", async () => {
+    respond = respondWithDotTypes;
+    const { user } = renderPage();
+    await screen.findByText(DOTS_TYPE.description);
+
+    await user.click(rowButton("Delete", DOTS_TYPE.type_code));
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Delete transaction type",
+    });
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => {
+      expect(requests("DELETE")).toHaveLength(1);
+    });
+    const [request] = requests("DELETE");
+    if (request === undefined) {
+      throw new Error("no delete request was sent");
+    }
+    const url = new URL(request.url);
+    expect(url.pathname).toBe(`${API_PATH}/~..`);
+    expect(url.search).toBe("");
+  });
+});
+
+describe("TranTypeListPage first page after a delete (F-COTRTLI-009)", () => {
+  // The toasts are counted on screen. A new Toaster shows the ones an earlier
+  // test left open, so those are dismissed first.
+  beforeEach(() => {
+    toast.dismiss();
+  });
+
+  // A type after the seven of the fixture, alone on the second page.
+  const SECOND_PAGE_TYPE = {
+    type_code: "08",
+    description: "Stub type",
+  } satisfies Schemas["TranTypeResponse"];
+
+  // The seven fixture types and one more: seven rows a page, the COTRTLI
+  // screen, so the eighth code starts a second page.
+  const TWO_PAGES: Schemas["TranTypeResponse"][] = [
+    PURCHASE,
+    PAYMENT,
+    { type_code: "03", description: "Credit" },
+    { type_code: "04", description: "Authorization" },
+    { type_code: "05", description: "Refund" },
+    { type_code: "06", description: "Reversal" },
+    { type_code: "07", description: "Adjustment" },
+    SECOND_PAGE_TYPE,
+  ];
+
+  // A page's text: its start and the deletes made before it was read, so a
+  // page shown from the cache is told apart from a fresh one.
+  function pageText(startKey: string | null, deletes: number): string {
+    return `Stub page from ${startKey ?? "the start"} after ${deletes} deletes`;
+  }
+
+  // Serves TWO_PAGES less the types deleted, forward from `start_key`. A read
+  // made after a delete answers after a pause, as over a network, so the page
+  // renders the copy it already holds while the read runs. `deleteAnswered`,
+  // when given, holds back the delete until it settles.
+  function serveTwoPages(deleteAnswered?: Promise<void>): void {
+    let onFile = [...TWO_PAGES];
+    let deletes = 0;
+    respond = async (request) => {
+      const url = new URL(request.url);
+      if (request.method === "DELETE") {
+        await deleteAnswered;
+        const code = decodeURIComponent(
+          url.pathname.slice(API_PATH.length + 1),
+        );
+        onFile = onFile.filter((type) => type.type_code !== code);
+        deletes += 1;
+        return json(DELETE_ANSWER);
+      }
+      if (request.method !== "GET") {
+        return defaultRespond(request);
+      }
+      if (deletes > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const startKey = url.searchParams.get("start_key");
+      const rows = onFile.filter(
+        (type) => startKey === null || type.type_code >= startKey,
+      );
+      return json({
+        items: rows.slice(0, 7),
+        next_key: rows[7]?.type_code ?? null,
+        prev_key: startKey,
+        message: pageText(startKey, deletes),
+      } satisfies Schemas["Page_TranTypeResponse"]);
+    };
+  }
+
+  async function confirmDelete(
+    user: ReturnType<typeof userEvent.setup>,
+    typeCode: string,
+  ): Promise<void> {
+    await user.click(rowButton("Delete", typeCode));
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Delete transaction type",
+    });
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+  }
+
+  // The requests sent after the delete of `typeCode`, each as its method and
+  // the names of its query parameters.
+  function sentAfterDelete(typeCode: string): [string, string[]][] {
+    const sent = fetchMock.mock.calls.map(([request]) => request);
+    const deleteAt = sent.findIndex((request) => request.method === "DELETE");
+    const deleted = sent[deleteAt];
+    if (deleted === undefined) {
+      throw new Error("no delete request was sent");
+    }
+    expect(new URL(deleted.url).pathname).toBe(`${API_PATH}/${typeCode}`);
+    return sent
+      .slice(deleteAt + 1)
+      .map((request) => [
+        request.method,
+        [...new URL(request.url).searchParams.keys()],
+      ]);
+  }
+
+  // COTRTLIC resets its paging after 9300-DELETE-RECORD (P-COTRTLIC-007): the
+  // list answers a delete with its first page, read once, wherever the delete
+  // was made, and with that page's text taken from the fresh answer.
+  it.each([
+    {
+      from: "the second page",
+      typeCode: SECOND_PAGE_TYPE.type_code,
+      paged: true,
+    },
+    { from: "the first page", typeCode: PAYMENT.type_code, paged: false },
+  ])(
+    "reads only the first page again after a delete on $from",
+    async ({ typeCode, paged }) => {
+      const successSpy = vi.spyOn(toast, "success");
+      serveTwoPages();
+      const { user } = await renderLoadedPage();
+      await screen.findByText(pageText(null, 0));
+      if (paged) {
+        await user.click(screen.getByRole("button", { name: "Next" }));
+        await screen.findByText(pageText(typeCode, 0));
+      }
+
+      await confirmDelete(user, typeCode);
+
+      await screen.findByText(pageText(null, 1));
+      expect(successSpy).toHaveBeenCalledWith(DELETE_ANSWER.message);
+      // One read follows the delete: the first page, with no cursor.
+      expect(sentAfterDelete(typeCode)).toEqual([["GET", []]]);
+      // The first page's text shows once for the fresh page, and the cached
+      // copy of the first page read before the delete is not shown again.
+      expect(screen.getAllByText(pageText(null, 1))).toHaveLength(1);
+      expect(screen.getAllByText(pageText(null, 0))).toHaveLength(1);
+      // The fresh first page: the deleted type is gone, and seven types are
+      // left, so no page follows.
+      expect(
+        screen.queryByRole("button", { name: "Delete", description: typeCode }),
+      ).toBeNull();
+      expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(7);
+      expect(
+        screen
+          .getByRole("button", { name: "Next" })
+          .getAttribute("aria-disabled"),
+      ).toBe("true");
+    },
+  );
+
+  // The confirm dialog closes on Confirm, so the list can move on while the
+  // delete runs. Its answer returns to the first page from the request then
+  // on screen, and the page left behind is not read again.
+  it("returns to the first page from the page shown when the delete answers", async () => {
+    let answerDelete = (): void => undefined;
+    serveTwoPages(
+      new Promise<void>((resolve) => {
+        answerDelete = resolve;
+      }),
+    );
+    const { user } = await renderLoadedPage();
+
+    await confirmDelete(user, PAYMENT.type_code);
+    await waitFor(() => {
+      expect(requests("DELETE")).toHaveLength(1);
+    });
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    await screen.findByText(SECOND_PAGE_TYPE.description);
+    answerDelete();
+
+    await screen.findByText(pageText(null, 1));
+    expect(sentAfterDelete(PAYMENT.type_code)).toEqual([
+      ["GET", ["start_key", "direction"]],
+      ["GET", []],
+    ]);
+    expect(screen.queryByText(PAYMENT.description)).toBeNull();
+    expect(screen.getByText(PURCHASE.description)).not.toBeNull();
+  });
+});
+
+// A refused delete (F-COTRTLI-009) leaves the list where it was: the toast
+// carries the server's text, the row stays on the page the delete was made
+// from, and the row's Delete asks again. A 4xx refuses the delete before
+// anything is stored, so no page is read again; a 5xx may follow a stored
+// delete, so the page shown is read again once, without a return to the first
+// page (api/queries/transaction-types.ts mayHaveWritten). COTRTLIC's delete
+// failures name no BMS field (V-COTRTLIC-021 to V-COTRTLIC-023), so their
+// bodies carry no fields.
+describe("TranTypeListPage refused delete (F-COTRTLI-009)", () => {
+  // Two pages of one type each, so a reset to the first page shows.
+  const FIRST_OF_TWO = {
+    items: [PURCHASE],
+    next_key: PAYMENT.type_code,
+    prev_key: null,
+  } satisfies Schemas["Page_TranTypeResponse"];
+
+  const SECOND_OF_TWO = {
+    items: [PAYMENT],
+    next_key: null,
+    prev_key: PAYMENT.type_code,
+  } satisfies Schemas["Page_TranTypeResponse"];
+
+  async function openDelete(
+    user: ReturnType<typeof userEvent.setup>,
+  ): Promise<HTMLElement> {
+    await user.click(rowButton("Delete", PAYMENT.type_code));
+    return screen.findByRole("alertdialog", {
+      name: "Delete transaction type",
+    });
+  }
+
+  it.each([
+    {
+      row: "V-COTRTLIC-021",
+      status: 409,
+      code: "CONFLICT",
+      message: "Stub delete conflict",
+      reread: false,
+    },
+    {
+      row: "V-COTRTLIC-022",
+      status: 404,
+      code: "NOT_FOUND",
+      message: "Stub delete not found",
+      reread: false,
+    },
+    {
+      row: "V-COTRTLIC-023",
+      status: 500,
+      code: "UNEXPECTED",
+      message: "Stub delete failure",
+      reread: true,
+    },
+  ])(
+    "a $status refusal ($row) is toasted and keeps the row on its page",
+    async ({ status, code, message, reread }) => {
+      const errorSpy = vi.spyOn(toast, "error");
+      const successSpy = vi.spyOn(toast, "success");
+      const refusal = { code, message } satisfies Schemas["ErrorBody"];
+      let refuse = true;
+      respond = (request) => {
+        if (request.method === "DELETE") {
+          return refuse ? json(refusal, status) : json(DELETE_ANSWER);
+        }
+        if (request.method === "GET") {
+          const startKey = new URL(request.url).searchParams.get("start_key");
+          return json(
+            startKey === PAYMENT.type_code ? SECOND_OF_TWO : FIRST_OF_TWO,
+          );
+        }
+        return defaultRespond(request);
+      };
+      const { user } = await renderLoadedPage();
+      await user.click(screen.getByRole("button", { name: "Next" }));
+      await screen.findByText(PAYMENT.description);
+      expect(screen.queryByText(PURCHASE.description)).toBeNull();
+      const readsBefore = requests("GET").length;
+
+      const dialog = await openDelete(user);
+      await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+
+      await waitFor(() => {
+        expect(errorSpy).toHaveBeenCalledWith(message);
+      });
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(successSpy).not.toHaveBeenCalled();
+      expect(requests("DELETE")).toHaveLength(1);
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      // The page is not reset: still the second page, read again only after
+      // a 5xx.
+      await waitFor(() => {
+        expect(
+          requests("GET")
+            .slice(readsBefore)
+            .map((request) => new URL(request.url).searchParams.get("start_key")),
+        ).toEqual(reread ? [PAYMENT.type_code] : []);
+      });
+      expect(rowButton("Delete", PAYMENT.type_code).textContent).toBe("Delete");
+      expect(screen.getByText(PAYMENT.description).textContent).toBe(
+        PAYMENT.description,
+      );
+      expect(screen.queryByText(PURCHASE.description)).toBeNull();
+      // The refusal names no field, so the filters stay unmarked.
+      expect(typeFilter().getAttribute("aria-invalid")).toBe("false");
+      expect(within(filterForm()).queryByRole("alert")).toBeNull();
+
+      // The row's Delete asks again: Cancel sends nothing, …
+      const asked = await openDelete(user);
+      await user.click(within(asked).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      expect(requests("DELETE")).toHaveLength(1);
+
+      // … and Confirm sends the delete again, which the server now accepts.
+      refuse = false;
+      const retried = await openDelete(user);
+      await user.click(within(retried).getByRole("button", { name: "Confirm" }));
+
+      await waitFor(() => {
+        expect(successSpy).toHaveBeenCalledWith(DELETE_ANSWER.message);
+      });
+      expect(requests("DELETE")).toHaveLength(2);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      // The accepted delete returns the list to its first page.
+      expect(
+        (await screen.findByText(PURCHASE.description)).textContent,
+      ).toBe(PURCHASE.description);
+    },
+  );
+});

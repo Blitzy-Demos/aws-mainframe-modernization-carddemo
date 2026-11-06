@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO reward_accruals (account_id, transaction_id, rule_id, points_earned, created_at)\nVALUES ($1, $2, $3, $4, '2022-07-01 12:00:00+00')\nRETURNING accrual_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "accrual_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "076fcefecfe07e8ff0e2eec5981a4042e00985b3cbb397e19d6401b9e0d9a04b"
+}

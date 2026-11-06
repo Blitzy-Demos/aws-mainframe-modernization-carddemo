@@ -1,0 +1,31 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    TranCategoryFileRecord {
+        tran_category: TranCategoryRecord {
+            tran_type_cd: TranTypeCode(
+                Alnum<2>("01"),
+            ),
+            tran_cat_cd: TranCategoryCode(
+                1,
+            ),
+            tran_cat_type_desc: Alnum<50>("Regular Sales Draft                               "),
+        },
+        filler: Alnum<4>("0000"),
+    },
+    TranCategoryFileRecord {
+        tran_category: TranCategoryRecord {
+            tran_type_cd: TranTypeCode(
+                Alnum<2>("07"),
+            ),
+            tran_cat_cd: TranCategoryCode(
+                1,
+            ),
+            tran_cat_type_desc: Alnum<50>("Sales draft credit adjustment                     "),
+        },
+        filler: Alnum<4>("0000"),
+    },
+)

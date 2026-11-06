@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE transaction_types SET tr_description = $2 WHERE tr_type = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e3f7065bb04f354da65b63cd004758db9b4c3f8fd86c2109c6ab9fb0275f9f2c"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SAVEPOINT carddemo_statement",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "c45f0b9b5e80dbceeb8d0fedd3e30a10e3f580099f9f2119d352d230103c5509"
+}

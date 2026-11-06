@@ -1,0 +1,73 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    DailyTranRecord {
+        daily_tran: DailyTran {
+            dalytran_id: TranId(
+                Alnum<16>("0000000000683580"),
+            ),
+            dalytran_type_cd: TranTypeCode(
+                Alnum<2>("01"),
+            ),
+            dalytran_cat_cd: TranCategoryCode(
+                1,
+            ),
+            dalytran_source: Alnum<10>("POS TERM  "),
+            dalytran_desc: Alnum<100>("Purchase at Abshire-Lowe                                                                            "),
+            dalytran_amt: Money(
+                504.77,
+            ),
+            dalytran_merchant_id: MerchantId(
+                800000000,
+            ),
+            dalytran_merchant_name: Alnum<50>("Abshire-Lowe                                      "),
+            dalytran_merchant_city: Alnum<50>("North Enoshaven                                   "),
+            dalytran_merchant_zip: Alnum<10>("72112     "),
+            dalytran_card_num: CardNumber(
+                "************7065",
+            ),
+            dalytran_orig_ts: Alnum<26>("2022-06-10 19:27:53.000000"),
+            dalytran_proc_ts: Alnum<26>("                          "),
+        },
+        filler: Alnum<20>("                    "),
+        preserved: PreservedFields(
+            [],
+        ),
+    },
+    DailyTranRecord {
+        daily_tran: DailyTran {
+            dalytran_id: TranId(
+                Alnum<16>("0000000996722787"),
+            ),
+            dalytran_type_cd: TranTypeCode(
+                Alnum<2>("01"),
+            ),
+            dalytran_cat_cd: TranCategoryCode(
+                1,
+            ),
+            dalytran_source: Alnum<10>("POS TERM  "),
+            dalytran_desc: Alnum<100>("Purchase at Kilback LLC                                                                             "),
+            dalytran_amt: Money(
+                603.22,
+            ),
+            dalytran_merchant_id: MerchantId(
+                800000000,
+            ),
+            dalytran_merchant_name: Alnum<50>("Kilback LLC                                       "),
+            dalytran_merchant_city: Alnum<50>("Cummeratamouth                                    "),
+            dalytran_merchant_zip: Alnum<10>("53200-7529"),
+            dalytran_card_num: CardNumber(
+                "************7560",
+            ),
+            dalytran_orig_ts: Alnum<26>("2022-06-10 19:27:53.000000"),
+            dalytran_proc_ts: Alnum<26>("                          "),
+        },
+        filler: Alnum<20>("                    "),
+        preserved: PreservedFields(
+            [],
+        ),
+    },
+)

@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE reward_rules SET transaction_type_cd = $2, transaction_category_cd = $3, reward_rate = $4, min_transaction_amount = $5, max_transaction_amount = $6, active_from = $7, active_to = $8 WHERE rule_id = $1 RETURNING rule_id, transaction_type_cd, transaction_category_cd, reward_rate, min_transaction_amount, max_transaction_amount, active_from, active_to",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rule_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "transaction_type_cd",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_category_cd",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "reward_rate",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "min_transaction_amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "max_transaction_amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "active_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "active_to",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Int4",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "89b31b5ec49364fd3d7aa4940fc2fefcd8e91c585ecb363ae54e5ad66eca32ee"
+}

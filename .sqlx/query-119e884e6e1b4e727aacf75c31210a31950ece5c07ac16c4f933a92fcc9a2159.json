@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT rule_id, transaction_type_cd, transaction_category_cd, reward_rate,\n                  min_transaction_amount, max_transaction_amount, active_from, active_to\n             FROM reward_rules\n            ORDER BY rule_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rule_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "transaction_type_cd",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_category_cd",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "reward_rate",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "min_transaction_amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "max_transaction_amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "active_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "active_to",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "119e884e6e1b4e727aacf75c31210a31950ece5c07ac16c4f933a92fcc9a2159"
+}

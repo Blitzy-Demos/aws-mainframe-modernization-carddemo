@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT s.pa_acct_id AS acct_id, s.pa_cust_id AS cust_id,\n                      s.pa_auth_status AS auth_status, s.pa_account_status AS account_status,\n                      s.pa_credit_limit AS credit_limit, s.pa_cash_limit AS cash_limit,\n                      s.pa_credit_balance AS credit_balance, s.pa_cash_balance AS cash_balance,\n                      s.pa_approved_auth_cnt AS approved_auth_cnt,\n                      s.pa_declined_auth_cnt AS declined_auth_cnt,\n                      s.pa_approved_auth_amt AS approved_auth_amt,\n                      s.pa_declined_auth_amt AS declined_auth_amt\n                 FROM pending_auth_details d\n                 JOIN pending_auth_summaries s ON s.pa_acct_id = d.pa_acct_id\n                WHERE d.auth_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "cust_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "auth_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "account_status",
+        "type_info": "VarcharArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "credit_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "cash_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "credit_balance",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 7,
+        "name": "cash_balance",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 8,
+        "name": "approved_auth_cnt",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 9,
+        "name": "declined_auth_cnt",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 10,
+        "name": "approved_auth_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 11,
+        "name": "declined_auth_amt",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "6134c0826b7978620b190ae2a4f0d46a20c244da4f3b687fc902d3e06ac2d032"
+}

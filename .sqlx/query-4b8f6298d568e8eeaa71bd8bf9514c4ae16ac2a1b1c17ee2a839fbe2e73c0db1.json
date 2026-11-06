@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT account_id, total_points_earned, total_points_redeemed, available_points FROM reward_balances WHERE account_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_points_earned",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_points_redeemed",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "available_points",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4b8f6298d568e8eeaa71bd8bf9514c4ae16ac2a1b1c17ee2a839fbe2e73c0db1"
+}

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE transaction_category_balances SET tran_cat_bal = $4 WHERE trancat_acct_id = $1 AND trancat_type_cd = $2 AND trancat_cd = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int4",
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a820972b33f0b8a739631985a9c7ea139037c67bb16e43833774bd25c0d71612"
+}

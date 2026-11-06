@@ -1,0 +1,105 @@
+diff --git a/dist/index.js b/dist/index.js
+index ccabbe78b68e1bb57a10cfd89219b3bc4489d963..11cd339aa595982d547036084a183e103c55afda 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -11,6 +11,14 @@ import { readFileSync } from "node:fs";
+ import os from "node:os";
+ import childProcess, { fork } from "node:child_process";
+ 
++//#region backport of tinypool 2.1.1 and 2.1.2 (GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr)
++// Copy own properties onto a prototype-less object, so that options are never
++// resolved through a polluted prototype chain.
++function withNullPrototype(source) {
++	return Object.assign(Object.create(null), source);
++}
++
++//#endregion
+ //#region src/physicalCpuCount.ts
+ function exec(command) {
+ 	const output = childProcess.execSync(command, {
+@@ -101,10 +109,13 @@ var ProcessWorker = class {
+ 		this.process = fork(fileURLToPath(import.meta.url + "/../entry/process.js"), options.argv, {
+ 			...options,
+ 			stdio: "pipe",
+-			env: {
++			// Node's spawn copies every enumerable key of `env` into the child,
++			// inherited ones included, so the child env has no prototype
++			// (GHSA-5gmw-xhrv-c9v3).
++			env: withNullPrototype({
+ 				...options.env,
+ 				TINYPOOL_WORKER_ID: options.workerData[0].workerId.toString()
+-			}
++			})
+ 		});
+ 		process.stdout.setMaxListeners(1 + process.stdout.getMaxListeners());
+ 		process.stderr.setMaxListeners(1 + process.stderr.getMaxListeners());
+@@ -506,12 +517,14 @@ var ThreadPool = class {
+ 		this.publicInterface = publicInterface;
+ 		this.taskQueue = options.taskQueue || new ArrayTaskQueue();
+ 		const filename = options.filename ? maybeFileURLToPath(options.filename) : null;
+-		this.options = {
++		// Options the caller did not set are never read from Object.prototype
++		// (GHSA-5gmw-xhrv-c9v3).
++		this.options = withNullPrototype({
+ 			...kDefaultOptions,
+ 			...options,
+ 			filename,
+ 			maxQueue: 0
+-		};
++		});
+ 		if (options.maxThreads !== void 0 && this.options.minThreads >= options.maxThreads) this.options.minThreads = options.maxThreads;
+ 		if (options.minThreads !== void 0 && this.options.maxThreads <= options.minThreads) this.options.maxThreads = options.minThreads;
+ 		if (options.maxQueue === "auto") this.options.maxQueue = this.options.maxThreads ** 2;
+@@ -543,14 +556,17 @@ var ThreadPool = class {
+ 		});
+ 		const tinypoolPrivateData = { workerId };
+ 		const worker = this.options.runtime === "child_process" ? new ProcessWorker() : new ThreadWorker();
+-		worker.initialize({
++		// worker_threads reads Worker options it is not given, `eval` and
++		// `stdout` among them, through the options object's prototype, so the
++		// object handed to it has none (GHSA-5gmw-xhrv-c9v3).
++		worker.initialize(withNullPrototype({
+ 			env: this.options.env,
+ 			argv: this.options.argv,
+ 			execArgv: this.options.execArgv,
+ 			resourceLimits: this.options.resourceLimits,
+ 			workerData: [tinypoolPrivateData, this.options.workerData],
+ 			trackUnmanagedFds: this.options.trackUnmanagedFds
+-		});
++		}));
+ 		const onMessage = (message$1) => {
+ 			const { taskId, result } = message$1;
+ 			const taskInfo = workerInfo.taskInfos.get(taskId);
+@@ -718,7 +734,9 @@ var ThreadPool = class {
+ 		}
+ 		await Promise.all(exitEvents);
+ 	}
+-	async recycleWorkers(options = {}) {
++	async recycleWorkers(_options = {}) {
++		// `runtime` is read only when the caller set it (GHSA-85c8-ppgw-ccpr).
++		const options = withNullPrototype(_options);
+ 		const runtimeChanged = options?.runtime && options.runtime !== this.options.runtime;
+ 		if (options?.runtime) this.options.runtime = options.runtime;
+ 		if (this.options.isolateWorkers && !runtimeChanged) return;
+@@ -735,7 +753,9 @@ var ThreadPool = class {
+ };
+ var Tinypool = class extends EventEmitterAsyncResource {
+ 	#pool;
+-	constructor(options = {}) {
++	constructor(_options = {}) {
++		// Pool options are the caller's own properties only (GHSA-5gmw-xhrv-c9v3).
++		const options = withNullPrototype(_options);
+ 		if (options.minThreads !== void 0 && options.minThreads > 0 && options.minThreads < 1) options.minThreads = Math.max(1, Math.floor(options.minThreads * cpuCount));
+ 		if (options.maxThreads !== void 0 && options.maxThreads > 0 && options.maxThreads < 1) options.maxThreads = Math.max(1, Math.floor(options.maxThreads * cpuCount));
+ 		super({
+@@ -746,7 +766,9 @@ var Tinypool = class extends EventEmitterAsyncResource {
+ 		this.#pool = new ThreadPool(this, options);
+ 	}
+ 	run(task, options = kDefaultRunOptions) {
+-		const { transferList, filename, name, signal, runtime, channel } = options;
++		// Task options, the defaults included, are the caller's own properties
++		// only, so `filename` cannot come from Object.prototype (GHSA-85c8-ppgw-ccpr).
++		const { transferList, filename, name, signal, runtime, channel } = withNullPrototype(options);
+ 		return this.#pool.runTask(task, {
+ 			transferList,
+ 			filename,

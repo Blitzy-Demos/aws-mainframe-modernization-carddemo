@@ -1,0 +1,190 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT auth_id, pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,\n                      pa_auth_orig_date, pa_auth_orig_time, pa_card_num, pa_auth_type,\n                      pa_card_expiry_date, pa_message_type, pa_message_source,\n                      pa_auth_id_code, pa_auth_resp_code, pa_auth_resp_reason,\n                      pa_processing_code, pa_transaction_amt, pa_approved_amt,\n                      pa_merchant_catagory_code, pa_acqr_country_code, pa_pos_entry_mode,\n                      pa_merchant_id, pa_merchant_name, pa_merchant_city, pa_merchant_state,\n                      pa_merchant_zip, pa_transaction_id, pa_match_status, pa_auth_fraud,\n                      pa_fraud_rpt_date\n                 FROM pending_auth_details\n                WHERE auth_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "auth_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "pa_acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "pa_auth_date_9c",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "pa_auth_time_9c",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "pa_auth_orig_date",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "pa_auth_orig_time",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "pa_card_num",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "pa_auth_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "pa_card_expiry_date",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "pa_message_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "pa_message_source",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "pa_auth_id_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "pa_auth_resp_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "pa_auth_resp_reason",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "pa_processing_code",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 15,
+        "name": "pa_transaction_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 16,
+        "name": "pa_approved_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 17,
+        "name": "pa_merchant_catagory_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 18,
+        "name": "pa_acqr_country_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 19,
+        "name": "pa_pos_entry_mode",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 20,
+        "name": "pa_merchant_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 21,
+        "name": "pa_merchant_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 22,
+        "name": "pa_merchant_city",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 23,
+        "name": "pa_merchant_state",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 24,
+        "name": "pa_merchant_zip",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 25,
+        "name": "pa_transaction_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 26,
+        "name": "pa_match_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 27,
+        "name": "pa_auth_fraud",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 28,
+        "name": "pa_fraud_rpt_date",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "611fdd17b7042c11a43bba2d9d98c162db66fd748570d802335d240de13ac16d"
+}

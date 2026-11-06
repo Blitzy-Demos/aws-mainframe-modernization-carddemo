@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"mismatches!\"\n                 FROM transaction_categories m\n                 FULL JOIN trancatg_file f\n                   ON f.tran_type_cd = m.trc_type_code\n                  AND f.tran_cat_cd = m.trc_type_category::integer\n                WHERE m.trc_type_code IS NULL OR f.tran_type_cd IS NULL\n                   OR f.tran_cat_type_desc <> m.trc_cat_data",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "mismatches!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6601145731e196b4dee315679a7387e244f9ed9e6af86ae5ce6cbf3466f6683f"
+}
